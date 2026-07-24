@@ -44,6 +44,26 @@ TEST_CASE("Third wall flow changes only prints with at least three walls", "[Flo
     CHECK(extrusion_for(3, 1.5) > extrusion_for(3, 1.0));
 }
 
+TEST_CASE("Third wall flow preserves first and exposed top layers", "[Flow][Regression]")
+{
+    const auto extrusion_for = [](double height, double third_wall_flow) {
+        return total_positive_extrusion(slice({make_cube(10., 10., height)}, {
+            {"layer_height", 0.2},
+            {"initial_layer_print_height", 0.2},
+            {"wall_generator", "classic"},
+            {"wall_loops", 3},
+            {"top_shell_layers", 3},
+            {"bottom_shell_layers", 3},
+            {"sparse_infill_density", "0%"},
+            {"set_other_flow_ratios", 0},
+            {"third_wall_flow_ratio", third_wall_flow}
+        }));
+    };
+
+    CHECK_THAT(extrusion_for(0.4, 1.5), Catch::Matchers::WithinAbs(extrusion_for(0.4, 1.0), 1e-5));
+    CHECK(extrusion_for(2.0, 1.5) > extrusion_for(2.0, 1.0));
+}
+
 /// Test the expected behavior for auto-width,
 /// spacing, etc
 SCENARIO("Flow math for non-bridges", "[Flow]") {

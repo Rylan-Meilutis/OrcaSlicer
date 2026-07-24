@@ -1011,6 +1011,14 @@ void PrintConfigDef::init_common_params()
     def->cli = ConfigOptionDef::nocli;
     def->set_default_value(new ConfigOptionString());
 
+    def = this->add("sync_spool_manager_filament_names", coBool);
+    def->label = L("Sync OctoPrint SpoolManager names");
+    def->tooltip = L("When sending G-code to OctoPrint, load the available SpoolManager spools using the configured "
+                     "OctoPrint API key and write the selected spool names into [sm_name=] markers in filament notes.");
+    def->mode = comAdvanced;
+    def->cli = ConfigOptionDef::nocli;
+    def->set_default_value(new ConfigOptionBool(false));
+
     def = this->add("flashforge_serial_number", coString);
     def->label = L("Serial Number");
     def->tooltip = L("Flashforge local API requires the printer serial number.");
@@ -2632,6 +2640,23 @@ void PrintConfigDef::init_fff_params()
     def->min = 0;
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionFloat(40));
+
+    def = this->add("sequential_print_gantry_geometry", coString);
+    def->label = L("Gantry collision geometry");
+    def->tooltip = L("Optional JSON geometry used for model-aware collision checks and auto-arrange in by-object printing. "
+                     "Use the same slices format as resources/data/printer_gantries/geometries.json. "
+                     "Leave empty to use a bundled machine match or the clearance radius fallback.");
+    def->multiline = true;
+    def->full_width = true;
+    def->height = 6;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionString());
+
+    def = this->add("sequential_print_gantry_model", coString);
+    def->label = L("Gantry model");
+    def->tooltip = L("Optional STL model of the printhead and gantry for sequential-print visualization.");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionString());
 
     def = this->add("nozzle_height", coFloat);
     def->label = L("Nozzle height");

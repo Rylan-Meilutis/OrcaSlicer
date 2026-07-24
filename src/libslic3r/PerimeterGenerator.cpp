@@ -33,8 +33,9 @@ using namespace Slic3r::Feature::FuzzySkin;
 static WallSequence effective_wall_sequence(const PerimeterGenerator &generator)
 {
     if (generator.config->wall_loops.value >= 3 &&
-        generator.config->third_wall_flow_ratio > 1.0 + EPSILON)
-        return generator.layer_id == 0 ? WallSequence::OuterInner : WallSequence::InnerOuterInner;
+        generator.config->third_wall_flow_ratio > 1.0 + EPSILON &&
+        generator.layer_id > 0 && generator.upper_slices != nullptr)
+        return WallSequence::InnerOuterInner;
     return generator.config->wall_sequence;
 }
 
@@ -1112,7 +1113,13 @@ std::tuple<std::vector<ExtrusionPaths>, Polygons> generate_extra_perimeters_over
 
 void PerimeterGenerator::apply_extra_perimeters(ExPolygons &infill_area)
 {
-    if (!m_spiral_vase && this->lower_slices != nullptr && this->config->detect_overhang_wall && this->config->extra_perimeters_on_overhangs &&
+    // Arc overhangs are selected from bridge fill surfaces after perimeter generation.
+    // Extra overhang perimeters may consume an entire unsupported roof (for example
+    // the top platform of the Autodesk FDM test), leaving no bridge surface for the
+    // arc selector. When arc overhangs are enabled, preserve the fill surface and let
+    // its distance thresholds choose arc or traditional bridge infill.
+    if (!m_spiral_vase && this->lower_slices != nullptr && this->config->detect_overhang_wall &&
+        this->config->extra_perimeters_on_overhangs && !this->config->arc_overhang_enabled &&
         this->config->wall_loops > 0 && this->layer_id > this->object_config->raft_layers) {
         // Generate extra perimeters on overhang areas, and cut them to these parts only, to save print time and material
         auto [extra_perimeters, filled_area] = generate_extra_perimeters_over_overhangs(infill_area, this->lower_slices_polygons(),

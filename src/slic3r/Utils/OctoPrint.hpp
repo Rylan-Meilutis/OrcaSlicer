@@ -2,6 +2,7 @@
 #define slic3r_OctoPrint_hpp_
 
 #include <string>
+#include <vector>
 #include <wx/string.h>
 #include <boost/optional.hpp>
 #include <boost/asio/ip/address.hpp>
@@ -33,6 +34,7 @@ public:
     std::string get_host() const override { return m_host; }
     const std::string& get_apikey() const { return m_apikey; }
     const std::string& get_cafile() const { return m_cafile; }
+    bool get_spool_manager_spools(std::vector<std::string> &spool_names, wxString &error) const;
 
 protected:
 #ifdef WIN32

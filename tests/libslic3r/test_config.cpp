@@ -3,6 +3,7 @@
 #include "libslic3r/PrintConfig.hpp"
 #include "libslic3r/PrintConfigConstants.hpp"
 #include "libslic3r/LocalesUtils.hpp"
+#include "libslic3r/SequentialGantryGeometry.hpp"
 
 #include <cereal/types/polymorphic.hpp>
 #include <cereal/types/string.hpp>
@@ -29,6 +30,29 @@ TEST_CASE("New strength and overhang options preserve existing print defaults", 
     CHECK_THAT(config.opt_float("arc_overhang_min_overhang_distance"), Catch::Matchers::WithinAbs(0.0, EPSILON));
     CHECK_THAT(config.opt_float("third_wall_flow_ratio"), Catch::Matchers::WithinAbs(1.0, EPSILON));
     CHECK(config.opt_int("support_interface_top_temperature") == 0);
+    const ConfigOptionDef *spool_sync = print_config_def.get("sync_spool_manager_filament_names");
+    REQUIRE(spool_sync != nullptr);
+    CHECK_FALSE(spool_sync->default_value->getBool());
+    CHECK(config.opt_string("sequential_print_gantry_geometry").empty());
+    CHECK(config.opt_string("sequential_print_gantry_model").empty());
+}
+
+TEST_CASE("Custom sequential gantry geometry is machine-independent", "[Config][Arrange]")
+{
+    DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+    config.set_key_value("sequential_print_gantry_geometry", new ConfigOptionString(R"({
+        "gantry_model_filename": "custom_gantry.stl",
+        "slices": [
+            {"height": "2", "type": "convex", "polygons": ["-30,-40; 30,-40; 30,40; -30,40"]},
+            {"height": "18", "type": "box", "polygons": ["-200,-10; 200,-10; 200,10; -200,10"]}
+        ]
+    })"));
+
+    const SequentialGantryGeometry geometry = load_sequential_gantry_geometry(config);
+    REQUIRE_FALSE(geometry.empty());
+    CHECK_THAT(geometry.conservative_clearance_radius(), Catch::Matchers::WithinAbs(50., EPSILON));
+    CHECK_THAT(geometry.first_box_height(), Catch::Matchers::WithinAbs(18., EPSILON));
+    CHECK(geometry.model_path == "custom_gantry.stl");
 }
 
 SCENARIO("Generic config validation performs as expected.", "[Config]") {

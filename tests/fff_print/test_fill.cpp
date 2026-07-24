@@ -96,6 +96,25 @@ TEST_CASE("Wide unsupported roofs reach the preview as arc overhangs", "[Fill][A
     }));
 }
 
+TEST_CASE("Extra overhang perimeters do not consume arc overhang roofs", "[Fill][ArcOverhang][Regression]")
+{
+    TriangleMesh model = make_cube(10., 20., 5.);
+    TriangleMesh roof  = make_cube(30., 20., 2.);
+    roof.translate(-10., 0., 5.);
+    model.merge(roof);
+
+    Print print;
+    Slic3r::Test::init_and_process_print({model}, print, {
+        {"arc_overhang_enabled", "1"},
+        {"arc_overhang_bridge_distance", "5"},
+        {"extra_perimeters_on_overhangs", "1"},
+        {"wall_loops", "3"},
+        {"enable_support", "0"}
+    });
+
+    CHECK(print_has_arc_overhang(print));
+}
+
 #if 0
 TEST_CASE("Adjusted solid distance", "[Fill]") {
     int surface_width = 250;

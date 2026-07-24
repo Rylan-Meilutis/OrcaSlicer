@@ -8,6 +8,7 @@
 
 #include "libslic3r/GCodeWriter.hpp"
 #include "libslic3r/GCode.hpp"
+#include "libslic3r/GCode/SpoolManagerMetadata.hpp"
 #include "libslic3r/Model.hpp"
 #include "libslic3r/Print.hpp"
 #include "libslic3r/ModelArrange.hpp"
@@ -18,6 +19,31 @@
 
 using namespace Slic3r;
 using namespace Slic3r::Test;
+
+TEST_CASE("SpoolManager metadata updates marked filament notes", "[GCodeWriter][SpoolManager]")
+{
+    const std::string tail =
+        "; filament_type = PLA;PETG;ABS\n"
+        "; filament used [mm] = 10, 20\n"
+        "; filament_notes = [sm_name=Old]; [sm_name = ]; ordinary note\n";
+
+    const std::string updated =
+        SpoolManagerMetadata::update_gcode_tail(tail, {"Purple PLA", "Blue PETG", "Ignored"});
+
+    CHECK_THAT(updated, Catch::Matchers::ContainsSubstring("; filament used [mm] = 10, 20, 0"));
+    CHECK_THAT(updated, Catch::Matchers::ContainsSubstring(
+                            "; filament_notes = [sm_name = Purple PLA]; [sm_name = Blue PETG]; ordinary note"));
+}
+
+TEST_CASE("SpoolManager metadata leaves G-code without markers unchanged", "[GCodeWriter][SpoolManager]")
+{
+    const std::string tail =
+        "; filament_type = PLA\n"
+        "; filament used [mm] = 10\n"
+        "; filament_notes = ordinary note\n";
+
+    CHECK(SpoolManagerMetadata::update_gcode_tail(tail, {"Purple PLA"}) == tail);
+}
 
 // Arrange on a finite bed, not an unbounded InfiniteBed: the latter places items
 // near INT64_MIN/4 (~2.3e18), which reaches ClipperLib's coordinate limit and throws

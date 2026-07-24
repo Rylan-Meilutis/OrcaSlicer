@@ -7436,7 +7436,13 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
             _mm3_per_mm *= m_config.first_layer_flow_ratio;
         }
     }
-    if (m_config.wall_loops.value >= 3 && path.role() == erPerimeter && path.inset_idx >= 2)
+    const bool layer_has_top_surface = m_layer != nullptr &&
+        std::any_of(m_layer->regions().begin(), m_layer->regions().end(), [](const LayerRegion *region) {
+            return std::any_of(region->fill_surfaces.surfaces.begin(), region->fill_surfaces.surfaces.end(),
+                               [](const Surface &surface) { return surface.is_top(); });
+        });
+    if (!this->on_first_layer() && !layer_has_top_surface &&
+        m_config.wall_loops.value >= 3 && path.role() == erPerimeter && path.inset_idx >= 2)
         _mm3_per_mm *= m_config.third_wall_flow_ratio;
 
     // Effective extrusion length per distance unit = (filament_flow_ratio/cross_section) * mm3_per_mm / print flow ratio

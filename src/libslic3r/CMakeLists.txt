@@ -244,6 +244,8 @@ set(lisbslic3r_sources
     GCode/SmallAreaInfillFlowCompensator.hpp
     GCode/SpiralVase.cpp
     GCode/SpiralVase.hpp
+    GCode/SpoolManagerMetadata.cpp
+    GCode/SpoolManagerMetadata.hpp
     GCode/ThumbnailData.cpp
     GCode/ThumbnailData.hpp
     GCode/Thumbnails.cpp
@@ -366,6 +368,8 @@ set(lisbslic3r_sources
     ProjectTask.hpp
     QuadricEdgeCollapse.cpp
     QuadricEdgeCollapse.hpp
+    SequentialGantryGeometry.cpp
+    SequentialGantryGeometry.hpp
     Semver.cpp
     Shape/TextShape.cpp
     Shape/TextShape.hpp

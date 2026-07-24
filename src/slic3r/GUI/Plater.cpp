@@ -40,6 +40,7 @@
 #include <wx/statbox.h>
 #include <wx/statbmp.h>
 #include <wx/filedlg.h>
+#include <wx/choicdlg.h>
 #include <wx/dnd.h>
 #include <wx/progdlg.h>
 #include <wx/string.h>
@@ -68,6 +69,7 @@
 //#include "libslic3r/Format/3mf.hpp"
 #include "libslic3r/Format/bbs_3mf.hpp"
 #include "libslic3r/GCode/ThumbnailData.hpp"
+#include "libslic3r/GCode/SpoolManagerMetadata.hpp"
 #include "libslic3r/Model.hpp"
 #include "libslic3r/SLA/Hollowing.hpp"
 #include "libslic3r/SLA/SupportPoint.hpp"
@@ -96,6 +98,7 @@
 #include "GUI_Factories.hpp"
 #include "wxExtensions.hpp"
 #include "../Utils/PrintHost.hpp"
+#include "../Utils/OctoPrint.hpp"
 #include "MainFrame.hpp"
 #include "format.hpp"
 #include "3DScene.hpp"
@@ -17297,6 +17300,79 @@ void Plater::send_gcode_legacy(int plate_idx, Export3mfProgressFn proFn)
         upload_job.upload_data.group       = pDlg->group();
         upload_job.upload_data.storage     = pDlg->storage();
         upload_job.upload_data.extended_info = pDlg->extendedInfo();
+
+        const auto *sync_spools_opt =
+            physical_printer_config->option<ConfigOptionBool>("sync_spool_manager_filament_names");
+        if (host_type == htOctoPrint && sync_spools_opt != nullptr && sync_spools_opt->value) {
+            auto *octoprint = dynamic_cast<OctoPrint *>(upload_job.printhost.get());
+            if (octoprint == nullptr) {
+                show_error(this, _L("OctoPrint SpoolManager synchronization is not available for this print host."), false);
+                return;
+            }
+
+            std::vector<std::string> available_spools;
+            wxString error;
+            {
+                wxBusyCursor wait;
+                if (!octoprint->get_spool_manager_spools(available_spools, error)) {
+                    show_error(this, error, false);
+                    return;
+                }
+            }
+
+            DynamicPrintConfig full_config = preset_bundle->full_config();
+            const auto *filament_notes = full_config.option<ConfigOptionStrings>("filament_notes");
+            const auto *filament_types = full_config.option<ConfigOptionStrings>("filament_type");
+            if (filament_notes == nullptr || filament_notes->values.empty()) {
+                show_error(this, _L("No filament notes are available for SpoolManager synchronization."), false);
+                return;
+            }
+
+            const std::regex marker_re(R"(\[\s*sm_name\s*=\s*([^\]]*)\])");
+            std::vector<std::string> selected_names(filament_notes->values.size());
+            wxArrayString choices;
+            for (const std::string &spool : available_spools)
+                choices.Add(from_u8(spool));
+
+            bool found_marker = false;
+            for (size_t index = 0; index < filament_notes->values.size(); ++index) {
+                std::smatch marker;
+                if (!std::regex_search(filament_notes->values[index], marker, marker_re))
+                    continue;
+                found_marker = true;
+
+                std::string current_name = marker[1].str();
+                boost::algorithm::trim(current_name);
+                const std::string filament_type =
+                    filament_types != nullptr && index < filament_types->values.size() ?
+                        filament_types->values[index] : _u8L("Unknown");
+                wxSingleChoiceDialog spool_dialog(
+                    this,
+                    format_wxstr(_L("Select the loaded spool for filament %1% (%2%)."),
+                                 index + 1, from_u8(filament_type)),
+                    _L("OctoPrint SpoolManager"), choices);
+
+                const auto current = std::find(available_spools.begin(), available_spools.end(), current_name);
+                if (current != available_spools.end())
+                    spool_dialog.SetSelection(static_cast<int>(std::distance(available_spools.begin(), current)));
+                else if (!available_spools.empty())
+                    spool_dialog.SetSelection(0);
+
+                if (spool_dialog.ShowModal() != wxID_OK)
+                    return;
+                selected_names[index] = into_u8(spool_dialog.GetStringSelection());
+            }
+
+            if (!found_marker) {
+                show_error(this,
+                           _L("Add an [sm_name=] marker to the filament profile notes before enabling "
+                              "OctoPrint SpoolManager synchronization."),
+                           false);
+                return;
+            }
+            upload_job.upload_data.extended_info["spool_manager_names"] = json(selected_names).dump();
+        }
+
         // Orca: gcode inside a .gcode.3mf is index-coded (Metadata/plate_<N>.gcode) and a bundle may
         // carry several of them, so the upload must name which plate to print via a 1-based plateindex.
         // Even a single-plate bundle needs it, since its gcode entry is still indexed. The host upload
@@ -17316,6 +17392,26 @@ void Plater::send_gcode_legacy(int plate_idx, Export3mfProgressFn proFn)
     }
 
     if (use_3mf) {
+        const std::string serialized_names = upload_job.upload_data.extended("spool_manager_names");
+        if (!serialized_names.empty()) {
+            try {
+                const std::vector<std::string> names = json::parse(serialized_names).get<std::vector<std::string>>();
+                std::string metadata_error;
+                PartPlate *selected_plate = get_partplate_list().get_plate(resolved_plate_idx);
+                if (selected_plate == nullptr ||
+                    !SpoolManagerMetadata::update_gcode_file(selected_plate->get_tmp_gcode_path(), names, metadata_error)) {
+                    if (metadata_error.empty())
+                        metadata_error = _u8L("Unable to find the selected plate G-code.");
+                    show_error(this, from_u8(metadata_error), false);
+                    return;
+                }
+            } catch (const std::exception &exception) {
+                show_error(this, format_wxstr("%s: %s", _L("Invalid SpoolManager filament selection"),
+                                              from_u8(exception.what())), false);
+                return;
+            }
+        }
+
         // Process gcode
         const int result = send_gcode(resolved_plate_idx, nullptr);
 

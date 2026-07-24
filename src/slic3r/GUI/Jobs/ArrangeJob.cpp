@@ -5,6 +5,7 @@
 #include "libslic3r/MTUtils.hpp"
 #include "libslic3r/PresetBundle.hpp"
 #include "libslic3r/ModelArrange.hpp"
+#include "libslic3r/SequentialGantryGeometry.hpp"
 
 #include "slic3r/GUI/PartPlate.hpp"
 #include "slic3r/GUI/GLCanvas3D.hpp"
@@ -793,6 +794,16 @@ arrangement::ArrangeParams init_arrange_params(Plater *p)
     }
 
     if (params.is_seq_print) {
+        const SequentialGantryGeometry gantry = load_sequential_gantry_geometry(print_config);
+        if (!gantry.empty()) {
+            // ArrangeParams expresses the required center-to-center clearance
+            // as a diameter, whereas the geometry is measured from the nozzle.
+            params.clearance_radius = std::max(
+                params.clearance_radius,
+                static_cast<float>(2. * (gantry.conservative_clearance_radius() + object_skirt_offset)));
+            if (const double box_height = gantry.first_box_height(); box_height > 0.)
+                params.clearance_height_to_rod = std::min(params.clearance_height_to_rod, static_cast<float>(box_height));
+        }
         params.bed_shrink_x = BED_SHRINK_SEQ_PRINT;
         params.bed_shrink_y = BED_SHRINK_SEQ_PRINT;
     }

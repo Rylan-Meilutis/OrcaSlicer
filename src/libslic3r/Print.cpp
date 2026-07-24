@@ -16,6 +16,7 @@
 #include "GCode/WipeTower2.hpp"
 #include "Utils.hpp"
 #include "PrintConfig.hpp"
+#include "SequentialGantryGeometry.hpp"
 #include "MaterialType.hpp"
 #include "Model.hpp"
 #include "format.hpp"
@@ -655,6 +656,10 @@ StringObjectException Print::sequential_print_clearance_valid(const Print &print
     };
 
     auto [object_skirt_offset, _] = print.object_skirt_offset();
+    const SequentialGantryGeometry gantry = load_sequential_gantry_geometry(print_config);
+    const double effective_clearance_radius = gantry.empty()
+        ? print_config.extruder_clearance_radius.value
+        : std::max(print_config.extruder_clearance_radius.value, 2. * gantry.conservative_clearance_radius());
     std::vector<struct print_instance_info> print_instance_with_bounding_box;
     {
         // sequential_print_horizontal_clearance_valid
@@ -665,7 +670,7 @@ StringObjectException Print::sequential_print_clearance_valid(const Print &print
 
         // Shrink the extruder_clearance_radius a tiny bit, so that if the object arrangement algorithm placed the objects
         // exactly by satisfying the extruder_clearance_radius, this test will not trigger collision.
-        float obj_distance = print.is_all_objects_are_short() ? scale_(std::max(0.5f * MAX_OUTER_NOZZLE_DIAMETER, object_skirt_offset) - 0.1) : scale_(0.5 * print.config().extruder_clearance_radius.value + object_skirt_offset - 0.1);
+        float obj_distance = print.is_all_objects_are_short() ? scale_(std::max(0.5f * MAX_OUTER_NOZZLE_DIAMETER, object_skirt_offset) - 0.1) : scale_(0.5 * effective_clearance_radius + object_skirt_offset - 0.1);
 
         for (const PrintObject *print_object : print.objects()) {
             assert(! print_object->model_object()->instances.empty());
@@ -749,7 +754,10 @@ StringObjectException Print::sequential_print_clearance_valid(const Print &print
 
     // calc sort order
     double hc1              = scale_(print.config().extruder_clearance_height_to_lid); // height to lid
-    double hc2              = scale_(print.config().extruder_clearance_height_to_rod); // height to rod
+    const double gantry_box_height = gantry.first_box_height();
+    double hc2              = scale_(gantry_box_height > 0.
+        ? std::min(print.config().extruder_clearance_height_to_rod.value, gantry_box_height)
+        : print.config().extruder_clearance_height_to_rod.value); // height to rod
     double printable_height = scale_(print.config().printable_height);
 
 #if 0 //do not sort anymore, use the order in object list
@@ -892,7 +900,7 @@ StringObjectException Print::sequential_print_clearance_valid(const Print &print
             auto inst = print_instance_with_bounding_box[k].print_instance;
             // 只需要考虑喷嘴到滑杆的偏移量，这个比整个工具头的碰撞半径要小得多
             // Only the offset from the nozzle to the slide bar needs to be considered, which is much smaller than the collision radius of the entire tool head.
-            auto bbox = print_instance_with_bounding_box[k].bounding_box.inflated(-scale_(0.5 * print.config().extruder_clearance_radius.value + object_skirt_offset));
+            auto bbox = print_instance_with_bounding_box[k].bounding_box.inflated(-scale_(0.5 * effective_clearance_radius + object_skirt_offset));
             auto iy1 = bbox.min.y();
             auto iy2 = bbox.max.y();
             (const_cast<ModelInstance*>(inst->model_instance))->arrange_order = k+1;

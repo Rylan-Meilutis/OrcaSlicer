@@ -13,6 +13,7 @@
 #include <boost/nowide/convert.hpp>
 
 #include <curl/curl.h>
+#include <nlohmann/json.hpp>
 
 #include <wx/progdlg.h>
 
@@ -22,6 +23,7 @@
 #include "slic3r/GUI/format.hpp"
 #include "Http.hpp"
 #include "libslic3r/AppConfig.hpp"
+#include "libslic3r/GCode/SpoolManagerMetadata.hpp"
 #include "Bonjour.hpp"
 #include "slic3r/GUI/BonjourDialog.hpp"
 
@@ -261,8 +263,77 @@ wxString OctoPrint::get_test_failed_msg (wxString &msg) const
         , _L("Note: OctoPrint version 1.1.0 or higher is required."));
 }
 
+bool OctoPrint::get_spool_manager_spools(std::vector<std::string> &spool_names, wxString &error) const
+{
+    const std::string url = make_url(
+        "plugin/SpoolManager/loadSpoolsByQuery?selectedPageSize=100000&from=0&to=100000"
+        "&sortColumn=displayName&sortOrder=desc&filterName=&materialFilter=all&vendorFilter=all&colorFilter=all");
+    std::string response_body;
+    bool success = true;
+
+    auto http = Http::get(url);
+    set_auth(http);
+    http.on_complete([&response_body](std::string body, unsigned) {
+            response_body = std::move(body);
+        })
+        .on_error([this, &error, &success](std::string body, std::string curl_error, unsigned status) {
+            error = format_error(body, curl_error, status);
+            success = false;
+        })
+#ifdef WIN32
+        .ssl_revoke_best_effort(m_ssl_revoke_best_effort)
+#endif
+        .perform_sync();
+
+    if (!success)
+        return false;
+
+    try {
+        std::stringstream stream(response_body);
+        pt::ptree root;
+        pt::read_json(stream, root);
+        const auto selected = root.get_child_optional("selectedSpools");
+        if (!selected) {
+            error = _L("The OctoPrint SpoolManager response did not contain a spool list.");
+            return false;
+        }
+        for (const auto &entry : *selected)
+            spool_names.emplace_back(entry.second.get<std::string>("displayName", ""));
+        spool_names.erase(std::remove_if(spool_names.begin(), spool_names.end(),
+                                        [](const std::string &name) { return name.empty(); }),
+                          spool_names.end());
+    } catch (const std::exception &exception) {
+        error = GUI::format_wxstr("%s: %s", _L("Could not parse the OctoPrint SpoolManager response"),
+                                  GUI::from_u8(exception.what()));
+        return false;
+    }
+
+    if (spool_names.empty()) {
+        error = _L("OctoPrint SpoolManager did not return any spools.");
+        return false;
+    }
+    return true;
+}
+
 bool OctoPrint::upload(PrintHostUpload upload_data, ProgressFn prorgess_fn, ErrorFn error_fn, InfoFn info_fn) const
 {
+    const std::string serialized_names = upload_data.extended("spool_manager_names");
+    if (!serialized_names.empty() && !upload_data.use_3mf) {
+        try {
+            const std::vector<std::string> names =
+                nlohmann::json::parse(serialized_names).get<std::vector<std::string>>();
+            std::string metadata_error;
+            if (!SpoolManagerMetadata::update_gcode_file(upload_data.source_path, names, metadata_error)) {
+                error_fn(GUI::from_u8(metadata_error));
+                return false;
+            }
+        } catch (const std::exception &exception) {
+            error_fn(GUI::format_wxstr("%s: %s", _L("Invalid SpoolManager filament selection"),
+                                       GUI::from_u8(exception.what())));
+            return false;
+        }
+    }
+
 #ifndef WIN32
     return upload_inner_with_host(std::move(upload_data), prorgess_fn, error_fn, info_fn);
 #else
