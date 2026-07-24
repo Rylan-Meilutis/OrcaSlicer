@@ -2774,6 +2774,16 @@ void TabPrint::build()
         optgroup->append_single_option_line("dont_filter_internal_bridges", "quality_settings_bridging#filter-out-small-internal-bridges");
         optgroup->append_single_option_line("counterbore_hole_bridging", "quality_settings_bridging#bridge-counterbore-hole");
 
+        optgroup = page->new_optgroup(L("Arc overhangs"), L"param_arc_overhang");
+        optgroup->append_single_option_line("arc_overhang_enabled");
+        optgroup->append_single_option_line("arc_overhang_flow_ratio");
+        optgroup->append_single_option_line("arc_overhang_speed");
+        optgroup->append_single_option_line("arc_overhang_stabilization_speed");
+        optgroup->append_single_option_line("arc_overhang_cooling");
+        optgroup->append_single_option_line("arc_overhang_layers");
+        optgroup->append_single_option_line("arc_overhang_bridge_distance");
+        optgroup->append_single_option_line("arc_overhang_min_overhang_distance");
+
         optgroup = page->new_optgroup(L("Overhangs"), L"param_overhang");
         optgroup->append_single_option_line("detect_overhang_wall", "quality_settings_overhangs#detect-overhang-wall");
         optgroup->append_single_option_line("make_overhang_printable", "quality_settings_overhangs#make-overhang-printable");
@@ -2789,6 +2799,9 @@ void TabPrint::build()
         optgroup->append_single_option_line("wall_loops", "strength_settings_walls#wall-loops");
         optgroup->append_single_option_line("alternate_extra_wall", "strength_settings_walls#alternate-extra-wall");
         optgroup->append_single_option_line("detect_thin_wall", "strength_settings_walls#detect-thin-wall");
+
+        optgroup = page->new_optgroup(L("Thicker inner walls"), L"param_wall");
+        optgroup->append_single_option_line("third_wall_flow_ratio");
 
         optgroup = page->new_optgroup(L("Top/bottom shells"), L"param_shell");
 
@@ -2965,6 +2978,7 @@ void TabPrint::build()
         optgroup->append_single_option_line("support_base_pattern_spacing", "support_settings_advanced#base-pattern-spacing");
         optgroup->append_single_option_line("support_angle", "support_settings_advanced#pattern-angle");
         optgroup->append_single_option_line("support_interface_top_layers", "support_settings_advanced#interface-layers");
+        optgroup->append_single_option_line("support_interface_top_temperature");
         optgroup->append_single_option_line("support_interface_bottom_layers", "support_settings_advanced#interface-layers");
         optgroup->append_single_option_line("support_interface_pattern", "support_settings_advanced#interface-pattern");
         optgroup->append_single_option_line("support_interface_spacing", "support_settings_advanced#interface-spacing");

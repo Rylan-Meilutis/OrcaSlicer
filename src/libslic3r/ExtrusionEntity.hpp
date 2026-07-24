@@ -39,6 +39,7 @@ enum ExtrusionRole : uint8_t {
     erCustom,
     // Extrusion role for a collection with multiple extrusion roles.
     erMixed,
+    erArcOverhang,
     erCount
 };
 
@@ -74,6 +75,7 @@ inline bool is_infill(ExtrusionRole role)
 {
     return role == erBridgeInfill
         || role == erInternalBridgeInfill
+        || role == erArcOverhang
         || role == erInternalInfill
         || role == erSolidInfill
         || role == erTopSolidInfill
@@ -90,6 +92,7 @@ inline bool is_solid_infill(ExtrusionRole role)
 {
     return role == erBridgeInfill
         || role == erInternalBridgeInfill
+        || role == erArcOverhang
         || role == erSolidInfill
         || role == erTopSolidInfill
         || role == erBottomSurface
@@ -100,6 +103,7 @@ inline bool is_bridge(ExtrusionRole role)
 {
     return role == erBridgeInfill
         || role == erInternalBridgeInfill
+        || role == erArcOverhang
         || role == erOverhangPerimeter;
 }
 

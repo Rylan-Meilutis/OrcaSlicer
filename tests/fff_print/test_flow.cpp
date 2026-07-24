@@ -15,6 +15,35 @@
 using namespace Slic3r::Test;
 using namespace Slic3r;
 
+static double total_positive_extrusion(const std::string &gcode)
+{
+    double total = 0.;
+    GCodeReader reader;
+    reader.parse_buffer(gcode, [&total](GCodeReader &self, const GCodeReader::GCodeLine &line) {
+        if (line.extruding(self))
+            total += line.dist_E(self);
+    });
+    return total;
+}
+
+TEST_CASE("Third wall flow changes only prints with at least three walls", "[Flow][Regression]")
+{
+    const auto extrusion_for = [](int walls, double third_wall_flow) {
+        return total_positive_extrusion(slice({cube(10.)}, {
+            {"wall_generator", "classic"},
+            {"wall_loops", walls},
+            {"top_shell_layers", 0},
+            {"bottom_shell_layers", 0},
+            {"sparse_infill_density", "0%"},
+            {"set_other_flow_ratios", 0},
+            {"third_wall_flow_ratio", third_wall_flow}
+        }));
+    };
+
+    CHECK_THAT(extrusion_for(2, 1.5), Catch::Matchers::WithinAbs(extrusion_for(2, 1.0), 1e-5));
+    CHECK(extrusion_for(3, 1.5) > extrusion_for(3, 1.0));
+}
+
 /// Test the expected behavior for auto-width,
 /// spacing, etc
 SCENARIO("Flow math for non-bridges", "[Flow]") {

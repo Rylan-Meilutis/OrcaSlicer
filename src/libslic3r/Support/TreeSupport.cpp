@@ -2423,6 +2423,8 @@ void TreeSupport::draw_circles()
 
             for (auto &area_group : ts_layer->area_groups) {
                 if (area_group.type == SupportLayer::RoofType || area_group.type == SupportLayer::Roof1stLayer) {
+                    if (area_group.type == SupportLayer::Roof1stLayer)
+                        ts_layer->has_top_interface_contact = true;
                     if (interlaced)
                         area_group.interface_id = roof_interface_id;
                     area_group.interface_as_base = top_base_layers > 0 && roof_interface_id < top_base_layers;

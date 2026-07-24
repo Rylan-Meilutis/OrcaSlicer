@@ -274,7 +274,8 @@ static t_config_enum_values s_keys_map_InfillPattern {
     { "concentric", ipConcentric },
     { "hilbertcurve", ipHilbertCurve },
     { "archimedeanchords", ipArchimedeanChords },
-    { "octagramspiral", ipOctagramSpiral }
+    { "octagramspiral", ipOctagramSpiral },
+    { "arc-overhang", ipArcOverhang }
 };
 CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(InfillPattern)
 
@@ -1510,6 +1511,87 @@ void PrintConfigDef::init_fff_params()
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionFloat(1));
 
+    def = this->add("arc_overhang_enabled", coBool);
+    def->label = L("Enable arc overhangs");
+    def->category = L("Quality");
+    def->tooltip = L("Replace eligible external bottom bridges with concentric arcs anchored to one edge. "
+                     "Arc overhangs are experimental and require strong part cooling and careful tuning.");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionBool(false));
+
+    def = this->add("arc_overhang_flow_ratio", coFloat);
+    def->label = L("Arc overhang flow ratio");
+    def->category = L("Quality");
+    def->tooltip = L("Flow multiplier used for arc-overhang paths.");
+    def->min = 0.1;
+    def->max = 2;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(1));
+
+    def = this->add("arc_overhang_speed", coFloat);
+    def->label = L("Arc layer speed");
+    def->category = L("Quality");
+    def->tooltip = L("Print speed for the arc-overhang layer itself.");
+    def->sidetext = L("mm/s");
+    def->min = 0.1;
+    def->max = 1000;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(5));
+
+    def = this->add("arc_overhang_stabilization_speed", coFloat);
+    def->label = L("One-sided stabilization speed");
+    def->category = L("Quality");
+    def->tooltip = L("Maximum print speed for the stabilization layers after a one-sided arc overhang. "
+                     "Slower follow-up layers reduce extrusion drag on the unsupported free edge and help prevent it from curling upward. "
+                     "This limit is not applied after arc bridges supported at both ends.");
+    def->sidetext = L("mm/s");
+    def->min = 0.1;
+    def->max = 1000;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(5));
+
+    def = this->add("arc_overhang_cooling", coPercent);
+    def->label = L("Cooling");
+    def->category = L("Quality");
+    def->tooltip = L("Part-cooling fan speed used for arc overhangs and their stabilization layers.");
+    def->min = 0;
+    def->max = 100;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionPercent(100));
+
+    def = this->add("arc_overhang_layers", coInt);
+    def->label = L("Stabilization layers");
+    def->category = L("Quality");
+    def->tooltip = L("Number of layers, including the arc layer, that use arc-overhang cooling. "
+                     "For one-sided arc overhangs, the layers after the arc also use the stabilization speed.");
+    def->sidetext = L("layers");
+    def->min = 1;
+    def->max = 20;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionInt(1));
+
+    def = this->add("arc_overhang_bridge_distance", coFloat);
+    def->label = L("Minimum bridge distance");
+    def->category = L("Quality");
+    def->tooltip = L("Unsupported bridge spans shorter than this distance use normal bridge infill; spans at or above it use arc overhangs. "
+                     "Generated support points split the measured span, and fully supported areas do not use arcs. "
+                     "Set to 0 to use arcs for every eligible unsupported bridge.");
+    def->sidetext = L("mm");
+    def->min = 0;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(0));
+
+    def = this->add("arc_overhang_min_overhang_distance", coFloat);
+    def->label = L("Minimum overhang distance");
+    def->category = L("Quality");
+    def->tooltip = L("The unsupported distance to the nearest model or generated support point is measured for one-sided overhangs. "
+                     "Distances below this value use normal overhang paths; distances at or above it use arc overhangs. "
+                     "Fully supported areas do not use arcs. Set to 0 to use arcs for every eligible unsupported overhang.");
+    def->sidetext = L("mm");
+    def->min = 0;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(0));
+
     def = this->add("top_solid_infill_flow_ratio", coFloat);
     def->label = L("Top surface flow ratio");
     def->category = L("Advanced");
@@ -1563,6 +1645,21 @@ void PrintConfigDef::init_fff_params()
     def->category = L("Advanced");
     def->tooltip = L("This factor affects the amount of material for inner walls.\n\n"
                      "The actual inner wall flow used is calculated by multiplying this value by the filament flow ratio, and if set, the object's flow ratio.");
+    def->min = 0;
+    def->max = 2;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(1));
+
+    def = this->add("third_wall_flow_ratio", coFloat);
+    def->label = L("Thicker inner wall flow ratio");
+    def->category = L("Strength");
+    def->tooltip = L("Adds material to the third wall and every wall farther inside the part. "
+                     "The outer wall and first inner wall are printed normally for dimensional accuracy, while deeper walls may be "
+                     "over-extruded to interlock adjacent layers and improve inter-layer adhesion. This setting has no effect unless "
+                     "at least three walls fit. Values above 1.00 enforce an outside-in order on the first layer and Inner/Outer/Inner "
+                     "ordering on later layers so the thicker walls cannot displace the dimension-controlling walls.\n\n"
+                     "The value is multiplied by the normal flow for these walls. Start with a small increase; excessive flow may cause "
+                     "overfill or surface artifacts.");
     def->min = 0;
     def->max = 2;
     def->mode = comAdvanced;
@@ -6777,6 +6874,19 @@ void PrintConfigDef::init_fff_params()
     append(def->enum_values, support_interface_top_layers->enum_values);
     def->enum_labels.push_back(L("Same as top"));
     append(def->enum_labels, support_interface_top_layers->enum_labels);
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionInt(0));
+
+    def = this->add("support_interface_top_temperature", coInt);
+    def->label = L("Top interface temperature");
+    def->category = L("Support");
+    def->tooltip = L("Use this nozzle temperature only while printing the top contact layer of the support interface, then restore the filament temperature. "
+                     "A lower temperature can make the interface easier to detach. Set to 0 to disable.\n\n"
+                     "WARNING: Rapid temperature changes are practical only with an induction-heated or similarly fast-response hotend. "
+                     "A conventional hotend may not reach the requested temperature before the short interface path is complete.");
+    def->sidetext = u8"°C";
+    def->min = 0;
+    def->max = 500;
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionInt(0));
 
@@ -12518,7 +12628,7 @@ CustomGcodeSpecificConfigDef::CustomGcodeSpecificConfigDef()
 
 // change_extrusion_role_gcode
     std::string extrusion_role_types = "Possible Values:\n[\"Perimeter\", \"ExternalPerimeter\", "
-                                                     "\"OverhangPerimeter\", \"InternalInfill\", \"SolidInfill\", \"TopSolidInfill\", \"BottomSurface\", \"BridgeInfill\", \"GapFill\", \"Ironing\", "
+                                                     "\"OverhangPerimeter\", \"InternalInfill\", \"SolidInfill\", \"TopSolidInfill\", \"BottomSurface\", \"BridgeInfill\", \"ArcOverhang\", \"GapFill\", \"Ironing\", "
                                                      "\"Skirt\", \"Brim\", \"SupportMaterial\", \"SupportMaterialInterface\", \"SupportTransition\", \"WipeTower\", \"Mixed\"]";
 
     new_def("extrusion_role", coString, "Extrusion role", "The new extrusion role/type that is going to be used\n" + extrusion_role_types);

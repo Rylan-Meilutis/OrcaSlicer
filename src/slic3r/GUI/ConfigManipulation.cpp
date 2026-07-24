@@ -642,9 +642,16 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, in
     }
 
     bool have_perimeters = config->opt_int("wall_loops") > 0;
+    const bool have_thicker_inner_walls =
+        config->opt_int("wall_loops") >= 3 &&
+        config->opt_float("third_wall_flow_ratio") > 1.0 + EPSILON;
+    if (have_thicker_inner_walls &&
+        config->opt_enum<WallSequence>("wall_sequence") != WallSequence::InnerOuterInner)
+        config->set_key_value("wall_sequence", new ConfigOptionEnum<WallSequence>(WallSequence::InnerOuterInner));
     for (auto el : { "extra_perimeters_on_overhangs", "ensure_vertical_shell_thickness", "detect_thin_wall", "detect_overhang_wall",
-        "seam_position", "staggered_inner_seams", "wall_sequence", "outer_wall_line_width" })
+        "seam_position", "staggered_inner_seams", "outer_wall_line_width" })
         toggle_field(el, have_perimeters);
+    toggle_field("wall_sequence", have_perimeters && !have_thicker_inner_walls);
     for (auto el : { "inner_wall_speed", "outer_wall_speed", "small_perimeter_speed", "small_perimeter_threshold" })
         toggle_field(el, have_perimeters, variant_index);
 
@@ -859,7 +866,7 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, in
     toggle_line("support_critical_regions_only", is_auto(support_type) && support_is_tree);
 
     for (auto el : { "support_interface_filament",
-        "support_interface_loop_pattern", "support_bottom_interface_spacing" })
+        "support_interface_loop_pattern", "support_bottom_interface_spacing", "support_interface_top_temperature" })
         toggle_field(el, have_support_material && have_support_interface);
 
     bool can_ironing_support = have_raft || (have_support_material && config->opt_int("support_interface_top_layers") > 0);
@@ -961,6 +968,11 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, in
     bool has_set_other_flow_ratios = config->opt_bool("set_other_flow_ratios");
     for (auto el : {"first_layer_flow_ratio", "outer_wall_flow_ratio", "inner_wall_flow_ratio", "overhang_flow_ratio", "sparse_infill_flow_ratio", "internal_solid_infill_flow_ratio", "gap_fill_flow_ratio", "support_flow_ratio", "support_interface_flow_ratio"})
         toggle_line(el, has_set_other_flow_ratios);
+
+    const bool has_arc_overhangs = config->opt_bool("arc_overhang_enabled");
+    for (auto el : {"arc_overhang_flow_ratio", "arc_overhang_speed", "arc_overhang_stabilization_speed", "arc_overhang_cooling", "arc_overhang_layers",
+                    "arc_overhang_bridge_distance", "arc_overhang_min_overhang_distance"})
+        toggle_line(el, has_arc_overhangs);
 
     bool has_overhang_speed = config->opt_bool_nullable("enable_overhang_speed", variant_index);
     for (auto el : {"overhang_1_4_speed", "overhang_2_4_speed", "overhang_3_4_speed", "overhang_4_4_speed"})

@@ -11,6 +11,7 @@
 #include "libslic3r/ClipperUtils.hpp"
 #include "libslic3r/Fill/Fill.hpp"
 #include "libslic3r/Flow.hpp"
+#include "libslic3r/GCode/GCodeProcessor.hpp"
 #include "libslic3r/Geometry.hpp"
 #include "libslic3r/Layer.hpp"
 #include "libslic3r/Print.hpp"
@@ -18,10 +19,82 @@
 #include "libslic3r/libslic3r.h"
 
 #include "test_helpers.hpp"
+#include "test_utils.hpp"
 
 using namespace Slic3r;
 
 bool test_if_solid_surface_filled(const ExPolygon& expolygon, double flow_spacing, double angle = 0, double density = 1.0);
+
+static bool print_has_arc_overhang(const Print &print)
+{
+    for (const PrintObject *object : print.objects())
+        for (const Layer *layer : object->layers())
+            for (const LayerRegion *region : layer->regions())
+                for (const ExtrusionEntity *entity : region->fills.flatten().entities)
+                    if (entity->role() == erArcOverhang)
+                        return true;
+    return false;
+}
+
+TEST_CASE("Arc overhang fill produces curved paths inside its bridge surface", "[Fill][ArcOverhang]")
+{
+    const ExPolygon expolygon(Points{
+        Point::new_scale(0., 0.),
+        Point::new_scale(20., 0.),
+        Point::new_scale(20., 10.),
+        Point::new_scale(0., 10.)
+    });
+    Surface surface(stBottomBridge, expolygon);
+    surface.bridge_angle = 0.;
+
+    std::unique_ptr<Fill> filler(Fill::new_from_type("arc-overhang"));
+    REQUIRE(filler != nullptr);
+    filler->spacing = 0.45;
+    filler->angle = 0.f;
+    filler->bounding_box = get_extents(expolygon);
+
+    FillParams params;
+    params.density = 1.f;
+    params.resolution = 0.05f;
+
+    const Polylines paths = filler->fill_surface(&surface, params);
+    REQUIRE_FALSE(paths.empty());
+    CHECK(std::any_of(paths.begin(), paths.end(), [](const Polyline &path) {
+        return path.points.size() > 3;
+    }));
+    CHECK(diff_pl(paths, offset(expolygon, float(SCALED_EPSILON * 10))).empty());
+}
+
+TEST_CASE("Arc overhang keeps a distinct G-code feature role", "[Fill][ArcOverhang][GCode]")
+{
+    CHECK(ExtrusionEntity::role_to_string(erArcOverhang) == "Arc overhang");
+    CHECK(ExtrusionEntity::string_to_role("Arc overhang") == erArcOverhang);
+}
+
+TEST_CASE("Wide unsupported roofs reach the preview as arc overhangs", "[Fill][ArcOverhang][GCode]")
+{
+    TriangleMesh model = make_cube(10., 20., 5.);
+    TriangleMesh roof  = make_cube(30., 20., 2.);
+    roof.translate(-10., 0., 5.);
+    model.merge(roof);
+
+    Print print;
+    Slic3r::Test::init_and_process_print({model}, print, {
+        {"arc_overhang_enabled", "1"},
+        {"arc_overhang_bridge_distance", "0"},
+        {"arc_overhang_min_overhang_distance", "0"},
+        {"enable_support", "0"}
+    });
+
+    CHECK(print_has_arc_overhang(print));
+
+    ScopedTemporaryFile gcode_file(".gcode");
+    GCodeProcessorResult preview;
+    print.export_gcode(gcode_file.string(), &preview, nullptr);
+    CHECK(std::any_of(preview.moves.begin(), preview.moves.end(), [](const auto &move) {
+        return move.type == EMoveType::Extrude && move.extrusion_role == erArcOverhang;
+    }));
+}
 
 #if 0
 TEST_CASE("Adjusted solid distance", "[Fill]") {

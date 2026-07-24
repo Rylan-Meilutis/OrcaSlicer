@@ -10,6 +10,7 @@ namespace Slic3r {
 
 class GCode;
 class Layer;
+class FullPrintConfig;
 struct PerExtruderAdjustments;
 
 // A standalone G-code filter, to control cooling of the print.
@@ -51,9 +52,10 @@ private:
     // Highest of m_extruder_ids plus 1.
     unsigned int                m_num_extruders { 0 };
     const std::string           m_toolchange_prefix;
-    // Referencs GCode::m_config, which is FullPrintConfig. While the PrintObjectConfig slice of FullPrintConfig is being modified,
-    // the PrintConfig slice of FullPrintConfig is constant, thus no thread synchronization is required.
-    const PrintConfig          &m_config;
+    // References GCode::m_config. Arc-overhang cooling is a region setting, so
+    // the cooling filter needs the complete configuration rather than only its
+    // PrintConfig slice.
+    const FullPrintConfig      &m_config;
     unsigned int                m_current_extruder;
     unsigned int                m_current_nozzle;
     //BBS: current fan speed

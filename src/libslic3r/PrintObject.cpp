@@ -957,6 +957,27 @@ void PrintObject::generate_support_material()
 
             this->_generate_support_material();
             m_print->throw_if_canceled();
+
+            // Arc selection needs the final support toolpaths. Support generation itself
+            // consumes the preliminary fills, so refresh fills once afterward; make_fills()
+            // clears the preliminary paths before rebuilding them.
+            bool has_arc_overhangs = false;
+            for (size_t region_id = 0; region_id < num_printing_regions() && !has_arc_overhangs; ++region_id)
+                has_arc_overhangs = printing_region(region_id).config().arc_overhang_enabled.value;
+            if (has_arc_overhangs && !m_support_layers.empty()) {
+                tbb::parallel_for(
+                    tbb::blocked_range<size_t>(0, m_layers.size()),
+                    [this](const tbb::blocked_range<size_t> &range) {
+                        for (size_t layer_idx = range.begin(); layer_idx < range.end(); ++layer_idx) {
+                            m_print->throw_if_canceled();
+                            m_layers[layer_idx]->make_fills(
+                                m_adaptive_fill_octrees.first.get(),
+                                m_adaptive_fill_octrees.second.get(),
+                                m_lightning_generator.get());
+                        }
+                    });
+                m_print->throw_if_canceled();
+            }
         }
         this->set_done(posSupportMaterial);
     }
@@ -1410,6 +1431,10 @@ bool PrintObject::invalidate_state_by_config_options(
             || opt_key == "lateral_lattice_angle_2"
             || opt_key == "infill_overhang_angle") {
             steps.emplace_back(posInfill);
+        } else if (opt_key == "arc_overhang_enabled" ||
+                   opt_key == "arc_overhang_bridge_distance" ||
+                   opt_key == "arc_overhang_min_overhang_distance") {
+            steps.emplace_back(posInfill);
         } else if (opt_key == "sparse_infill_pattern"
                    || opt_key == "symmetric_infill_y_axis"
                    || opt_key == "infill_shift_step"
@@ -1520,12 +1545,19 @@ bool PrintObject::invalidate_state_by_config_options(
             || opt_key == "bottom_solid_infill_flow_ratio"
             || opt_key == "outer_wall_flow_ratio"
             || opt_key == "inner_wall_flow_ratio"
+            || opt_key == "third_wall_flow_ratio"
             || opt_key == "overhang_flow_ratio"
             || opt_key == "sparse_infill_flow_ratio"
             || opt_key == "internal_solid_infill_flow_ratio"
             || opt_key == "gap_fill_flow_ratio"
             || opt_key == "support_flow_ratio"
             || opt_key == "support_interface_flow_ratio"
+            || opt_key == "support_interface_top_temperature"
+            || opt_key == "arc_overhang_flow_ratio"
+            || opt_key == "arc_overhang_speed"
+            || opt_key == "arc_overhang_stabilization_speed"
+            || opt_key == "arc_overhang_cooling"
+            || opt_key == "arc_overhang_layers"
             || opt_key == "brim_flow_ratio"
             || opt_key == "filament_flow_ratio"
             || opt_key == "scarf_joint_flow_ratio"

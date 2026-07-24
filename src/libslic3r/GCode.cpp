@@ -2802,6 +2802,9 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
     m_last_layer_accumulated_mass = 0.0;
     m_is_role_based_fan_on.fill(false);
     m_role_based_fan_marker_layer.fill(-1);
+    m_arc_overhang_stabilization_until.clear();
+    m_one_sided_arc_overhang_start.clear();
+    m_one_sided_arc_overhang_until.clear();
 
     m_fan_mover.release();
     
@@ -6656,6 +6659,8 @@ std::string GCode::extrude_loop(const ExtrusionLoop&        loop_ref,
     ExtrusionPaths paths;
     loop.clip_end(clip_length, &paths);
     if (paths.empty()) return "";
+    for (ExtrusionPath &path : paths)
+        path.inset_idx = loop.inset_idx;
 
     // SoftFever: check loop lenght for small perimeter. 
     double small_peri_speed = -1;
@@ -6910,7 +6915,9 @@ std::string GCode::extrude_multi_path(const ExtrusionMultiPath& multipath, const
         m_multi_flow_segment_path_average_mm3_per_mm = weighted_sum_mm3_per_mm / total_multipath_length;
     // Orca: end of multipath average mm3_per_mm value calculation
 
-    for (const ExtrusionPath &path : multipath.paths){
+    for (const ExtrusionPath &source_path : multipath.paths){
+        ExtrusionPath path = source_path;
+        path.inset_idx = multipath.inset_idx;
         gcode += this->_extrude(path, description, speed);
         // Orca: Adaptive PA - dont adapt PA after the first pultipath extrusion is completed
         // as we have already set the PA value to the average flow over the totality of the path
@@ -7055,6 +7062,28 @@ std::string GCode::extrude_support(const ExtrusionEntityCollection &support_fill
 
     std::string gcode;
     if (!support_fills.entities.empty()) {
+        const SupportLayer *support_layer = dynamic_cast<const SupportLayer *>(m_layer);
+        const int top_interface_temperature = m_config.support_interface_top_temperature.value;
+        const bool temperature_override_available = support_layer != nullptr &&
+                                                    support_layer->has_top_interface_contact &&
+                                                    top_interface_temperature > 0;
+        bool temperature_overridden = false;
+        const auto set_top_interface_temperature = [&](bool enable) {
+            if (!temperature_override_available || enable == temperature_overridden || m_writer.filament() == nullptr)
+                return;
+            const unsigned int extruder_id = m_writer.filament()->id();
+            if (enable) {
+                gcode += m_writer.set_temperature(top_interface_temperature, true, extruder_id);
+            } else {
+                const int filament_id = get_filament_config_index(int(extruder_id));
+                const int normal_temperature = this->on_first_layer() ?
+                    m_config.nozzle_temperature_initial_layer.get_at(filament_id) :
+                    m_config.nozzle_temperature.get_at(filament_id);
+                if (normal_temperature > 0)
+                    gcode += m_writer.set_temperature(normal_temperature, true, extruder_id);
+            }
+            temperature_overridden = enable;
+        };
 
         ExtrusionEntitiesPtr extrusions;
         extrusions.reserve(support_fills.entities.size());
@@ -7084,6 +7113,12 @@ std::string GCode::extrude_support(const ExtrusionEntityCollection &support_fill
             const ExtrusionLoop* loop = dynamic_cast<const ExtrusionLoop*>(ee);
             const ExtrusionEntityCollection* collection = dynamic_cast<const ExtrusionEntityCollection*>(ee);
 
+            // A nested collection manages its own role transitions. Keeping the
+            // parent at the normal temperature avoids the two recursion levels
+            // disagreeing about which temperature is currently active.
+            if (collection == nullptr)
+                set_top_interface_temperature(role == erSupportMaterialInterface);
+
             if (path) {
                 gcode += extrude_path(*path, label, speed_for_path(path->length(), role));
             }
@@ -7094,12 +7129,14 @@ std::string GCode::extrude_support(const ExtrusionEntityCollection &support_fill
                 gcode += extrude_loop(*loop, label, speed_for_path(loop->length(), role));
             }
             else if (collection) {
+                set_top_interface_temperature(false);
                 gcode += extrude_support(*collection, support_extrusion_role);
             }
             else {
                 throw Slic3r::InvalidArgument("Unknown extrusion type");
             }
         }
+        set_top_interface_temperature(false);
     }
     return gcode;
 }
@@ -7215,6 +7252,27 @@ double GCode::calc_max_volumetric_speed(const double layer_height, const double 
 std::string GCode::_extrude(const ExtrusionPath &path, std::string description, double speed)
 {
     std::string gcode;
+    const PrintObject *print_object = m_layer == nullptr ? nullptr : m_layer->object();
+    if (path.role() == erArcOverhang && print_object != nullptr)
+        m_arc_overhang_stabilization_until[print_object] =
+            layer_id() + std::max(1, m_config.arc_overhang_layers.value) - 1;
+    if (path.role() == erArcOverhang && print_object != nullptr &&
+        m_layer->has_one_sided_arc_overhang) {
+        m_one_sided_arc_overhang_start[print_object] = layer_id();
+        m_one_sided_arc_overhang_until[print_object] =
+            layer_id() + std::max(1, m_config.arc_overhang_layers.value) - 1;
+    }
+    const auto stabilization_it = m_arc_overhang_stabilization_until.find(print_object);
+    const bool arc_overhang_stabilization = print_object != nullptr &&
+        stabilization_it != m_arc_overhang_stabilization_until.end() &&
+        layer_id() <= stabilization_it->second;
+    const auto one_sided_start_it = m_one_sided_arc_overhang_start.find(print_object);
+    const auto one_sided_until_it = m_one_sided_arc_overhang_until.find(print_object);
+    const bool one_sided_arc_followup = print_object != nullptr &&
+        one_sided_start_it != m_one_sided_arc_overhang_start.end() &&
+        one_sided_until_it != m_one_sided_arc_overhang_until.end() &&
+        layer_id() > one_sided_start_it->second &&
+        layer_id() <= one_sided_until_it->second;
 
     if (is_bridge(path.role()))
         description += " (bridge)";
@@ -7346,6 +7404,8 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
         _mm3_per_mm *= m_config.bottom_solid_infill_flow_ratio;
     } else if (path.role() == erInternalBridgeInfill) {
         _mm3_per_mm *= m_config.internal_bridge_flow;
+    } else if (path.role() == erArcOverhang) {
+        _mm3_per_mm *= m_config.arc_overhang_flow_ratio;
     } else if (path.role() == erBrim) {
         _mm3_per_mm *= m_config.brim_flow_ratio;
     } else if (sloped) {
@@ -7376,6 +7436,8 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
             _mm3_per_mm *= m_config.first_layer_flow_ratio;
         }
     }
+    if (m_config.wall_loops.value >= 3 && path.role() == erPerimeter && path.inset_idx >= 2)
+        _mm3_per_mm *= m_config.third_wall_flow_ratio;
 
     // Effective extrusion length per distance unit = (filament_flow_ratio/cross_section) * mm3_per_mm / print flow ratio
     // m_writer.extruder()->e_per_mm3() below is (filament flow ratio / cross-sectional area)
@@ -7395,7 +7457,9 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                 speed = std::min(speed, m_config.scarf_joint_speed.get_abs_value(speed));
             }
         } 
-        else if(path.role() == erInternalBridgeInfill) {
+        else if(path.role() == erArcOverhang) {
+            speed = m_config.arc_overhang_speed.value;
+        } else if(path.role() == erInternalBridgeInfill) {
             speed = m_config.get_abs_value_at("internal_bridge_speed", get_nozzle_config_index(m_writer.filament()->id()));
         } else if (path.role() == erOverhangPerimeter || path.role() == erSupportTransition || path.role() == erBridgeInfill) {
             speed = NOZZLE_CONFIG(bridge_speed);
@@ -7470,6 +7534,8 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
         if (skirt_speed > 0.0)
         speed = skirt_speed;
     }
+    if (one_sided_arc_followup)
+        speed = std::min(speed, m_config.arc_overhang_stabilization_speed.value);
     //BBS: remove this config
     //else if (this->object_layer_over_raft())
     //    speed = m_config.get_abs_value("first_layer_speed_over_raft", speed);
@@ -7780,7 +7846,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
         }
     };
     auto apply_role_based_fan_speed = [
-        &path, &append_role_based_fan_marker,
+        &path, &append_role_based_fan_marker, arc_overhang_stabilization,
         supp_interface_fan_speed = FILAMENT_CONFIG(support_material_interface_fan_speed),
         ironing_fan_speed        = FILAMENT_CONFIG(ironing_fan_speed)
     ] {
@@ -7788,6 +7854,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                                      supp_interface_fan_speed >= 0 && path.role() == erSupportMaterialInterface);
         append_role_based_fan_marker(erIroning, "_IRONING"sv,
                                      ironing_fan_speed >= 0 && path.role() == erIroning);
+        append_role_based_fan_marker(erArcOverhang, "_ARC_OVERHANG"sv, arc_overhang_stabilization);
     };
 
     // Farthest-point timelapse inline hook. When the photo head reaches (within 0.5 mm of) the
@@ -8177,6 +8244,7 @@ std::string GCode::extrusion_role_to_string_for_parser(const ExtrusionRole & rol
         case erBottomSurface: return "BottomSurface";
         case erBridgeInfill:
         case erInternalBridgeInfill: return "BridgeInfill";
+        case erArcOverhang: return "ArcOverhang";
         case erGapFill: return "GapFill";
         case erIroning: return "Ironing";
         case erSkirt: return "Skirt";

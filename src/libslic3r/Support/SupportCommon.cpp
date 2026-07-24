@@ -1398,7 +1398,8 @@ SupportGeneratorLayersPtr generate_support_layers(
                         this_layer_id_interface = other_layer.interface_id() + 1;
                     }
             }
-            object.add_support_layer(layer_id ++, this_layer_id_interface, height_min, zavg);
+            SupportLayer *support_layer = object.add_support_layer(layer_id ++, this_layer_id_interface, height_min, zavg);
+            support_layer->has_top_interface_contact = num_top_contacts > 0;
             if (num_interfaces && ! this_layer_contacts_only)
                 ++ layer_id_interface;
         }

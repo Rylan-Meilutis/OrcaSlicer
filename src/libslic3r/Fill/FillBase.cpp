@@ -24,6 +24,7 @@
 #include "FillLine.hpp"
 #include "FillRectilinear.hpp"
 #include "FillAdaptive.hpp"
+#include "FillArcOverhang.hpp"
 #include "FillLightning.hpp"
 // BBS: new infill pattern header
 #include "FillConcentricInternal.hpp"
@@ -41,6 +42,7 @@ Fill* Fill::new_from_type(const InfillPattern type)
 {
     switch (type) {
     case ipConcentric:          return new FillConcentric();
+    case ipArcOverhang:         return new FillArcOverhang();
     case ipHoneycomb:           return new FillHoneycomb();
     case ipLateralHoneycomb:         return new FillLateralHoneycomb();
     case ip3DHoneycomb:         return new Fill3DHoneycomb();

@@ -115,6 +115,7 @@ enum InfillPattern : int {
     ipCrossHatch, ipTpmsD, ipTpmsFK, ipGyroid,
     ipConcentric, ipHilbertCurve, ipArchimedeanChords, ipOctagramSpiral,
     ipSupportBase, ipConcentricInternal,
+    ipArcOverhang,
     ipCount,
 };
 
@@ -1119,6 +1120,7 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionInt,                 support_interface_filament))
     ((ConfigOptionInt,                 support_interface_top_layers))
     ((ConfigOptionInt,                 support_interface_bottom_layers))
+    ((ConfigOptionInt,                 support_interface_top_temperature))
     // Spacing between interface lines (the hatching distance). Set zero to get a solid interface.
     ((ConfigOptionFloat,               support_interface_spacing))
     ((ConfigOptionFloatsNullable,      support_interface_speed))
@@ -1392,10 +1394,19 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionFloat,                first_layer_flow_ratio))
     ((ConfigOptionFloat,                outer_wall_flow_ratio))
     ((ConfigOptionFloat,                inner_wall_flow_ratio))
+    ((ConfigOptionFloat,                third_wall_flow_ratio))
     ((ConfigOptionFloat,                overhang_flow_ratio))
     ((ConfigOptionFloat,                sparse_infill_flow_ratio))
     ((ConfigOptionFloat,                internal_solid_infill_flow_ratio))
     ((ConfigOptionFloat,                gap_fill_flow_ratio))
+    ((ConfigOptionBool,                 arc_overhang_enabled))
+    ((ConfigOptionFloat,                arc_overhang_flow_ratio))
+    ((ConfigOptionFloat,                arc_overhang_speed))
+    ((ConfigOptionFloat,                arc_overhang_stabilization_speed))
+    ((ConfigOptionPercent,              arc_overhang_cooling))
+    ((ConfigOptionInt,                  arc_overhang_layers))
+    ((ConfigOptionFloat,                arc_overhang_bridge_distance))
+    ((ConfigOptionFloat,                arc_overhang_min_overhang_distance))
 
     // Orca: seam slopes
     ((ConfigOptionEnum<SeamScarfType>,  seam_slope_type))

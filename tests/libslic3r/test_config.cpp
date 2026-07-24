@@ -15,6 +15,22 @@
 
 using namespace Slic3r;
 
+TEST_CASE("New strength and overhang options preserve existing print defaults", "[Config]")
+{
+    const DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+
+    CHECK_FALSE(config.opt_bool("arc_overhang_enabled"));
+    CHECK_THAT(config.opt_float("arc_overhang_flow_ratio"), Catch::Matchers::WithinAbs(1.0, EPSILON));
+    CHECK_THAT(config.opt_float("arc_overhang_speed"), Catch::Matchers::WithinAbs(5.0, EPSILON));
+    CHECK_THAT(config.opt_float("arc_overhang_stabilization_speed"), Catch::Matchers::WithinAbs(5.0, EPSILON));
+    CHECK_THAT(config.opt_float("arc_overhang_cooling"), Catch::Matchers::WithinAbs(100.0, EPSILON));
+    CHECK(config.opt_int("arc_overhang_layers") == 1);
+    CHECK_THAT(config.opt_float("arc_overhang_bridge_distance"), Catch::Matchers::WithinAbs(0.0, EPSILON));
+    CHECK_THAT(config.opt_float("arc_overhang_min_overhang_distance"), Catch::Matchers::WithinAbs(0.0, EPSILON));
+    CHECK_THAT(config.opt_float("third_wall_flow_ratio"), Catch::Matchers::WithinAbs(1.0, EPSILON));
+    CHECK(config.opt_int("support_interface_top_temperature") == 0);
+}
+
 SCENARIO("Generic config validation performs as expected.", "[Config]") {
     GIVEN("A config generated from default options") {
         Slic3r::DynamicPrintConfig config = Slic3r::DynamicPrintConfig::full_print_config();

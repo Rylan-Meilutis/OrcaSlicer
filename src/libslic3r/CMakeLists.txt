@@ -145,6 +145,8 @@ set(lisbslic3r_sources
     Fill/FillAdaptive.hpp
     Fill/FillBase.cpp
     Fill/FillBase.hpp
+    Fill/FillArcOverhang.cpp
+    Fill/FillArcOverhang.hpp
     Fill/FillConcentric.cpp
     Fill/FillConcentric.hpp
     Fill/FillConcentricInternal.cpp

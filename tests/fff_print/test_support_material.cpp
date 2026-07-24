@@ -1,5 +1,8 @@
 #include <catch2/catch_all.hpp>
 
+#include <algorithm>
+#include <string>
+
 #include "libslic3r/GCodeReader.hpp"
 #include "libslic3r/Layer.hpp"
 
@@ -103,4 +106,26 @@ TEST_CASE("Support G-code emission survives a second slice in the same process",
 
     const std::string second = slice({ TestMesh::overhang }, { { "enable_support", 1 } });
     REQUIRE(! layers_with_role(second, "support").empty());
+}
+
+TEST_CASE("Top support interface uses and restores its temperature override", "[SupportMaterial][Regression]")
+{
+    constexpr int interface_temperature = 150;
+    constexpr int normal_temperature = 215;
+    Print print;
+    init_and_process_print({TestMesh::overhang}, print, {
+        {"enable_support", 1},
+        {"support_interface_top_layers", 2},
+        {"support_interface_top_temperature", interface_temperature},
+        {"nozzle_temperature", normal_temperature}
+    });
+
+    const auto support_layers = print.objects().front()->support_layers();
+    REQUIRE(std::any_of(support_layers.begin(), support_layers.end(), [](const SupportLayer *layer) {
+        return layer->has_top_interface_contact;
+    }));
+
+    const std::string output = gcode(print);
+    CHECK(output.find("M109 S" + std::to_string(interface_temperature)) != std::string::npos);
+    CHECK(output.find("M109 S" + std::to_string(normal_temperature)) != std::string::npos);
 }

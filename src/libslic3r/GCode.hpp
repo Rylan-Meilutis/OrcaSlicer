@@ -647,6 +647,11 @@ private:
     ExtrusionRole                       m_last_extrusion_role;
     // To ignore gapfill role for retract_lift_enforce
     ExtrusionRole                       m_last_notgapfill_extrusion_role;
+    // Last layer (inclusive) that retains arc-overhang stabilization settings.
+    std::map<const PrintObject*, int>    m_arc_overhang_stabilization_until;
+    // One-sided arcs additionally slow only the layers printed after the arc layer.
+    std::map<const PrintObject*, int>    m_one_sided_arc_overhang_start;
+    std::map<const PrintObject*, int>    m_one_sided_arc_overhang_until;
     // Support for G-Code Processor
     float                               m_last_height{ 0.0f };
     float                               m_last_layer_z{ 0.0f };

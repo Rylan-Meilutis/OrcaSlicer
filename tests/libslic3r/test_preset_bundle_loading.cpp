@@ -80,6 +80,13 @@ struct RenameTestCollection : public PresetCollection
 
 } // namespace
 
+TEST_CASE("Print presets include every arc overhang GUI option", "[Preset][Config]")
+{
+    RenameTestCollection collection;
+
+    CHECK(collection.default_preset().config.option("arc_overhang_stabilization_speed") != nullptr);
+}
+
 TEST_CASE("Preset identity is canonicalized from load path", "[Preset][Identity]")
 {
     TempPresetDir              temp_dir;
@@ -463,4 +470,3 @@ TEST_CASE("Profile validator flags dangling and renamed preset references", "[Pr
         CHECK_FALSE(bundle.check_preset_references());
     }
 }
-

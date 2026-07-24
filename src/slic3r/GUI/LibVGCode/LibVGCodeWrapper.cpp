@@ -92,6 +92,7 @@ Slic3r::ExtrusionRole convert(EGCodeExtrusionRole role)
     case EGCodeExtrusionRole::Brim:                     { return Slic3r::ExtrusionRole::erBrim; }
     case EGCodeExtrusionRole::SupportTransition:        { return Slic3r::ExtrusionRole::erSupportTransition; }
     case EGCodeExtrusionRole::Mixed:                    { return Slic3r::ExtrusionRole::erMixed; }
+    case EGCodeExtrusionRole::ArcOverhang:              { return Slic3r::ExtrusionRole::erArcOverhang; }
     default:                                            { return Slic3r::ExtrusionRole::erNone; }
     }
 }
@@ -121,6 +122,7 @@ EGCodeExtrusionRole convert(Slic3r::ExtrusionRole role)
     case Slic3r::ExtrusionRole::erBrim:                        { return EGCodeExtrusionRole::Brim; }
     case Slic3r::ExtrusionRole::erSupportTransition:           { return EGCodeExtrusionRole::SupportTransition; }
     case Slic3r::ExtrusionRole::erMixed:                       { return EGCodeExtrusionRole::Mixed; }
+    case Slic3r::ExtrusionRole::erArcOverhang:                 { return EGCodeExtrusionRole::ArcOverhang; }
     default:                                                   { return EGCodeExtrusionRole::None; }
     }
 }
@@ -830,4 +832,3 @@ GCodeInputData convert(const Slic3r::Print& print, const std::vector<std::string
 }
 
 } // namespace libvgcode
-
