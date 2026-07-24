@@ -74,6 +74,7 @@ public:
             bool m_is_dark = false;
             bool m_fixed_screen_size{ false };
             float m_scale_factor{ 1.0f };
+            bool m_is_gantry_model{ false };
 #if ENABLE_ACTUAL_SPEED_DEBUG
             ActualSpeedImguiWidget m_actual_speed_imgui_widget;
 #endif // ENABLE_ACTUAL_SPEED_DEBUG
@@ -81,7 +82,7 @@ public:
         public:
             float m_scale = 1.0f;
 
-            void init(std::string filename);
+            void init(const std::string& filename, bool is_gantry_model = false);
 
             const BoundingBoxf3& get_bounding_box() const { return m_model.get_bounding_box(); }
 
@@ -212,6 +213,7 @@ private:
     std::vector<float> m_filament_diameters;
     std::vector<float> m_filament_densities;
     SequentialView m_sequential_view;
+    std::string m_marker_config_signature;
     IMSlider* m_moves_slider;
     IMSlider* m_layers_slider;
 #if VGCODE_ENABLE_COG_AND_TOOL_MARKERS
@@ -360,6 +362,7 @@ public:
 private:
     //BBS: always load shell at preview
     //void load_shells(const Print& print);
+    void refresh_marker_model();
     void render_toolpaths();
     void render_shells(int canvas_width, int canvas_height);
 
@@ -373,4 +376,3 @@ private:
 } // namespace Slic3r
 
 #endif // slic3r_GCodeViewer_hpp_
-

@@ -2776,6 +2776,8 @@ void TabPrint::build()
 
         optgroup = page->new_optgroup(L("Arc overhangs"), L"param_arc_overhang");
         optgroup->append_single_option_line("arc_overhang_enabled");
+        optgroup->append_single_option_line("arc_overhang_bridges");
+        optgroup->append_single_option_line("arc_overhang_overhangs");
         optgroup->append_single_option_line("arc_overhang_flow_ratio");
         optgroup->append_single_option_line("arc_overhang_speed");
         optgroup->append_single_option_line("arc_overhang_stabilization_speed");

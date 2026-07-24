@@ -17927,6 +17927,7 @@ void Plater::update_flush_volume_matrix(size_t old_nozzle_size, size_t new_nozzl
 void Plater::set_bed_shape() const
 {
     std::string texture_filename;
+    std::string model_filename = p->config->option<ConfigOptionString>("bed_custom_model")->value;
     auto bundle = wxGetApp().preset_bundle;
     if (bundle != nullptr) {
         const Preset* curr = &bundle->printers.get_selected_preset();
@@ -17938,6 +17939,20 @@ void Plater::set_bed_shape() const
                 texture_filename = bundle->get_texture_for_printer_model(printer_model->value);
             }
         }
+
+        // CORE One INDX user presets inherit the standard CORE One machine
+        // model. Select the INDX bed from the profile's identifying note while
+        // leaving ordinary CORE One presets on their standard bed.
+        const std::string notes = curr->config.opt_string("printer_notes");
+        if (notes.find("PRINTER_MODEL_COREONE_INDX") != std::string::npos ||
+            notes.find("SEQ_ARRANGE_MODEL_COREONE_INDX") != std::string::npos) {
+            const boost::filesystem::path profile_dir =
+                boost::filesystem::path(resources_dir()) / "profiles" / "Prusa";
+            if (p->config->option<ConfigOptionString>("bed_custom_texture")->value.empty())
+                texture_filename = (profile_dir / "coreone_indx.svg").string();
+            if (model_filename.empty())
+                model_filename = (profile_dir / "coreone_indx.stl").string();
+        }
     }
     set_bed_shape(p->config->option<ConfigOptionPoints>("printable_area")->values,
         //BBS: add bed exclude areas
@@ -17947,7 +17962,7 @@ void Plater::set_bed_shape() const
         p->config->option<ConfigOptionPointsGroups>("extruder_printable_area")->values,
         p->config->option<ConfigOptionFloatsNullable>("extruder_printable_height")->values,
         p->config->option<ConfigOptionString>("bed_custom_texture")->value.empty() ? texture_filename : p->config->option<ConfigOptionString>("bed_custom_texture")->value,
-        p->config->option<ConfigOptionString>("bed_custom_model")->value);
+        model_filename);
 }
 
 //BBS: add bed exclude area

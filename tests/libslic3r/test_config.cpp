@@ -4,6 +4,7 @@
 #include "libslic3r/PrintConfigConstants.hpp"
 #include "libslic3r/LocalesUtils.hpp"
 #include "libslic3r/SequentialGantryGeometry.hpp"
+#include "libslic3r/Utils.hpp"
 
 #include <cereal/types/polymorphic.hpp>
 #include <cereal/types/string.hpp>
@@ -21,6 +22,8 @@ TEST_CASE("New strength and overhang options preserve existing print defaults", 
     const DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
 
     CHECK_FALSE(config.opt_bool("arc_overhang_enabled"));
+    CHECK(config.opt_bool("arc_overhang_bridges"));
+    CHECK(config.opt_bool("arc_overhang_overhangs"));
     CHECK_THAT(config.opt_float("arc_overhang_flow_ratio"), Catch::Matchers::WithinAbs(1.0, EPSILON));
     CHECK_THAT(config.opt_float("arc_overhang_speed"), Catch::Matchers::WithinAbs(5.0, EPSILON));
     CHECK_THAT(config.opt_float("arc_overhang_stabilization_speed"), Catch::Matchers::WithinAbs(5.0, EPSILON));
@@ -35,6 +38,35 @@ TEST_CASE("New strength and overhang options preserve existing print defaults", 
     CHECK_FALSE(spool_sync->default_value->getBool());
     CHECK(config.opt_string("sequential_print_gantry_geometry").empty());
     CHECK(config.opt_string("sequential_print_gantry_model").empty());
+}
+
+TEST_CASE("Bundled Prusa sequential gantry models match their printer notes", "[Config][Arrange]")
+{
+    struct ResourcesDirGuard {
+        std::string original = resources_dir();
+        ~ResourcesDirGuard() { set_resources_dir(original); }
+    } resources_dir_guard;
+    const boost::filesystem::path source_root =
+        boost::filesystem::path(__FILE__).parent_path().parent_path().parent_path();
+    set_resources_dir((source_root / "resources").string());
+
+    const std::array<std::pair<const char*, const char*>, 5> cases{{
+        {"PRINTER_MODEL_COREONE", "prusa3d_coreone_gantry.stl"},
+        {"PRINTER_MODEL_COREONE_INDX\nSEQ_ARRANGE_MODEL_COREONE_INDX", "prusa3d_coreone_indx_gantry.stl"},
+        {"PRINTER_MODEL_MK4IS", "prusa3d_mk4_gantry.stl"},
+        {"PRINTER_MODEL_XLIS", "prusa3d_xl_gantry.stl"},
+        {"PRINTER_MODEL_MINI", "prusa3d_mini_gantry.stl"}
+    }};
+
+    for (const auto& [notes, filename] : cases) {
+        DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+        config.set_key_value("printer_notes", new ConfigOptionString(notes));
+        const SequentialGantryGeometry geometry = load_sequential_gantry_geometry(config);
+        CAPTURE(notes);
+        REQUIRE_FALSE(geometry.empty());
+        CHECK(boost::filesystem::path(geometry.model_path).filename().string() == filename);
+        CHECK(boost::filesystem::exists(geometry.model_path));
+    }
 }
 
 TEST_CASE("Custom sequential gantry geometry is machine-independent", "[Config][Arrange]")

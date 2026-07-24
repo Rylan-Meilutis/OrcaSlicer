@@ -115,6 +115,28 @@ TEST_CASE("Extra overhang perimeters do not consume arc overhang roofs", "[Fill]
     CHECK(print_has_arc_overhang(print));
 }
 
+TEST_CASE("Arc bridge and overhang selectors can be disabled independently", "[Fill][ArcOverhang][Config]")
+{
+    TriangleMesh model = make_cube(5., 20., 5.);
+    TriangleMesh right_support = make_cube(5., 20., 5.);
+    right_support.translate(25., 0., 0.);
+    model.merge(right_support);
+    TriangleMesh roof  = make_cube(30., 20., 2.);
+    roof.translate(0., 0., 5.);
+    model.merge(roof);
+
+    Print print;
+    Slic3r::Test::init_and_process_print({model}, print, {
+        {"arc_overhang_enabled", "1"},
+        {"arc_overhang_bridges", "0"},
+        {"arc_overhang_overhangs", "1"},
+        {"arc_overhang_bridge_distance", "0"},
+        {"enable_support", "0"}
+    });
+
+    CHECK_FALSE(print_has_arc_overhang(print));
+}
+
 #if 0
 TEST_CASE("Adjusted solid distance", "[Fill]") {
     int surface_width = 250;

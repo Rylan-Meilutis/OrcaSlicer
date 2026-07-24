@@ -1400,6 +1400,8 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionFloat,                internal_solid_infill_flow_ratio))
     ((ConfigOptionFloat,                gap_fill_flow_ratio))
     ((ConfigOptionBool,                 arc_overhang_enabled))
+    ((ConfigOptionBool,                 arc_overhang_bridges))
+    ((ConfigOptionBool,                 arc_overhang_overhangs))
     ((ConfigOptionFloat,                arc_overhang_flow_ratio))
     ((ConfigOptionFloat,                arc_overhang_speed))
     ((ConfigOptionFloat,                arc_overhang_stabilization_speed))

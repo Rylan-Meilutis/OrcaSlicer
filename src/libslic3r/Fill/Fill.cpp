@@ -1076,11 +1076,11 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
                     bool use_arc_overhang;
                     if (one_sided_overhang) {
                         const double minimum_depth = region_config.arc_overhang_min_overhang_distance.value;
-                        use_arc_overhang = has_unsupported_area &&
+                        use_arc_overhang = region_config.arc_overhang_overhangs && has_unsupported_area &&
                             (minimum_depth <= 0. || unscale_(overhang_span) >= minimum_depth);
                     } else {
                         const double minimum_span = region_config.arc_overhang_bridge_distance.value;
-                        use_arc_overhang = has_unsupported_area &&
+                        use_arc_overhang = region_config.arc_overhang_bridges && has_unsupported_area &&
                             (minimum_span <= 0. || unscale_(bridge_span) >= minimum_span);
                     }
 

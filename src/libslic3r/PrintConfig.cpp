@@ -1527,6 +1527,22 @@ void PrintConfigDef::init_fff_params()
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionBool(false));
 
+    def = this->add("arc_overhang_bridges", coBool);
+    def->label = L("Use arc overhangs for bridges");
+    def->category = L("Quality");
+    def->tooltip = L("Allow arc overhangs on unsupported regions anchored at both ends. "
+                     "The minimum bridge distance decides when traditional bridging is retained.");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionBool(true));
+
+    def = this->add("arc_overhang_overhangs", coBool);
+    def->label = L("Use arc overhangs for overhangs");
+    def->category = L("Quality");
+    def->tooltip = L("Allow arc overhangs on one-sided unsupported regions. "
+                     "The minimum overhang distance decides when normal overhang paths are retained.");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionBool(true));
+
     def = this->add("arc_overhang_flow_ratio", coFloat);
     def->label = L("Arc overhang flow ratio");
     def->category = L("Quality");

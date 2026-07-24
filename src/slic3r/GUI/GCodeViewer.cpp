@@ -9,6 +9,7 @@
 #include "libslic3r/Utils.hpp"
 #include "libslic3r/LocalesUtils.hpp"
 #include "libslic3r/PresetBundle.hpp"
+#include "libslic3r/SequentialGantryGeometry.hpp"
 //BBS: add convex hull logic for toolpath check
 #include "libslic3r/Geometry/ConvexHull.hpp"
 
@@ -230,12 +231,19 @@ int GCodeViewer::SequentialView::ActualSpeedImguiWidget::plot(const char* label,
 }
 #endif // ENABLE_ACTUAL_SPEED_DEBUG
 
-void GCodeViewer::SequentialView::Marker::init(std::string filename)
+void GCodeViewer::SequentialView::Marker::init(const std::string& filename, bool is_gantry_model)
 {
+    if (m_model.is_initialized() && m_model.get_filename() == filename && m_is_gantry_model == is_gantry_model)
+        return;
+
+    m_model.reset();
+    m_is_gantry_model = is_gantry_model;
     if (filename.empty()) {
         m_model.init_from(stilized_arrow(16, 1.5f, 3.0f, 0.8f, 3.0f));
-    } else {
-        m_model.init_from_file(filename);
+        m_is_gantry_model = false;
+    } else if (!m_model.init_from_file(filename)) {
+        m_model.init_from(stilized_arrow(16, 1.5f, 3.0f, 0.8f, 3.0f));
+        m_is_gantry_model = false;
     }
     m_model.set_color({ 1.0f, 1.0f, 1.0f, 0.5f });
 }
@@ -259,9 +267,12 @@ void GCodeViewer::SequentialView::Marker::render(int canvas_width, int canvas_he
     const Camera& camera = wxGetApp().plater()->get_camera();
     const Transform3d& view_matrix = camera.get_view_matrix();
     float scale_factor = m_scale_factor;
-    const Transform3d model_matrix = (Geometry::translation_transform((m_world_position + m_model_z_offset * Vec3f::UnitZ()).cast<double>()) *
-        Geometry::translation_transform(scale_factor * m_model.get_bounding_box().size().z() * Vec3d::UnitZ()) * Geometry::rotation_transform({ M_PI, 0.0, 0.0 })) *
-        Geometry::scale_transform(scale_factor);
+    const Transform3d model_matrix = m_is_gantry_model
+        ? Geometry::translation_transform(m_world_position.cast<double>())
+        : (Geometry::translation_transform((m_world_position + m_model_z_offset * Vec3f::UnitZ()).cast<double>()) *
+           Geometry::translation_transform(scale_factor * m_model.get_bounding_box().size().z() * Vec3d::UnitZ()) *
+           Geometry::rotation_transform({ M_PI, 0.0, 0.0 })) *
+          Geometry::scale_transform(scale_factor);
     shader->set_uniform("view_model_matrix", view_matrix * model_matrix);
     shader->set_uniform("projection_matrix", camera.get_projection_matrix());
     const Matrix3d view_normal_matrix = view_matrix.matrix().block(0, 0, 3, 3) * model_matrix.matrix().block(0, 0, 3, 3).inverse().transpose();
@@ -996,30 +1007,54 @@ GCodeViewer::~GCodeViewer()
     }
 }
 
+void GCodeViewer::refresh_marker_model()
+{
+    PresetBundle* preset_bundle = wxGetApp().preset_bundle;
+    if (preset_bundle == nullptr)
+        return;
+
+    const Preset& printer = preset_bundle->printers.get_edited_preset();
+    const Preset& print = preset_bundle->prints.get_edited_preset();
+    const bool complete_objects = print.config.opt_bool("complete_objects");
+    const std::string printer_notes = printer.config.opt_string("printer_notes");
+    const std::string custom_geometry = printer.config.opt_string("sequential_print_gantry_geometry");
+    const std::string custom_model = printer.config.opt_string("sequential_print_gantry_model");
+    const std::string signature = printer.name + '\n' + print.name + '\n' +
+        (complete_objects ? "1\n" : "0\n") + printer_notes + '\n' + custom_geometry + '\n' + custom_model;
+    if (signature == m_marker_config_signature)
+        return;
+    m_marker_config_signature = signature;
+
+    if (complete_objects) {
+        const SequentialGantryGeometry geometry = load_sequential_gantry_geometry(printer.config);
+        if (!geometry.model_path.empty()) {
+            m_sequential_view.marker.init(geometry.model_path, true);
+            return;
+        }
+    }
+
+    std::string filename;
+    const Preset& selected = preset_bundle->printers.get_selected_preset();
+    if (selected.is_system)
+        filename = PresetUtils::system_printer_hotend_model(selected);
+    else {
+        const auto* printer_model = selected.config.opt<ConfigOptionString>("printer_model");
+        if (printer_model != nullptr && !printer_model->value.empty())
+            filename = preset_bundle->get_hotend_model_for_printer_model(printer_model->value);
+        if (filename.empty())
+            filename = preset_bundle->get_hotend_model_for_printer_model(PresetBundle::ORCA_DEFAULT_PRINTER_MODEL);
+    }
+    m_sequential_view.marker.init(filename);
+}
+
 void GCodeViewer::init(ConfigOptionMode mode, PresetBundle* preset_bundle)
 {
     if (m_gl_data_initialized)
         return;
 
-    // initializes tool marker
-    std::string filename;
-    if (preset_bundle != nullptr) {
-        const Preset* curr = &preset_bundle->printers.get_selected_preset();
-        if (curr->is_system)
-            filename = PresetUtils::system_printer_hotend_model(*curr);
-        else {
-            auto *printer_model = curr->config.opt<ConfigOptionString>("printer_model");
-            if (printer_model != nullptr && ! printer_model->value.empty()) {
-                filename = preset_bundle->get_hotend_model_for_printer_model(printer_model->value);
-            }
-
-            if (filename.empty()) {
-                filename = preset_bundle->get_hotend_model_for_printer_model(PresetBundle::ORCA_DEFAULT_PRINTER_MODEL);
-            }
-        }
-    }
-
-    m_sequential_view.marker.init(filename);
+    // Initialize the regular hotend marker or the full gantry model used by
+    // print-by-object previews.
+    refresh_marker_model();
 
     // initializes point sizes
     std::array<int, 2> point_sizes;
@@ -1597,6 +1632,8 @@ void GCodeViewer::render(int canvas_width, int canvas_height, int right_margin)
         update_by_mode(wxGetApp().get_mode());
         m_user_mode = wxGetApp().get_mode();
     }
+
+    refresh_marker_model();
 
     //BBS fixed bottom_margin for space to render horiz slider
     int bottom_margin = SLIDER_BOTTOM_MARGIN * GCODE_VIEWER_SLIDER_SCALE;
