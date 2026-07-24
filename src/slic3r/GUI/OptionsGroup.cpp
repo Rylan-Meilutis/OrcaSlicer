@@ -1006,6 +1006,20 @@ boost::any ConfigOptionsGroup::get_config_value(const DynamicPrintConfig& config
     boost::any ret;
     wxString text_value        = wxString("");
     const ConfigOptionDef* opt = config.def()->get(opt_key);
+    if (opt == nullptr)
+        return ret;
+
+    // Object, volume and older preset configurations are intentionally sparse.
+    // A newly introduced option may therefore be present in the page definition
+    // before it has been materialized in the edited configuration. Read its
+    // declared default instead of dereferencing a missing ConfigOption.
+    if (!config.has(opt_key)) {
+        if (!opt->default_value)
+            return ret;
+        DynamicPrintConfig default_config;
+        default_config.set_key_value(opt_key, opt->default_value->clone());
+        return get_config_value(default_config, opt_key, opt_index);
+    }
 
     if (opt->nullable) {
         switch (opt->type) {
@@ -1163,6 +1177,16 @@ boost::any ConfigOptionsGroup::get_config_value2(const DynamicPrintConfig& confi
 
     boost::any ret;
     const ConfigOptionDef* opt = config.def()->get(opt_key);
+    if (opt == nullptr)
+        return ret;
+
+    if (!config.has(opt_key)) {
+        if (!opt->default_value)
+            return ret;
+        DynamicPrintConfig default_config;
+        default_config.set_key_value(opt_key, opt->default_value->clone());
+        return get_config_value2(default_config, opt_key, opt_index);
+    }
 
     if (opt->nullable) {
         switch (opt->type) {

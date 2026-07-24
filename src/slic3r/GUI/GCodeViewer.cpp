@@ -1015,10 +1015,14 @@ void GCodeViewer::refresh_marker_model()
 
     const Preset& printer = preset_bundle->printers.get_edited_preset();
     const Preset& print = preset_bundle->prints.get_edited_preset();
-    const bool complete_objects = print.config.opt_bool("complete_objects");
-    const std::string printer_notes = printer.config.opt_string("printer_notes");
-    const std::string custom_geometry = printer.config.opt_string("sequential_print_gantry_geometry");
-    const std::string custom_model = printer.config.opt_string("sequential_print_gantry_model");
+    const auto* complete_objects_opt = print.config.opt<ConfigOptionBool>("complete_objects");
+    const auto* printer_notes_opt = printer.config.opt<ConfigOptionString>("printer_notes");
+    const auto* custom_geometry_opt = printer.config.opt<ConfigOptionString>("sequential_print_gantry_geometry");
+    const auto* custom_model_opt = printer.config.opt<ConfigOptionString>("sequential_print_gantry_model");
+    const bool complete_objects = complete_objects_opt != nullptr && complete_objects_opt->value;
+    const std::string printer_notes = printer_notes_opt == nullptr ? std::string() : printer_notes_opt->value;
+    const std::string custom_geometry = custom_geometry_opt == nullptr ? std::string() : custom_geometry_opt->value;
+    const std::string custom_model = custom_model_opt == nullptr ? std::string() : custom_model_opt->value;
     const std::string signature = printer.name + '\n' + print.name + '\n' +
         (complete_objects ? "1\n" : "0\n") + printer_notes + '\n' + custom_geometry + '\n' + custom_model;
     if (signature == m_marker_config_signature)

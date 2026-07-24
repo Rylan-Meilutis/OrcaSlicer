@@ -17943,7 +17943,8 @@ void Plater::set_bed_shape() const
         // CORE One INDX user presets inherit the standard CORE One machine
         // model. Select the INDX bed from the profile's identifying note while
         // leaving ordinary CORE One presets on their standard bed.
-        const std::string notes = curr->config.opt_string("printer_notes");
+        const auto* printer_notes = curr->config.opt<ConfigOptionString>("printer_notes");
+        const std::string notes = printer_notes == nullptr ? std::string() : printer_notes->value;
         if (notes.find("PRINTER_MODEL_COREONE_INDX") != std::string::npos ||
             notes.find("SEQ_ARRANGE_MODEL_COREONE_INDX") != std::string::npos) {
             const boost::filesystem::path profile_dir =

@@ -969,7 +969,8 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, in
     for (auto el : {"first_layer_flow_ratio", "outer_wall_flow_ratio", "inner_wall_flow_ratio", "overhang_flow_ratio", "sparse_infill_flow_ratio", "internal_solid_infill_flow_ratio", "gap_fill_flow_ratio", "support_flow_ratio", "support_interface_flow_ratio"})
         toggle_line(el, has_set_other_flow_ratios);
 
-    const bool has_arc_overhangs = config->opt_bool("arc_overhang_enabled");
+    const auto* arc_overhang_enabled = config->opt<ConfigOptionBool>("arc_overhang_enabled");
+    const bool has_arc_overhangs = arc_overhang_enabled != nullptr && arc_overhang_enabled->value;
     for (auto el : {"arc_overhang_flow_ratio", "arc_overhang_speed", "arc_overhang_stabilization_speed", "arc_overhang_cooling", "arc_overhang_layers",
                     "arc_overhang_bridge_distance", "arc_overhang_min_overhang_distance"})
         toggle_line(el, has_arc_overhangs);
