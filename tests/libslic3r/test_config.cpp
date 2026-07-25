@@ -24,6 +24,7 @@ TEST_CASE("New strength and overhang options preserve existing print defaults", 
     CHECK_FALSE(config.opt_bool("arc_overhang_enabled"));
     CHECK(config.opt_bool("arc_overhang_bridges"));
     CHECK(config.opt_bool("arc_overhang_overhangs"));
+    CHECK(config.opt_bool("arc_overhang_recursive_fill"));
     CHECK_THAT(config.opt_float("arc_overhang_flow_ratio"), Catch::Matchers::WithinAbs(1.0, EPSILON));
     CHECK_THAT(config.opt_float("arc_overhang_speed"), Catch::Matchers::WithinAbs(5.0, EPSILON));
     CHECK_THAT(config.opt_float("arc_overhang_stabilization_speed"), Catch::Matchers::WithinAbs(5.0, EPSILON));

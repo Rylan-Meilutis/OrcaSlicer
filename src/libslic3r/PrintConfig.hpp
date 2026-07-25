@@ -1402,6 +1402,7 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionBool,                 arc_overhang_enabled))
     ((ConfigOptionBool,                 arc_overhang_bridges))
     ((ConfigOptionBool,                 arc_overhang_overhangs))
+    ((ConfigOptionBool,                 arc_overhang_recursive_fill))
     ((ConfigOptionFloat,                arc_overhang_flow_ratio))
     ((ConfigOptionFloat,                arc_overhang_speed))
     ((ConfigOptionFloat,                arc_overhang_stabilization_speed))

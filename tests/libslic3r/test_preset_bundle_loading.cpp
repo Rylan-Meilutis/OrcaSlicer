@@ -85,6 +85,7 @@ TEST_CASE("Print presets include every arc overhang GUI option", "[Preset][Confi
     RenameTestCollection collection;
 
     CHECK(collection.default_preset().config.option("arc_overhang_stabilization_speed") != nullptr);
+    CHECK(collection.default_preset().config.option("arc_overhang_recursive_fill") != nullptr);
 }
 
 TEST_CASE("Preset identity is canonicalized from load path", "[Preset][Identity]")

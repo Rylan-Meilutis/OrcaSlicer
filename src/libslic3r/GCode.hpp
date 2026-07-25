@@ -517,7 +517,8 @@ private:
 		const size_t                     				 single_object_instance_idx);
 
     std::string     extrude_perimeters(const Print& print, const std::vector<ObjectByExtruder::Island::Region>& by_region, bool is_first_layer, bool is_infill_first);
-    std::string     extrude_infill(const Print& print, const std::vector<ObjectByExtruder::Island::Region>& by_region, bool ironing);
+    std::string     extrude_infill(const Print& print, const std::vector<ObjectByExtruder::Island::Region>& by_region, bool ironing,
+                                   ExtrusionRole role_filter = erMixed);
     std::string     extrude_support(const ExtrusionEntityCollection& support_fills, const ExtrusionRole support_extrusion_role);
 
     // Farthest-point timelapse: find the extrusion point farthest from camera (0,0)

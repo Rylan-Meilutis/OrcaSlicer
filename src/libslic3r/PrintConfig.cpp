@@ -1012,9 +1012,10 @@ void PrintConfigDef::init_common_params()
     def->set_default_value(new ConfigOptionString());
 
     def = this->add("sync_spool_manager_filament_names", coBool);
-    def->label = L("Sync OctoPrint SpoolManager names");
-    def->tooltip = L("When sending G-code to OctoPrint, load the available SpoolManager spools using the configured "
-                     "OctoPrint API key and write the selected spool names into [sm_name=] markers in filament notes.");
+    def->label = L("Enable OctoPrint SpoolManager sync");
+    def->tooltip = L("Allows Orca Slicer to load filament names, materials, and colors from the SpoolManager plugin "
+                     "using this OctoPrint host and API key. Selected spool metadata is embedded in G-code for "
+                     "host-side material validation. Existing [sm_name=] note markers are also updated.");
     def->mode = comAdvanced;
     def->cli = ConfigOptionDef::nocli;
     def->set_default_value(new ConfigOptionBool(false));
@@ -1540,6 +1541,14 @@ void PrintConfigDef::init_fff_params()
     def->category = L("Quality");
     def->tooltip = L("Allow arc overhangs on one-sided unsupported regions. "
                      "The minimum overhang distance decides when normal overhang paths are retained.");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionBool(true));
+
+    def = this->add("arc_overhang_recursive_fill", coBool);
+    def->label = L("Recursive arc fill");
+    def->category = L("Quality");
+    def->tooltip = L("Fill the space left by the initial arc family with smaller arcs that branch from already printed larger arcs. "
+                     "This follows concave boundaries more completely while keeping every new branch supported.");
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionBool(true));
 

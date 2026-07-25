@@ -65,6 +65,74 @@ TEST_CASE("Arc overhang fill produces curved paths inside its bridge surface", "
     CHECK(diff_pl(paths, offset(expolygon, float(SCALED_EPSILON * 10))).empty());
 }
 
+TEST_CASE("Arc overhangs keep consecutive starts on the current side", "[Fill][ArcOverhang][Travel]")
+{
+    const ExPolygon expolygon(Points{
+        Point::new_scale(0., 0.),
+        Point::new_scale(20., 0.),
+        Point::new_scale(20., 10.),
+        Point::new_scale(0., 10.)
+    });
+    Surface surface(stBottomBridge, expolygon);
+    surface.bridge_angle = 0.;
+
+    std::unique_ptr<Fill> filler(Fill::new_from_type("arc-overhang"));
+    REQUIRE(filler != nullptr);
+    filler->spacing = 0.45;
+    filler->bounding_box = get_extents(expolygon);
+
+    PrintRegionConfig config;
+    config.arc_overhang_recursive_fill.value = false;
+    FillParams params;
+    params.density = 1.f;
+    params.resolution = 0.05f;
+    params.config = &config;
+
+    const Polylines paths = filler->fill_surface(&surface, params);
+    REQUIRE(paths.size() > 1);
+    for (size_t idx = 1; idx < paths.size(); ++idx) {
+        const Point previous = paths[idx - 1].last_point();
+        CHECK((paths[idx].first_point() - previous).squaredNorm() <=
+              (paths[idx].last_point() - previous).squaredNorm());
+    }
+}
+
+TEST_CASE("Recursive arc fill branches into uncovered space", "[Fill][ArcOverhang][Recursive]")
+{
+    ExPolygon expolygon(Points{
+        Point::new_scale(0., 0.),
+        Point::new_scale(30., 0.),
+        Point::new_scale(30., 20.),
+        Point::new_scale(0., 20.)
+    });
+    expolygon.holes.emplace_back(Points{
+        Point::new_scale(8., 6.),
+        Point::new_scale(8., 14.),
+        Point::new_scale(12., 14.),
+        Point::new_scale(12., 6.)
+    });
+    Surface surface(stBottomBridge, expolygon);
+    surface.bridge_angle = 0.;
+
+    std::unique_ptr<Fill> filler(Fill::new_from_type("arc-overhang"));
+    REQUIRE(filler != nullptr);
+    filler->spacing = 0.45;
+    filler->bounding_box = get_extents(expolygon);
+
+    PrintRegionConfig config;
+    FillParams params;
+    params.density = 1.f;
+    params.resolution = 0.05f;
+    params.config = &config;
+
+    config.arc_overhang_recursive_fill.value = false;
+    const Polylines root_paths = filler->fill_surface(&surface, params);
+    config.arc_overhang_recursive_fill.value = true;
+    const Polylines recursive_paths = filler->fill_surface(&surface, params);
+
+    CHECK(recursive_paths.size() > root_paths.size());
+}
+
 TEST_CASE("Arc overhang keeps a distinct G-code feature role", "[Fill][ArcOverhang][GCode]")
 {
     CHECK(ExtrusionEntity::role_to_string(erArcOverhang) == "Arc overhang");

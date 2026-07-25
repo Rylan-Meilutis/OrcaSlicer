@@ -6258,7 +6258,18 @@ LayerResult GCode::process_layer(
                         }
                         return false;
                     };
+                    const bool has_arc_overhang = std::any_of(
+                        by_region_specific.begin(), by_region_specific.end(),
+                        [](const ObjectByExtruder::Island::Region &region) {
+                            return std::any_of(region.infills.begin(), region.infills.end(),
+                                [](const ExtrusionEntity *entity) { return entity->role() == erArcOverhang; });
+                        });
                     {
+                        // Arc overhangs form the bottom surface and replace its
+                        // unsupported perimeter portions, so establish the arcs
+                        // before printing any remaining supported walls.
+                        if (has_arc_overhang)
+                            gcode += this->extrude_infill(print, by_region_specific, false, erArcOverhang);
                         // Print perimeters of regions that has is_infill_first == false
                         gcode += this->extrude_perimeters(print, by_region_specific, first_layer, false);
                         if (!has_wipe_tower && need_insert_timelapse_gcode_for_traditional && printer_structure == PrinterStructure::psI3
@@ -6269,7 +6280,8 @@ LayerResult GCode::process_layer(
                             has_insert_timelapse_gcode = true;
                         }
                         // Then print infill
-                        gcode += this->extrude_infill(print, by_region_specific, false);
+                        gcode += this->extrude_infill(print, by_region_specific, false,
+                            has_arc_overhang ? erCount : erMixed);
                         // Then print perimeters of regions that has is_infill_first == true
                         gcode += this->extrude_perimeters(print, by_region_specific, first_layer, true);
                     }
@@ -7000,14 +7012,42 @@ std::string GCode::extrude_perimeters(const Print &print, const std::vector<Obje
                 : (m_config.is_infill_first == is_infill_first);
             if (!should_print) continue;
 
-            for (const ExtrusionEntity* ee : region.perimeters)
-                gcode += this->extrude_entity(*ee, "perimeter", -1., region.perimeters);
+            const bool replace_unsupported_perimeters = std::any_of(
+                region.infills.begin(), region.infills.end(),
+                [](const ExtrusionEntity *entity) { return entity->role() == erArcOverhang; });
+            if (!replace_unsupported_perimeters) {
+                for (const ExtrusionEntity* ee : region.perimeters)
+                    gcode += this->extrude_entity(*ee, "perimeter", -1., region.perimeters);
+                continue;
+            }
+
+            std::function<void(const ExtrusionEntity &)> extrude_supported;
+            extrude_supported = [&](const ExtrusionEntity &entity) {
+                if (const auto *path = dynamic_cast<const ExtrusionPath *>(&entity)) {
+                    if (path->role() != erOverhangPerimeter)
+                        gcode += this->extrude_path(*path, "perimeter", -1.);
+                } else if (const auto *multipath = dynamic_cast<const ExtrusionMultiPath *>(&entity)) {
+                    for (const ExtrusionPath &path : multipath->paths)
+                        extrude_supported(path);
+                } else if (const auto *loop = dynamic_cast<const ExtrusionLoop *>(&entity)) {
+                    // Removing an unsupported span opens the loop. Emit the
+                    // remaining anchors as paths rather than falsely closing it.
+                    for (const ExtrusionPath &path : loop->paths)
+                        extrude_supported(path);
+                } else if (const auto *collection = dynamic_cast<const ExtrusionEntityCollection *>(&entity)) {
+                    for (const ExtrusionEntity *child : collection->entities)
+                        extrude_supported(*child);
+                }
+            };
+            for (const ExtrusionEntity *entity : region.perimeters)
+                extrude_supported(*entity);
         }
     return gcode;
 }
 
 // Chain the paths hierarchically by a greedy algorithm to minimize a travel distance.
-std::string GCode::extrude_infill(const Print &print, const std::vector<ObjectByExtruder::Island::Region> &by_region, bool ironing)
+std::string GCode::extrude_infill(const Print &print, const std::vector<ObjectByExtruder::Island::Region> &by_region, bool ironing,
+                                  ExtrusionRole role_filter)
 {
     std::string 		 gcode;
     ExtrusionEntitiesPtr extrusions;
@@ -7017,7 +7057,9 @@ std::string GCode::extrude_infill(const Print &print, const std::vector<ObjectBy
             extrusions.clear();
             extrusions.reserve(region.infills.size());
             for (ExtrusionEntity *ee : region.infills)
-                if ((ee->role() == erIroning) == ironing)
+                if ((ee->role() == erIroning) == ironing &&
+                    (role_filter == erMixed ||
+                     (role_filter == erCount ? ee->role() != erArcOverhang : ee->role() == role_filter)))
                     extrusions.emplace_back(ee);
             if (! extrusions.empty()) {
                 m_config.apply(print.get_print_region(&region - &by_region.front()).config());

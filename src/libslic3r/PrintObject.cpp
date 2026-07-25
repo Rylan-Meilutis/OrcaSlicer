@@ -1432,6 +1432,9 @@ bool PrintObject::invalidate_state_by_config_options(
             || opt_key == "infill_overhang_angle") {
             steps.emplace_back(posInfill);
         } else if (opt_key == "arc_overhang_enabled" ||
+                   opt_key == "arc_overhang_bridges" ||
+                   opt_key == "arc_overhang_overhangs" ||
+                   opt_key == "arc_overhang_recursive_fill" ||
                    opt_key == "arc_overhang_bridge_distance" ||
                    opt_key == "arc_overhang_min_overhang_distance") {
             steps.emplace_back(posInfill);

@@ -2,11 +2,14 @@
 
 #include <algorithm>
 #include <fstream>
+#include <functional>
 #include <regex>
 #include <sstream>
 
 #include <boost/filesystem.hpp>
 #include <boost/nowide/fstream.hpp>
+#include <boost/property_tree/json_parser.hpp>
+#include <boost/property_tree/ptree.hpp>
 
 #include "../Utils.hpp"
 
@@ -19,12 +22,24 @@ namespace {
 constexpr size_t tail_line_count = 1000;
 constexpr size_t copy_buffer_size = 64 * 1024;
 
-std::string sanitize_spool_name(std::string name)
+std::string sanitize_metadata_value(std::string value)
 {
-    std::replace_if(name.begin(), name.end(), [](char ch) {
-        return ch == ']' || ch == '\r' || ch == '\n';
+    std::replace_if(value.begin(), value.end(), [](char ch) {
+        return ch == ']' || ch == ';' || ch == '\r' || ch == '\n';
     }, ' ');
-    return name;
+    return value;
+}
+
+std::string metadata_line(const char *key, const std::vector<Filament> &filaments,
+                          const std::function<const std::string &(const Filament &)> &value)
+{
+    std::string output = std::string("; ") + key + " = ";
+    for (size_t index = 0; index < filaments.size(); ++index) {
+        if (index > 0)
+            output += ';';
+        output += sanitize_metadata_value(value(filaments[index]));
+    }
+    return output + '\n';
 }
 
 std::pair<std::string, std::streamoff> read_tail(const fs::path &path)
@@ -68,18 +83,51 @@ std::pair<std::string, std::streamoff> read_tail(const fs::path &path)
 
 } // namespace
 
-std::string update_gcode_tail(const std::string &gcode_tail, const std::vector<std::string> &spool_names)
+bool parse_spools(const std::string &response, std::vector<Filament> &spools, std::string &error)
+{
+    try {
+        std::stringstream stream(response);
+        boost::property_tree::ptree root;
+        boost::property_tree::read_json(stream, root);
+        const auto all_spools = root.get_child_optional("allSpools");
+        if (!all_spools) {
+            error = "The OctoPrint SpoolManager response did not contain allSpools.";
+            return false;
+        }
+
+        for (const auto &entry : *all_spools) {
+            Filament spool{
+                entry.second.get<std::string>("displayName", ""),
+                entry.second.get<std::string>("material", ""),
+                entry.second.get<std::string>("color", ""),
+                entry.second.get<std::string>("colorName", "")
+            };
+            if (!spool.name.empty())
+                spools.emplace_back(std::move(spool));
+        }
+    } catch (const std::exception &exception) {
+        error = exception.what();
+        return false;
+    }
+
+    if (spools.empty()) {
+        error = "OctoPrint SpoolManager did not return any spools.";
+        return false;
+    }
+    return true;
+}
+
+std::string update_gcode_tail(const std::string &gcode_tail, const std::vector<Filament> &filaments)
 {
     static const std::regex filament_type_re(R"((^|\n); filament_type = ([^\r\n]+))");
     static const std::regex filament_used_re(R"((^|\n); filament used \[mm\] = ([^\r\n]+))");
     static const std::regex filament_notes_re(R"((^|\n); filament_notes = ([^\r\n]+))");
     static const std::regex spool_name_re(R"(\[\s*sm_name\s*=\s*[^\]]*\])");
 
-    std::smatch notes_match;
-    if (!std::regex_search(gcode_tail, notes_match, filament_notes_re))
-        return gcode_tail;
-
     std::string output = gcode_tail;
+    static const std::regex metadata_re(
+        R"((^|\n); spool_manager_filament_(names|materials|colors) = [^\r\n]*(\r?\n|$))");
+    output = std::regex_replace(output, metadata_re, "$1");
 
     size_t filament_count = 0;
     std::smatch type_match;
@@ -102,33 +150,52 @@ std::string update_gcode_tail(const std::string &gcode_tail, const std::vector<s
         output.replace(static_cast<size_t>(used_match.position()), static_cast<size_t>(used_match.length()), replacement);
     }
 
-    if (!std::regex_search(output, notes_match, filament_notes_re))
-        return output;
+    std::smatch notes_match;
+    if (std::regex_search(output, notes_match, filament_notes_re)) {
+        std::vector<std::string> notes;
+        std::stringstream notes_stream(notes_match[2].str());
+        for (std::string note; std::getline(notes_stream, note, ';');)
+            notes.emplace_back(std::move(note));
 
-    std::vector<std::string> notes;
-    std::stringstream notes_stream(notes_match[2].str());
-    for (std::string note; std::getline(notes_stream, note, ';');)
-        notes.emplace_back(std::move(note));
+        for (size_t index = 0; index < notes.size() && index < filaments.size(); ++index) {
+            if (filaments[index].name.empty() || !std::regex_search(notes[index], spool_name_re))
+                continue;
+            notes[index] = std::regex_replace(
+                notes[index], spool_name_re, "[sm_name = " + sanitize_metadata_value(filaments[index].name) + "]",
+                std::regex_constants::format_first_only);
+        }
 
-    for (size_t index = 0; index < notes.size() && index < spool_names.size(); ++index) {
-        if (spool_names[index].empty() || !std::regex_search(notes[index], spool_name_re))
-            continue;
-        notes[index] = std::regex_replace(
-            notes[index], spool_name_re, "[sm_name = " + sanitize_spool_name(spool_names[index]) + "]",
-            std::regex_constants::format_first_only);
+        std::string replacement = notes_match[1].str() + "; filament_notes = ";
+        for (size_t index = 0; index < notes.size(); ++index) {
+            if (index > 0)
+                replacement += ';';
+            replacement += notes[index];
+        }
+        output.replace(static_cast<size_t>(notes_match.position()), static_cast<size_t>(notes_match.length()), replacement);
     }
 
-    std::string replacement = notes_match[1].str() + "; filament_notes = ";
-    for (size_t index = 0; index < notes.size(); ++index) {
-        if (index > 0)
-            replacement += ';';
-        replacement += notes[index];
+    const std::string metadata =
+        metadata_line("spool_manager_filament_names", filaments,
+                      [](const Filament &filament) -> const std::string & { return filament.name; }) +
+        metadata_line("spool_manager_filament_materials", filaments,
+                      [](const Filament &filament) -> const std::string & { return filament.material; }) +
+        metadata_line("spool_manager_filament_colors", filaments,
+                      [](const Filament &filament) -> const std::string & { return filament.color; });
+
+    size_t insertion_position = output.size();
+    if (std::regex_search(output, notes_match, filament_notes_re))
+        insertion_position = static_cast<size_t>(notes_match.position() + notes_match.length(1));
+    else if (std::regex_search(output, type_match, filament_type_re))
+        insertion_position = static_cast<size_t>(type_match.position() + type_match.length(1));
+    else if (!output.empty() && output.back() != '\n') {
+        output += '\n';
+        insertion_position = output.size();
     }
-    output.replace(static_cast<size_t>(notes_match.position()), static_cast<size_t>(notes_match.length()), replacement);
+    output.insert(insertion_position, metadata);
     return output;
 }
 
-bool update_gcode_file(const fs::path &path, const std::vector<std::string> &spool_names, std::string &error)
+bool update_gcode_file(const fs::path &path, const std::vector<Filament> &filaments, std::string &error)
 {
     const auto [tail, tail_offset] = read_tail(path);
     if (tail_offset < 0) {
@@ -136,7 +203,7 @@ bool update_gcode_file(const fs::path &path, const std::vector<std::string> &spo
         return false;
     }
 
-    const std::string updated_tail = update_gcode_tail(tail, spool_names);
+    const std::string updated_tail = update_gcode_tail(tail, filaments);
     if (updated_tail == tail)
         return true;
 

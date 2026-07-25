@@ -1212,6 +1212,32 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
 	        }
 	}
 
+    // Fill surfaces are inset by the perimeter generator. Arc overhangs replace
+    // the unsupported bottom-wall footprint as well, otherwise those walls are
+    // emitted first as ordinary bridge perimeters and sag before the arcs exist.
+    ExPolygons supported;
+    if (layer.lower_layer != nullptr)
+        supported = layer.lower_layer->lslices;
+    append(supported, support_below);
+    supported = union_ex(supported);
+    for (SurfaceFill &fill : surface_fills) {
+        if (fill.params.extrusion_role != erArcOverhang || fill.expolygons.empty())
+            continue;
+
+        const LayerRegion &layerm = *layer.regions()[fill.region_id];
+        const coord_t wall_footprint =
+            std::max(0, int(layerm.region().config().wall_loops)) * layerm.flow(frPerimeter).scaled_spacing();
+        if (wall_footprint == 0)
+            continue;
+
+        ExPolygons unsupported_region = supported.empty() ?
+            to_expolygons(layerm.slices.surfaces) :
+            diff_ex(layerm.slices.surfaces, offset_ex(supported, 0.5f * layerm.flow(frPerimeter).scaled_width()));
+        ExPolygons replacement = intersection_ex(offset_ex(fill.expolygons, float(wall_footprint)), unsupported_region);
+        append(replacement, fill.expolygons);
+        fill.expolygons = union_ex(replacement);
+    }
+
 	{
 		Polygons all_polygons;
 		for (SurfaceFill &fill : surface_fills)

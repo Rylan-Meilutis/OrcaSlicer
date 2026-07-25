@@ -263,7 +263,7 @@ wxString OctoPrint::get_test_failed_msg (wxString &msg) const
         , _L("Note: OctoPrint version 1.1.0 or higher is required."));
 }
 
-bool OctoPrint::get_spool_manager_spools(std::vector<std::string> &spool_names, wxString &error) const
+bool OctoPrint::get_spool_manager_spools(std::vector<SpoolManagerMetadata::Filament> &spools, wxString &error) const
 {
     const std::string url = make_url(
         "plugin/SpoolManager/loadSpoolsByQuery?selectedPageSize=100000&from=0&to=100000"
@@ -288,28 +288,10 @@ bool OctoPrint::get_spool_manager_spools(std::vector<std::string> &spool_names, 
     if (!success)
         return false;
 
-    try {
-        std::stringstream stream(response_body);
-        pt::ptree root;
-        pt::read_json(stream, root);
-        const auto selected = root.get_child_optional("selectedSpools");
-        if (!selected) {
-            error = _L("The OctoPrint SpoolManager response did not contain a spool list.");
-            return false;
-        }
-        for (const auto &entry : *selected)
-            spool_names.emplace_back(entry.second.get<std::string>("displayName", ""));
-        spool_names.erase(std::remove_if(spool_names.begin(), spool_names.end(),
-                                        [](const std::string &name) { return name.empty(); }),
-                          spool_names.end());
-    } catch (const std::exception &exception) {
+    std::string parse_error;
+    if (!SpoolManagerMetadata::parse_spools(response_body, spools, parse_error)) {
         error = GUI::format_wxstr("%s: %s", _L("Could not parse the OctoPrint SpoolManager response"),
-                                  GUI::from_u8(exception.what()));
-        return false;
-    }
-
-    if (spool_names.empty()) {
-        error = _L("OctoPrint SpoolManager did not return any spools.");
+                                  GUI::from_u8(parse_error));
         return false;
     }
     return true;
@@ -317,13 +299,13 @@ bool OctoPrint::get_spool_manager_spools(std::vector<std::string> &spool_names, 
 
 bool OctoPrint::upload(PrintHostUpload upload_data, ProgressFn prorgess_fn, ErrorFn error_fn, InfoFn info_fn) const
 {
-    const std::string serialized_names = upload_data.extended("spool_manager_names");
-    if (!serialized_names.empty() && !upload_data.use_3mf) {
+    const std::string serialized_filaments = upload_data.extended("spool_manager_filaments");
+    if (!serialized_filaments.empty() && !upload_data.use_3mf) {
         try {
-            const std::vector<std::string> names =
-                nlohmann::json::parse(serialized_names).get<std::vector<std::string>>();
+            const std::vector<SpoolManagerMetadata::Filament> filaments =
+                nlohmann::json::parse(serialized_filaments).get<std::vector<SpoolManagerMetadata::Filament>>();
             std::string metadata_error;
-            if (!SpoolManagerMetadata::update_gcode_file(upload_data.source_path, names, metadata_error)) {
+            if (!SpoolManagerMetadata::update_gcode_file(upload_data.source_path, filaments, metadata_error)) {
                 error_fn(GUI::from_u8(metadata_error));
                 return false;
             }

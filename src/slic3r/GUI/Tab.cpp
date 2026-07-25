@@ -2778,6 +2778,7 @@ void TabPrint::build()
         optgroup->append_single_option_line("arc_overhang_enabled");
         optgroup->append_single_option_line("arc_overhang_bridges");
         optgroup->append_single_option_line("arc_overhang_overhangs");
+        optgroup->append_single_option_line("arc_overhang_recursive_fill");
         optgroup->append_single_option_line("arc_overhang_flow_ratio");
         optgroup->append_single_option_line("arc_overhang_speed");
         optgroup->append_single_option_line("arc_overhang_stabilization_speed");
@@ -5025,7 +5026,6 @@ void TabPrinter::build_fff()
         optgroup->append_single_option_line("pellet_modded_printer", "printer_basic_information_advanced#pellet-modded-printer");
         optgroup->append_single_option_line("bbl_use_printhost", "printer_basic_information_advanced#use-3rd-party-print-host");
         optgroup->append_single_option_line("use_3mf");
-        optgroup->append_single_option_line("sync_spool_manager_filament_names");
         optgroup->append_single_option_line("scan_first_layer" , "printer_basic_information_advanced#scan-first-layer");
         optgroup->append_single_option_line("enable_power_loss_recovery", "printer_basic_information_advanced#power-loss-recovery");
         //option  = optgroup->get_option("wrapping_exclude_area");
@@ -5247,6 +5247,35 @@ void TabPrinter::build_fff()
         option.opt.is_code = true;
         option.opt.height = gcode_field_height;//150;
         optgroup->append_single_option_line(option, "printer_machine_gcode#template-custom-g-code");
+
+    page = add_options_page(L("OctoPrint SpoolManager"), "custom-gcode_filament");
+        optgroup = page->new_optgroup(L("Filament synchronization"), "param_filament");
+        optgroup->append_single_option_line("sync_spool_manager_filament_names");
+        {
+            Line explanation{"", ""};
+            explanation.full_width = 1;
+            explanation.append_widget([](wxWindow *parent) {
+                auto *sizer = new wxBoxSizer(wxVERTICAL);
+                auto *text = new wxStaticText(
+                    parent, wxID_ANY,
+                    _L("This integration reads spools from the SpoolManager plugin on the configured OctoPrint host. "
+                       "The Sync button matches each Orca filament to a spool, updates its material preset and color, "
+                       "and uses the host API key already configured for this printer.\n\n"
+                       "When G-code is sent, Orca asks you to confirm the loaded spool for every filament. It embeds "
+                       "aligned spool name, material, and color metadata so OctoPrint can validate the job. Legacy "
+                       "[sm_name=] markers in filament notes remain supported."));
+                text->Wrap(parent->FromDIP(620));
+                sizer->Add(text, 0, wxEXPAND | wxBOTTOM, parent->FromDIP(10));
+                auto *button = new Button(parent, _L("Sync filament color and material"));
+                button->Bind(wxEVT_BUTTON, [](wxCommandEvent &) {
+                    if (wxGetApp().plater() != nullptr)
+                        wxGetApp().plater()->sidebar().sync_spool_manager_filaments();
+                });
+                sizer->Add(button, 0, wxALIGN_LEFT);
+                return sizer;
+            });
+            optgroup->append_line(explanation);
+        }
 
     page = add_options_page(L("Notes"), "custom-gcode_note"); // ORCA: icon only visible on placeholders
         optgroup = page->new_optgroup(L("Notes"), "note", 0);

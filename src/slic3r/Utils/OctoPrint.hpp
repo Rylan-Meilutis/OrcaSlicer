@@ -9,6 +9,7 @@
 
 #include "PrintHost.hpp"
 #include "libslic3r/PrintConfig.hpp"
+#include "libslic3r/GCode/SpoolManagerMetadata.hpp"
 
 
 namespace Slic3r {
@@ -34,7 +35,7 @@ public:
     std::string get_host() const override { return m_host; }
     const std::string& get_apikey() const { return m_apikey; }
     const std::string& get_cafile() const { return m_cafile; }
-    bool get_spool_manager_spools(std::vector<std::string> &spool_names, wxString &error) const;
+    bool get_spool_manager_spools(std::vector<SpoolManagerMetadata::Filament> &spools, wxString &error) const;
 
 protected:
 #ifdef WIN32

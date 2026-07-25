@@ -27,22 +27,69 @@ TEST_CASE("SpoolManager metadata updates marked filament notes", "[GCodeWriter][
         "; filament used [mm] = 10, 20\n"
         "; filament_notes = [sm_name=Old]; [sm_name = ]; ordinary note\n";
 
-    const std::string updated =
-        SpoolManagerMetadata::update_gcode_tail(tail, {"Purple PLA", "Blue PETG", "Ignored"});
+    const std::vector<SpoolManagerMetadata::Filament> filaments{
+        {"Purple PLA", "PLA", "#800080", "Purple"},
+        {"Blue PETG", "PETG", "#0000FF", "Blue"},
+        {"Ignored", "ABS", "#000000", "Black"}
+    };
+    const std::string updated = SpoolManagerMetadata::update_gcode_tail(tail, filaments);
 
     CHECK_THAT(updated, Catch::Matchers::ContainsSubstring("; filament used [mm] = 10, 20, 0"));
     CHECK_THAT(updated, Catch::Matchers::ContainsSubstring(
                             "; filament_notes = [sm_name = Purple PLA]; [sm_name = Blue PETG]; ordinary note"));
+    CHECK_THAT(updated, Catch::Matchers::ContainsSubstring(
+                            "; spool_manager_filament_names = Purple PLA;Blue PETG;Ignored"));
+    CHECK_THAT(updated, Catch::Matchers::ContainsSubstring(
+                            "; spool_manager_filament_materials = PLA;PETG;ABS"));
+    CHECK_THAT(updated, Catch::Matchers::ContainsSubstring(
+                            "; spool_manager_filament_colors = #800080;#0000FF;#000000"));
 }
 
-TEST_CASE("SpoolManager metadata leaves G-code without markers unchanged", "[GCodeWriter][SpoolManager]")
+TEST_CASE("SpoolManager embeds explicit metadata without legacy note markers", "[GCodeWriter][SpoolManager]")
 {
     const std::string tail =
         "; filament_type = PLA\n"
         "; filament used [mm] = 10\n"
         "; filament_notes = ordinary note\n";
 
-    CHECK(SpoolManagerMetadata::update_gcode_tail(tail, {"Purple PLA"}) == tail);
+    const std::string updated = SpoolManagerMetadata::update_gcode_tail(
+        tail, {{"Purple PLA", "PLA", "#800080", "Purple"}});
+    CHECK_THAT(updated, Catch::Matchers::ContainsSubstring("; filament_notes = ordinary note"));
+    CHECK_THAT(updated, Catch::Matchers::ContainsSubstring("; spool_manager_filament_names = Purple PLA"));
+}
+
+TEST_CASE("SpoolManager embeds explicit metadata without filament notes", "[GCodeWriter][SpoolManager]")
+{
+    const std::string tail =
+        "; filament_type = PLA\n"
+        "; filament used [mm] = 10\n";
+
+    const std::string updated = SpoolManagerMetadata::update_gcode_tail(
+        tail, {{"Purple PLA", "PLA", "#800080", "Purple"}});
+    CHECK_THAT(updated, Catch::Matchers::ContainsSubstring("; spool_manager_filament_names = Purple PLA"));
+    CHECK_THAT(updated, Catch::Matchers::ContainsSubstring("; spool_manager_filament_materials = PLA"));
+    CHECK_THAT(updated, Catch::Matchers::ContainsSubstring("; spool_manager_filament_colors = #800080"));
+}
+
+TEST_CASE("SpoolManager response parser preserves name material and color", "[GCodeWriter][SpoolManager]")
+{
+    const std::string response = R"({
+        "allSpools": [
+            {"displayName":"Galaxy PLA","material":"PLA","color":"#123456","colorName":"Galaxy"},
+            {"displayName":"Safety PETG","material":"PETG","color":"#FF8800","colorName":"Orange"}
+        ],
+        "selectedSpools": []
+    })";
+    std::vector<SpoolManagerMetadata::Filament> spools;
+    std::string error;
+
+    REQUIRE(SpoolManagerMetadata::parse_spools(response, spools, error));
+    REQUIRE(spools.size() == 2);
+    CHECK(spools[0].name == "Galaxy PLA");
+    CHECK(spools[0].material == "PLA");
+    CHECK(spools[0].color == "#123456");
+    CHECK(spools[0].color_name == "Galaxy");
+    CHECK(spools[1].name == "Safety PETG");
 }
 
 // Arrange on a finite bed, not an unbounded InfiniteBed: the latter places items

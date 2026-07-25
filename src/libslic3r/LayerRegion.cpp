@@ -132,7 +132,13 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
 
     g.layer_id              = (int)this->layer()->id();
     g.ext_perimeter_flow    = this->flow(frExternalPerimeter);
-    g.overhang_flow         = this->bridging_flow(frPerimeter, object_config.thick_bridges);
+    // Arc-overhang bottom surfaces replace unsupported wall segments. Keep any
+    // remaining bridge perimeter anchors at ordinary perimeter flow: applying
+    // thick/overextruded bridge flow to them makes the free edge sag before the
+    // arc family can bond to it.
+    g.overhang_flow         = region_config.arc_overhang_enabled ?
+                                  this->flow(frPerimeter) :
+                                  this->bridging_flow(frPerimeter, object_config.thick_bridges);
     g.solid_infill_flow     = this->flow(frSolidInfill);
 
     if (this->layer()->object()->config().wall_generator.value == PerimeterGeneratorType::Arachne && !spiral_mode)
