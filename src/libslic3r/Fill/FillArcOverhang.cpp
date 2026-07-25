@@ -53,8 +53,7 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
     // the printable half-circle reaches another boundary; continuing concentric
     // circles beyond that point creates paths whose endpoints begin in midair.
     auto generate_family = [&](const Point &family_center, const Point &start_from, double first_radius,
-                               const ExPolygon &region,
-                               Polylines &arcs, Polylines &outer_arcs) {
+                               const ExPolygon &region, size_t max_paths, Polylines &arcs) {
         Point previous = start_from;
         const BoundingBox region_bbox = get_extents(region);
         const double family_max_radius =
@@ -111,8 +110,12 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
             const double clipped_length = std::accumulate(
                 ordered.begin(), ordered.end(), 0.,
                 [](double length, const Polyline &path) { return length + path.length(); });
-            outer_arcs = ordered;
+            const bool path_limit_reached = ordered.size() >= max_paths - std::min(max_paths, arcs.size());
+            if (path_limit_reached)
+                ordered.resize(max_paths - arcs.size());
             append(arcs, std::move(ordered));
+            if (path_limit_reached)
+                break;
 
             // A supported arc family needs at least a half circle. Once another
             // boundary clips it below that amount, use this last arc as a parent
@@ -123,31 +126,43 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
     };
 
     Polylines arcs;
-    Polylines frontier;
-    generate_family(center, center, 0.5 * spacing, expolygon, arcs, frontier);
+    generate_family(center, center, 0.5 * spacing, expolygon, std::numeric_limits<size_t>::max(), arcs);
 
     const bool recursive_fill = params.config != nullptr && params.config->arc_overhang_recursive_fill.value;
     if (recursive_fill && !arcs.empty()) {
-        constexpr size_t max_branches = 128;
-        for (size_t branch = 0; branch < max_branches && !frontier.empty(); ++branch) {
-            const ExPolygons covered = union_ex(offset(arcs, float(0.52 * spacing)));
-            ExPolygons remaining = diff_ex(ExPolygons{expolygon}, covered);
-            // Polygonized line offsets leave narrow radial slivers between
-            // otherwise adjacent arcs. They are not printable child regions.
-            remaining = opening_ex(remaining, float(0.75 * spacing));
-            remaining.erase(std::remove_if(remaining.begin(), remaining.end(), [spacing](const ExPolygon &part) {
-                return std::abs(area(part)) < double(spacing) * double(spacing);
-            }), remaining.end());
-            if (remaining.empty())
-                break;
+        // Lay down the largest useful family first, then find all pockets left
+        // beside it once. Recomputing a union of every generated path after each
+        // child made recursive fill grow quadratically and could eventually
+        // cancel slicing on complex models.
+        const size_t primary_arc_count = arcs.size();
+        const ExPolygons covered = union_ex(offset(arcs, float(0.52 * spacing)));
+        ExPolygons remaining = diff_ex(ExPolygons{expolygon}, covered);
+        // Polygonized line offsets leave narrow radial slivers between
+        // otherwise adjacent arcs. They are not printable child regions.
+        remaining = opening_ex(remaining, float(0.75 * spacing));
+        remaining.erase(std::remove_if(remaining.begin(), remaining.end(), [spacing](const ExPolygon &part) {
+            return std::abs(area(part)) < double(spacing) * double(spacing);
+        }), remaining.end());
+        std::sort(remaining.begin(), remaining.end(), [](const ExPolygon &lhs, const ExPolygon &rhs) {
+            return std::abs(area(lhs)) > std::abs(area(rhs));
+        });
 
-            auto largest = std::max_element(remaining.begin(), remaining.end(), [](const ExPolygon &lhs, const ExPolygon &rhs) {
-                return std::abs(area(lhs)) < std::abs(area(rhs));
-            });
+        // Recursive fill is a refinement pass. These limits keep pathological
+        // meshes bounded while prioritizing the largest leftover spaces.
+        constexpr size_t max_child_regions = 64;
+        constexpr size_t max_child_paths = 4096;
+        const size_t primary_point_count = std::accumulate(
+            arcs.begin(), arcs.begin() + primary_arc_count, size_t(0),
+            [](size_t count, const Polyline &path) { return count + path.points.size(); });
+        const size_t point_stride = std::max<size_t>(1, (primary_point_count + 8191) / 8192);
+        size_t child_path_count = 0;
+        for (size_t region_idx = 0;
+             region_idx < std::min(remaining.size(), max_child_regions) && child_path_count < max_child_paths;
+             ++region_idx) {
             ExPolygons branch_regions = intersection_ex(
-                offset_ex(ExPolygons{*largest}, float(0.75 * spacing)), ExPolygons{expolygon});
+                offset_ex(ExPolygons{remaining[region_idx]}, float(0.75 * spacing)), ExPolygons{expolygon});
             if (branch_regions.empty())
-                break;
+                continue;
             auto branch_region = std::max_element(branch_regions.begin(), branch_regions.end(),
                 [](const ExPolygon &lhs, const ExPolygon &rhs) {
                     return std::abs(area(lhs)) < std::abs(area(rhs));
@@ -155,11 +170,15 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
             const Lines remaining_boundary = to_lines(*branch_region);
             Point child_center;
             double nearest_distance = std::numeric_limits<double>::max();
-            // A child may branch from any already printed arc, not only from the
-            // last root ring. Concave surfaces and holes often leave an uncovered
-            // pocket beside an earlier parent arc.
-            for (const Polyline &parent : arcs) {
+            // Children branch only from the primary, larger arches. Sample very
+            // dense primary paths to bound nearest-boundary work without changing
+            // ordinary models.
+            size_t point_idx = 0;
+            for (size_t parent_idx = 0; parent_idx < primary_arc_count; ++parent_idx) {
+                const Polyline &parent = arcs[parent_idx];
                 for (const Point &point : parent.points) {
+                    if (point_idx++ % point_stride != 0)
+                        continue;
                     for (const Line &line : remaining_boundary) {
                         const double distance = line.distance_to_squared(point);
                         if (distance < nearest_distance) {
@@ -170,19 +189,18 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
                 }
             }
             if (nearest_distance > 2.25 * double(spacing) * double(spacing))
-                break;
+                continue;
 
             Polylines child_arcs;
-            Polylines child_frontier;
             // The covered mask extends just beyond half a line spacing. Start
             // children slightly farther out so their first arc overlaps the
             // parent while still intersecting the uncovered pocket.
-            generate_family(child_center, arcs.back().last_point(), 0.55 * spacing,
-                            *branch_region, child_arcs, child_frontier);
+            generate_family(child_center, arcs.back().last_point(), 0.55 * spacing, *branch_region,
+                            max_child_paths - child_path_count, child_arcs);
             if (child_arcs.empty())
-                break;
+                continue;
+            child_path_count += child_arcs.size();
             append(arcs, std::move(child_arcs));
-            append(frontier, std::move(child_frontier));
         }
     }
 

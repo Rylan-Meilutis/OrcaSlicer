@@ -25,6 +25,7 @@
 #include "GUI.hpp"
 #include "GUI_App.hpp"
 #include "MainFrame.hpp"
+#include "Plater.hpp"
 #include "slic3r/Utils/NetworkAgentFactory.hpp"
 #include "format.hpp"
 #include "Tab.hpp"
@@ -384,6 +385,20 @@ void PhysicalPrinterDialog::build_printhost_settings(ConfigOptionsGroup* m_optgr
     option.opt.width = Field::def_width_wider();
     m_optgroup->append_single_option_line(option);
 
+    option = m_optgroup->get_option("sync_spool_manager_filament_names");
+    Line spool_manager_line = m_optgroup->create_single_option_line(option);
+    spool_manager_line.append_widget([this, create_sizer_with_btn](wxWindow *parent) {
+        Button *button = nullptr;
+        auto *sizer = create_sizer_with_btn(
+            parent, &button, "printer_sync", _L("Sync filament color and material"));
+        button->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
+            if (wxGetApp().plater() != nullptr)
+                wxGetApp().plater()->sidebar().sync_spool_manager_filaments(m_config);
+        });
+        return sizer;
+    });
+    m_optgroup->append_line(spool_manager_line);
+
     option = m_optgroup->get_option("flashforge_serial_number");
     option.opt.width = Field::def_width_wider();
     m_optgroup->append_single_option_line(option);
@@ -655,6 +670,7 @@ void PhysicalPrinterDialog::update(bool printer_change)
         update_host_type(printer_change);
         const auto opt = m_config->option<ConfigOptionEnum<PrintHostType>>("host_type");
         m_optgroup->show_field("host_type");
+        m_optgroup->show_field("sync_spool_manager_filament_names", opt != nullptr && opt->value == htOctoPrint);
 
         m_optgroup->enable_field("print_host");
         m_optgroup->show_field("print_host_webui");
@@ -764,6 +780,7 @@ void PhysicalPrinterDialog::update(bool printer_change)
     else {
         m_optgroup->set_value("host_type", int(PrintHostType::htOctoPrint), false);
         m_optgroup->hide_field("host_type");
+        m_optgroup->hide_field("sync_spool_manager_filament_names");
         m_optgroup->hide_field("flashforge_serial_number");
 
         m_optgroup->show_field("printhost_authorization_type");
@@ -887,6 +904,8 @@ void PhysicalPrinterDialog::check_host_key_valid()
         auto it = m_config->option<ConfigOptionString>(key);
         if (!it) m_config->set_key_value(key, new ConfigOptionString(""));
     }
+    if (m_config->option<ConfigOptionBool>("sync_spool_manager_filament_names") == nullptr)
+        m_config->set_key_value("sync_spool_manager_filament_names", new ConfigOptionBool(false));
     return;
 }
 

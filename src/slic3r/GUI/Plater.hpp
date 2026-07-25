@@ -195,7 +195,7 @@ public:
     void load_ams_list(MachineObject* obj);
     std::map<int, DynamicPrintConfig> build_filament_ams_list(MachineObject* obj);
     void sync_ams_list(bool is_from_big_sync_btn = false);
-    void sync_spool_manager_filaments();
+    void sync_spool_manager_filaments(DynamicPrintConfig *host_config = nullptr);
     bool sync_extruder_list();
     bool is_fila_switch_ready();
     void reset_fila_switch();

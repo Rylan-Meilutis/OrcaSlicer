@@ -1,8 +1,11 @@
 #include <catch2/catch_all.hpp>
 
+#include <algorithm>
+
 #include "libslic3r/PrintConfig.hpp"
 #include "libslic3r/PrintConfigConstants.hpp"
 #include "libslic3r/LocalesUtils.hpp"
+#include "libslic3r/Preset.hpp"
 #include "libslic3r/SequentialGantryGeometry.hpp"
 #include "libslic3r/Utils.hpp"
 
@@ -37,6 +40,11 @@ TEST_CASE("New strength and overhang options preserve existing print defaults", 
     const ConfigOptionDef *spool_sync = print_config_def.get("sync_spool_manager_filament_names");
     REQUIRE(spool_sync != nullptr);
     CHECK_FALSE(spool_sync->default_value->getBool());
+    const std::vector<std::string> &physical_printer_options = PhysicalPrinter::printer_options();
+    CHECK(std::find(physical_printer_options.begin(), physical_printer_options.end(), "printhost_apikey") !=
+          physical_printer_options.end());
+    CHECK(std::find(physical_printer_options.begin(), physical_printer_options.end(),
+                    "sync_spool_manager_filament_names") != physical_printer_options.end());
     CHECK(config.opt_string("sequential_print_gantry_geometry").empty());
     CHECK(config.opt_string("sequential_print_gantry_model").empty());
 }

@@ -763,7 +763,12 @@ void Selection::clear()
     // Skip on shutdown: Plater's pImpl is already freed, so plater()->canvas3D() would use-after-free.
     if (wxGetApp().is_closing())
         return;
-    wxGetApp().plater()->canvas3D()->handle_sidebar_focus_event("", false);
+    Plater *plater = wxGetApp().plater();
+    if (plater == nullptr)
+        return;
+    GLCanvas3D *canvas = plater->canvas3D();
+    if (canvas != nullptr)
+        canvas->handle_sidebar_focus_event("", false);
 }
 
 // Update the selection based on the new instance IDs.

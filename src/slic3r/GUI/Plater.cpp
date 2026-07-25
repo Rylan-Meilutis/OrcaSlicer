@@ -4593,10 +4593,11 @@ void Sidebar::sync_ams_list(bool is_from_big_sync_btn)
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << "finish pop_finsish_sync_ams_dialog";
 }
 
-void Sidebar::sync_spool_manager_filaments()
+void Sidebar::sync_spool_manager_filaments(DynamicPrintConfig *host_config)
 {
     auto &bundle = *wxGetApp().preset_bundle;
-    DynamicPrintConfig &printer_config = bundle.printers.get_edited_preset().config;
+    DynamicPrintConfig &printer_config =
+        host_config != nullptr ? *host_config : bundle.printers.get_edited_preset().config;
     const auto *host_type = printer_config.option<ConfigOptionEnum<PrintHostType>>("host_type");
     if (host_type == nullptr || host_type->value != htOctoPrint) {
         show_error(this, _L("Select OctoPrint as the print host before synchronizing SpoolManager filaments."), false);
@@ -4605,7 +4606,7 @@ void Sidebar::sync_spool_manager_filaments()
 
     const auto *enabled = printer_config.option<ConfigOptionBool>("sync_spool_manager_filament_names");
     if (enabled == nullptr || !enabled->value) {
-        show_error(this, _L("Enable OctoPrint SpoolManager sync in the printer settings first."), false);
+        show_error(this, _L("Enable OctoPrint SpoolManager sync in the physical printer connection settings first."), false);
         return;
     }
 
@@ -18314,13 +18315,13 @@ bool Plater::is_single_full_object_selection() const
 GLCanvas3D* Plater::canvas3D()
 {
     // BBS modify view3D->get_canvas3d() to current canvas
-    return p->get_current_canvas3D();
+    return p ? p->get_current_canvas3D() : nullptr;
 }
 
 const GLCanvas3D* Plater::canvas3D() const
 {
     // BBS modify view3D->get_canvas3d() to current canvas
-    return p->get_current_canvas3D();
+    return p ? p->get_current_canvas3D() : nullptr;
 }
 
 GLCanvas3D* Plater::get_view3D_canvas3D()
@@ -18330,7 +18331,7 @@ GLCanvas3D* Plater::get_view3D_canvas3D()
 
 GLCanvas3D* Plater::get_preview_canvas3D()
 {
-    return p->preview->get_canvas3d();
+    return p ? p->preview->get_canvas3d() : nullptr;
 }
 
 GLCanvas3D* Plater::get_assmeble_canvas3D()
@@ -18342,7 +18343,7 @@ GLCanvas3D* Plater::get_assmeble_canvas3D()
 
 GLCanvas3D* Plater::get_current_canvas3D(bool exclude_preview)
 {
-    return p->get_current_canvas3D(exclude_preview);
+    return p ? p->get_current_canvas3D(exclude_preview) : nullptr;
 }
 
 void Plater::arrange()
