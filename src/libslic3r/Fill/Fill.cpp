@@ -364,6 +364,7 @@ struct SurfaceFill {
     // BBS
     std::vector<size_t> region_id_group;
     ExPolygons          no_overlap_expolygons;
+    ExPolygons          arc_anchor_regions;
 };
 
 
@@ -1212,9 +1213,10 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
 	        }
 	}
 
-    // Fill surfaces are inset by the perimeter generator. Arc overhangs replace
-    // the unsupported bottom-wall footprint as well, otherwise those walls are
-    // emitted first as ordinary bridge perimeters and sag before the arcs exist.
+    // Fill surfaces are inset by the perimeter generator. Grow arc overhangs
+    // through every unsupported wall footprint. Unsupported wall fragments are
+    // omitted at G-code generation time, while supported fragments remain as
+    // the physical ledge from which the arcs start.
     ExPolygons supported;
     if (layer.lower_layer != nullptr)
         supported = layer.lower_layer->lslices;
@@ -1225,17 +1227,26 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
             continue;
 
         const LayerRegion &layerm = *layer.regions()[fill.region_id];
+        const int wall_loops = std::max(0, int(layerm.region().config().wall_loops));
         const coord_t wall_footprint =
-            std::max(0, int(layerm.region().config().wall_loops)) * layerm.flow(frPerimeter).scaled_spacing();
-        if (wall_footprint == 0)
-            continue;
+            wall_loops * layerm.flow(frPerimeter).scaled_spacing();
+        if (wall_footprint > 0) {
+            ExPolygons unsupported_region = supported.empty() ?
+                to_expolygons(layerm.slices.surfaces) :
+                diff_ex(layerm.slices.surfaces, offset_ex(supported, 0.5f * layerm.flow(frPerimeter).scaled_width()));
+            ExPolygons replacement = intersection_ex(offset_ex(fill.expolygons, float(wall_footprint)), unsupported_region);
+            append(replacement, fill.expolygons);
+            fill.expolygons = union_ex(replacement);
+        }
 
-        ExPolygons unsupported_region = supported.empty() ?
-            to_expolygons(layerm.slices.surfaces) :
-            diff_ex(layerm.slices.surfaces, offset_ex(supported, 0.5f * layerm.flow(frPerimeter).scaled_width()));
-        ExPolygons replacement = intersection_ex(offset_ex(fill.expolygons, float(wall_footprint)), unsupported_region);
-        append(replacement, fill.expolygons);
-        fill.expolygons = union_ex(replacement);
+        if (!supported.empty()) {
+            // Include the printable wall width around lower-layer support. The
+            // intersection's inner edge is where a retained supported wall
+            // transitions into the unsupported arc replacement.
+            fill.arc_anchor_regions = intersection_ex(
+                fill.expolygons,
+                offset_ex(supported, 0.5f * layerm.flow(frPerimeter).scaled_width()));
+        }
     }
 
 	{
@@ -1488,6 +1499,7 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
 		params.no_extrusion_overlap = surface_fill.params.overlap;
         auto &region_config = layerm->region().config();
         params.config               = &region_config;
+        params.arc_anchor_regions   = &surface_fill.arc_anchor_regions;
         params.pattern              = surface_fill.params.pattern;
         params.fill_order           = surface_fill.params.fill_order;
 

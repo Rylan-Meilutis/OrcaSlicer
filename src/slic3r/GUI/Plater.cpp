@@ -2942,7 +2942,12 @@ Sidebar::Sidebar(Plater *parent)
                                                  wxBU_EXACTFIT | wxNO_BORDER, false, 16); // ORCA match icon size with other icons as 16x16
     ams_btn->SetToolTip(_L("Synchronize filament list from AMS"));
     ams_btn->Bind(wxEVT_BUTTON, [this, scrolled_sizer](wxCommandEvent &e) {
-        sync_ams_list();
+        auto &printer_config = wxGetApp().preset_bundle->printers.get_edited_preset().config;
+        const auto *host_type = printer_config.option<ConfigOptionEnum<PrintHostType>>("host_type");
+        if (host_type != nullptr && host_type->value == htOctoPrint)
+            sync_spool_manager_filaments(&printer_config);
+        else
+            sync_ams_list();
     });
 
     ams_btn->Bind(wxEVT_UPDATE_UI, &Sidebar::update_sync_ams_btn_enable, this);
@@ -3257,18 +3262,24 @@ void Sidebar::update_all_preset_comboboxes()
         p->m_printer_connect->Hide();
         //only show sync-ams button for BBL printer
         p->m_bpButton_ams_filament->Show();
+        p->m_bpButton_ams_filament->SetToolTip(_L("Synchronize filament list from AMS"));
         //update print button default value for bbl or third-party printer
         p_mainframe->set_print_button_to_default(MainFrame::PrintSelectType::ePrintPlate);
     } else {
         //p->btn_connect_printer->Show();
         p->m_printer_connect->Show();
 
-        // ORCA: show/hide sync-ams button based on filament sync mode
+        // ORCA: OctoPrint SpoolManager uses the same filament-title sync action as
+        // AMS and other printer agents. Its host URL and API key are read from this
+        // physical printer's connection settings.
+        const auto *host_type = cfg.option<ConfigOptionEnum<PrintHostType>>("host_type");
+        const bool is_octoprint = host_type != nullptr && host_type->value == htOctoPrint;
         auto agent = wxGetApp().getAgent();
-        if (agent && agent->get_filament_sync_mode() != FilamentSyncMode::none)
-            p->m_bpButton_ams_filament->Show();
-        else
-            p->m_bpButton_ams_filament->Hide();
+        p->m_bpButton_ams_filament->Show(
+            is_octoprint || (agent && agent->get_filament_sync_mode() != FilamentSyncMode::none));
+        p->m_bpButton_ams_filament->SetToolTip(
+            is_octoprint ? _L("Synchronize filament list from OctoPrint SpoolManager")
+                         : _L("Synchronize filament list from AMS"));
 
         // Orca: with "Support 3MF as gcode" (use_3mf) the local export is a .gcode.3mf bundle, so when no
         // printer host/IP is configured the default action is "Export plate sliced file" (mirrors the
@@ -4035,7 +4046,8 @@ void Sidebar::on_filaments_delete(size_t filament_id)
 }
 
 void Sidebar::add_filament() {
-    if (p->combos_filament.size() >= MAXIMUM_EXTRUDER_NUMBER) return;
+    if (wxGetApp().preset_bundle->has_fixed_filament_slots()) return;
+    if (p->combos_filament.size() >= wxGetApp().preset_bundle->max_filament_colors()) return;
     wxColour    new_col        = Plater::get_next_color_for_filament();
     add_custom_filament(new_col);
 
@@ -4049,6 +4061,7 @@ void Sidebar::add_filament() {
 
 void Sidebar::delete_filament(size_t filament_id, int replace_filament_id) {
     if (is_new_project_in_gcode3mf()) { return; }
+    if (wxGetApp().preset_bundle->has_fixed_filament_slots()) return;
     if (p->combos_filament.size() <= 1) return;
 
     size_t filament_count = p->combos_filament.size() - 1;
@@ -4102,7 +4115,8 @@ void Sidebar::edit_filament()
 
 void Sidebar::add_custom_filament(wxColour new_col) {
     if (is_new_project_in_gcode3mf()) { return; }
-    if (p->combos_filament.size() >= MAXIMUM_EXTRUDER_NUMBER) return;
+    if (wxGetApp().preset_bundle->has_fixed_filament_slots()) return;
+    if (p->combos_filament.size() >= wxGetApp().preset_bundle->max_filament_colors()) return;
 
     int         filament_count = p->combos_filament.size() + 1;
     std::string new_color      = new_col.GetAsString(wxC2S_HTML_SYNTAX).ToStdString();
@@ -4610,102 +4624,158 @@ void Sidebar::sync_spool_manager_filaments(DynamicPrintConfig *host_config)
         return;
     }
 
+    const auto *sync_mode_opt =
+        printer_config.option<ConfigOptionEnum<SpoolManagerSyncMode>>("spool_manager_sync_mode");
+    const SpoolManagerSyncMode sync_mode =
+        sync_mode_opt == nullptr ? smsmColorsAndProfiles : sync_mode_opt->value;
+    const bool sync_colors = sync_mode != smsmProfilesOnly;
+    const bool sync_profiles = sync_mode != smsmColorsOnly;
+
     OctoPrint host(&printer_config);
-    std::vector<SpoolManagerMetadata::Filament> spools;
+    std::vector<SpoolManagerMetadata::Filament> slots;
     wxString error;
     {
         wxBusyCursor wait;
-        if (!host.get_spool_manager_spools(spools, error)) {
+        if (!host.get_spool_manager_selected_spools(slots, error)) {
             show_error(this, error, false);
             return;
         }
     }
 
-    wxArrayString choices;
-    for (const auto &spool : spools) {
-        wxString description = from_u8(spool.name);
-        if (!spool.material.empty())
-            description += " — " + from_u8(spool.material);
-        if (!spool.color_name.empty())
-            description += " — " + from_u8(spool.color_name);
-        choices.Add(description);
-    }
-
-    const auto normalize_material = [](std::string material) {
-        boost::algorithm::to_lower(material);
-        boost::replace_all(material, "+", "plus");
-        material.erase(std::remove_if(material.begin(), material.end(),
-                                      [](unsigned char ch) { return !std::isalnum(ch); }),
-                       material.end());
+    const auto normalize_token = [](std::string value) {
+        boost::algorithm::to_lower(value);
+        boost::replace_all(value, "+", "plus");
+        value.erase(std::remove_if(value.begin(), value.end(),
+                                   [](unsigned char ch) { return !std::isalnum(ch); }),
+                    value.end());
+        return value;
+    };
+    const auto normalize_material = [&normalize_token](std::string material) {
+        material = normalize_token(std::move(material));
+        // SpoolManager commonly distinguishes enhanced PLA marketing names,
+        // while Orca filament presets store these products in the PLA family.
+        if (material == "plaplus" || material == "plapro" ||
+            material == "plaproplus" || material == "plaenhanced")
+            return std::string("pla");
         return material;
     };
 
     auto &filament_presets = bundle.filament_presets;
+    const bool fixed_slots = bundle.has_fixed_filament_slots();
+    const size_t slot_count =
+        fixed_slots ? bundle.max_filament_colors() : std::min(slots.size(), bundle.max_filament_colors());
+    bundle.set_num_filaments(static_cast<unsigned int>(slot_count));
+
     auto *colors = bundle.project_config.option<ConfigOptionStrings>("filament_colour");
+    auto *multi_colors = bundle.project_config.option<ConfigOptionStrings>("filament_multi_colour");
+    auto *color_types = bundle.project_config.option<ConfigOptionStrings>("filament_colour_type");
     std::vector<std::string> updated_colors = colors->values;
     updated_colors.resize(filament_presets.size(), "#FFFFFF");
-    std::vector<size_t> selected_spools;
-    selected_spools.reserve(filament_presets.size());
 
-    for (size_t index = 0; index < filament_presets.size(); ++index) {
-        const Preset *current = bundle.filaments.find_preset(filament_presets[index]);
-        const std::string current_type = current != nullptr ?
-            current->config.opt_string("filament_type", 0) : _u8L("Unknown");
-
-        wxSingleChoiceDialog dialog(
-            this,
-            format_wxstr(_L("Select the SpoolManager spool for filament %1% (%2%)."),
-                         index + 1, from_u8(current_type)),
-            _L("Sync filaments from OctoPrint SpoolManager"), choices);
-
-        const auto suggested = std::find_if(
-            spools.begin(), spools.end(),
-            [&current_type, &updated_colors, index](const SpoolManagerMetadata::Filament &spool) {
-                return boost::iequals(spool.material, current_type) &&
-                       (spool.color.empty() || boost::iequals(spool.color, updated_colors[index]));
-            });
-        dialog.SetSelection(suggested == spools.end() ? 0 :
-                            static_cast<int>(std::distance(spools.begin(), suggested)));
-        if (dialog.ShowModal() != wxID_OK)
-            return;
-        selected_spools.emplace_back(static_cast<size_t>(dialog.GetSelection()));
-    }
-
-    const auto valid_color = [](const std::string &color) {
-        return (color.size() == 7 || color.size() == 9) && color.front() == '#' &&
-               std::all_of(color.begin() + 1, color.end(),
-                           [](unsigned char ch) { return std::isxdigit(ch) != 0; });
+    const auto normalized_color = [](std::string color) {
+        boost::algorithm::trim(color);
+        if ((color.size() == 6 || color.size() == 8) && color.front() != '#')
+            color.insert(color.begin(), '#');
+        if ((color.size() != 7 && color.size() != 9) || color.front() != '#' ||
+            !std::all_of(color.begin() + 1, color.end(),
+                         [](unsigned char ch) { return std::isxdigit(ch) != 0; }))
+            return std::string();
+        boost::algorithm::to_upper(color);
+        return color;
     };
 
-    for (size_t index = 0; index < selected_spools.size(); ++index) {
-        const SpoolManagerMetadata::Filament &spool = spools[selected_spools[index]];
-        if (valid_color(spool.color))
-            updated_colors[index] = spool.color;
+    const std::string most_recent_preset = bundle.filaments.get_selected_preset_name();
+    size_t assigned_count = 0;
+    const size_t synchronized_slots = std::min(filament_presets.size(), slots.size());
+    for (size_t index = 0; index < synchronized_slots; ++index) {
+        const SpoolManagerMetadata::Filament &spool = slots[index];
+        if (spool.name.empty())
+            continue;
+        ++assigned_count;
+
+        if (sync_colors) {
+            const std::string spool_color = normalized_color(spool.color);
+            if (!spool_color.empty())
+                updated_colors[index] = spool_color;
+        }
+
+        if (!sync_profiles)
+            continue;
 
         const Preset *current = bundle.filaments.find_preset(filament_presets[index]);
-        const std::string current_type = current != nullptr ?
-            current->config.opt_string("filament_type", 0) : _u8L("Unknown");
         const std::string wanted_material = normalize_material(spool.material);
-        if (wanted_material.empty() || normalize_material(current_type) == wanted_material)
+        if (wanted_material.empty())
+            continue;
+
+        const std::string wanted_vendor = normalize_token(spool.vendor);
+        const auto material_matches = [&](const Preset &candidate) {
+            return candidate.is_visible && candidate.is_compatible &&
+                   normalize_material(candidate.config.opt_string("filament_type", 0)) == wanted_material;
+        };
+        const auto vendor_matches = [&](const Preset &candidate) {
+            return !wanted_vendor.empty() &&
+                   normalize_token(candidate.config.opt_string("filament_vendor", 0)) == wanted_vendor;
+        };
+        const auto name_matches_manufacturer_material = [&](const Preset &candidate) {
+            const std::string normalized_name = normalize_token(candidate.name);
+            return normalized_name.find(wanted_vendor) != std::string::npos &&
+                   normalized_name.find(wanted_material) != std::string::npos;
+        };
+
+        // A manufacturer preset is available only if it is actually present in
+        // the current filament selector. Bundled but hidden profiles must not
+        // override a user's visible material profiles.
+        const bool has_manufacturer_profile =
+            std::any_of(bundle.filaments.begin(), bundle.filaments.end(),
+                        [&](const Preset &candidate) {
+                            return material_matches(candidate) && vendor_matches(candidate) &&
+                                   name_matches_manufacturer_material(candidate);
+                        });
+        const bool current_material_matches =
+            current != nullptr && current->is_visible && current->is_compatible &&
+            normalize_material(current->config.opt_string("filament_type", 0)) == wanted_material;
+
+        // Without an available manufacturer profile, the material is the source
+        // of truth. Preserve existing tuning when it already uses that material.
+        if (!has_manufacturer_profile && current_material_matches)
             continue;
 
         const Preset *match = nullptr;
-        bool match_is_generic_system = false;
+        int best_score = std::numeric_limits<int>::min();
         for (const Preset &candidate : bundle.filaments) {
-            if (!candidate.is_compatible ||
-                normalize_material(candidate.config.opt_string("filament_type", 0)) != wanted_material)
+            if (!material_matches(candidate) ||
+                (has_manufacturer_profile &&
+                 (!vendor_matches(candidate) || !name_matches_manufacturer_material(candidate))))
                 continue;
-            const bool is_generic_system =
-                candidate.is_system && boost::istarts_with(candidate.name, "Generic ");
-            if (match == nullptr || (is_generic_system && !match_is_generic_system)) {
+
+            int score = 0;
+            if (current != nullptr && candidate.name == current->name)
+                score += 100;
+            if (candidate.name == most_recent_preset)
+                score += 80;
+            const auto recently_used =
+                std::find(filament_presets.begin(), filament_presets.end(), candidate.name);
+            if (recently_used != filament_presets.end())
+                score += 60 - int(std::distance(filament_presets.begin(), recently_used));
+            if (!candidate.is_system)
+                score += 10;
+            if (!has_manufacturer_profile &&
+                candidate.is_system && boost::istarts_with(candidate.name, "Generic "))
+                score += 25;
+
+            if (match == nullptr || score > best_score) {
                 match = &candidate;
-                match_is_generic_system = is_generic_system;
+                best_score = score;
             }
         }
         if (match != nullptr)
             filament_presets[index] = match->name;
     }
-    colors->values = std::move(updated_colors);
+    if (sync_colors) {
+        colors->values = updated_colors;
+        multi_colors->values = updated_colors;
+        color_types->values.resize(updated_colors.size(), "1");
+    }
 
     wxGetApp().plater()->on_filament_count_change(filament_presets.size());
     for (auto *combo : combos_filament())
@@ -4716,11 +4786,17 @@ void Sidebar::sync_spool_manager_filaments(DynamicPrintConfig *host_config)
     update_dynamic_filament_list();
     wxGetApp().plater()->update();
 
+    const wxString synchronized_content =
+        sync_mode == smsmColorsOnly ? _L("colors") :
+        sync_mode == smsmProfilesOnly ? _L("profiles") :
+        _L("colors and profiles");
     MessageDialog(
         this,
-        _L("Filament material presets and colors were synchronized from OctoPrint SpoolManager. "
-           "When this job is sent to OctoPrint, Orca Slicer will ask you to confirm the spool mapping "
-           "and embed each spool name, material, and color in the G-code."),
+        format_wxstr(
+            _L("%1% OctoPrint SpoolManager tool/slot assignments were synchronized (%2%). "
+               "The assignments are read-only in Orca Slicer and their spool names, materials, "
+               "and colors will be embedded in G-code sent to this OctoPrint host."),
+            assigned_count, synchronized_content),
         _L("OctoPrint SpoolManager"), wxOK | wxICON_INFORMATION).ShowModal();
 }
 
@@ -4742,12 +4818,15 @@ void Sidebar::show_SEMM_buttons()
     
     bool is_multi_material = p->combos_filament.size() > 1;
     bool single_or_bbl     = should_show_SEMM_buttons();
+    bool fixed_slots       = wxGetApp().preset_bundle->has_fixed_filament_slots();
     bool is_single = single_or_bbl && !is_multi_material; // SINGLE EXTRUDER / BBL WITH 1 MATERIAL
     bool is_multi  = single_or_bbl && is_multi_material;  // MULTI MATERIAL WITH SINGLE EXTRUDER
     bool is_fixed  = !is_single && !is_multi;             // MULTI EXTRUDER / TOOLCHANGER / IDEX WITH FIXED MATERIAL
 
-    p->m_bpButton_add_filament->Show(single_or_bbl);
-    p->m_bpButton_del_filament->Show(is_multi);
+    p->m_bpButton_add_filament->Show(single_or_bbl && !fixed_slots);
+    p->m_bpButton_add_filament->Enable(
+        !fixed_slots && p->combos_filament.size() < wxGetApp().preset_bundle->max_filament_colors());
+    p->m_bpButton_del_filament->Show(is_multi && !fixed_slots);
     p->m_flushing_volume_btn->Show(  is_multi);
 
     if (is_multi) {
@@ -7052,7 +7131,8 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                         int size = extruderIds.size() == 0 ? 0 : *(extruderIds.rbegin());
 
                         int filament_size = sidebar->combos_filament().size();
-                        while (filament_size < MAXIMUM_EXTRUDER_NUMBER && filament_size < size) {
+                        const size_t filament_limit = wxGetApp().preset_bundle->max_filament_colors();
+                        while (size_t(filament_size) < filament_limit && filament_size < size) {
                             int         filament_count = filament_size + 1;
                             wxColour    new_col        = Plater::get_next_color_for_filament();
                             std::string new_color      = new_col.GetAsString(wxC2S_HTML_SYNTAX).ToStdString();
@@ -17441,11 +17521,11 @@ void Plater::send_gcode_legacy(int plate_idx, Export3mfProgressFn proFn)
                 return;
             }
 
-            std::vector<SpoolManagerMetadata::Filament> available_spools;
+            std::vector<SpoolManagerMetadata::Filament> selected_slots;
             wxString error;
             {
                 wxBusyCursor wait;
-                if (!octoprint->get_spool_manager_spools(available_spools, error)) {
+                if (!octoprint->get_spool_manager_selected_spools(selected_slots, error)) {
                     show_error(this, error, false);
                     return;
                 }
@@ -17453,50 +17533,14 @@ void Plater::send_gcode_legacy(int plate_idx, Export3mfProgressFn proFn)
 
             DynamicPrintConfig full_config = preset_bundle->full_config();
             const auto *filament_types = full_config.option<ConfigOptionStrings>("filament_type");
-            const auto *filament_colors = full_config.option<ConfigOptionStrings>("filament_colour");
-            const auto *filament_names = full_config.option<ConfigOptionStrings>("filament_settings_id");
             if (filament_types == nullptr || filament_types->values.empty()) {
                 show_error(this, _L("No filaments are available for SpoolManager synchronization."), false);
                 return;
             }
 
             std::vector<SpoolManagerMetadata::Filament> selected_filaments(filament_types->values.size());
-            wxArrayString choices;
-            for (const auto &spool : available_spools) {
-                wxString description = from_u8(spool.name);
-                if (!spool.material.empty())
-                    description += " — " + from_u8(spool.material);
-                if (!spool.color_name.empty())
-                    description += " — " + from_u8(spool.color_name);
-                choices.Add(description);
-            }
-
-            for (size_t index = 0; index < selected_filaments.size(); ++index) {
-                const std::string &filament_type = filament_types->get_at(index);
-                const std::string filament_name =
-                    filament_names != nullptr ? filament_names->get_at(index) : filament_type;
-                wxSingleChoiceDialog spool_dialog(
-                    this,
-                    format_wxstr(_L("Select the SpoolManager spool for filament %1% (%2%, %3%). "
-                                    "Its name, material, and color will be embedded in the G-code."),
-                                 index + 1, from_u8(filament_name), from_u8(filament_type)),
-                    _L("OctoPrint SpoolManager"), choices);
-
-                const std::string filament_color =
-                    filament_colors != nullptr ? filament_colors->get_at(index) : "";
-                const auto current = std::find_if(
-                    available_spools.begin(), available_spools.end(),
-                    [&filament_type, &filament_color](const SpoolManagerMetadata::Filament &spool) {
-                        return boost::iequals(spool.material, filament_type) &&
-                               (filament_color.empty() || boost::iequals(spool.color, filament_color));
-                    });
-                spool_dialog.SetSelection(current != available_spools.end() ?
-                    static_cast<int>(std::distance(available_spools.begin(), current)) : 0);
-
-                if (spool_dialog.ShowModal() != wxID_OK)
-                    return;
-                selected_filaments[index] = available_spools[spool_dialog.GetSelection()];
-            }
+            std::copy_n(selected_slots.begin(), std::min(selected_slots.size(), selected_filaments.size()),
+                        selected_filaments.begin());
             upload_job.upload_data.extended_info["spool_manager_filaments"] = json(selected_filaments).dump();
         }
 

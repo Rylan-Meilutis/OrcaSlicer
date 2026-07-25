@@ -156,6 +156,7 @@ protected:
 	ScalableButton*		m_btn_compare_preset;
 	ScalableButton*		m_btn_save_preset;
 	ScalableButton*		m_btn_delete_preset;
+	ScalableButton*		m_btn_manage_presets;
 	//ScalableButton*		m_btn_edit_ph_printer {nullptr};
 	//ScalableButton*		m_btn_hide_incompatible_presets;
 	//wxBoxSizer*			m_hsizer;
@@ -359,6 +360,9 @@ public:
 	//void		save_preset(std::string name = std::string(), bool detach = false);
 
 	void		delete_preset();
+	void		show_profile_manager_menu();
+	void		edit_user_profile();
+	void		export_current_preset_json();
 	void		toggle_show_hide_incompatible();
 	void		update_show_hide_incompatible_button();
 	void		update_ui_from_settings();
@@ -463,12 +467,15 @@ protected:
 	void			update_printer_agent_if_needed();
 	void			build_preset_description_line(ConfigOptionsGroup* optgroup);
 	void			update_preset_description_line();
+	Option			get_inherits_option(ConfigOptionsGroup* optgroup) const;
+	void			on_inherits_changed(const boost::any& value);
 	void			update_frequently_changed_parameters();
 	void			set_tooltips_text();
     void			filter_diff_option(std::vector<std::string> &options);
 
     ConfigManipulation m_config_manipulation;
     std::string m_last_sparse_infill_rotate_template_value;
+    std::string m_loaded_inherits;
     ConfigManipulation get_config_manipulation();
     friend class EditGCodeDialog;
 };

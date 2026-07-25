@@ -97,6 +97,9 @@ struct FillParams
     //BBS: only used for new top surface pattern
     float           no_extrusion_overlap{ 0.0 };
     const           PrintRegionConfig* config{ nullptr };
+    // Regions backed by the preceding layer. Arc overhangs use this to start
+    // their root family against a retained, supported wall.
+    const           ExPolygons* arc_anchor_regions{ nullptr };
     bool            dont_sort{ false }; // do not sort the lines, just simply connect them
     bool            can_reverse{true};
 

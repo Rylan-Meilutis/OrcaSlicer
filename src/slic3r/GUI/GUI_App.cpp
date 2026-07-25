@@ -8771,12 +8771,22 @@ void GUI_App::load_current_presets(bool active_preset_combox/*= false*/, bool ch
 
     auto& edited_printer_preset = preset_bundle->printers.get_edited_preset();
     PrinterTechnology printer_technology = edited_printer_preset.printer_technology();
-    // ORCA: Sync filament count with the printer's nozzle count before loading presets for multi-tool printers.
-    // This ensures filament_presets vector is properly sized when combo boxes are created/updated.
-    if (printer_technology == ptFFF && !edited_printer_preset.config.opt_bool("single_extruder_multi_material")) {
-        auto* nozzle_diameter = edited_printer_preset.config.option<ConfigOptionFloats>("nozzle_diameter");
-        if (nozzle_diameter) {
-            preset_bundle->set_num_filaments(nozzle_diameter->values.size());
+    // Keep the project filament slots aligned with the saved printer limit.
+    // Without a configured limit, fixed multi-tool printers still follow their
+    // physical nozzle count.
+    if (printer_technology == ptFFF) {
+        const auto *nozzle_diameter =
+            edited_printer_preset.config.option<ConfigOptionFloats>("nozzle_diameter");
+        const size_t nozzle_count = nozzle_diameter != nullptr ? nozzle_diameter->values.size() : 1;
+        const int configured_colors = edited_printer_preset.config.opt_int("max_filament_colors");
+        const bool single_extruder_multi_material =
+            edited_printer_preset.config.opt_bool("single_extruder_multi_material") &&
+            nozzle_count == 1;
+        if (single_extruder_multi_material && configured_colors > 0) {
+            preset_bundle->set_num_filaments(
+                static_cast<unsigned int>(configured_colors));
+        } else if (!single_extruder_multi_material) {
+            preset_bundle->set_num_filaments(static_cast<unsigned int>(nozzle_count));
         }
     }
 	this->plater()->set_printer_technology(printer_technology);

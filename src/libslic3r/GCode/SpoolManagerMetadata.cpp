@@ -8,9 +8,6 @@
 
 #include <boost/filesystem.hpp>
 #include <boost/nowide/fstream.hpp>
-#include <boost/property_tree/json_parser.hpp>
-#include <boost/property_tree/ptree.hpp>
-
 #include "../Utils.hpp"
 
 namespace fs = boost::filesystem;
@@ -83,35 +80,49 @@ std::pair<std::string, std::streamoff> read_tail(const fs::path &path)
 
 } // namespace
 
-bool parse_spools(const std::string &response, std::vector<Filament> &spools, std::string &error)
+bool parse_selected_spools(const std::string &response, std::vector<Filament> &slots, std::string &error)
 {
     try {
-        std::stringstream stream(response);
-        boost::property_tree::ptree root;
-        boost::property_tree::read_json(stream, root);
-        const auto all_spools = root.get_child_optional("allSpools");
-        if (!all_spools) {
-            error = "The OctoPrint SpoolManager response did not contain allSpools.";
+        const nlohmann::json root = nlohmann::json::parse(response);
+        const auto selected = root.find("selectedSpools");
+        if (selected == root.end() || !selected->is_array()) {
+            error = "The OctoPrint SpoolManager response did not contain selectedSpools.";
             return false;
         }
 
-        for (const auto &entry : *all_spools) {
+        slots.clear();
+        slots.reserve(selected->size());
+        bool has_assigned_spool = false;
+        for (const nlohmann::json &entry : *selected) {
+            if (entry.is_null()) {
+                slots.emplace_back();
+                continue;
+            }
+            if (!entry.is_object()) {
+                error = "The OctoPrint SpoolManager selectedSpools list contained an invalid slot.";
+                slots.clear();
+                return false;
+            }
+
             Filament spool{
-                entry.second.get<std::string>("displayName", ""),
-                entry.second.get<std::string>("material", ""),
-                entry.second.get<std::string>("color", ""),
-                entry.second.get<std::string>("colorName", "")
+                entry.value("displayName", ""),
+                entry.value("material", ""),
+                entry.value("color", ""),
+                entry.value("colorName", ""),
+                entry.value("vendor", "")
             };
-            if (!spool.name.empty())
-                spools.emplace_back(std::move(spool));
+            has_assigned_spool |= !spool.name.empty();
+            slots.emplace_back(std::move(spool));
+        }
+
+        if (slots.empty() || !has_assigned_spool) {
+            error = "OctoPrint SpoolManager has no spools assigned to its tools or slots.";
+            slots.clear();
+            return false;
         }
     } catch (const std::exception &exception) {
         error = exception.what();
-        return false;
-    }
-
-    if (spools.empty()) {
-        error = "OctoPrint SpoolManager did not return any spools.";
+        slots.clear();
         return false;
     }
     return true;

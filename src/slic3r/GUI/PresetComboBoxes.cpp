@@ -1718,7 +1718,11 @@ void TabPresetComboBox::update()
     for (size_t i = presets.front().is_visible ? 0 : m_collection->num_default_presets(); i < presets.size(); ++i)
     {
         const Preset& preset = presets[i];
-        if (!preset.is_visible || (!show_incompatible && !preset.is_compatible && i != idx_selected))
+        // Keep the explicitly selected profile visible while it is being
+        // repaired in the profile editor, even when normal machine filtering
+        // would hide it.
+        if ((!preset.is_visible && i != idx_selected) ||
+            (!show_incompatible && !preset.is_compatible && i != idx_selected))
             continue;
 
         // marker used for disable incompatible printer models for the selected physical printer

@@ -1,8 +1,10 @@
 #include "OctoPrint.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <sstream>
 #include <exception>
+#include <thread>
 #include <boost/format.hpp>
 #include <boost/log/trivial.hpp>
 #include <boost/property_tree/ptree.hpp>
@@ -263,33 +265,46 @@ wxString OctoPrint::get_test_failed_msg (wxString &msg) const
         , _L("Note: OctoPrint version 1.1.0 or higher is required."));
 }
 
-bool OctoPrint::get_spool_manager_spools(std::vector<SpoolManagerMetadata::Filament> &spools, wxString &error) const
+bool OctoPrint::get_spool_manager_selected_spools(
+    std::vector<SpoolManagerMetadata::Filament> &slots, wxString &error) const
 {
     const std::string url = make_url(
         "plugin/SpoolManager/loadSpoolsByQuery?selectedPageSize=100000&from=0&to=100000"
         "&sortColumn=displayName&sortOrder=desc&filterName=&materialFilter=all&vendorFilter=all&colorFilter=all");
     std::string response_body;
-    bool success = true;
-
-    auto http = Http::get(url);
-    set_auth(http);
-    http.on_complete([&response_body](std::string body, unsigned) {
-            response_body = std::move(body);
-        })
-        .on_error([this, &error, &success](std::string body, std::string curl_error, unsigned status) {
-            error = format_error(body, curl_error, status);
-            success = false;
-        })
+    constexpr int max_attempts = 3;
+    bool success = false;
+    for (int attempt = 1; attempt <= max_attempts; ++attempt) {
+        wxString attempt_error;
+        auto http = Http::get(url);
+        set_auth(http);
+        http.on_complete([&response_body, &success](std::string body, unsigned) {
+                response_body = std::move(body);
+                success = true;
+            })
+            .on_error([this, &attempt_error](std::string body, std::string curl_error, unsigned status) {
+                attempt_error = format_error(body, curl_error, status);
+            })
 #ifdef WIN32
-        .ssl_revoke_best_effort(m_ssl_revoke_best_effort)
+            .ssl_revoke_best_effort(m_ssl_revoke_best_effort)
 #endif
-        .perform_sync();
+            .perform_sync();
+
+        if (success)
+            break;
+
+        error = std::move(attempt_error);
+        BOOST_LOG_TRIVIAL(warning) << "OctoPrint SpoolManager connection attempt "
+                                   << attempt << " of " << max_attempts << " failed";
+        if (attempt < max_attempts)
+            std::this_thread::sleep_for(std::chrono::milliseconds(250 * attempt));
+    }
 
     if (!success)
         return false;
 
     std::string parse_error;
-    if (!SpoolManagerMetadata::parse_spools(response_body, spools, parse_error)) {
+    if (!SpoolManagerMetadata::parse_selected_spools(response_body, slots, parse_error)) {
         error = GUI::format_wxstr("%s: %s", _L("Could not parse the OctoPrint SpoolManager response"),
                                   GUI::from_u8(parse_error));
         return false;

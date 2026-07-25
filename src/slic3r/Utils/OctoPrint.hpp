@@ -35,7 +35,7 @@ public:
     std::string get_host() const override { return m_host; }
     const std::string& get_apikey() const { return m_apikey; }
     const std::string& get_cafile() const { return m_cafile; }
-    bool get_spool_manager_spools(std::vector<SpoolManagerMetadata::Filament> &spools, wxString &error) const;
+    bool get_spool_manager_selected_spools(std::vector<SpoolManagerMetadata::Filament> &slots, wxString &error) const;
 
 protected:
 #ifdef WIN32

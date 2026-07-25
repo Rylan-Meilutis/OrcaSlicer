@@ -745,9 +745,9 @@ std::string CoolingBuffer::apply_layer_cooldown(
         &ironing_fan_control, &ironing_fan_speed,
         &arc_overhang_fan_control, &arc_overhang_fan_speed
     ](bool immediately_apply) {
-        arc_overhang_fan_speed = m_config.arc_overhang_cooling.value;
         arc_overhang_fan_control = m_config.arc_overhang_enabled.value;
 #define EXTRUDER_CONFIG(OPT) m_config.OPT.get_at(m_current_extruder)
+        arc_overhang_fan_speed = EXTRUDER_CONFIG(arc_overhang_cooling);
         float fan_min_speed = EXTRUDER_CONFIG(fan_min_speed);
         float fan_speed_new = EXTRUDER_CONFIG(reduce_fan_stop_start_freq) ? fan_min_speed : 0;
         //BBS

@@ -169,6 +169,13 @@ static t_config_enum_values s_keys_map_AuthorizationType {
 };
 CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(AuthorizationType)
 
+static t_config_enum_values s_keys_map_SpoolManagerSyncMode {
+    { "colors_and_profiles", smsmColorsAndProfiles },
+    { "colors_only",         smsmColorsOnly },
+    { "profiles_only",       smsmProfilesOnly }
+};
+CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(SpoolManagerSyncMode)
+
 static t_config_enum_values s_keys_map_GCodeFlavor {
     { "marlin",         gcfMarlinLegacy },
     { "klipper",        gcfKlipper },
@@ -1013,12 +1020,24 @@ void PrintConfigDef::init_common_params()
 
     def = this->add("sync_spool_manager_filament_names", coBool);
     def->label = L("Enable OctoPrint SpoolManager sync");
-    def->tooltip = L("Allows Orca Slicer to load filament names, materials, and colors from the SpoolManager plugin "
-                     "using this OctoPrint host and API key. Selected spool metadata is embedded in G-code for "
-                     "host-side material validation. Existing [sm_name=] note markers are also updated.");
+    def->tooltip = L("Loads the current tool/slot spool names, materials, and colors from the SpoolManager plugin "
+                     "using this OctoPrint host and API key. Synchronization is read-only and never changes the "
+                     "OctoPrint machine configuration. Selected spool metadata is embedded in G-code for host-side "
+                     "material validation. Existing [sm_name=] note markers are also updated.");
     def->mode = comAdvanced;
     def->cli = ConfigOptionDef::nocli;
     def->set_default_value(new ConfigOptionBool(false));
+
+    def = this->add("spool_manager_sync_mode", coEnum);
+    def->label = L("SpoolManager sync contents");
+    def->tooltip = L("Choose whether OctoPrint SpoolManager synchronization updates filament colors, "
+                     "filament profiles, or both. Spool metadata embedded in G-code is unaffected.");
+    def->enum_keys_map = &ConfigOptionEnum<SpoolManagerSyncMode>::get_enum_values();
+    def->enum_values = { "Colors and profiles", "Colors only", "Profiles only" };
+    def->enum_labels = { L("Colors and profiles"), L("Colors only"), L("Profiles only") };
+    def->mode = comAdvanced;
+    def->cli = ConfigOptionDef::nocli;
+    def->set_default_value(new ConfigOptionEnum<SpoolManagerSyncMode>(smsmColorsAndProfiles));
 
     def = this->add("flashforge_serial_number", coString);
     def->label = L("Serial Number");
@@ -1572,36 +1591,45 @@ void PrintConfigDef::init_fff_params()
     def->set_default_value(new ConfigOptionFloat(5));
 
     def = this->add("arc_overhang_stabilization_speed", coFloat);
-    def->label = L("One-sided stabilization speed");
+    def->label = L("Arc stabilization speed");
     def->category = L("Quality");
-    def->tooltip = L("Maximum print speed for the stabilization layers after a one-sided arc overhang. "
-                     "Slower follow-up layers reduce extrusion drag on the unsupported free edge and help prevent it from curling upward. "
-                     "This limit is not applied after arc bridges supported at both ends.");
+    def->tooltip = L("Initial maximum print speed used while blending follow-up layers back to their normal speed. "
+                     "The overhang and bridge blend-layer settings control their recovery independently.");
     def->sidetext = L("mm/s");
     def->min = 0.1;
     def->max = 1000;
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionFloat(5));
 
-    def = this->add("arc_overhang_cooling", coPercent);
-    def->label = L("Cooling");
-    def->category = L("Quality");
-    def->tooltip = L("Part-cooling fan speed used for arc overhangs and their stabilization layers.");
-    def->min = 0;
-    def->max = 100;
-    def->mode = comAdvanced;
-    def->set_default_value(new ConfigOptionPercent(100));
-
     def = this->add("arc_overhang_layers", coInt);
-    def->label = L("Stabilization layers");
+    def->label = L("Increased cooling layers");
     def->category = L("Quality");
-    def->tooltip = L("Number of layers, including the arc layer, that use arc-overhang cooling. "
-                     "For one-sided arc overhangs, the layers after the arc also use the stabilization speed.");
+    def->tooltip = L("Number of layers, including the arc layer, that use arc-overhang cooling.");
     def->sidetext = L("layers");
     def->min = 1;
     def->max = 20;
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionInt(1));
+
+    def = this->add("arc_overhang_overhang_speed_layers", coInt);
+    def->label = L("Overhang speed blend layers");
+    def->category = L("Quality");
+    def->tooltip = L("Number of layers after a one-sided arc overhang used to blend from the stabilization speed back to normal speed.");
+    def->sidetext = L("layers");
+    def->min = 0;
+    def->max = 20;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionInt(0));
+
+    def = this->add("arc_overhang_bridge_speed_layers", coInt);
+    def->label = L("Bridge speed blend layers");
+    def->category = L("Quality");
+    def->tooltip = L("Number of layers after an arc bridge used to blend from the stabilization speed back to normal speed.");
+    def->sidetext = L("layers");
+    def->min = 0;
+    def->max = 20;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionInt(0));
 
     def = this->add("arc_overhang_bridge_distance", coFloat);
     def->label = L("Minimum bridge distance");
@@ -3866,6 +3894,16 @@ void PrintConfigDef::init_fff_params()
     def->max = 100;
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionInts{ -1 });
+
+    def = this->add("arc_overhang_cooling", coPercents);
+    def->label = L("Arc overhang fan speed");
+    def->tooltip = L("Part-cooling fan speed used for arc overhangs and their increased-cooling layers. "
+                     "This is stored in the filament preset so each material can use appropriate cooling.");
+    def->sidetext = "%";
+    def->min = 0;
+    def->max = 100;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionPercents{ 100 });
     
     // ORCA: Add support for separate internal bridge fan speed control
     def = this->add("internal_bridge_fan_speed", coInts);
@@ -6621,6 +6659,16 @@ void PrintConfigDef::init_fff_params()
     def->tooltip = L("Use single nozzle to print multi filament.");
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionBool(true));
+
+    def = this->add("max_filament_colors", coInt);
+    def->label = L("Filament colors");
+    def->tooltip = L("Exact number of numbered filament/tool slots for a single-extruder multi-material printer. "
+                     "Use 0 to allow the project filament count to be changed manually. "
+                     "Multi-extruder printers use the Extruders setting instead.");
+    def->min = 0;
+    def->max = int(MAXIMUM_EXTRUDER_NUMBER);
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionInt(0));
 
     def = this->add("manual_filament_change", coBool);
     def->label = L("Manual Filament Change");

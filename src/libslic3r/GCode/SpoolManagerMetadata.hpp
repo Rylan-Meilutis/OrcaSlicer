@@ -14,6 +14,7 @@ struct Filament
     std::string material;
     std::string color;
     std::string color_name;
+    std::string vendor;
 };
 
 inline void to_json(nlohmann::json &json, const Filament &filament)
@@ -22,7 +23,8 @@ inline void to_json(nlohmann::json &json, const Filament &filament)
         {"name", filament.name},
         {"material", filament.material},
         {"color", filament.color},
-        {"color_name", filament.color_name}
+        {"color_name", filament.color_name},
+        {"vendor", filament.vendor}
     };
 }
 
@@ -32,11 +34,12 @@ inline void from_json(const nlohmann::json &json, Filament &filament)
     filament.material   = json.value("material", "");
     filament.color      = json.value("color", "");
     filament.color_name = json.value("color_name", "");
+    filament.vendor     = json.value("vendor", "");
 }
 
-// Parses the SpoolManager loadSpoolsByQuery response. The allSpools list is
-// intentionally used so the user may map any loaded project filament.
-bool parse_spools(const std::string &response, std::vector<Filament> &spools, std::string &error);
+// Parses the current OctoPrint tool assignments. Empty slots are preserved so
+// each vector index continues to match the SpoolManager tool index.
+bool parse_selected_spools(const std::string &response, std::vector<Filament> &slots, std::string &error);
 
 // Replaces [sm_name=...] markers in the serialized filament notes and pads
 // per-filament usage metadata to the number of configured filaments. Explicit

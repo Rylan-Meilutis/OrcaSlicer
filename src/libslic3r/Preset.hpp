@@ -615,6 +615,13 @@ public:
     // Verify and correct the sync metadata for the preset to ensure proper cloud synchronization.
     void check_and_fix_syncinfo(Preset& preset, const std::string& user_id);
 
+    // Change the direct parent of the edited user preset. Values still equal to
+    // the previous parent are inherited from the new parent, while child
+    // overrides are retained. Returns false for an invalid parent or cycle.
+    bool rebase_edited_preset(const std::string& previous_parent_name,
+                              const std::string& new_parent_name,
+                              std::string* error = nullptr);
+
     // Enable / disable the "- default -" preset.
     void            set_default_suppressed(bool default_suppressed);
     bool            is_default_suppressed() const { return m_default_suppressed; }

@@ -71,25 +71,38 @@ TEST_CASE("SpoolManager embeds explicit metadata without filament notes", "[GCod
     CHECK_THAT(updated, Catch::Matchers::ContainsSubstring("; spool_manager_filament_colors = #800080"));
 }
 
-TEST_CASE("SpoolManager response parser preserves name material and color", "[GCodeWriter][SpoolManager]")
+TEST_CASE("SpoolManager selected spool parser preserves tool slot indices", "[GCodeWriter][SpoolManager]")
 {
     const std::string response = R"({
-        "allSpools": [
-            {"displayName":"Galaxy PLA","material":"PLA","color":"#123456","colorName":"Galaxy"},
+        "allSpools": [],
+        "selectedSpools": [
+            {"displayName":"Galaxy PLA","vendor":"Prusament","material":"PLA","color":"#123456","colorName":"Galaxy"},
+            null,
             {"displayName":"Safety PETG","material":"PETG","color":"#FF8800","colorName":"Orange"}
-        ],
-        "selectedSpools": []
+        ]
     })";
-    std::vector<SpoolManagerMetadata::Filament> spools;
+    std::vector<SpoolManagerMetadata::Filament> slots;
     std::string error;
 
-    REQUIRE(SpoolManagerMetadata::parse_spools(response, spools, error));
-    REQUIRE(spools.size() == 2);
-    CHECK(spools[0].name == "Galaxy PLA");
-    CHECK(spools[0].material == "PLA");
-    CHECK(spools[0].color == "#123456");
-    CHECK(spools[0].color_name == "Galaxy");
-    CHECK(spools[1].name == "Safety PETG");
+    REQUIRE(SpoolManagerMetadata::parse_selected_spools(response, slots, error));
+    REQUIRE(slots.size() == 3);
+    CHECK(slots[0].name == "Galaxy PLA");
+    CHECK(slots[0].material == "PLA");
+    CHECK(slots[0].color == "#123456");
+    CHECK(slots[0].vendor == "Prusament");
+    CHECK(slots[1].name.empty());
+    CHECK(slots[2].name == "Safety PETG");
+}
+
+TEST_CASE("SpoolManager selected spool parser rejects an unassigned machine", "[GCodeWriter][SpoolManager]")
+{
+    std::vector<SpoolManagerMetadata::Filament> slots;
+    std::string error;
+
+    CHECK_FALSE(SpoolManagerMetadata::parse_selected_spools(
+        R"({"allSpools":[],"selectedSpools":[null,null]})", slots, error));
+    CHECK_FALSE(error.empty());
+    CHECK(slots.empty());
 }
 
 // Arrange on a finite bed, not an unbounded InfiniteBed: the latter places items

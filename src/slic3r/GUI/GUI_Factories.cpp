@@ -1668,7 +1668,8 @@ void MenuFactory::create_filament_action_menu(bool init, int active_filament_men
 
     wxMenu* sub_menu = new wxMenu();
     std::vector<wxBitmap*> icons = get_extruder_color_icons(true);
-    int filaments_cnt = Sidebar::should_show_SEMM_buttons() ? icons.size() : 0;
+    const bool fixed_slots = wxGetApp().preset_bundle->has_fixed_filament_slots();
+    int filaments_cnt = Sidebar::should_show_SEMM_buttons() && !fixed_slots ? icons.size() : 0;
     for (int i = 0; i < filaments_cnt; i++) {
         if (i == active_filament_menu_id)
             continue;
@@ -1694,7 +1695,8 @@ void MenuFactory::create_filament_action_menu(bool init, int active_filament_men
         []() {
             return plater()->sidebar().combos_filament().size() > 1
                 // Orca: only show delete filament option for SEMM machines unless is BBL
-                && Sidebar::should_show_SEMM_buttons();
+                && Sidebar::should_show_SEMM_buttons()
+                && !wxGetApp().preset_bundle->has_fixed_filament_slots();
         }, m_parent);
 }
 

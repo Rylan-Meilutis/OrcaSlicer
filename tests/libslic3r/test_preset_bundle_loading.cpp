@@ -88,6 +88,75 @@ TEST_CASE("Print presets include every arc overhang GUI option", "[Preset][Confi
     CHECK(collection.default_preset().config.option("arc_overhang_recursive_fill") != nullptr);
 }
 
+TEST_CASE("Changing a system preset working copy refreshes inherited values and preserves overrides", "[Preset][Inheritance]")
+{
+    RenameTestCollection collection;
+
+    DynamicPrintConfig parent_a_config(collection.default_preset().config);
+    parent_a_config.opt_float("layer_height") = 0.20;
+    parent_a_config.opt_int("wall_loops") = 2;
+    Preset& parent_a = collection.load_preset({}, "Parent A", parent_a_config, false);
+    parent_a.is_system = true;
+
+    DynamicPrintConfig parent_b_config(collection.default_preset().config);
+    parent_b_config.opt_float("layer_height") = 0.28;
+    parent_b_config.opt_int("wall_loops") = 4;
+    Preset& parent_b = collection.load_preset({}, "Parent B", parent_b_config, false);
+    parent_b.is_system = true;
+
+    DynamicPrintConfig child_config(parent_a.config);
+    Preset::inherits(child_config) = parent_a.name;
+    child_config.opt_int("wall_loops") = 7;
+    collection.load_preset({}, "Child", child_config, true);
+    collection.get_edited_preset().is_system = true;
+
+    std::string error;
+    REQUIRE(collection.rebase_edited_preset("Parent A", "Parent B", &error));
+    const Preset& child = collection.get_edited_preset();
+    CHECK(child.inherits() == "Parent B");
+    CHECK_THAT(child.config.opt_float("layer_height"), Catch::Matchers::WithinAbs(0.28, EPSILON));
+    CHECK(child.config.opt_int("wall_loops") == 7);
+}
+
+TEST_CASE("Changing a preset parent rejects inheritance cycles", "[Preset][Inheritance]")
+{
+    RenameTestCollection collection;
+
+    Preset& parent = add_inmemory_preset(collection, "Parent");
+    parent.is_system = true;
+    DynamicPrintConfig child_config(parent.config);
+    Preset::inherits(child_config) = parent.name;
+    collection.load_preset({}, "Child", child_config, true);
+    add_inmemory_preset(collection, "Descendant", "Child");
+
+    std::string error;
+    CHECK_FALSE(collection.rebase_edited_preset("Parent", "Descendant", &error));
+    CHECK_FALSE(error.empty());
+    CHECK(collection.get_edited_preset().inherits() == "Parent");
+}
+
+TEST_CASE("A user preset with a missing parent can select a replacement", "[Preset][Inheritance]")
+{
+    RenameTestCollection collection;
+
+    DynamicPrintConfig replacement_config(collection.default_preset().config);
+    replacement_config.opt_float("layer_height") = 0.28;
+    Preset& replacement = collection.load_preset({}, "Replacement", replacement_config, false);
+    replacement.is_system = true;
+
+    DynamicPrintConfig child_config(collection.default_preset().config);
+    Preset::inherits(child_config) = "Removed upstream profile";
+    child_config.opt_int("wall_loops") = 7;
+    collection.load_preset({}, "Child", child_config, true);
+
+    std::string error;
+    REQUIRE(collection.rebase_edited_preset("Removed upstream profile", "Replacement", &error));
+    const Preset& child = collection.get_edited_preset();
+    CHECK(child.inherits() == "Replacement");
+    CHECK_THAT(child.config.opt_float("layer_height"), Catch::Matchers::WithinAbs(0.28, EPSILON));
+    CHECK(child.config.opt_int("wall_loops") == 7);
+}
+
 TEST_CASE("Preset identity is canonicalized from load path", "[Preset][Identity]")
 {
     TempPresetDir              temp_dir;

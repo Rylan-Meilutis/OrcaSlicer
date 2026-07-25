@@ -3041,7 +3041,41 @@ void PresetBundle::export_selections(AppConfig &config)
 }
 
 // BBS
+size_t PresetBundle::max_filament_colors() const
+{
+    const Preset& printer = printers.get_edited_preset();
+    const auto* configured = printer.config.opt<ConfigOptionInt>("max_filament_colors");
+    const bool single_extruder_multi_material =
+        printer.config.opt_bool("single_extruder_multi_material") &&
+        get_printer_extruder_count() == 1;
+    if (!single_extruder_multi_material || configured == nullptr || configured->value <= 0)
+        return MAXIMUM_EXTRUDER_NUMBER;
+    return size_t(configured->value);
+}
+
+bool PresetBundle::has_fixed_filament_slots() const
+{
+    const Preset &printer = printers.get_edited_preset();
+    const auto *configured = printer.config.opt<ConfigOptionInt>("max_filament_colors");
+    return printer.config.opt_bool("single_extruder_multi_material") &&
+           get_printer_extruder_count() == 1 &&
+           configured != nullptr && configured->value > 0;
+}
+
+static std::string fixed_filament_slot_color(size_t index)
+{
+    static constexpr const char *colors[] = {
+        "#00C1AE", "#F4E2C1", "#ED1C24", "#00FF7F",
+        "#F26722", "#FFEB31", "#7841CE", "#115877",
+        "#ED1E79", "#2EBDEF", "#345B2F", "#800080",
+        "#FA8173", "#800000", "#F7B763", "#A4C41E"
+    };
+    return colors[index % std::size(colors)];
+}
+
 void PresetBundle::set_num_filaments(unsigned int n, std::vector<std::string> new_colors) {
+    const bool fixed_slots = has_fixed_filament_slots();
+    n = unsigned(fixed_slots ? max_filament_colors() : std::min<size_t>(n, max_filament_colors()));
     int old_filament_count = this->filament_presets.size();
     if (n > old_filament_count && old_filament_count != 0)
         filament_presets.resize(n, filament_presets.back());
@@ -3069,12 +3103,14 @@ void PresetBundle::set_num_filaments(unsigned int n, std::vector<std::string> ne
 
     // BBS set new filament color to new_color
     if (old_filament_count < n) {
-        if (!new_colors.empty()) {
-            for (int i = old_filament_count; i < n; i++) {
-                filament_color->values[i] = new_colors[i - old_filament_count];
-                filament_multi_color->values[i] = new_colors[i - old_filament_count];
-                filament_color_type->values[i]  = "1";  // default color type
-            }
+        for (int i = old_filament_count; i < n; i++) {
+            const size_t new_color_index = size_t(i - old_filament_count);
+            if (new_color_index < new_colors.size())
+                filament_color->values[i] = new_colors[new_color_index];
+            else if (fixed_slots)
+                filament_color->values[i] = fixed_filament_slot_color(i);
+            filament_multi_color->values[i] = filament_color->values[i];
+            filament_color_type->values[i]  = "1";  // default color type
         }
     }
 
@@ -3082,6 +3118,8 @@ void PresetBundle::set_num_filaments(unsigned int n, std::vector<std::string> ne
 }
 void PresetBundle::set_num_filaments(unsigned int n, std::string new_color)
 {
+    const bool fixed_slots = has_fixed_filament_slots();
+    n = unsigned(fixed_slots ? max_filament_colors() : std::min<size_t>(n, max_filament_colors()));
     unsigned old_filament_count = this->filament_presets.size();
     if (n > old_filament_count && old_filament_count != 0)
         filament_presets.resize(n, filament_presets.back());
@@ -3109,12 +3147,13 @@ void PresetBundle::set_num_filaments(unsigned int n, std::string new_color)
 
     //BBS set new filament color to new_color
     if (old_filament_count < n) {
-        if (!new_color.empty()) {
-            for (unsigned i = old_filament_count; i < n; i++) {
+        for (unsigned i = old_filament_count; i < n; i++) {
+            if (!new_color.empty())
                 filament_color->values[i] = new_color;
-                filament_multi_color->values[i] = new_color;
-                filament_color_type->values[i]  = "1";  // default color type
-            }
+            else if (fixed_slots)
+                filament_color->values[i] = fixed_filament_slot_color(i);
+            filament_multi_color->values[i] = filament_color->values[i];
+            filament_color_type->values[i]  = "1";  // default color type
         }
     }
 
@@ -3257,7 +3296,10 @@ unsigned int PresetBundle::sync_ams_list(std::vector<std::pair<DynamicPrintConfi
     auto is_double_extruder = get_printer_extruder_count() == 2;
     std::vector<AmsInfo> ams_infos;
     int                  index = 0;
+    const size_t filament_limit = max_filament_colors();
     for (auto &entry : filament_ams_list) {
+        if (size_t(index) >= filament_limit)
+            break;
         auto & ams = entry.second;
         auto filament_id = ams.opt_string("filament_id", 0u);
         auto filament_color = ams.opt_string("filament_colour", 0u);
@@ -3550,7 +3592,7 @@ unsigned int PresetBundle::sync_ams_list(std::vector<std::pair<DynamicPrintConfi
                 return -1;
             };
             for (size_t i = 0; i < need_append_colors.size(); i++){
-                if (exist_filament_presets.size() >= size_t(EnforcerBlockerType::ExtruderMax)){
+                if (exist_filament_presets.size() >= filament_limit) {
                     break;
                 }
                 auto idx = get_idx_in_array(exist_filament_presets, exist_colors, need_append_colors[i].filament_preset, need_append_colors[i].filament_color);
@@ -3580,7 +3622,7 @@ unsigned int PresetBundle::sync_ams_list(std::vector<std::pair<DynamicPrintConfi
             auto exist_presets      = this->filament_presets;
 
             size_t tray_count = ams_filament_presets.size();
-            size_t total      = std::max(tray_count, exist_presets.size());
+            size_t total      = std::min(filament_limit, std::max(tray_count, exist_presets.size()));
 
             std::vector<std::string> result_colors;
             std::vector<std::string> result_color_types;
@@ -3626,6 +3668,10 @@ unsigned int PresetBundle::sync_ams_list(std::vector<std::pair<DynamicPrintConfi
             filament_volume_map->values.resize(total, static_cast<int>(NozzleVolumeType::nvtStandard));
         } else {
             // BBL: existing wholesale replace
+            ams_filament_colors.resize(std::min(ams_filament_colors.size(), filament_limit));
+            ams_filament_color_types.resize(std::min(ams_filament_color_types.size(), filament_limit));
+            ams_filament_presets.resize(std::min(ams_filament_presets.size(), filament_limit));
+            ams_multi_color_filment.resize(std::min(ams_multi_color_filment.size(), filament_limit));
             filament_color->values = ams_filament_colors;
             filament_color_type->values = ams_filament_color_types;
             this->filament_presets = ams_filament_presets;

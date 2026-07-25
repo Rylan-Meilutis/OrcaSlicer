@@ -2803,8 +2803,8 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
     m_is_role_based_fan_on.fill(false);
     m_role_based_fan_marker_layer.fill(-1);
     m_arc_overhang_stabilization_until.clear();
-    m_one_sided_arc_overhang_start.clear();
-    m_one_sided_arc_overhang_until.clear();
+    m_arc_overhang_overhang_start.clear();
+    m_arc_overhang_bridge_start.clear();
 
     m_fan_mover.release();
     
@@ -6265,13 +6265,13 @@ LayerResult GCode::process_layer(
                                 [](const ExtrusionEntity *entity) { return entity->role() == erArcOverhang; });
                         });
                     {
-                        // Arc overhangs form the bottom surface and replace its
-                        // unsupported perimeter portions, so establish the arcs
-                        // before printing any remaining supported walls.
-                        if (has_arc_overhang)
-                            gcode += this->extrude_infill(print, by_region_specific, false, erArcOverhang);
                         // Print perimeters of regions that has is_infill_first == false
                         gcode += this->extrude_perimeters(print, by_region_specific, first_layer, false);
+                        // Arc overhangs replace only the innermost unsupported
+                        // wall. Print the retained outer walls first so each arc
+                        // starts on an existing perimeter ledge.
+                        if (has_arc_overhang)
+                            gcode += this->extrude_infill(print, by_region_specific, false, erArcOverhang);
                         if (!has_wipe_tower && need_insert_timelapse_gcode_for_traditional && printer_structure == PrinterStructure::psI3
                             && !has_insert_timelapse_gcode && has_infill(by_region_specific)) {
                             gcode += this->retract(false, false, auto_lift_type, true);
@@ -7006,41 +7006,46 @@ std::string GCode::extrude_perimeters(const Print &print, const std::vector<Obje
     for (const ObjectByExtruder::Island::Region &region : by_region)
         if (! region.perimeters.empty()) {
             m_config.apply(print.get_print_region(&region - &by_region.front()).config());
-            // BBS: for first layer, we always print wall firstly to get better bed adhesive force
-            // This behaviour is same with cura
-            const bool should_print = is_first_layer ? !is_infill_first
-                : (m_config.is_infill_first == is_infill_first);
-            if (!should_print) continue;
-
             const bool replace_unsupported_perimeters = std::any_of(
                 region.infills.begin(), region.infills.end(),
                 [](const ExtrusionEntity *entity) { return entity->role() == erArcOverhang; });
+            // BBS: for first layer, we always print wall firstly to get better bed adhesive force
+            // This behaviour is same with cura
+            // Arc anchors always precede the arcs, irrespective of the ordinary
+            // infill-first preference. The second perimeter pass then stays empty.
+            const bool should_print = replace_unsupported_perimeters ? !is_infill_first :
+                (is_first_layer ? !is_infill_first : (m_config.is_infill_first == is_infill_first));
+            if (!should_print) continue;
+
             if (!replace_unsupported_perimeters) {
                 for (const ExtrusionEntity* ee : region.perimeters)
                     gcode += this->extrude_entity(*ee, "perimeter", -1., region.perimeters);
                 continue;
             }
 
-            std::function<void(const ExtrusionEntity &)> extrude_supported;
-            extrude_supported = [&](const ExtrusionEntity &entity) {
+            std::function<void(const ExtrusionEntity &)> extrude_anchor_perimeters;
+            extrude_anchor_perimeters = [&](const ExtrusionEntity &entity) {
                 if (const auto *path = dynamic_cast<const ExtrusionPath *>(&entity)) {
+                    // Arc fill replaces every wall fragment that would itself
+                    // need bridge/overhang extrusion. Supported fragments remain
+                    // and are emitted first as the arc's physical anchor.
                     if (path->role() != erOverhangPerimeter)
                         gcode += this->extrude_path(*path, "perimeter", -1.);
                 } else if (const auto *multipath = dynamic_cast<const ExtrusionMultiPath *>(&entity)) {
                     for (const ExtrusionPath &path : multipath->paths)
-                        extrude_supported(path);
+                        extrude_anchor_perimeters(path);
                 } else if (const auto *loop = dynamic_cast<const ExtrusionLoop *>(&entity)) {
                     // Removing an unsupported span opens the loop. Emit the
                     // remaining anchors as paths rather than falsely closing it.
                     for (const ExtrusionPath &path : loop->paths)
-                        extrude_supported(path);
+                        extrude_anchor_perimeters(path);
                 } else if (const auto *collection = dynamic_cast<const ExtrusionEntityCollection *>(&entity)) {
                     for (const ExtrusionEntity *child : collection->entities)
-                        extrude_supported(*child);
+                        extrude_anchor_perimeters(*child);
                 }
             };
             for (const ExtrusionEntity *entity : region.perimeters)
-                extrude_supported(*entity);
+                extrude_anchor_perimeters(*entity);
         }
     return gcode;
 }
@@ -7298,23 +7303,32 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
     if (path.role() == erArcOverhang && print_object != nullptr)
         m_arc_overhang_stabilization_until[print_object] =
             layer_id() + std::max(1, m_config.arc_overhang_layers.value) - 1;
-    if (path.role() == erArcOverhang && print_object != nullptr &&
-        m_layer->has_one_sided_arc_overhang) {
-        m_one_sided_arc_overhang_start[print_object] = layer_id();
-        m_one_sided_arc_overhang_until[print_object] =
-            layer_id() + std::max(1, m_config.arc_overhang_layers.value) - 1;
+    if (path.role() == erArcOverhang && print_object != nullptr) {
+        if (m_layer->has_one_sided_arc_overhang)
+            m_arc_overhang_overhang_start[print_object] = layer_id();
+        else
+            m_arc_overhang_bridge_start[print_object] = layer_id();
     }
     const auto stabilization_it = m_arc_overhang_stabilization_until.find(print_object);
     const bool arc_overhang_stabilization = print_object != nullptr &&
         stabilization_it != m_arc_overhang_stabilization_until.end() &&
         layer_id() <= stabilization_it->second;
-    const auto one_sided_start_it = m_one_sided_arc_overhang_start.find(print_object);
-    const auto one_sided_until_it = m_one_sided_arc_overhang_until.find(print_object);
-    const bool one_sided_arc_followup = print_object != nullptr &&
-        one_sided_start_it != m_one_sided_arc_overhang_start.end() &&
-        one_sided_until_it != m_one_sided_arc_overhang_until.end() &&
-        layer_id() > one_sided_start_it->second &&
-        layer_id() <= one_sided_until_it->second;
+    auto arc_speed_blend = [this, print_object](const std::map<const PrintObject*, int> &starts,
+                                                int blend_layers) -> std::optional<double> {
+        if (print_object == nullptr || blend_layers <= 0)
+            return std::nullopt;
+        const auto start_it = starts.find(print_object);
+        if (start_it == starts.end())
+            return std::nullopt;
+        const int elapsed_layers = layer_id() - start_it->second;
+        if (elapsed_layers <= 0 || elapsed_layers > blend_layers)
+            return std::nullopt;
+        return std::clamp(double(elapsed_layers) / double(blend_layers), 0., 1.);
+    };
+    const std::optional<double> overhang_speed_blend = arc_speed_blend(
+        m_arc_overhang_overhang_start, m_config.arc_overhang_overhang_speed_layers.value);
+    const std::optional<double> bridge_speed_blend = arc_speed_blend(
+        m_arc_overhang_bridge_start, m_config.arc_overhang_bridge_speed_layers.value);
 
     if (is_bridge(path.role()))
         description += " (bridge)";
@@ -7483,7 +7497,14 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
             return std::any_of(region->fill_surfaces.surfaces.begin(), region->fill_surfaces.surfaces.end(),
                                [](const Surface &surface) { return surface.is_top(); });
         });
-    if (!this->on_first_layer() && !layer_has_top_surface &&
+    const bool layer_has_bridge_surface = m_layer != nullptr &&
+        std::any_of(m_layer->regions().begin(), m_layer->regions().end(), [](const LayerRegion *region) {
+            return std::any_of(region->fill_surfaces.surfaces.begin(), region->fill_surfaces.surfaces.end(),
+                               [](const Surface &surface) { return surface.is_bridge(); });
+        });
+    // Bridge layers retain their bridge-calculated flow. Deeper-wall
+    // reinforcement starts only on a later, normally supported layer.
+    if (!this->on_first_layer() && !layer_has_top_surface && !layer_has_bridge_surface &&
         m_config.wall_loops.value >= 3 && path.role() == erPerimeter && path.inset_idx >= 2)
         _mm3_per_mm *= m_config.third_wall_flow_ratio;
 
@@ -7582,8 +7603,10 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
         if (skirt_speed > 0.0)
         speed = skirt_speed;
     }
-    if (one_sided_arc_followup)
-        speed = std::min(speed, m_config.arc_overhang_stabilization_speed.value);
+    for (const std::optional<double> blend : {overhang_speed_blend, bridge_speed_blend})
+        if (blend)
+            speed = std::min(speed, Slic3r::lerp(
+                m_config.arc_overhang_stabilization_speed.value, speed, *blend));
     //BBS: remove this config
     //else if (this->object_layer_over_raft())
     //    speed = m_config.get_abs_value("first_layer_speed_over_raft", speed);

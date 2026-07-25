@@ -62,6 +62,7 @@ public:
         class Marker
         {
             GLModel m_model;
+            GLModel m_gantry_x_axis_model;
             Vec3f m_world_position;
             // for seams, the position of the marker is on the last endpoint of the toolpath containing it
             // the offset is used to show the correct value of tool position in the "ToolPosition" window
@@ -75,6 +76,9 @@ public:
             bool m_fixed_screen_size{ false };
             float m_scale_factor{ 1.0f };
             bool m_is_gantry_model{ false };
+            bool m_has_fixed_x_axis{ false };
+            std::string m_filename;
+            std::pair<float, float> m_bed_x_bounds{ 0.0f, 0.0f };
 #if ENABLE_ACTUAL_SPEED_DEBUG
             ActualSpeedImguiWidget m_actual_speed_imgui_widget;
 #endif // ENABLE_ACTUAL_SPEED_DEBUG
@@ -82,9 +86,12 @@ public:
         public:
             float m_scale = 1.0f;
 
-            void init(const std::string& filename, bool is_gantry_model = false);
+            void init(const std::string& filename, bool is_gantry_model = false,
+                      const std::pair<float, float>& bed_x_bounds = { 0.0f, 0.0f });
+            void clear();
 
             const BoundingBoxf3& get_bounding_box() const { return m_model.get_bounding_box(); }
+            bool is_gantry_model() const { return m_is_gantry_model; }
 
             void set_world_position(const Vec3f& position) { m_world_position = position; }
             void set_world_offset(const Vec3f& offset) { m_world_offset = offset; }

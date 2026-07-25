@@ -302,6 +302,8 @@ public:
     // BBS
     void            set_num_filaments(unsigned int n, std::vector<std::string> new_colors);
     void            set_num_filaments(unsigned int n, std::string new_col = "");
+    size_t          max_filament_colors() const;
+    bool            has_fixed_filament_slots() const;
     void         update_num_filaments(unsigned int to_del_flament_id);
 
     void get_ams_cobox_infos(AMSComboInfo &combox_info);

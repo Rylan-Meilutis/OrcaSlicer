@@ -1244,8 +1244,9 @@ static std::vector<std::string> s_Preset_print_options{
     "arc_overhang_flow_ratio",
     "arc_overhang_speed",
     "arc_overhang_stabilization_speed",
-    "arc_overhang_cooling",
     "arc_overhang_layers",
+    "arc_overhang_overhang_speed_layers",
+    "arc_overhang_bridge_speed_layers",
     "arc_overhang_bridge_distance",
     "arc_overhang_min_overhang_distance",
     "support_interface_top_temperature",
@@ -1373,7 +1374,7 @@ static std::vector<std::string> s_Preset_filament_options {/*"filament_colour", 
     "nozzle_temperature_range_low", "nozzle_temperature_range_high",
     "filament_extruder_variant",
     //SoftFever
-    "enable_pressure_advance", "pressure_advance","adaptive_pressure_advance","adaptive_pressure_advance_model","adaptive_pressure_advance_overhangs", "adaptive_pressure_advance_bridges","chamber_temperature", "filament_shrink","filament_shrinkage_compensation_z", "support_material_interface_fan_speed","internal_bridge_fan_speed", "filament_notes" /*,"filament_seam_gap"*/,
+    "enable_pressure_advance", "pressure_advance","adaptive_pressure_advance","adaptive_pressure_advance_model","adaptive_pressure_advance_overhangs", "adaptive_pressure_advance_bridges","chamber_temperature", "filament_shrink","filament_shrinkage_compensation_z", "arc_overhang_cooling","support_material_interface_fan_speed","internal_bridge_fan_speed","filament_notes" /*,"filament_seam_gap"*/,
     "ironing_fan_speed",
     // Filament ironing overrides
     "filament_ironing_flow", "filament_ironing_spacing", "filament_ironing_inset", "filament_ironing_speed",
@@ -1417,7 +1418,7 @@ static std::vector<std::string> s_Preset_printer_options {
     "printer_technology",
     "printable_area", "extruder_printable_area", "support_parallel_printheads", "parallel_printheads_count", "parallel_printheads_bed_exclude_areas", "bed_exclude_area","bed_custom_texture", "bed_custom_model", "gcode_flavor",
     "fan_kickstart", "part_cooling_fan_min_pwm", "fan_speedup_time", "fan_speedup_overhangs",
-    "single_extruder_multi_material", "manual_filament_change", "file_start_gcode", "machine_start_gcode", "machine_end_gcode", "before_layer_change_gcode", "printing_by_object_gcode", "layer_change_gcode", "time_lapse_gcode", "wrapping_detection_gcode", "change_filament_gcode", "change_extrusion_role_gcode",
+    "single_extruder_multi_material", "max_filament_colors", "manual_filament_change", "file_start_gcode", "machine_start_gcode", "machine_end_gcode", "before_layer_change_gcode", "printing_by_object_gcode", "layer_change_gcode", "time_lapse_gcode", "wrapping_detection_gcode", "change_filament_gcode", "change_extrusion_role_gcode",
     "printer_model", "printer_variant", "printer_extruder_id", "printer_extruder_variant", "extruder_variant_list", "default_nozzle_volume_type",
     "printable_height", "extruder_printable_height", "extruder_clearance_radius", "extruder_clearance_height_to_lid", "extruder_clearance_height_to_rod",
     "sequential_print_gantry_geometry", "sequential_print_gantry_model",
@@ -1427,7 +1428,7 @@ static std::vector<std::string> s_Preset_printer_options {
     "scan_first_layer", "enable_power_loss_recovery", "wrapping_detection_layers", "wrapping_exclude_area", "machine_load_filament_time", "machine_unload_filament_time", "machine_tool_change_time", "time_cost", "machine_pause_gcode", "template_custom_gcode",
     "nozzle_type", "nozzle_hrc","auxiliary_fan", "fan_direction", "nozzle_volume","upward_compatible_machine", "z_hop_types", "travel_slope", "retract_lift_enforce","support_chamber_temp_control","support_air_filtration","support_cooling_filter","cooling_filter_enabled","printer_structure","farthest_point_timelapse",
     "best_object_pos", "head_wrap_detect_zone",
-    "host_type", "print_host", "printhost_apikey", "sync_spool_manager_filament_names", "flashforge_serial_number", "bbl_use_printhost", "printer_agent",
+    "host_type", "print_host", "printhost_apikey", "sync_spool_manager_filament_names", "spool_manager_sync_mode", "flashforge_serial_number", "bbl_use_printhost", "printer_agent",
     "print_host_webui",
     "printhost_cafile","printhost_port","printhost_authorization_type",
     "printhost_user", "printhost_password", "printhost_ssl_ignore_revoke", "thumbnails", "thumbnails_format",
@@ -3146,6 +3147,77 @@ void PresetCollection::check_and_fix_syncinfo(Preset& preset, const std::string&
     }
 }
 
+bool PresetCollection::rebase_edited_preset(const std::string& previous_parent_name,
+                                            const std::string& new_parent_name,
+                                            std::string* error)
+{
+    auto fail = [error](const std::string& message) {
+        if (error != nullptr)
+            *error = message;
+        return false;
+    };
+
+    Preset& edited = get_edited_preset();
+    if (edited.is_default)
+        return fail("The default profile cannot change its parent profile.");
+
+    const Preset* previous_parent = nullptr;
+    if (!previous_parent_name.empty()) {
+        // Renamed or removed upstream profiles must not make a user profile
+        // impossible to repair. Prefer renamed-history matching, then fall
+        // back to the default config when identifying untouched values.
+        previous_parent = find_preset2(previous_parent_name, true);
+    }
+
+    Preset* new_parent = nullptr;
+    if (!new_parent_name.empty()) {
+        new_parent = find_preset2(new_parent_name, false);
+        if (new_parent == nullptr)
+            return fail("The requested parent profile could not be found.");
+        if (new_parent == &edited || new_parent->name == edited.name)
+            return fail("A profile cannot inherit from itself.");
+        if (m_type == Preset::TYPE_PRINTER &&
+            new_parent->printer_technology() != edited.printer_technology())
+            return fail("Machine profiles may only inherit from a machine using the same technology.");
+
+        // Walking upward from the proposed parent must never reach the child.
+        std::set<std::string> visited;
+        for (const Preset* ancestor = new_parent; ancestor != nullptr;
+             ancestor = get_preset_parent(*ancestor)) {
+            if (ancestor->name == edited.name)
+                return fail("The requested parent would create an inheritance cycle.");
+            if (!visited.insert(ancestor->name).second)
+                return fail("The requested parent belongs to an invalid inheritance cycle.");
+        }
+    }
+
+    // A saved child stores its overrides as values which differ from its
+    // direct parent. Update only values that still match the old parent.
+    // This is also backward-compatible with existing presets: no additional
+    // per-option metadata is required in their JSON.
+    if (new_parent != nullptr) {
+        const DynamicPrintConfig* old_parent_config = previous_parent != nullptr ?
+            &previous_parent->config : &default_preset_for(edited.config).config;
+        t_config_option_keys inherited_keys;
+        for (const t_config_option_key& key : edited.config.keys()) {
+            if (key == BBL_JSON_KEY_INHERITS)
+                continue;
+            const ConfigOption* child_option = edited.config.option(key);
+            const ConfigOption* old_parent_option = old_parent_config->option(key);
+            const ConfigOption* new_parent_option = new_parent->config.option(key);
+            if (child_option != nullptr && old_parent_option != nullptr &&
+                new_parent_option != nullptr && *child_option == *old_parent_option)
+                inherited_keys.emplace_back(key);
+        }
+        edited.config.apply_only(new_parent->config, inherited_keys, true);
+    }
+
+    Preset::inherits(edited.config) = new_parent == nullptr ? std::string() : new_parent->name;
+    edited.base_id = new_parent == nullptr ? std::string() : new_parent->setting_id;
+    edited.set_dirty(true);
+    return true;
+}
+
 const Preset* PresetCollection::get_selected_preset_parent() const
 {
     if (this->get_selected_idx() == size_t(-1))
@@ -4034,6 +4106,7 @@ static std::vector<std::string> s_PhysicalPrinter_opts {
     "print_host_webui",
     "printhost_apikey",
     "sync_spool_manager_filament_names",
+    "spool_manager_sync_mode",
     "flashforge_serial_number",
     "printhost_cafile",
     "printhost_port",

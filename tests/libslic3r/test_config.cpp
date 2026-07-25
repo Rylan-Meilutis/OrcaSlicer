@@ -31,20 +31,43 @@ TEST_CASE("New strength and overhang options preserve existing print defaults", 
     CHECK_THAT(config.opt_float("arc_overhang_flow_ratio"), Catch::Matchers::WithinAbs(1.0, EPSILON));
     CHECK_THAT(config.opt_float("arc_overhang_speed"), Catch::Matchers::WithinAbs(5.0, EPSILON));
     CHECK_THAT(config.opt_float("arc_overhang_stabilization_speed"), Catch::Matchers::WithinAbs(5.0, EPSILON));
-    CHECK_THAT(config.opt_float("arc_overhang_cooling"), Catch::Matchers::WithinAbs(100.0, EPSILON));
+    const auto *arc_overhang_cooling = config.option<ConfigOptionPercents>("arc_overhang_cooling");
+    REQUIRE(arc_overhang_cooling != nullptr);
+    CHECK_THAT(arc_overhang_cooling->get_at(0), Catch::Matchers::WithinAbs(100.0, EPSILON));
+    DynamicPrintConfig legacy_config = config;
+    REQUIRE_NOTHROW(legacy_config.set_deserialize_strict("arc_overhang_cooling", "73%"));
+    const auto *legacy_arc_overhang_cooling = legacy_config.option<ConfigOptionPercents>("arc_overhang_cooling");
+    REQUIRE(legacy_arc_overhang_cooling != nullptr);
+    CHECK_THAT(legacy_arc_overhang_cooling->get_at(0), Catch::Matchers::WithinAbs(73.0, EPSILON));
     CHECK(config.opt_int("arc_overhang_layers") == 1);
+    CHECK(config.opt_int("arc_overhang_overhang_speed_layers") == 0);
+    CHECK(config.opt_int("arc_overhang_bridge_speed_layers") == 0);
     CHECK_THAT(config.opt_float("arc_overhang_bridge_distance"), Catch::Matchers::WithinAbs(0.0, EPSILON));
     CHECK_THAT(config.opt_float("arc_overhang_min_overhang_distance"), Catch::Matchers::WithinAbs(0.0, EPSILON));
     CHECK_THAT(config.opt_float("third_wall_flow_ratio"), Catch::Matchers::WithinAbs(1.0, EPSILON));
     CHECK(config.opt_int("support_interface_top_temperature") == 0);
     const ConfigOptionDef *spool_sync = print_config_def.get("sync_spool_manager_filament_names");
     REQUIRE(spool_sync != nullptr);
-    CHECK_FALSE(spool_sync->default_value->getBool());
+    const auto *spool_sync_default = dynamic_cast<const ConfigOptionBool *>(spool_sync->default_value.get());
+    REQUIRE(spool_sync_default != nullptr);
+    CHECK_FALSE(spool_sync_default->value);
+    const ConfigOptionDef *spool_sync_mode = print_config_def.get("spool_manager_sync_mode");
+    REQUIRE(spool_sync_mode != nullptr);
+    const auto *spool_sync_mode_default =
+        dynamic_cast<const ConfigOptionEnum<SpoolManagerSyncMode> *>(spool_sync_mode->default_value.get());
+    REQUIRE(spool_sync_mode_default != nullptr);
+    CHECK(spool_sync_mode_default->value == smsmColorsAndProfiles);
+    CHECK(config.opt_int("max_filament_colors") == 0);
+    const std::vector<std::string> &printer_options = Preset::printer_options();
+    CHECK(std::find(printer_options.begin(), printer_options.end(), "max_filament_colors") !=
+          printer_options.end());
     const std::vector<std::string> &physical_printer_options = PhysicalPrinter::printer_options();
     CHECK(std::find(physical_printer_options.begin(), physical_printer_options.end(), "printhost_apikey") !=
           physical_printer_options.end());
     CHECK(std::find(physical_printer_options.begin(), physical_printer_options.end(),
                     "sync_spool_manager_filament_names") != physical_printer_options.end());
+    CHECK(std::find(physical_printer_options.begin(), physical_printer_options.end(),
+                    "spool_manager_sync_mode") != physical_printer_options.end());
     CHECK(config.opt_string("sequential_print_gantry_geometry").empty());
     CHECK(config.opt_string("sequential_print_gantry_model").empty());
 }
@@ -59,10 +82,13 @@ TEST_CASE("Bundled Prusa sequential gantry models match their printer notes", "[
         boost::filesystem::path(__FILE__).parent_path().parent_path().parent_path();
     set_resources_dir((source_root / "resources").string());
 
-    const std::array<std::pair<const char*, const char*>, 5> cases{{
+    const std::array<std::pair<const char*, const char*>, 8> cases{{
         {"PRINTER_MODEL_COREONE", "prusa3d_coreone_gantry.stl"},
+        {"PRINTER_MODEL_COREONE_L", "prusa3d_coreoneL_gantry.stl"},
         {"PRINTER_MODEL_COREONE_INDX\nSEQ_ARRANGE_MODEL_COREONE_INDX", "prusa3d_coreone_indx_gantry.stl"},
         {"PRINTER_MODEL_MK4IS", "prusa3d_mk4_gantry.stl"},
+        {"PRINTER_MODEL_MK4S", "prusa3d_mk4s_gantry.stl"},
+        {"PRINTER_MODEL_MK3", "prusa3d_mk3s_gantry.stl"},
         {"PRINTER_MODEL_XLIS", "prusa3d_xl_gantry.stl"},
         {"PRINTER_MODEL_MINI", "prusa3d_mini_gantry.stl"}
     }};

@@ -22,6 +22,7 @@
 #include <wx/imaglist.h>
 #include <wx/settings.h>
 #include <wx/filedlg.h>
+#include <wx/choicdlg.h>
 
 #include <boost/algorithm/string/predicate.hpp>
 #include <boost/algorithm/string/replace.hpp>
@@ -275,6 +276,7 @@ void Tab::create_preset_tab()
     //add_scaled_button(panel, &m_btn_compare_preset, "compare");
     add_scaled_button(m_top_panel, &m_btn_save_preset, "save");
     add_scaled_button(m_top_panel, &m_btn_delete_preset, "cross");
+    add_scaled_button(m_top_panel, &m_btn_manage_presets, "cog");
     //if (m_type == Preset::Type::TYPE_PRINTER)
     //    add_scaled_button(panel, &m_btn_edit_ph_printer, "cog");
 
@@ -288,6 +290,7 @@ void Tab::create_preset_tab()
     // TRN "Save current Settings"
     m_btn_save_preset->SetToolTip(wxString::Format(_L("Save current %s"), m_title));
     m_btn_delete_preset->SetToolTip(_(L("Delete this preset")));
+    m_btn_manage_presets->SetToolTip(_L("Manage user profiles"));
     m_btn_delete_preset->Hide();
 
     /*add_scaled_button(panel, &m_question_btn, "question");
@@ -348,6 +351,7 @@ void Tab::create_preset_tab()
 
         m_btn_save_preset->Show();
         m_btn_delete_preset->Show(); // ORCA: fixes delete preset button visible while search box focused
+        m_btn_manage_presets->Show();
         m_undo_btn->Show();          // ORCA: fixes revert preset button visible while search box focused
         m_btn_search->Show();
         m_search_item->Hide();
@@ -378,6 +382,7 @@ void Tab::create_preset_tab()
 
          m_btn_save_preset->Hide();
          m_btn_delete_preset->Hide(); // ORCA: fixes delete preset button visible while search box focused
+         m_btn_manage_presets->Hide();
          m_undo_btn->Hide();          // ORCA: fixes revert preset button visible while search box focused
          m_btn_search->Hide();
          m_search_item->Show();
@@ -420,6 +425,7 @@ void Tab::create_preset_tab()
 #endif
     m_top_sizer->Add(m_btn_save_preset  , 0, wxALIGN_CENTER_VERTICAL | wxLEFT, FromDIP(SidebarProps::IconSpacing()));
     m_top_sizer->Add(m_btn_delete_preset, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, FromDIP(SidebarProps::IconSpacing()));
+    m_top_sizer->Add(m_btn_manage_presets, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, FromDIP(SidebarProps::IconSpacing()));
     m_top_sizer->Add(m_btn_search       , 0, wxALIGN_CENTER_VERTICAL | wxLEFT, FromDIP(SidebarProps::WideSpacing()));
     m_top_sizer->Add(m_search_item      , 1, wxALIGN_CENTER_VERTICAL | wxLEFT, FromDIP(SidebarProps::ContentMargin()));
 
@@ -584,6 +590,7 @@ void Tab::create_preset_tab()
     //m_btn_compare_preset->Bind(wxEVT_BUTTON, ([this](wxCommandEvent e) { compare_preset(); }));
     m_btn_save_preset->Bind(wxEVT_BUTTON, ([this](wxCommandEvent& e) { save_preset(); }));
     m_btn_delete_preset->Bind(wxEVT_BUTTON, ([this](wxCommandEvent& e) { delete_preset(); }));
+    m_btn_manage_presets->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { show_profile_manager_menu(); });
     /*m_btn_hide_incompatible_presets->Bind(wxEVT_BUTTON, ([this](wxCommandEvent e) {
         toggle_show_hide_incompatible();
     }));
@@ -1553,8 +1560,73 @@ void Tab::reload_config()
 {
     if (m_active_page)
         m_active_page->reload_config();
+    if (m_config != nullptr)
+        m_loaded_inherits = Preset::inherits(*m_config);
     if (m_type == Preset::TYPE_PRINT && m_config != nullptr)
         m_last_sparse_infill_rotate_template_value = m_config->opt_string("sparse_infill_rotate_template");
+}
+
+Option Tab::get_inherits_option(ConfigOptionsGroup* optgroup) const
+{
+    Option option = optgroup->get_option("inherits");
+    option.opt.gui_type = ConfigOptionDef::GUIType::select_open;
+    option.opt.height = 1;
+    option.opt.multiline = false;
+    option.opt.enum_values = {""};
+    option.opt.enum_labels = {L("None")};
+    option.opt.tooltip = L("The current upstream profile. Changing it updates values inherited from the previous "
+                           "upstream profile while preserving settings changed manually in this profile.");
+
+    if (m_presets == nullptr)
+        return option;
+
+    const Preset& edited = m_presets->get_edited_preset();
+    for (const Preset& candidate : m_presets->get_presets()) {
+        if (candidate.is_default || candidate.name == edited.name)
+            continue;
+        if (m_type == Preset::TYPE_PRINTER &&
+            candidate.printer_technology() != edited.printer_technology())
+            continue;
+
+        bool creates_cycle = false;
+        std::set<std::string> visited;
+        for (const Preset* ancestor = &candidate; ancestor != nullptr;
+             ancestor = m_presets->get_preset_parent(*ancestor)) {
+            if (ancestor->name == edited.name || !visited.insert(ancestor->name).second) {
+                creates_cycle = true;
+                break;
+            }
+        }
+        if (creates_cycle)
+            continue;
+
+        option.opt.enum_values.emplace_back(candidate.name);
+        option.opt.enum_labels.emplace_back(candidate.name);
+    }
+    return option;
+}
+
+void Tab::on_inherits_changed(const boost::any& value)
+{
+    const std::string requested_parent = boost::any_cast<std::string>(value);
+    const std::string previous_parent = m_loaded_inherits;
+
+    // ConfigOptionsGroup writes the field before invoking this callback. Put
+    // the old value back so PresetCollection can compare the child against
+    // the parent which actually supplied its inherited values.
+    Preset::inherits(*m_config) = previous_parent;
+
+    std::string error;
+    if (!m_presets->rebase_edited_preset(previous_parent, requested_parent, &error)) {
+        MessageDialog(parent(), from_u8(error), _L("Unable to change parent profile"),
+                      wxOK | wxICON_WARNING).ShowModal();
+    }
+
+    m_loaded_inherits = Preset::inherits(*m_config);
+    reload_config();
+    update_dirty();
+    on_value_change("inherits", m_loaded_inherits);
+    update();
 }
 
 void Tab::update_mode()
@@ -2782,8 +2854,9 @@ void TabPrint::build()
         optgroup->append_single_option_line("arc_overhang_flow_ratio");
         optgroup->append_single_option_line("arc_overhang_speed");
         optgroup->append_single_option_line("arc_overhang_stabilization_speed");
-        optgroup->append_single_option_line("arc_overhang_cooling");
         optgroup->append_single_option_line("arc_overhang_layers");
+        optgroup->append_single_option_line("arc_overhang_overhang_speed_layers");
+        optgroup->append_single_option_line("arc_overhang_bridge_speed_layers");
         optgroup->append_single_option_line("arc_overhang_bridge_distance");
         optgroup->append_single_option_line("arc_overhang_min_overhang_distance");
 
@@ -3161,10 +3234,15 @@ void TabPrint::build()
         option.opt.height = 25;//250;
         optgroup->append_single_option_line(option, "others_settings_notes");
 
-    // Orca: hide the dependencies tab for process for now. The UI is not ready yet.
-    // page = add_options_page(L("Dependencies"), "param_profile_dependencies"); // icons ready
-    //     optgroup = page->new_optgroup(L("Profile dependencies"), "param_profile_dependencies"); // icons ready
+        optgroup = page->new_optgroup(L("Profile inheritance"), "param_dependencies_presets");
+        optgroup->m_on_change = [this](const t_config_option_key& opt_key, const boost::any& value) {
+            if (opt_key == "inherits")
+                on_inherits_changed(value);
+        };
+        optgroup->append_single_option_line(get_inherits_option(optgroup.get()));
 
+    // The remaining process-dependency controls are still hidden until their
+    // compatibility editor is ready.
     //     create_line_with_widget(optgroup.get(), "compatible_printers", "", [this](wxWindow* parent) {
     //         return compatible_widget_create(parent, m_compatible_printers);
     //     });
@@ -4504,6 +4582,7 @@ void TabFilament::build()
         optgroup->append_single_option_line("enable_overhang_bridge_fan", "material_cooling#force-cooling-for-overhangs-and-bridges");
         optgroup->append_single_option_line("overhang_fan_threshold", "material_cooling#overhang-cooling-activation-threshold");
         optgroup->append_single_option_line("overhang_fan_speed", "material_cooling#overhangs-and-external-bridges-fan-speed");
+        optgroup->append_single_option_line("arc_overhang_cooling");
         optgroup->append_single_option_line("internal_bridge_fan_speed", "material_cooling#internal-bridges-fan-speed"); // ORCA: Add support for separate internal bridge fan speed control
         optgroup->append_single_option_line("support_material_interface_fan_speed", "material_cooling#support-interface-fan-speed");
         optgroup->append_single_option_line("ironing_fan_speed", "material_cooling#ironing-fan-speed"); // ORCA: Add support for ironing fan speed control
@@ -5019,6 +5098,13 @@ void TabPrinter::build_fff()
         optgroup->append_single_option_line("z_offset", "printer_basic_information_printable_space#z-offset");
         optgroup->append_single_option_line("preferred_orientation", "printer_basic_information_printable_space#preferred-orientation");
 
+        optgroup = page->new_optgroup(L("Profile inheritance"), "param_dependencies_printers");
+        optgroup->m_on_change = [this](const t_config_option_key& opt_key, const boost::any& value) {
+            if (opt_key == "inherits")
+                on_inherits_changed(value);
+        };
+        optgroup->append_single_option_line(get_inherits_option(optgroup.get()));
+
         optgroup = page->new_optgroup(L("Advanced"), L"param_advanced");
 
         optgroup->append_single_option_line("printer_structure", "printer_basic_information_advanced#printer-structure");
@@ -5501,6 +5587,7 @@ if (is_marlin_flavor)
         auto page     = add_options_page(L("Multimaterial"), "custom-gcode_multi_material", true); // ORCA: icon only visible on placeholders
         auto optgroup = page->new_optgroup(L("Single extruder multi-material setup"), "param_multi_material");
         optgroup->append_single_option_line("single_extruder_multi_material", "printer_multimaterial_setup#single-extruder-multi-material");
+        optgroup->append_single_option_line("max_filament_colors");
         ConfigOptionDef def;
         def.type    = coInt, def.set_default_value(new ConfigOptionInt((int) m_extruders_count));
         def.label   = L("Extruders");
@@ -6095,14 +6182,15 @@ void TabPrinter::toggle_options()
             new_conf.set_key_value("manual_filament_change", new ConfigOptionBool(false));
             load_config(new_conf);
         }
+        const size_t extruders_count = m_config->option<ConfigOptionFloats>("nozzle_diameter")->size();
         toggle_option("extruders_count", !bSEMM);
+        toggle_line("max_filament_colors", bSEMM && extruders_count == 1);
         toggle_option("manual_filament_change", bSEMM);
         toggle_option("purge_in_prime_tower", bSEMM && supports_wipe_tower_2);
 
         // Orca: "Tool change on wipe tower" only makes sense for multi-extruder (multi-toolhead) printers
         // using a Type 2 wipe tower. SEMM already always travels to the tower as part of the purge,
         // so the option is irrelevant there.
-        const size_t extruders_count = m_config->option<ConfigOptionFloats>("nozzle_diameter")->size();
         toggle_option("tool_change_on_wipe_tower", !bSEMM && supports_wipe_tower_2 && extruders_count > 1);
     }
     wxString extruder_number;
@@ -6303,6 +6391,20 @@ void TabPrinter::on_value_change(const std::string& opt_key, const boost::any& v
                 reload_config();
                 update_tab_ui();
             }
+        }
+    }
+
+    if (opt_key == "max_filament_colors" || opt_key == "single_extruder_multi_material") {
+        const int configured = m_config->opt_int("max_filament_colors");
+        const auto *nozzle_diameter = m_config->option<ConfigOptionFloats>("nozzle_diameter");
+        const bool fixed_slots =
+            m_config->opt_bool("single_extruder_multi_material") &&
+            nozzle_diameter != nullptr && nozzle_diameter->values.size() == 1 &&
+            configured > 0;
+        if (fixed_slots) {
+            const size_t filament_count = size_t(configured);
+            wxGetApp().preset_bundle->set_num_filaments(static_cast<unsigned int>(filament_count));
+            wxGetApp().plater()->on_filament_count_change(filament_count);
         }
     }
 
@@ -7574,6 +7676,123 @@ void Tab::delete_preset()
     this->select_preset("", true);
 
     BOOST_LOG_TRIVIAL(info) << boost::format("delete preset finished");
+}
+
+void Tab::show_profile_manager_menu()
+{
+    wxMenu menu;
+    wxMenuItem* edit_item   = menu.Append(wxID_ANY, _L("Edit any user profile") + dots);
+    wxMenuItem* import_item = menu.Append(wxID_ANY, _L("Import profile JSON") + dots);
+    wxMenuItem* export_item = menu.Append(wxID_ANY, _L("Export current profile as JSON") + dots);
+
+    menu.Bind(wxEVT_MENU, [this](wxCommandEvent&) { edit_user_profile(); }, edit_item->GetId());
+    menu.Bind(wxEVT_MENU, [this](wxCommandEvent&) {
+        if (wxGetApp().mainframe != nullptr)
+            wxGetApp().mainframe->load_config_file();
+    }, import_item->GetId());
+    menu.Bind(wxEVT_MENU, [this](wxCommandEvent&) { export_current_preset_json(); }, export_item->GetId());
+    PopupMenu(&menu);
+}
+
+void Tab::edit_user_profile()
+{
+    struct UserProfile {
+        Preset::Type type;
+        std::string  name;
+        wxString     label;
+    };
+
+    std::vector<UserProfile> profiles;
+    auto append_profiles = [&profiles](Preset::Type type, const wxString& type_label,
+                                      const PresetCollection& collection) {
+        for (const Preset& preset : collection.get_presets()) {
+            if (preset.is_user())
+                profiles.push_back({type, preset.name,
+                                    wxString::Format("[%s] %s", type_label, from_u8(preset.name))});
+        }
+    };
+
+    append_profiles(Preset::TYPE_PRINT,        _L("Process"),     m_preset_bundle->prints);
+    append_profiles(Preset::TYPE_FILAMENT,     _L("Filament"),    m_preset_bundle->filaments);
+    append_profiles(Preset::TYPE_PRINTER,      _L("Printer"),     m_preset_bundle->printers);
+    append_profiles(Preset::TYPE_SLA_PRINT,    _L("SLA process"), m_preset_bundle->sla_prints);
+    append_profiles(Preset::TYPE_SLA_MATERIAL, _L("SLA material"),m_preset_bundle->sla_materials);
+
+    std::sort(profiles.begin(), profiles.end(), [](const UserProfile& lhs, const UserProfile& rhs) {
+        return lhs.label.CmpNoCase(rhs.label) < 0;
+    });
+
+    if (profiles.empty()) {
+        MessageDialog(parent(), _L("There are no user profiles to edit."),
+                      _L("User profile editor"), wxOK | wxICON_INFORMATION).ShowModal();
+        return;
+    }
+
+    wxArrayString choices;
+    choices.Alloc(profiles.size());
+    int initial_selection = 0;
+    for (size_t index = 0; index < profiles.size(); ++index) {
+        choices.Add(profiles[index].label);
+        if (profiles[index].type == m_type &&
+            profiles[index].name == m_presets->get_edited_preset().name)
+            initial_selection = static_cast<int>(index);
+    }
+
+    wxSingleChoiceDialog dialog(parent(),
+        _L("Select any user profile to open it for editing. Profiles incompatible with the current machine are included."),
+        _L("User profile editor"), choices);
+    dialog.SetSelection(initial_selection);
+    if (dialog.ShowModal() != wxID_OK)
+        return;
+
+    const UserProfile& selected = profiles[dialog.GetSelection()];
+    Tab* target_tab = wxGetApp().get_tab(selected.type);
+    if (target_tab == nullptr)
+        return;
+
+    // This is an explicit editing action, so expose incompatible profiles in
+    // the editor without changing their compatibility rules.
+    target_tab->m_show_incompatible_presets = true;
+    if (target_tab->m_presets_choice != nullptr)
+        target_tab->m_presets_choice->set_show_incompatible_presets(true);
+    if (wxGetApp().mainframe != nullptr)
+        wxGetApp().mainframe->select_tab(target_tab);
+    target_tab->select_preset(selected.name, false, std::string(), false, true);
+}
+
+void Tab::export_current_preset_json()
+{
+    const Preset& preset = m_presets->get_edited_preset();
+    if (!preset.is_user()) {
+        MessageDialog(parent(), _L("Only saved user profiles can be exported from the profile editor."),
+                      _L("Export profile"), wxOK | wxICON_INFORMATION).ShowModal();
+        return;
+    }
+    if (m_presets->current_is_dirty()) {
+        MessageDialog(parent(), _L("Save this profile before exporting it so the JSON contains the current settings."),
+                      _L("Export profile"), wxOK | wxICON_INFORMATION).ShowModal();
+        return;
+    }
+    if (preset.file.empty() || !boost::filesystem::exists(preset.file)) {
+        MessageDialog(parent(), _L("The saved JSON file for this profile could not be found."),
+                      _L("Export profile"), wxOK | wxICON_ERROR).ShowModal();
+        return;
+    }
+
+    const wxString filename = from_u8(sanitize_filename(preset.name) + ".json");
+    wxFileDialog dialog(parent(), _L("Export profile as JSON"),
+                        from_u8(wxGetApp().app_config->get_last_dir()), filename,
+                        _L("JSON profile (*.json)|*.json"),
+                        wxFD_SAVE | wxFD_OVERWRITE_PROMPT);
+    if (dialog.ShowModal() != wxID_OK)
+        return;
+
+    std::string error;
+    if (copy_file_gui(preset.file, into_u8(dialog.GetPath()), error, true) != SUCCESS) {
+        show_error(parent(), _L("Could not export the profile:") + "\n" + from_u8(error));
+        return;
+    }
+    wxGetApp().app_config->update_config_dir(into_path(dialog.GetPath()).parent_path().string());
 }
 
 void Tab::toggle_show_hide_incompatible()

@@ -46,6 +46,8 @@
 #include <algorithm>
 #include <cmath>
 #include <chrono>
+#include <cstdint>
+#include <unordered_set>
 
 
 namespace Slic3r {
@@ -231,27 +233,314 @@ int GCodeViewer::SequentialView::ActualSpeedImguiWidget::plot(const char* label,
 }
 #endif // ENABLE_ACTUAL_SPEED_DEBUG
 
-void GCodeViewer::SequentialView::Marker::init(const std::string& filename, bool is_gantry_model)
+void GCodeViewer::SequentialView::Marker::init(
+    const std::string& filename, bool is_gantry_model, const std::pair<float, float>& bed_x_bounds)
 {
-    if (m_model.is_initialized() && m_model.get_filename() == filename && m_is_gantry_model == is_gantry_model)
+    if (m_model.is_initialized() && m_filename == filename &&
+        m_is_gantry_model == is_gantry_model && m_bed_x_bounds == bed_x_bounds)
         return;
 
     m_model.reset();
+    m_gantry_x_axis_model.reset();
     m_is_gantry_model = is_gantry_model;
+    m_has_fixed_x_axis = false;
+    m_filename = filename;
+    m_bed_x_bounds = bed_x_bounds;
     if (filename.empty()) {
         m_model.init_from(stilized_arrow(16, 1.5f, 3.0f, 0.8f, 3.0f));
         m_is_gantry_model = false;
+    } else if (m_is_gantry_model &&
+               boost::algorithm::istarts_with(
+                   boost::filesystem::path(filename).filename().string(), "prusa3d_") &&
+               boost::algorithm::iends_with(filename, "_gantry.stl") &&
+               bed_x_bounds.second > bed_x_bounds.first) {
+        try {
+            const Model source = Model::read_from_file(filename);
+            indexed_triangle_set carriage;
+            indexed_triangle_set x_axis;
+            const float bed_width = bed_x_bounds.second - bed_x_bounds.first;
+            const float axis_component_min_width = std::max(100.0f, bed_width * 0.6f);
+            const bool is_coreone_gantry = boost::algorithm::icontains(
+                boost::filesystem::path(filename).filename().string(), "coreone");
+            float source_axis_min_y = std::numeric_limits<float>::max();
+            float source_axis_min_z = std::numeric_limits<float>::max();
+            float source_axis_max_y = std::numeric_limits<float>::lowest();
+            float source_axis_max_z = std::numeric_limits<float>::lowest();
+
+            const auto append_face = [](indexed_triangle_set& destination,
+                                        const indexed_triangle_set& source,
+                                        const Vec3i32& face) {
+                const int vertex_offset = int(destination.vertices.size());
+                destination.vertices.emplace_back(source.vertices[face[0]]);
+                destination.vertices.emplace_back(source.vertices[face[1]]);
+                destination.vertices.emplace_back(source.vertices[face[2]]);
+                destination.indices.emplace_back(
+                    vertex_offset, vertex_offset + 1, vertex_offset + 2);
+            };
+
+            for (indexed_triangle_set& component : its_split(source.mesh().its)) {
+                const BoundingBoxf3 bbox = bounding_box(component);
+                if (bbox.size().x() > axis_component_min_width) {
+                    // The Prusa models repeat the rail along X so it remains
+                    // visible while the complete gantry marker moves and is
+                    // clipped by PrusaSlicer. With a stationary rail, retain
+                    // only the repeat intersecting the toolhead origin.
+                    if (bbox.min.x() > 0.0 || bbox.max.x() < 0.0)
+                        continue;
+
+                    // INDX stores each repeated rail as a separate, complete
+                    // component. Preserve the origin-crossing component as-is
+                    // so its depth, fastener holes, and side walls survive.
+                    if (bbox.size().x() <= bed_width + 100.0f) {
+                        its_merge(x_axis, component);
+                        continue;
+                    }
+
+                    // Prusa's gantry STLs may join the carriage to the X-axis
+                    // into one connected mesh. Identify the rail from faces
+                    // spanning a substantial portion of the bed, then include
+                    // the local rail faces occupying the same Y/Z envelope.
+                    float axis_min_y = std::numeric_limits<float>::max();
+                    float axis_min_z = std::numeric_limits<float>::max();
+                    float axis_max_y = std::numeric_limits<float>::lowest();
+                    float axis_max_z = std::numeric_limits<float>::lowest();
+                    for (const Vec3i32& face : component.indices) {
+                        const Vec3f& a = component.vertices[face[0]];
+                        const Vec3f& b = component.vertices[face[1]];
+                        const Vec3f& c = component.vertices[face[2]];
+                        const float face_min_x = std::min({ a.x(), b.x(), c.x() });
+                        const float face_max_x = std::max({ a.x(), b.x(), c.x() });
+                        if (face_max_x - face_min_x <= axis_component_min_width)
+                            continue;
+                        axis_min_y = std::min({ axis_min_y, a.y(), b.y(), c.y() });
+                        axis_min_z = std::min({ axis_min_z, a.z(), b.z(), c.z() });
+                        axis_max_y = std::max({ axis_max_y, a.y(), b.y(), c.y() });
+                        axis_max_z = std::max({ axis_max_z, a.z(), b.z(), c.z() });
+                    }
+
+                    const bool axis_envelope_valid =
+                        axis_min_y <= axis_max_y && axis_min_z <= axis_max_z;
+                    if (axis_envelope_valid) {
+                        source_axis_min_y = std::min(source_axis_min_y, axis_min_y);
+                        source_axis_min_z = std::min(source_axis_min_z, axis_min_z);
+                        source_axis_max_y = std::max(source_axis_max_y, axis_max_y);
+                        source_axis_max_z = std::max(source_axis_max_z, axis_max_z);
+                    }
+                    constexpr float envelope_tolerance = 0.5f;
+                    std::vector<bool> axis_faces(component.indices.size(), false);
+                    for (size_t face_idx = 0; face_idx < component.indices.size(); ++face_idx) {
+                        const Vec3i32& face = component.indices[face_idx];
+                        const Vec3f& a = component.vertices[face[0]];
+                        const Vec3f& b = component.vertices[face[1]];
+                        const Vec3f& c = component.vertices[face[2]];
+                        const float face_min_x = std::min({ a.x(), b.x(), c.x() });
+                        const float face_max_x = std::max({ a.x(), b.x(), c.x() });
+                        const Vec3f center = (a + b + c) / 3.0f;
+                        const bool spans_axis =
+                            face_max_x - face_min_x > axis_component_min_width;
+                        const bool inside_axis_envelope =
+                            axis_envelope_valid &&
+                            center.y() >= axis_min_y - envelope_tolerance &&
+                            center.y() <= axis_max_y + envelope_tolerance &&
+                            center.z() >= axis_min_z - envelope_tolerance &&
+                            center.z() <= axis_max_z + envelope_tolerance;
+                        axis_faces[face_idx] = spans_axis || inside_axis_envelope;
+                    }
+
+                    // Include one edge-adjacent ring around the detected rail
+                    // surfaces. Thin linear rails are commonly tessellated into
+                    // short triangles: their broad faces fall in the envelope,
+                    // while their narrow thickness faces do not. The adjacent
+                    // ring restores those side faces without flooding through
+                    // the connected carriage mesh.
+                    const auto edge_key = [](int first, int second) {
+                        const uint32_t low = uint32_t(std::min(first, second));
+                        const uint32_t high = uint32_t(std::max(first, second));
+                        return (uint64_t(low) << 32) | high;
+                    };
+                    std::unordered_set<uint64_t> axis_edges;
+                    for (size_t face_idx = 0; face_idx < component.indices.size(); ++face_idx) {
+                        if (!axis_faces[face_idx])
+                            continue;
+                        const Vec3i32& face = component.indices[face_idx];
+                        axis_edges.insert(edge_key(face[0], face[1]));
+                        axis_edges.insert(edge_key(face[1], face[2]));
+                        axis_edges.insert(edge_key(face[2], face[0]));
+                    }
+                    for (size_t face_idx = 0; face_idx < component.indices.size(); ++face_idx) {
+                        if (axis_faces[face_idx])
+                            continue;
+                        const Vec3i32& face = component.indices[face_idx];
+                        axis_faces[face_idx] =
+                            axis_edges.count(edge_key(face[0], face[1])) > 0 ||
+                            axis_edges.count(edge_key(face[1], face[2])) > 0 ||
+                            axis_edges.count(edge_key(face[2], face[0])) > 0;
+                    }
+
+                    for (size_t face_idx = 0; face_idx < component.indices.size(); ++face_idx) {
+                        if (!axis_faces[face_idx]) {
+                            append_face(carriage, component, component.indices[face_idx]);
+                            continue;
+                        }
+
+                        // A connected Core One mesh contains several overlapping
+                        // repeats of the rail. Keep one local repeat; compressing
+                        // all repeats into the bed width produced foreground bars
+                        // and hid the linear-rail fastener detail.
+                        const Vec3i32& face = component.indices[face_idx];
+                        const float center_x =
+                            (component.vertices[face[0]].x() +
+                             component.vertices[face[1]].x() +
+                             component.vertices[face[2]].x()) / 3.0f;
+                        const float repeat_half_width = 0.5f * (bed_width + 60.0f);
+                        if (bbox.size().x() <= 2.0f * repeat_half_width ||
+                            std::abs(center_x) <= repeat_half_width)
+                            append_face(x_axis, component, face);
+                    }
+                } else {
+                    its_merge(carriage, component);
+                }
+            }
+
+            if (is_coreone_gantry) {
+                // Core One's standard gantry STL connects the carriage to
+                // several overlapping rail repeats. Face classification is
+                // sufficient for removing those repeats from the carriage,
+                // but cannot reconstruct one watertight rail. The INDX asset
+                // contains the same rail and extrusion as separate components,
+                // including their depth and fastener holes, so use its single
+                // origin-crossing repeat for every Core One-family toolhead.
+                indexed_triangle_set clean_x_axis;
+                const boost::filesystem::path clean_axis_path =
+                    boost::filesystem::path(filename).parent_path() /
+                    "prusa3d_coreone_indx_gantry.stl";
+                const Model clean_axis_source =
+                    Model::read_from_file(clean_axis_path.string());
+                for (indexed_triangle_set& component :
+                     its_split(clean_axis_source.mesh().its)) {
+                    const BoundingBoxf3 bbox = bounding_box(component);
+                    if (bbox.size().x() > axis_component_min_width &&
+                        bbox.min.x() <= 0.0 && bbox.max.x() >= 0.0)
+                        its_merge(clean_x_axis, component);
+                }
+
+                if (!clean_x_axis.indices.empty()) {
+                    const bool source_axis_envelope_valid =
+                        source_axis_min_y <= source_axis_max_y &&
+                        source_axis_min_z <= source_axis_max_z;
+                    if (source_axis_envelope_valid) {
+                        const BoundingBoxf3 clean_bbox =
+                            bounding_box(clean_x_axis);
+                        const float y_offset =
+                            0.5f * (source_axis_min_y + source_axis_max_y) -
+                            0.5f * float(clean_bbox.min.y() + clean_bbox.max.y());
+                        const float z_offset =
+                            0.5f * (source_axis_min_z + source_axis_max_z) -
+                            0.5f * float(clean_bbox.min.z() + clean_bbox.max.z());
+                        for (Vec3f& vertex : clean_x_axis.vertices) {
+                            vertex.y() += y_offset;
+                            vertex.z() += z_offset;
+                        }
+                    }
+                    x_axis = std::move(clean_x_axis);
+                }
+            }
+
+            if (!carriage.indices.empty() && !x_axis.indices.empty()) {
+                const BoundingBoxf3 x_axis_bbox = bounding_box(x_axis);
+                constexpr float side_margin = 3.0f;
+                const float target_min = bed_x_bounds.first - side_margin;
+                const float target_max = bed_x_bounds.second + side_margin;
+                const float source_center =
+                    0.5f * float(x_axis_bbox.min.x() + x_axis_bbox.max.x());
+                const float target_center = 0.5f * (target_min + target_max);
+                for (Vec3f& vertex : x_axis.vertices)
+                    vertex.x() += target_center - source_center;
+
+                // Keep the rail at its original scale so its profile, fastener
+                // spacing, and screw holes are not distorted. PrusaSlicer clips
+                // its moving repeated model at the bed sides; do the equivalent
+                // once here for Orca's stationary X-axis model.
+                const auto clip_polygon = [](std::vector<Vec3f> polygon, float boundary, bool keep_greater) {
+                    std::vector<Vec3f> clipped;
+                    if (polygon.empty())
+                        return clipped;
+                    Vec3f previous = polygon.back();
+                    bool previous_inside =
+                        keep_greater ? previous.x() >= boundary : previous.x() <= boundary;
+                    for (const Vec3f& current : polygon) {
+                        const bool current_inside =
+                            keep_greater ? current.x() >= boundary : current.x() <= boundary;
+                        if (current_inside != previous_inside) {
+                            const float denominator = current.x() - previous.x();
+                            if (std::abs(denominator) > EPSILON) {
+                                const float t = (boundary - previous.x()) / denominator;
+                                clipped.emplace_back(previous + t * (current - previous));
+                            }
+                        }
+                        if (current_inside)
+                            clipped.emplace_back(current);
+                        previous = current;
+                        previous_inside = current_inside;
+                    }
+                    return clipped;
+                };
+
+                indexed_triangle_set clipped_x_axis;
+                for (const Vec3i32& face : x_axis.indices) {
+                    std::vector<Vec3f> polygon{
+                        x_axis.vertices[face[0]],
+                        x_axis.vertices[face[1]],
+                        x_axis.vertices[face[2]]
+                    };
+                    polygon = clip_polygon(std::move(polygon), target_min, true);
+                    polygon = clip_polygon(std::move(polygon), target_max, false);
+                    for (size_t idx = 1; idx + 1 < polygon.size(); ++idx) {
+                        const int vertex_offset = int(clipped_x_axis.vertices.size());
+                        clipped_x_axis.vertices.emplace_back(polygon[0]);
+                        clipped_x_axis.vertices.emplace_back(polygon[idx]);
+                        clipped_x_axis.vertices.emplace_back(polygon[idx + 1]);
+                        clipped_x_axis.indices.emplace_back(
+                            vertex_offset, vertex_offset + 1, vertex_offset + 2);
+                    }
+                }
+                x_axis = std::move(clipped_x_axis);
+
+                m_model.init_from(carriage);
+                m_gantry_x_axis_model.init_from(x_axis);
+                m_has_fixed_x_axis = true;
+            } else {
+                m_model.init_from(source.mesh());
+            }
+        } catch (const std::exception&) {
+            m_is_gantry_model = false;
+        }
     } else if (!m_model.init_from_file(filename)) {
         m_model.init_from(stilized_arrow(16, 1.5f, 3.0f, 0.8f, 3.0f));
         m_is_gantry_model = false;
     }
+    if (!m_model.is_initialized()) {
+        m_model.init_from(stilized_arrow(16, 1.5f, 3.0f, 0.8f, 3.0f));
+        m_is_gantry_model = false;
+        m_has_fixed_x_axis = false;
+    }
     m_model.set_color({ 1.0f, 1.0f, 1.0f, 0.5f });
+    m_gantry_x_axis_model.set_color({ 1.0f, 1.0f, 1.0f, 0.5f });
+}
+
+void GCodeViewer::SequentialView::Marker::clear()
+{
+    m_model.reset();
+    m_gantry_x_axis_model.reset();
+    m_filename.clear();
+    m_is_gantry_model = false;
+    m_has_fixed_x_axis = false;
 }
 
 //BBS: GUI refactor: add canvas size from parameters
 void GCodeViewer::SequentialView::Marker::render(int canvas_width, int canvas_height, const libvgcode::EViewType& view_type)
 {
-    if (!m_visible)
+    if (!m_visible || !m_model.is_initialized())
         return;
 
     GLShaderProgram* shader = wxGetApp().get_shader("gouraud_light");
@@ -260,6 +549,8 @@ void GCodeViewer::SequentialView::Marker::render(int canvas_width, int canvas_he
 
     glsafe(::glEnable(GL_BLEND));
     glsafe(::glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA));
+    const bool cull_face_was_enabled = glIsEnabled(GL_CULL_FACE);
+    glsafe(::glDisable(GL_CULL_FACE));
 
     shader->start_using();
     shader->set_uniform("emission_factor", 0.0f);
@@ -280,8 +571,23 @@ void GCodeViewer::SequentialView::Marker::render(int canvas_width, int canvas_he
 
     m_model.render();
 
+    if (m_has_fixed_x_axis) {
+        // The carriage follows X/Y/Z. The X-axis stays fixed in X and follows
+        // only Y/Z, matching the physical Prusa gantry.
+        const Vec3d axis_position(0.0, m_world_position.y(), m_world_position.z());
+        const Transform3d axis_matrix = Geometry::translation_transform(axis_position);
+        shader->set_uniform("view_model_matrix", view_matrix * axis_matrix);
+        const Matrix3d axis_normal_matrix =
+            view_matrix.matrix().block(0, 0, 3, 3) *
+            axis_matrix.matrix().block(0, 0, 3, 3).inverse().transpose();
+        shader->set_uniform("view_normal_matrix", axis_normal_matrix);
+        m_gantry_x_axis_model.render();
+    }
+
     shader->stop_using();
 
+    if (cull_face_was_enabled)
+        glsafe(::glEnable(GL_CULL_FACE));
     glsafe(::glDisable(GL_BLEND));
 }
 
@@ -1020,35 +1326,59 @@ void GCodeViewer::refresh_marker_model()
     const auto* custom_geometry_opt = printer.config.opt<ConfigOptionString>("sequential_print_gantry_geometry");
     const auto* custom_model_opt = printer.config.opt<ConfigOptionString>("sequential_print_gantry_model");
     const bool complete_objects = complete_objects_opt != nullptr && complete_objects_opt->value;
+    const bool show_gantry_in_preview = get_app_config()->get_bool("preview_show_gantry_model");
     const std::string printer_notes = printer_notes_opt == nullptr ? std::string() : printer_notes_opt->value;
     const std::string custom_geometry = custom_geometry_opt == nullptr ? std::string() : custom_geometry_opt->value;
     const std::string custom_model = custom_model_opt == nullptr ? std::string() : custom_model_opt->value;
     const std::string signature = printer.name + '\n' + print.name + '\n' +
-        (complete_objects ? "1\n" : "0\n") + printer_notes + '\n' + custom_geometry + '\n' + custom_model;
+        (complete_objects ? "1\n" : "0\n") + (show_gantry_in_preview ? "1\n" : "0\n") +
+        printer_notes + '\n' + custom_geometry + '\n' + custom_model;
     if (signature == m_marker_config_signature)
         return;
     m_marker_config_signature = signature;
 
-    if (complete_objects) {
+    if (complete_objects || show_gantry_in_preview) {
         const SequentialGantryGeometry geometry = load_sequential_gantry_geometry(printer.config);
         if (!geometry.model_path.empty()) {
-            m_sequential_view.marker.init(geometry.model_path, true);
+            std::pair<float, float> bed_x_bounds{ 0.0f, 0.0f };
+            if (const auto* printable_area = printer.config.opt<ConfigOptionPoints>("printable_area");
+                printable_area != nullptr && !printable_area->values.empty()) {
+                bed_x_bounds.first = bed_x_bounds.second = float(printable_area->values.front().x());
+                for (const Vec2d& point : printable_area->values) {
+                    bed_x_bounds.first = std::min(bed_x_bounds.first, float(point.x()));
+                    bed_x_bounds.second = std::max(bed_x_bounds.second, float(point.x()));
+                }
+            }
+            m_sequential_view.marker.init(geometry.model_path, true, bed_x_bounds);
             return;
         }
     }
 
+    const VendorProfile::PrinterModel* system_model = PresetUtils::system_printer_model(printer);
+    const bool prusa_model_has_toolhead =
+        printer.vendor != nullptr && printer.vendor->id == "Prusa" &&
+        system_model != nullptr && !system_model->hotend_model.empty();
+    const bool notes_select_toolhead =
+        boost::algorithm::contains(printer_notes, "TOOLHEAD_MODEL");
+    if (!prusa_model_has_toolhead && !notes_select_toolhead) {
+        m_sequential_view.marker.clear();
+        return;
+    }
+
     std::string filename;
-    const Preset& selected = preset_bundle->printers.get_selected_preset();
-    if (selected.is_system)
-        filename = PresetUtils::system_printer_hotend_model(selected);
-    else {
-        const auto* printer_model = selected.config.opt<ConfigOptionString>("printer_model");
+    if (printer.is_system && system_model != nullptr && !system_model->hotend_model.empty()) {
+        filename = PresetUtils::system_printer_hotend_model(printer);
+    } else {
+        const auto* printer_model = printer.config.opt<ConfigOptionString>("printer_model");
         if (printer_model != nullptr && !printer_model->value.empty())
             filename = preset_bundle->get_hotend_model_for_printer_model(printer_model->value);
-        if (filename.empty())
+        if (filename.empty() && notes_select_toolhead)
             filename = preset_bundle->get_hotend_model_for_printer_model(PresetBundle::ORCA_DEFAULT_PRINTER_MODEL);
     }
-    m_sequential_view.marker.init(filename);
+    if (filename.empty())
+        m_sequential_view.marker.clear();
+    else
+        m_sequential_view.marker.init(filename);
 }
 
 void GCodeViewer::init(ConfigOptionMode mode, PresetBundle* preset_bundle)
@@ -1643,7 +1973,9 @@ void GCodeViewer::render(int canvas_width, int canvas_height, int right_margin)
     int bottom_margin = SLIDER_BOTTOM_MARGIN * GCODE_VIEWER_SLIDER_SCALE;
     auto current = m_viewer.get_view_visible_range();
     auto endpoints = m_viewer.get_view_full_range();
-    m_sequential_view.m_show_marker = m_sequential_view.m_show_marker || (current.back() != endpoints.back() && !m_no_render_path);
+    const bool keep_gantry_visible = m_sequential_view.marker.is_gantry_model();
+    m_sequential_view.m_show_marker = keep_gantry_visible ||
+        m_sequential_view.m_show_marker || (current.back() != endpoints.back() && !m_no_render_path);
     const libvgcode::PathVertex& curr_vertex = m_viewer.get_current_vertex();
     m_sequential_view.marker.set_world_position(libvgcode::convert(curr_vertex.position));
     m_sequential_view.marker.set_z_offset(m_z_offset + 0.5f);

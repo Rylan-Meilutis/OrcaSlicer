@@ -506,6 +506,12 @@ enum FilamentMapMode {
     fmmDefault
 };
 
+enum SpoolManagerSyncMode {
+    smsmColorsAndProfiles = 0,
+    smsmColorsOnly,
+    smsmProfilesOnly
+};
+
 // All auto modes are ordered before fmmManual (see the enum ordering note above).
 inline bool is_auto_filament_map_mode(FilamentMapMode mode) {
     return mode < fmmManual;
@@ -1406,8 +1412,9 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionFloat,                arc_overhang_flow_ratio))
     ((ConfigOptionFloat,                arc_overhang_speed))
     ((ConfigOptionFloat,                arc_overhang_stabilization_speed))
-    ((ConfigOptionPercent,              arc_overhang_cooling))
     ((ConfigOptionInt,                  arc_overhang_layers))
+    ((ConfigOptionInt,                  arc_overhang_overhang_speed_layers))
+    ((ConfigOptionInt,                  arc_overhang_bridge_speed_layers))
     ((ConfigOptionFloat,                arc_overhang_bridge_distance))
     ((ConfigOptionFloat,                arc_overhang_min_overhang_distance))
 
@@ -1593,6 +1600,7 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionString,              machine_start_gcode))
     ((ConfigOptionStrings,             filament_start_gcode))
     ((ConfigOptionBool,                single_extruder_multi_material))
+    ((ConfigOptionInt,                 max_filament_colors))
     ((ConfigOptionBool,                manual_filament_change))
     ((ConfigOptionBool,                single_extruder_multi_material_priming))
     ((ConfigOptionEnum<ToolChangeOrderingType>, toolchange_ordering))
@@ -1887,6 +1895,7 @@ PRINT_CONFIG_CLASS_DERIVED_DEFINE(
     ((ConfigOptionFloats,             grab_length))
     ((ConfigOptionBool,                gcode_comments))
     ((ConfigOptionInt,                 slow_down_layers))
+    ((ConfigOptionPercents,            arc_overhang_cooling))
     ((ConfigOptionInts,                support_material_interface_fan_speed))
     ((ConfigOptionInts,                internal_bridge_fan_speed)) // ORCA: Add support for separate internal bridge fan speed control
     ((ConfigOptionInts,                ironing_fan_speed))
