@@ -215,6 +215,8 @@ enum class PrintOrder
 {
     Default,
     AsObjectList,
+    BestOfStrategies,    // run all custom strategies, pick the shortest total path
+    Snake,               // snake-like row traversal (back-and-forth) + 2-opt
     Count,
 };
 
@@ -1806,6 +1808,7 @@ PRINT_CONFIG_CLASS_DERIVED_DEFINE(
     ((ConfigOptionString,             filename_format))
     ((ConfigOptionStrings,            post_process))
     ((ConfigOptionStrings,            slicing_pipeline_plugin))
+    ((ConfigOptionString,             print_plugin_config_overrides))
     ((ConfigOptionString,             printer_model))
     ((ConfigOptionFloat,              resolution))
     ((ConfigOptionFloats,             retraction_minimum_travel))
