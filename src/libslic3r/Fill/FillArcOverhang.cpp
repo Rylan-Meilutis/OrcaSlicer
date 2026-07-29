@@ -1993,7 +1993,7 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
         // defects to the reference swept-disk work queue. Keeping the complete
         // centerline-shaped residual for every rejected fragment makes the
         // breadth-first search recursively chase thousands of sub-bead lanes.
-        actual_uncovered     = opening_ex(actual_uncovered, float(0.30 * spacing));
+        actual_uncovered     = opening_ex(actual_uncovered, float(0.15 * spacing));
         ExPolygons remaining = diff_ex(ExPolygons{expolygon}, primary_covered);
         append(remaining, std::move(actual_uncovered));
         remaining            = union_ex(remaining);
@@ -2012,7 +2012,7 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
                                              // its opened shape removes narrow
                                              // necks which may lead to a large
                                              // real uncovered lobe.
-                                             return opening_ex(ExPolygons{part}, float(0.30 * spacing)).empty();
+                                             return opening_ex(ExPolygons{part}, float(0.15 * spacing)).empty();
                                          }),
                           regions.end());
             std::sort(regions.begin(), regions.end(),
@@ -2088,7 +2088,7 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
                         const Vec2d sample = boundary.a.cast<double>() + t * (boundary.b - boundary.a).cast<double>();
                         const Point point(coord_t(std::lround(sample.x())), coord_t(std::lround(sample.y())));
                         const auto [distance, line_idx, nearest_point] = parent_index.distance_from_lines_extra<false>(point);
-                        if (distance > 1.10 * line_width)
+                        if (distance > 1.50 * line_width)
                             continue;
                         const Point parent_point(coord_t(std::lround(nearest_point.x())), coord_t(std::lround(nearest_point.y())));
                         const auto [boundary_distance, boundary_line_idx,
@@ -2102,7 +2102,7 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
                         }
                     }
                 }
-                if (nearest_distance > 1.10 * line_width)
+                if (nearest_distance > 1.50 * line_width)
                     continue;
 
                 Vec2d remaining_direction = (child_region_point - child_anchor).cast<double>();
@@ -2255,7 +2255,7 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
                 const ExPolygons substantial_missing =
                     opening_ex(
                         diff_ex(ideal_swept_area, deposited_area),
-                        float(0.50 * spacing));
+                        float(0.30 * spacing));
                 ExPolygons accepted_swept_area =
                     substantial_missing.empty() ?
                         std::move(ideal_swept_area) :
