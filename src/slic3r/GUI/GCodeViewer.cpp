@@ -1320,25 +1320,22 @@ void GCodeViewer::refresh_marker_model()
         return;
 
     const Preset& printer = preset_bundle->printers.get_edited_preset();
-    const Preset& print = preset_bundle->prints.get_edited_preset();
-    const auto* complete_objects_opt = print.config.opt<ConfigOptionBool>("complete_objects");
     const auto* printer_notes_opt = printer.config.opt<ConfigOptionString>("printer_notes");
     const auto* custom_geometry_opt = printer.config.opt<ConfigOptionString>("sequential_print_gantry_geometry");
     const auto* custom_model_opt = printer.config.opt<ConfigOptionString>("sequential_print_gantry_model");
-    const bool complete_objects = complete_objects_opt != nullptr && complete_objects_opt->value;
     const bool show_gantry_in_preview =
         get_app_config()->get("preview_tool_model") == "gantry";
     const std::string printer_notes = printer_notes_opt == nullptr ? std::string() : printer_notes_opt->value;
     const std::string custom_geometry = custom_geometry_opt == nullptr ? std::string() : custom_geometry_opt->value;
     const std::string custom_model = custom_model_opt == nullptr ? std::string() : custom_model_opt->value;
-    const std::string signature = printer.name + '\n' + print.name + '\n' +
-        (complete_objects ? "1\n" : "0\n") + (show_gantry_in_preview ? "1\n" : "0\n") +
+    const std::string signature = printer.name + '\n' +
+        (m_print_by_object ? "1\n" : "0\n") + (show_gantry_in_preview ? "1\n" : "0\n") +
         printer_notes + '\n' + custom_geometry + '\n' + custom_model;
     if (signature == m_marker_config_signature)
         return;
     m_marker_config_signature = signature;
 
-    if (complete_objects || show_gantry_in_preview) {
+    if (m_print_by_object || show_gantry_in_preview) {
         const SequentialGantryGeometry geometry = load_sequential_gantry_geometry(printer.config);
         if (!geometry.model_path.empty()) {
             std::pair<float, float> bed_x_bounds{ 0.0f, 0.0f };
@@ -1356,30 +1353,23 @@ void GCodeViewer::refresh_marker_model()
     }
 
     const VendorProfile::PrinterModel* system_model = PresetUtils::system_printer_model(printer);
-    const bool prusa_model_has_toolhead =
-        printer.vendor != nullptr && printer.vendor->id == "Prusa" &&
-        system_model != nullptr && !system_model->hotend_model.empty();
-    const bool notes_select_toolhead =
-        boost::algorithm::contains(printer_notes, "TOOLHEAD_MODEL");
-    if (!prusa_model_has_toolhead && !notes_select_toolhead) {
-        m_sequential_view.marker.clear();
-        return;
-    }
-
     std::string filename;
-    if (printer.is_system && system_model != nullptr && !system_model->hotend_model.empty()) {
+    if (system_model != nullptr) {
+        // system_printer_hotend_model() deliberately falls back to the bundled
+        // small nozzle when a printer (including the Prusa Core One family)
+        // does not provide a dedicated hotend asset.
         filename = PresetUtils::system_printer_hotend_model(printer);
     } else {
         const auto* printer_model = printer.config.opt<ConfigOptionString>("printer_model");
         if (printer_model != nullptr && !printer_model->value.empty())
             filename = preset_bundle->get_hotend_model_for_printer_model(printer_model->value);
-        if (filename.empty() && notes_select_toolhead)
-            filename = preset_bundle->get_hotend_model_for_printer_model(PresetBundle::ORCA_DEFAULT_PRINTER_MODEL);
     }
+
+    // "Nozzle only" is an explicit request for a tool-position marker. Keep
+    // it useful for custom and partially configured printers as well.
     if (filename.empty())
-        m_sequential_view.marker.clear();
-    else
-        m_sequential_view.marker.init(filename);
+        filename = resources_dir() + "/profiles/hotend.stl";
+    m_sequential_view.marker.init(filename);
 }
 
 void GCodeViewer::init(ConfigOptionMode mode, PresetBundle* preset_bundle)
@@ -1499,6 +1489,8 @@ void GCodeViewer::load_as_gcode(const GCodeProcessorResult& gcode_result, const 
                 const std::vector<BoundingBoxf3>& exclude_bounding_box, ConfigOptionMode mode, bool only_gcode)
 {
     m_loaded_as_preview = false;
+    const bool print_by_object =
+        print.config().print_sequence == PrintSequence::ByObject;
 
     const bool current_top_layer_only = m_viewer.is_top_layer_only_view_range();
     const bool required_top_layer_only = get_app_config()->get_bool("seq_top_layer_only");
@@ -1510,6 +1502,7 @@ void GCodeViewer::load_as_gcode(const GCodeProcessorResult& gcode_result, const 
 
     // avoid processing if called with the same gcode_result
     if (m_last_result_id == gcode_result.id && wxGetApp().is_editor()) {
+        m_print_by_object = print_by_object;
         //BBS: add logs
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": the same id %1%, return directly, result %2% ") % m_last_result_id % (&gcode_result);
 
@@ -1537,6 +1530,7 @@ void GCodeViewer::load_as_gcode(const GCodeProcessorResult& gcode_result, const 
 
     // release gpu memory, if used
     reset();
+    m_print_by_object = print_by_object;
 
     //BBS: add mutex for protection of gcode result
     wxGetApp().plater()->suppress_background_process(true);
@@ -1927,6 +1921,7 @@ void GCodeViewer::reset()
     m_last_result_id = -1;
     //BBS: add only gcode mode
     m_only_gcode_in_preview = false;
+    m_print_by_object = false;
 
     m_viewer.reset();
 

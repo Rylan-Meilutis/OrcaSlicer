@@ -199,6 +199,10 @@ private:
     std::array<float, static_cast<size_t>(EMoveType::Count)> m_move_type_distances{};
     //BBS: add only gcode mode
     bool m_only_gcode_in_preview {false};
+    // Captured from the Print that generated the currently loaded G-code.
+    // This includes per-plate overrides and is therefore more authoritative
+    // than the edited process preset while rendering the preview.
+    bool m_print_by_object {false};
 
     //BBS: extruder dispensing filament
     std::vector<ExtruderFilament> m_left_extruder_filament;
