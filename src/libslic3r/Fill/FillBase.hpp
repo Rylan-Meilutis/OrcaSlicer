@@ -100,6 +100,21 @@ struct FillParams
     // Regions backed by the preceding layer. Arc overhangs use this to start
     // their root family against a retained, supported wall.
     const           ExPolygons* arc_anchor_regions{ nullptr };
+    // Actual deposited perimeter footprint on the preceding layer. Prefer this
+    // narrower mask for the first arc family so it establishes its shape over
+    // a printed bead before entering free air.
+    const           ExPolygons* arc_root_anchor_regions{ nullptr };
+    // Centerlines of retained perimeter paths already scheduled before arc
+    // overhangs. Arc paths must terminate rather than cross these obstacles.
+    const           Polylines* arc_obstacle_paths{ nullptr };
+    // Arc paths accepted by earlier fill invocations on this layer. Fill
+    // surfaces and regions are generated independently, but their final
+    // toolpaths share one layer and must not cross one another.
+    Polylines*       arc_prior_paths{ nullptr };
+    // Narrow protected cores inside those perimeter beads. Keeping arc
+    // fragments out of this region prevents the G-code path chain from joining
+    // opposite-side fragments back across an existing perimeter.
+    const           ExPolygons* arc_obstacle_regions{ nullptr };
     bool            dont_sort{ false }; // do not sort the lines, just simply connect them
     bool            can_reverse{true};
 

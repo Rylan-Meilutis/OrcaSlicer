@@ -1230,6 +1230,7 @@ bool PrintObject::invalidate_state_by_config_options(
             || opt_key == "infill_wall_overlap"
             || opt_key == "top_bottom_infill_wall_overlap"
             || opt_key == "seam_gap"
+            || opt_key == "seam_start_on_inner_wall"
             || opt_key == "role_based_wipe_speed"
             || opt_key == "wipe_on_loops"
             || opt_key == "wipe_speed") {
@@ -1435,6 +1436,8 @@ bool PrintObject::invalidate_state_by_config_options(
                    opt_key == "arc_overhang_bridges" ||
                    opt_key == "arc_overhang_overhangs" ||
                    opt_key == "arc_overhang_recursive_fill" ||
+                   opt_key == "arc_overhang_overlap" ||
+                   opt_key == "arc_overhang_flow_ratio" ||
                    opt_key == "arc_overhang_bridge_distance" ||
                    opt_key == "arc_overhang_min_overhang_distance") {
             steps.emplace_back(posInfill);
@@ -1548,7 +1551,7 @@ bool PrintObject::invalidate_state_by_config_options(
             || opt_key == "bottom_solid_infill_flow_ratio"
             || opt_key == "outer_wall_flow_ratio"
             || opt_key == "inner_wall_flow_ratio"
-            || opt_key == "third_wall_flow_ratio"
+            || opt_key == "inner_walls_flow_ratio"
             || opt_key == "overhang_flow_ratio"
             || opt_key == "sparse_infill_flow_ratio"
             || opt_key == "internal_solid_infill_flow_ratio"
@@ -1556,7 +1559,6 @@ bool PrintObject::invalidate_state_by_config_options(
             || opt_key == "support_flow_ratio"
             || opt_key == "support_interface_flow_ratio"
             || opt_key == "support_interface_top_temperature"
-            || opt_key == "arc_overhang_flow_ratio"
             || opt_key == "arc_overhang_speed"
             || opt_key == "arc_overhang_stabilization_speed"
             || opt_key == "arc_overhang_layers"

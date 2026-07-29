@@ -6638,7 +6638,9 @@ std::string GCode::extrude_loop(const ExtrusionLoop&        loop_ref,
     float seam_overhang = std::numeric_limits<float>::lowest();
     if (!m_config.spiral_mode && description == "perimeter") {
         assert(m_layer != nullptr);
-        m_seam_placer.place_seam(m_layer, loop, last_pos, seam_overhang);
+        const bool stagger_inner_seam =
+            !(m_config.seam_start_on_inner_wall && loop.role() == erPerimeter && loop.inset_idx == 1);
+        m_seam_placer.place_seam(m_layer, loop, last_pos, seam_overhang, stagger_inner_seam);
     } else
         loop.split_at(last_pos, false);
 
@@ -6665,7 +6667,9 @@ std::string GCode::extrude_loop(const ExtrusionLoop&        loop_ref,
     const bool seam_gap_applied = enable_seam_slope || m_enable_loop_clipping;
     const double seam_gap_distance_mm = seam_gap_applied ? unscale_(seam_gap) : 0.0;
     double seam_scarf_distance_mm = 0.0;
-    const double clip_length = m_enable_loop_clipping && !enable_seam_slope ? seam_gap : 0;
+    double clip_length = m_enable_loop_clipping && !enable_seam_slope ? seam_gap : 0;
+    if (m_config.seam_start_on_inner_wall && loop.role() == erPerimeter && loop.inset_idx == 1)
+        clip_length = std::min(scale_(nozzle_diameter), loop.length() * 0.25);
 
     // get paths
     ExtrusionPaths paths;
@@ -6691,7 +6695,9 @@ std::string GCode::extrude_loop(const ExtrusionLoop&        loop_ref,
     // If region perimeters size not greater than or equal to 2, then skip the wipe inside move as we will extrude in mid air
     // as no neighbouring perimeter exists. If an internal perimeter exists, we should find 2 perimeters touching the de-retraction point
     // 1 - the currently printed external perimeter and 2 - the neighbouring internal perimeter.
-    if (m_config.wipe_before_external_loop.value && !paths.empty() && paths.front().size() > 1 && paths.back().size() > 1 && paths.front().role() == erExternalPerimeter && region_perimeters.size() > 1) {
+    if (m_config.wipe_before_external_loop.value && !m_config.seam_start_on_inner_wall &&
+        !paths.empty() && paths.front().size() > 1 && paths.back().size() > 1 &&
+        paths.front().role() == erExternalPerimeter && region_perimeters.size() > 1) {
         const bool is_full_loop_ccw = loop.polygon().is_counter_clockwise();
         bool is_hole_loop = (loop.loop_role() & ExtrusionLoopRole::elrHole) != 0;
         const double nozzle_diam = nozzle_diameter;
@@ -6765,6 +6771,106 @@ std::string GCode::extrude_loop(const ExtrusionLoop&        loop_ref,
         const bool is_small_small_perimeter = small_peri_speed > 0 && !is_bridge(path.role()) && is_perimeter(path.role());
         return is_small_small_perimeter ? small_peri_speed : speed;
     };
+
+    // Prepare only the external wall from the adjacent inner wall. The move
+    // performs the unretract inside the part but deposits no material across
+    // the wall gap, keeping the external seam at nominal width. The nearest
+    // point projection makes the transition leave the inner wall directly
+    // outwards. Reject ambiguous geometry where that short transition would
+    // intersect an inner wall anywhere except its starting point.
+    if (m_config.seam_start_on_inner_wall && paths.front().role() == erExternalPerimeter &&
+        !region_perimeters.empty()) {
+        Lines adjacent_inner_wall_lines;
+        Lines all_inner_wall_lines;
+        std::vector<const ExtrusionLoop *> adjacent_inner_wall_loops;
+        std::function<void(const ExtrusionEntity &)> collect_inner_walls;
+        collect_inner_walls = [&](const ExtrusionEntity &entity) {
+            if (const auto *collection = dynamic_cast<const ExtrusionEntityCollection *>(&entity)) {
+                for (const ExtrusionEntity *child : collection->entities)
+                    collect_inner_walls(*child);
+            } else if (entity.inset_idx > 0 && entity.role() == erPerimeter) {
+                if (entity.inset_idx == 1)
+                    if (const auto *inner_loop = dynamic_cast<const ExtrusionLoop *>(&entity))
+                        adjacent_inner_wall_loops.push_back(inner_loop);
+                Polylines polylines;
+                entity.collect_polylines(polylines);
+                for (const Polyline &polyline : polylines) {
+                    Lines lines = polyline.lines();
+                    append(all_inner_wall_lines, lines);
+                    if (entity.inset_idx == 1)
+                        append(adjacent_inner_wall_lines, std::move(lines));
+                }
+            }
+        };
+        for (const ExtrusionEntity *entity : region_perimeters)
+            collect_inner_walls(*entity);
+
+        if (!adjacent_inner_wall_lines.empty()) {
+            const Point outer_start = paths.front().first_point();
+            AABBTreeLines::LinesDistancer<Line> adjacent_inner_wall_distancer{adjacent_inner_wall_lines};
+            const auto [distance, line_idx, nearest] =
+                adjacent_inner_wall_distancer.distance_from_lines_extra<false>(outer_start);
+            const Point inner_start = nearest.cast<coord_t>();
+            const double max_transition_length = scale_(2.0 * nozzle_diameter);
+
+            if (line_idx != size_t(-1) && distance > scaled<double>(0.05) &&
+                distance <= max_transition_length) {
+                const ExtrusionLoop *source_inner_loop = nullptr;
+                double source_distance2 = std::numeric_limits<double>::max();
+                for (const ExtrusionLoop *candidate : adjacent_inner_wall_loops) {
+                    const Point candidate_point =
+                        candidate->get_closest_path_and_point(inner_start, false).foot_pt;
+                    const double candidate_distance2 =
+                        (candidate_point - inner_start).cast<double>().squaredNorm();
+                    if (candidate_distance2 < source_distance2) {
+                        source_distance2 = candidate_distance2;
+                        source_inner_loop = candidate;
+                    }
+                }
+
+                // The adjacent inner loop omits exactly this nozzle-length tail
+                // when it is emitted. Print that tail once here as the pressure
+                // preparation path, regardless of the selected wall order.
+                if (source_inner_loop != nullptr) {
+                    ExtrusionLoop primer_source = *source_inner_loop;
+                    primer_source.split_at(inner_start, false);
+                    primer_source.reverse();
+                    const double primer_length = std::min(
+                        scale_(nozzle_diameter), primer_source.length() * 0.25);
+                    ExtrusionPaths primer_paths;
+                    primer_source.clip_end(primer_source.length() - primer_length, &primer_paths);
+                    std::reverse(primer_paths.begin(), primer_paths.end());
+                    for (ExtrusionPath &primer_path : primer_paths) {
+                        primer_path.reverse();
+                        primer_path.inset_idx = 1;
+                        gcode += this->_extrude(
+                            primer_path, "outer wall seam prime", speed_for_path(primer_path));
+                    }
+                }
+
+                AABBTreeLines::LinesDistancer<Line> all_inner_wall_distancer{all_inner_wall_lines};
+                const Line transition(inner_start, outer_start);
+                const auto transition_intersections =
+                    all_inner_wall_distancer.intersections_with_line<true>(transition);
+                const double endpoint_tolerance2 = scaled<double>(0.01) * scaled<double>(0.01);
+                const bool transition_crosses_inner_wall = std::any_of(
+                    transition_intersections.begin(), transition_intersections.end(),
+                    [&](const auto &intersection) {
+                        return (intersection.first - inner_start).template cast<double>().squaredNorm() >
+                               endpoint_tolerance2;
+                    });
+
+                if (!transition_crosses_inner_wall) {
+                    ExtrusionPath seam_transition(
+                        Polyline3(Points3{Point3(inner_start), paths.front().first_point3()}),
+                        paths.front());
+                    seam_transition.set_force_no_extrusion(true);
+                    seam_transition.mm3_per_mm = 0.0;
+                    gcode += this->_extrude(seam_transition, "outer wall seam transition", speed_for_path(paths.front()));
+                }
+            }
+        }
+    }
 
     
     //Orca: Adaptive PA: calculate average mm3_per_mm value over the length of the loop.
@@ -7023,8 +7129,18 @@ std::string GCode::extrude_perimeters(const Print &print, const std::vector<Obje
                 continue;
             }
 
+            const int wall_loops = std::max(0, m_config.wall_loops.value);
+            const int replaced_inset =
+                wall_loops > 1 ? wall_loops - 1 : -1;
             std::function<void(const ExtrusionEntity &)> extrude_anchor_perimeters;
             extrude_anchor_perimeters = [&](const ExtrusionEntity &entity) {
+                // The arc surface is expanded through the innermost configured
+                // wall footprint. Do not emit that wall, or any extra overhang
+                // walls nested inside it: the arc must begin on the broad
+                // lower-layer runway exposed behind the retained outer shell.
+                if (replaced_inset > 0 &&
+                    entity.inset_idx >= replaced_inset)
+                    return;
                 if (const auto *path = dynamic_cast<const ExtrusionPath *>(&entity)) {
                     // Arc fill replaces every wall fragment that would itself
                     // need bridge/overhang extrusion. Supported fragments remain
@@ -7068,12 +7184,33 @@ std::string GCode::extrude_infill(const Print &print, const std::vector<ObjectBy
                     extrusions.emplace_back(ee);
             if (! extrusions.empty()) {
                 m_config.apply(print.get_print_region(&region - &by_region.front()).config());
-                chain_and_reorder_extrusion_entities(extrusions, m_last_pos.to_point());
+                // Different arc-overhang collections on the same layer share
+                // prior_arc_paths and may therefore depend on their generation
+                // order. Preserve that order just as we preserve paths inside
+                // each collection.
+                if (role_filter != erArcOverhang)
+                    chain_and_reorder_extrusion_entities(
+                        extrusions, m_last_pos.to_point());
                 for (const ExtrusionEntity *fill : extrusions) {
                     auto *eec = dynamic_cast<const ExtrusionEntityCollection*>(fill);
                     if (eec) {
-                        for (ExtrusionEntity *ee : eec->chained_path_from(m_last_pos.to_point()).entities)
-                            gcode += this->extrude_entity(*ee, extrusion_name);
+                        if (fill->role() == erArcOverhang && eec->no_sort) {
+                            // Arc families are dependency ordered: root arcs
+                            // precede large backbone arcs, which precede their
+                            // breadth-first children. chained_path_from() always
+                            // sorts its cloned children even when no_sort is set,
+                            // so using it here can print a recursive child before
+                            // the arc that supports its lead-in.
+                            for (const ExtrusionEntity *ee : eec->entities)
+                                gcode += this->extrude_entity(
+                                    *ee, extrusion_name);
+                        } else {
+                            for (ExtrusionEntity *ee :
+                                 eec->chained_path_from(
+                                     m_last_pos.to_point()).entities)
+                                gcode += this->extrude_entity(
+                                    *ee, extrusion_name);
+                        }
                     } else
                         gcode += this->extrude_entity(*fill, extrusion_name);
                 }
@@ -7460,8 +7597,6 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
         _mm3_per_mm *= m_config.bottom_solid_infill_flow_ratio;
     } else if (path.role() == erInternalBridgeInfill) {
         _mm3_per_mm *= m_config.internal_bridge_flow;
-    } else if (path.role() == erArcOverhang) {
-        _mm3_per_mm *= m_config.arc_overhang_flow_ratio;
     } else if (path.role() == erBrim) {
         _mm3_per_mm *= m_config.brim_flow_ratio;
     } else if (sloped) {
@@ -7503,10 +7638,16 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                                [](const Surface &surface) { return surface.is_bridge(); });
         });
     // Bridge layers retain their bridge-calculated flow. Deeper-wall
-    // reinforcement starts only on a later, normally supported layer.
-    if (!this->on_first_layer() && !layer_has_top_surface && !layer_has_bridge_surface &&
-        m_config.wall_loops.value >= 3 && path.role() == erPerimeter && path.inset_idx >= 2)
-        _mm3_per_mm *= m_config.third_wall_flow_ratio;
+    // reinforcement starts only on a later, normally supported layer. Keep
+    // both the outermost and innermost walls at normal flow; only walls
+    // between those boundaries receive the additional material.
+    const bool use_inner_walls_flow =
+        !this->on_first_layer() && !layer_has_top_surface && !layer_has_bridge_surface &&
+        m_config.wall_loops.value >= 3 && path.role() == erPerimeter &&
+        path.inset_idx > 0 && path.inset_idx < m_config.wall_loops.value - 1;
+    const double inner_walls_flow = m_config.inner_walls_flow_ratio.get_abs_value(1.);
+    if (use_inner_walls_flow)
+        _mm3_per_mm *= inner_walls_flow;
 
     // Effective extrusion length per distance unit = (filament_flow_ratio/cross_section) * mm3_per_mm / print flow ratio
     // m_writer.extruder()->e_per_mm3() below is (filament flow ratio / cross-sectional area)
@@ -7797,8 +7938,18 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
         gcode += buf;
     }
 
-    if (last_was_wipe_tower || m_last_width != path.width) {
-        m_last_width = path.width;
+    // The third-wall ratio is applied while emitting G-code rather than while
+    // generating perimeter geometry. Give the preview an equal-area strand at
+    // the planned layer height so it shows the additional material as a wider
+    // line instead of retaining the unadjusted path width.
+    float processor_width = path.width;
+    if (use_inner_walls_flow && path.height > EPSILON) {
+        const double extra_area =
+            path.mm3_per_mm * (inner_walls_flow - 1.);
+        processor_width = float(std::max<double>(path.height, path.width + extra_area / path.height));
+    }
+    if (last_was_wipe_tower || m_last_width != processor_width) {
+        m_last_width = processor_width;
         sprintf(buf, ";%s%g\n", GCodeProcessor::reserved_tag(GCodeProcessor::ETags::Width).c_str(), m_last_width);
         gcode += buf;
     }
@@ -8024,7 +8175,9 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
             }
             // BBS: use G1 if not enable arc fitting or has no arc fitting result or in spiral_mode mode or we are doing sloped extrusion
             // Attention: G2 and G3 is not supported in spiral_mode mode
-            if (!m_config.enable_arc_fitting || path.polyline.fitting_result.empty() || m_config.spiral_mode || sloped != nullptr || path.z_contoured) {
+            if (!m_config.enable_arc_fitting || path.role() == erArcOverhang ||
+                path.polyline.fitting_result.empty() || m_config.spiral_mode ||
+                sloped != nullptr || path.z_contoured) {
                 double path_length = 0.;
                 double total_length = sloped == nullptr ? 0. : path.polyline.length() * SCALING_FACTOR;
                 double saved_z      = m_writer.get_position().z();

@@ -53,6 +53,17 @@ endfunction()
 
 # Register Catch2 tags as CTest labels so `ctest -L`/`-LE` can filter by tag.
 function(orcaslicer_discover_tests TARGET)
+    if (APPLE AND XCODE)
+        # CMake disables Xcode code signing for local test app bundles, which
+        # also passes -no_adhoc_codesign to ld. Recent macOS releases kill those
+        # unsigned arm64 executables before Catch2 can enumerate their tests.
+        # Sign the Mach-O itself before catch_discover_tests adds its post-build
+        # discovery command; the packaged OrcaSlicer app is signed separately.
+        add_custom_command(TARGET ${TARGET} POST_BUILD
+            COMMAND /usr/bin/codesign --force --sign - "$<TARGET_FILE:${TARGET}>"
+            COMMENT "Ad-hoc signing ${TARGET} for Catch2 test discovery"
+            VERBATIM)
+    endif()
     catch_discover_tests(${TARGET} ADD_TAGS_AS_LABELS)
 endfunction()
 
@@ -62,5 +73,4 @@ add_subdirectory(slic3rutils)
 add_subdirectory(fff_print)
 add_subdirectory(sla_print)
 add_subdirectory(filament_group)
-
 

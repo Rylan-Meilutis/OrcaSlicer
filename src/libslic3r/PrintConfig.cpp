@@ -1571,14 +1571,28 @@ void PrintConfigDef::init_fff_params()
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionBool(true));
 
-    def = this->add("arc_overhang_flow_ratio", coFloat);
-    def->label = L("Arc overhang flow ratio");
+    def = this->add("arc_overhang_overlap", coPercent);
+    def->label = L("Arc line overlap");
     def->category = L("Quality");
-    def->tooltip = L("Flow multiplier used for arc-overhang paths.");
-    def->min = 0.1;
-    def->max = 2;
+    // xgettext:no-c-format, no-boost-format
+    def->tooltip = L("Reduces the center-to-center spacing between adjacent arc-overhang lines so free-air extrusions overlap and bond. "
+                     "The percentage is relative to the arc line width. Use a small value to compensate for arc lines remaining round instead of being squished against a lower layer.");
+    def->sidetext = "%";
+    def->ratio_over = "bridge_line_width";
+    def->min = 0;
+    def->max = 50;
     def->mode = comAdvanced;
-    def->set_default_value(new ConfigOptionFloat(1));
+    def->set_default_value(new ConfigOptionPercent(0));
+
+    def = this->add("arc_overhang_flow_ratio", coPercent);
+    def->label = L("Arc overhang flow");
+    def->category = L("Quality");
+    def->tooltip = L("Flow used for arc-overhang paths, as a percentage of the normal bridge flow.");
+    def->sidetext = "%";
+    def->min = 10;
+    def->max = 200;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionPercent(100));
 
     def = this->add("arc_overhang_speed", coFloat);
     def->label = L("Arc layer speed");
@@ -1711,20 +1725,21 @@ void PrintConfigDef::init_fff_params()
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionFloat(1));
 
-    def = this->add("third_wall_flow_ratio", coFloat);
-    def->label = L("Thicker inner wall flow ratio");
+    def = this->add("inner_walls_flow_ratio", coPercent);
+    def->label = L("Thicker inner wall flow");
     def->category = L("Strength");
-    def->tooltip = L("Adds material to the third wall and every wall farther inside the part. "
-                     "The outer wall and first inner wall are printed normally for dimensional accuracy, while deeper walls may be "
-                     "over-extruded to interlock adjacent layers and improve inter-layer adhesion. This setting has no effect unless "
-                     "at least three walls fit. Values above 1.00 enforce an outside-in order on the first layer and Inner/Outer/Inner "
-                     "ordering on later layers so the thicker walls cannot displace the dimension-controlling walls.\n\n"
-                     "The value is multiplied by the normal flow for these walls. Start with a small increase; excessive flow may cause "
+    def->tooltip = L("Adds material to walls between the outermost and innermost walls. "
+                     "Both boundary walls retain normal flow: the outermost wall preserves dimensional accuracy and the innermost wall "
+                     "preserves the intended boundary with infill. With three walls, only the middle wall is thickened. This setting has "
+                     "no effect unless at least three walls fit. Values above 100% enforce an outside-in order on the first layer and "
+                     "Inner/Outer/Inner ordering on later layers so the thicker walls cannot displace the boundary walls.\n\n"
+                     "The percentage is applied to the normal flow for intermediate walls. Start with a small increase; excessive flow may cause "
                      "overfill or surface artifacts.");
+    def->sidetext = "%";
     def->min = 0;
-    def->max = 2;
+    def->max = 200;
     def->mode = comAdvanced;
-    def->set_default_value(new ConfigOptionFloat(1));
+    def->set_default_value(new ConfigOptionPercent(100));
 
     def = this->add("overhang_flow_ratio", coFloat);
     def->label = L("Overhang flow ratio");
@@ -6203,6 +6218,16 @@ void PrintConfigDef::init_fff_params()
     def->tooltip = L("This option causes the inner seams to be shifted backwards based on their depth, forming a zigzag pattern.");
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionBool(false));
+
+    def = this->add("seam_start_on_inner_wall", coBool);
+    def->label = L("Start seam on inner wall");
+    def->category = L("Quality");
+    def->tooltip = L("For two or more walls, prepare the outer-wall seam on the adjacent inner-wall line, then move directly "
+                     "outwards without extruding across the wall gap. The selected wall sequence is preserved, and the "
+                     "transition is rejected if it would cross an inner-wall line. This restores pressure inside the part "
+                     "so the dimensional outer wall starts once at normal flow without a thick seam spot.");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionBool(false));
     
     def = this->add("seam_gap", coFloatOrPercent);
     def->label = L("Seam gap");
@@ -9031,8 +9056,22 @@ void PrintConfigDef::init_sla_params()
 void PrintConfigDef::handle_legacy(t_config_option_key &opt_key, std::string &value)
 {
     //BBS: handle legacy options
+    if (opt_key == "third_wall_flow_ratio")
+        opt_key = "inner_walls_flow_ratio";
+
     if (opt_key == "curr_bed_type" && value == "SuperTack Plate") {
         value = "Supertack Plate";
+    } else if ((opt_key == "arc_overhang_flow_ratio" || opt_key == "inner_walls_flow_ratio") &&
+               value.find('%') == std::string::npos) {
+        // This option was stored as a unitless multiplier before it became a
+        // percentage. Preserve existing process presets and 3MF projects while
+        // leaving new, already percentage-scaled numeric values unchanged.
+        try {
+            const double legacy_ratio = boost::lexical_cast<double>(value);
+            if (legacy_ratio >= 0. && legacy_ratio <= 2.)
+                value = float_to_string_decimal_point(legacy_ratio * 100.) + "%";
+        } catch (const boost::bad_lexical_cast &) {
+        }
     } else if (opt_key == "enable_wipe_tower") {
         opt_key = "enable_prime_tower";
     } else if (opt_key == "wipe_tower_width") {

@@ -2741,6 +2741,7 @@ void TabPrint::build()
         optgroup = page->new_optgroup(L("Seam"), L"param_seam");
         optgroup->append_single_option_line("seam_position", "quality_settings_seam#seam-position");
         optgroup->append_single_option_line("staggered_inner_seams", "quality_settings_seam#staggered-inner-seams");
+        optgroup->append_single_option_line("seam_start_on_inner_wall");
         optgroup->append_single_option_line("seam_gap","quality_settings_seam#seam-gap");
         optgroup->append_single_option_line("seam_slope_type", "quality_settings_seam#scarf-joint-seam");
         optgroup->append_single_option_line("seam_slope_conditional", "quality_settings_seam#scarf-joint-seam");
@@ -2851,6 +2852,7 @@ void TabPrint::build()
         optgroup->append_single_option_line("arc_overhang_bridges");
         optgroup->append_single_option_line("arc_overhang_overhangs");
         optgroup->append_single_option_line("arc_overhang_recursive_fill");
+        optgroup->append_single_option_line("arc_overhang_overlap");
         optgroup->append_single_option_line("arc_overhang_flow_ratio");
         optgroup->append_single_option_line("arc_overhang_speed");
         optgroup->append_single_option_line("arc_overhang_stabilization_speed");
@@ -2877,7 +2879,7 @@ void TabPrint::build()
         optgroup->append_single_option_line("detect_thin_wall", "strength_settings_walls#detect-thin-wall");
 
         optgroup = page->new_optgroup(L("Thicker inner walls"), L"param_wall");
-        optgroup->append_single_option_line("third_wall_flow_ratio");
+        optgroup->append_single_option_line("inner_walls_flow_ratio");
 
         optgroup = page->new_optgroup(L("Top/bottom shells"), L"param_shell");
 
@@ -7750,11 +7752,9 @@ void Tab::edit_user_profile()
     if (target_tab == nullptr)
         return;
 
-    // This is an explicit editing action, so expose incompatible profiles in
-    // the editor without changing their compatibility rules.
-    target_tab->m_show_incompatible_presets = true;
-    if (target_tab->m_presets_choice != nullptr)
-        target_tab->m_presets_choice->set_show_incompatible_presets(true);
+    // Open only the explicitly selected profile. TabPresetComboBox keeps the
+    // current selection visible even when it is incompatible, so there is no
+    // need to expose every incompatible profile in the normal selector.
     if (wxGetApp().mainframe != nullptr)
         wxGetApp().mainframe->select_tab(target_tab);
     target_tab->select_preset(selected.name, false, std::string(), false, true);

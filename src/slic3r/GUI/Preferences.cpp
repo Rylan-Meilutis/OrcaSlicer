@@ -1914,13 +1914,16 @@ void PreferencesDialog::create_items()
     );
     g_sizer->Add(item_dim_previous_layers);
 
-    auto item_show_gantry_model = create_item_checkbox(
-        _L("Show printer gantry in G-code preview"),
-        _L("Show the printer's gantry model at the current tool position in G-code preview. "
-           "This is always used for by-object printing and may also be enabled for normal layer-by-layer preview."),
-        "preview_show_gantry_model"
+    auto item_preview_tool_model = create_item_combobox(
+        _L("Tool model in G-code preview"),
+        _L("Choose whether normal G-code preview shows only the nozzle/toolhead "
+           "or the complete printer gantry. By-object printing always shows the "
+           "complete gantry."),
+        "preview_tool_model",
+        {_L("Nozzle only"), _L("Full gantry")},
+        {"nozzle", "gantry"}
     );
-    g_sizer->Add(item_show_gantry_model);
+    g_sizer->Add(item_preview_tool_model);
 
     g_sizer->AddSpacer(FromDIP(10));
     sizer_page->Add(g_sizer, 0, wxEXPAND);

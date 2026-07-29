@@ -91,6 +91,7 @@ public:
             void clear();
 
             const BoundingBoxf3& get_bounding_box() const { return m_model.get_bounding_box(); }
+            bool has_model() const { return m_model.is_initialized(); }
             bool is_gantry_model() const { return m_is_gantry_model; }
 
             void set_world_position(const Vec3f& position) { m_world_position = position; }

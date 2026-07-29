@@ -359,12 +359,15 @@ struct SurfaceFill {
 
 	size_t 				region_id;
 	Surface 			surface;
-	ExPolygons       	expolygons;
+    ExPolygons       	expolygons;
 	SurfaceFillParams	params;
     // BBS
     std::vector<size_t> region_id_group;
     ExPolygons          no_overlap_expolygons;
     ExPolygons          arc_anchor_regions;
+    ExPolygons          arc_root_anchor_regions;
+    Polylines           arc_obstacle_paths;
+    ExPolygons          arc_obstacle_regions;
 };
 
 
@@ -1117,6 +1120,16 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
 					//Orca: enable thick bridge based on config
 					layerm.bridging_flow(extrusion_role, is_thick_bridge) :
 					layerm.flow(extrusion_role, (surface.thickness == -1) ? layer.height : surface.thickness);
+                if (params.extrusion_role == erArcOverhang) {
+                    // Keep arc paths at the normal perimeter width. Representing
+                    // reduced free-air volume by shrinking the path width may
+                    // request a strand narrower than the nozzle and makes both
+                    // spacing and preview misleading. FillBase applies the
+                    // arc-specific volume percentage independently.
+                    const Flow perimeter_flow = layerm.flow(frPerimeter);
+                    params.flow = Flow::bridging_flow(
+                        perimeter_flow.width(), perimeter_flow.nozzle_diameter());
+                }
 
 				params.role_speed = 0;
                 if (params.extrusion_role == erBridgeInfill)
@@ -1222,6 +1235,70 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
         supported = layer.lower_layer->lslices;
     append(supported, support_below);
     supported = union_ex(supported);
+
+    // Arc layers keep the outer wall stack as a dimensional shell, but replace
+    // the innermost configured wall (and any extra overhang walls inside it).
+    // That exposes a lower-layer runway wide enough for the first arc to be
+    // deposited fully supported before it grows across the opening. Build one
+    // layer-wide obstacle set here: a fill may be grouped across regions, and
+    // considering only its primary region allowed arcs to cross walls emitted
+    // by another region on the same layer.
+    std::vector<bool> arc_regions(layer.regions().size(), false);
+    for (const SurfaceFill &fill : surface_fills) {
+        if (fill.params.extrusion_role != erArcOverhang)
+            continue;
+        for (const size_t region_id : fill.region_id_group)
+            if (region_id < arc_regions.size())
+                arc_regions[region_id] = true;
+    }
+
+    Polylines layer_arc_obstacle_paths;
+    Polygons layer_retained_perimeter_coverage;
+    std::function<void(const ExtrusionEntity &, int)> collect_retained_perimeters;
+    collect_retained_perimeters =
+        [&](const ExtrusionEntity &entity, int replaced_inset) {
+            if (replaced_inset > 0 && entity.inset_idx >= replaced_inset)
+                return;
+            if (const auto *collection =
+                    dynamic_cast<const ExtrusionEntityCollection *>(&entity)) {
+                for (const ExtrusionEntity *child : collection->entities)
+                    collect_retained_perimeters(*child, replaced_inset);
+            } else if (const auto *multipath =
+                           dynamic_cast<const ExtrusionMultiPath *>(&entity)) {
+                for (const ExtrusionPath &path : multipath->paths)
+                    collect_retained_perimeters(path, replaced_inset);
+            } else if (const auto *loop =
+                           dynamic_cast<const ExtrusionLoop *>(&entity)) {
+                for (const ExtrusionPath &path : loop->paths)
+                    collect_retained_perimeters(path, replaced_inset);
+            } else if (entity.role() != erOverhangPerimeter) {
+                entity.collect_polylines(layer_arc_obstacle_paths);
+                entity.polygons_covered_by_width(
+                    layer_retained_perimeter_coverage,
+                    float(SCALED_EPSILON));
+            }
+        };
+    for (size_t region_id = 0; region_id < layer.regions().size(); ++region_id) {
+        const LayerRegion &perimeter_region = *layer.regions()[region_id];
+        const int wall_loops =
+            std::max(0, int(perimeter_region.region().config().wall_loops));
+        const int replaced_inset =
+            arc_regions[region_id] && wall_loops > 1 ? wall_loops - 1 : -1;
+        collect_retained_perimeters(
+            perimeter_region.perimeters, replaced_inset);
+    }
+
+    ExPolygons previous_layer_perimeter_beads;
+    if (layer.lower_layer != nullptr) {
+        Polygons previous_layer_perimeter_coverage;
+        for (const LayerRegion *lower_region : layer.lower_layer->regions())
+            lower_region->perimeters.polygons_covered_by_width(
+                previous_layer_perimeter_coverage,
+                float(SCALED_EPSILON));
+        if (!previous_layer_perimeter_coverage.empty())
+            previous_layer_perimeter_beads =
+                union_ex(previous_layer_perimeter_coverage);
+    }
     for (SurfaceFill &fill : surface_fills) {
         if (fill.params.extrusion_role != erArcOverhang || fill.expolygons.empty())
             continue;
@@ -1240,12 +1317,93 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
         }
 
         if (!supported.empty()) {
-            // Include the printable wall width around lower-layer support. The
-            // intersection's inner edge is where a retained supported wall
-            // transitions into the unsupported arc replacement.
-            fill.arc_anchor_regions = intersection_ex(
-                fill.expolygons,
-                offset_ex(supported, 0.5f * layerm.flow(frPerimeter).scaled_width()));
+            const coord_t perimeter_width = layerm.flow(frPerimeter).scaled_width();
+            const ExPolygons supported_wall = intersection_ex(
+                layerm.slices.surfaces,
+                offset_ex(supported, 0.5f * perimeter_width));
+            if (!previous_layer_perimeter_beads.empty()) {
+                // Keep the root on a bead that was actually emitted on the
+                // preceding layer. The broader supported-wall mask remains
+                // available for later arcs and for models where no lower
+                // perimeter intersects this bridge.
+                fill.arc_root_anchor_regions = intersection_ex(
+                    supported_wall, previous_layer_perimeter_beads);
+            }
+
+            // The ordinary fill surface stops roughly one perimeter spacing
+            // before the retained wall. Add the complete runway between that
+            // inset and the supported bead; adding only the final overlap would
+            // leave it as a disconnected island and the arc generator would
+            // continue to seed from the unsupported fill edge.
+            const coord_t anchor_runway_depth =
+                layerm.flow(frPerimeter).scaled_spacing();
+            ExPolygons anchor_runways = intersection_ex(
+                offset_ex(fill.expolygons, float(anchor_runway_depth)),
+                offset_ex(supported_wall, float(anchor_runway_depth)));
+            anchor_runways = intersection_ex(
+                anchor_runways, to_expolygons(layerm.slices.surfaces));
+            fill.arc_anchor_regions = intersection_ex(anchor_runways, supported_wall);
+            if (!fill.arc_anchor_regions.empty()) {
+                append(fill.expolygons, std::move(anchor_runways));
+                fill.expolygons = union_ex(fill.expolygons);
+            }
+        }
+
+        // Perimeters are generated before fills and arc anchors are emitted
+        // before the arcs. Preserve every centerline that will actually be
+        // emitted anywhere on this layer as a hard obstacle.
+        fill.arc_obstacle_paths = layer_arc_obstacle_paths;
+        if (!layer_retained_perimeter_coverage.empty()) {
+            const ExPolygons perimeter_beads =
+                union_ex(layer_retained_perimeter_coverage);
+            const coord_t arc_width =
+                std::max<coord_t>(1, fill.params.flow.scaled_width());
+            const double overlap_ratio = 0.01 * std::clamp(
+                layerm.region().config().arc_overhang_overlap.value,
+                0., 50.);
+            const coord_t perimeter_clearance =
+                std::max<coord_t>(
+                    0, coord_t(std::lround(
+                           0.5 * double(arc_width) -
+                           overlap_ratio * double(arc_width))));
+            // Clip arc centerlines far enough from a retained wall that the
+            // deposited beads have only the configured overlap. Protecting
+            // merely the wall center allowed a 0.45 mm arc to track a 0.45 mm
+            // perimeter only 0.12 mm away around a corner, laying most of one
+            // extrusion on top of the other without a centerline crossing.
+            ExPolygons perimeter_cores = offset_ex(
+                perimeter_beads, float(perimeter_clearance));
+            fill.arc_obstacle_regions = perimeter_cores;
+
+            // A fill surface may be more than half a line width away from the
+            // innermost retained perimeter. Grow a connected runway to the
+            // contact band before clipping the protected bead footprint.
+            const coord_t anchor_runway_depth =
+                layerm.flow(frPerimeter).scaled_spacing();
+            ExPolygons perimeter_runways = intersection_ex(
+                offset_ex(fill.expolygons, float(anchor_runway_depth)),
+                offset_ex(perimeter_beads, float(anchor_runway_depth)));
+            perimeter_runways = intersection_ex(
+                perimeter_runways, to_expolygons(layerm.slices.surfaces));
+            const ExPolygons perimeter_contact_extent = offset_ex(
+                perimeter_beads, 0.5f * float(arc_width));
+            const ExPolygons perimeter_anchor_rims =
+                diff_ex(perimeter_contact_extent, perimeter_cores);
+            ExPolygons perimeter_anchors = intersection_ex(
+                perimeter_runways, perimeter_anchor_rims);
+            if (!perimeter_anchors.empty()) {
+                // The bead is printable support after the perimeter-first pass.
+                append(fill.arc_anchor_regions, perimeter_anchors);
+                fill.arc_anchor_regions = union_ex(fill.arc_anchor_regions);
+            }
+            if (!perimeter_runways.empty()) {
+                // Keep the connected approach even when safety-offset
+                // quantization removes the very thin bead-rim intersection.
+                // Final path validation still requires the emitted arc to be
+                // within one extrusion width of the real perimeter centerline.
+                append(fill.expolygons, std::move(perimeter_runways));
+                fill.expolygons = union_ex(fill.expolygons);
+            }
         }
     }
 
@@ -1420,6 +1578,7 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
 #endif /* SLIC3R_DEBUG_SLICE_PROCESSING */
     LockRegionParam lock_param;
     std::vector<SurfaceFill>     surface_fills = group_fills(*this, lock_param);
+    Polylines                    prior_arc_paths;
 	const Slic3r::BoundingBox bbox 			= this->object()->bounding_box();
 	const auto                resolution 	= this->object()->print()->config().resolution.value;
 
@@ -1500,6 +1659,11 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
         auto &region_config = layerm->region().config();
         params.config               = &region_config;
         params.arc_anchor_regions   = &surface_fill.arc_anchor_regions;
+        params.arc_root_anchor_regions =
+            &surface_fill.arc_root_anchor_regions;
+        params.arc_obstacle_paths   = &surface_fill.arc_obstacle_paths;
+        params.arc_prior_paths      = &prior_arc_paths;
+        params.arc_obstacle_regions = &surface_fill.arc_obstacle_regions;
         params.pattern              = surface_fill.params.pattern;
         params.fill_order           = surface_fill.params.fill_order;
 

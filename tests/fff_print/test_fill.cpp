@@ -2,9 +2,11 @@
 
 #include <algorithm>
 #include <cmath>
+#include <fstream>
 #include <limits>
 #include <map>
 #include <numeric>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -37,7 +39,20 @@ static bool print_has_arc_overhang(const Print &print)
     return false;
 }
 
-static bool arc_paths_have_proper_crossing(const Polylines &paths)
+static std::optional<ExtrusionPath> first_arc_overhang_path(const Print &print)
+{
+    for (const PrintObject *object : print.objects())
+        for (const Layer *layer : object->layers())
+            for (const LayerRegion *region : layer->regions())
+                for (const ExtrusionEntity *entity : region->fills.flatten().entities)
+                    if (const auto *path = dynamic_cast<const ExtrusionPath *>(entity);
+                        path != nullptr && path->role() == erArcOverhang && path->mm3_per_mm > 0.)
+                        return *path;
+    return std::nullopt;
+}
+
+static bool arc_paths_have_proper_crossing(const Polylines &paths,
+                                           std::string *details = nullptr)
 {
     struct PathLine {
         Line line;
@@ -72,21 +87,248 @@ static bool arc_paths_have_proper_crossing(const Polylines &paths)
             if (std::abs(denominator) <= std::numeric_limits<double>::epsilon())
                 continue;
             const double first_position = cross(q - p, s) / denominator;
-            const double second_position = cross(q - p, r) / denominator;
-            const double first_endpoint_distance =
-                std::min(std::abs(first_position), std::abs(1. - first_position)) * r.norm();
-            const double second_endpoint_distance =
-                std::min(std::abs(second_position), std::abs(1. - second_position)) * s.norm();
-            const double endpoint_epsilon = scale_(0.001);
+            const double second_position      = cross(q - p, r) / denominator;
+            const auto path_endpoint_distance = [&paths, &intersection](size_t path_idx) {
+                return std::min((intersection - paths[path_idx].first_point()).cast<double>().norm(),
+                                (intersection - paths[path_idx].last_point()).cast<double>().norm());
+            };
+            const double first_endpoint_distance  = path_endpoint_distance(first.path_idx);
+            const double second_endpoint_distance = path_endpoint_distance(second.path_idx);
+            // Parent/child arcs intentionally meet at a path endpoint. Arc
+            // fitting and three-decimal G-code coordinates can move the
+            // centerline intersection away from that endpoint, but it remains
+            // an anchored T-junction while it lies within half of the standard
+            // 0.45 mm deposited bead. An intersection farther into both
+            // complete paths is a real crossing.
+            const double endpoint_epsilon = scale_(0.225);
             // A child arc is allowed to terminate on its supporting parent.
-            // Only an intersection in the interior of both segments means
-            // extrusion actually continues across an existing path.
-            if (first_endpoint_distance > endpoint_epsilon &&
-                second_endpoint_distance > endpoint_epsilon)
+            // Only an intersection in the interior of both complete paths
+            // means extrusion actually continues across an existing path.
+            if (first_endpoint_distance > endpoint_epsilon && second_endpoint_distance > endpoint_epsilon) {
+                if (details != nullptr) {
+                    std::ostringstream message;
+                    message << "paths " << first.path_idx << "/" << second.path_idx << ", segments " << first.line_idx << "/"
+                            << second.line_idx << ", intersection " << unscale<double>(intersection.x()) << ","
+                            << unscale<double>(intersection.y()) << ", endpoint distances " << unscale<double>(first_endpoint_distance)
+                            << "/" << unscale<double>(second_endpoint_distance) << " mm";
+                    *details = message.str();
+                }
                 return true;
+            }
         }
     }
     return false;
+}
+
+static bool arc_paths_cross_obstacles(const Polylines &arcs,
+                                      const Polylines &obstacles,
+                                      std::string *details = nullptr)
+{
+    for (size_t arc_idx = 0; arc_idx < arcs.size(); ++arc_idx) {
+        const Polyline &arc = arcs[arc_idx];
+        for (size_t arc_line_idx = 1;
+             arc_line_idx < arc.points.size(); ++arc_line_idx) {
+            const Line arc_line(
+                arc.points[arc_line_idx - 1], arc.points[arc_line_idx]);
+            for (size_t obstacle_idx = 0;
+                 obstacle_idx < obstacles.size(); ++obstacle_idx) {
+                const Polyline &obstacle = obstacles[obstacle_idx];
+                for (size_t obstacle_line_idx = 1;
+                     obstacle_line_idx < obstacle.points.size();
+                     ++obstacle_line_idx) {
+                    const Line obstacle_line(
+                        obstacle.points[obstacle_line_idx - 1],
+                        obstacle.points[obstacle_line_idx]);
+                    Point intersection;
+                    if (!arc_line.intersection(
+                            obstacle_line, &intersection))
+                        continue;
+                    const double arc_endpoint_distance = std::min(
+                        (intersection - arc.first_point())
+                            .cast<double>().norm(),
+                        (intersection - arc.last_point())
+                            .cast<double>().norm());
+                    // An arc may begin or terminate on a retained wall. Any
+                    // intersection farther into the arc means the nozzle
+                    // extrudes through that already printed perimeter.
+                    if (arc_endpoint_distance <= scale_(0.05))
+                        continue;
+                    if (details != nullptr) {
+                        std::ostringstream message;
+                        message << "arc " << arc_idx << " segment "
+                                << arc_line_idx - 1 << " crosses obstacle "
+                                << obstacle_idx << " segment "
+                                << obstacle_line_idx - 1 << " at "
+                                << unscale<double>(intersection.x()) << ","
+                                << unscale<double>(intersection.y())
+                                << ", arc endpoint distance "
+                                << unscale<double>(arc_endpoint_distance)
+                                << " mm";
+                        *details = message.str();
+                    }
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+static bool arc_paths_track_obstacles(const Polylines &arcs,
+                                      const Polylines &obstacles,
+                                      coord_t minimum_centerline_clearance,
+                                      coord_t allowed_endpoint_lead,
+                                      std::string *details = nullptr)
+{
+    const Lines obstacle_lines = to_lines(obstacles);
+    const double sample_step = scale_(0.05);
+    for (size_t arc_idx = 0; arc_idx < arcs.size(); ++arc_idx) {
+        const Polyline &arc = arcs[arc_idx];
+        const double total_length = arc.length();
+        double path_position = 0.;
+        for (size_t line_idx = 1; line_idx < arc.points.size(); ++line_idx) {
+            const Point &start = arc.points[line_idx - 1];
+            const Point &end = arc.points[line_idx];
+            const Vec2d delta = (end - start).cast<double>();
+            const double length = delta.norm();
+            const size_t samples = std::max<size_t>(
+                1, size_t(std::ceil(length / sample_step)));
+            for (size_t sample_idx = 0; sample_idx <= samples; ++sample_idx) {
+                const double segment_position =
+                    double(sample_idx) / double(samples);
+                const double position =
+                    path_position + segment_position * length;
+                if (position <= allowed_endpoint_lead ||
+                    total_length - position <= allowed_endpoint_lead)
+                    continue;
+                const Vec2d sample =
+                    start.cast<double>() + segment_position * delta;
+                const Point point(coord_t(std::lround(sample.x())),
+                                  coord_t(std::lround(sample.y())));
+                const double clearance_squared = std::accumulate(
+                    obstacle_lines.begin(), obstacle_lines.end(),
+                    std::numeric_limits<double>::max(),
+                    [&point](double nearest, const Line &obstacle) {
+                        return std::min(
+                            nearest,
+                            obstacle.distance_to_squared(point));
+                    });
+                if (clearance_squared >=
+                    double(minimum_centerline_clearance) *
+                        double(minimum_centerline_clearance))
+                    continue;
+                if (details != nullptr) {
+                    std::ostringstream message;
+                    message << "arc " << arc_idx << " tracks a retained wall "
+                            << unscale<double>(std::sqrt(clearance_squared))
+                            << " mm away at "
+                            << unscale<double>(point.x()) << ","
+                            << unscale<double>(point.y());
+                    *details = message.str();
+                }
+                return true;
+            }
+            path_position += length;
+        }
+    }
+    return false;
+}
+
+static bool arc_paths_have_sustained_endpoint_retrace(
+    const Polylines &arcs, coord_t centerline_clearance,
+    coord_t minimum_run, bool trailing,
+    std::string *details = nullptr)
+{
+    Lines printed;
+    const double sample_step = scale_(0.05);
+    for (size_t arc_idx = 0; arc_idx < arcs.size(); ++arc_idx) {
+        Polyline inspected = arcs[arc_idx];
+        if (trailing)
+            inspected.reverse();
+        double close_run = 0.;
+        bool left_leading_contact = false;
+        for (size_t point_idx = 1;
+             point_idx < inspected.points.size(); ++point_idx) {
+            const Vec2d start =
+                inspected.points[point_idx - 1].cast<double>();
+            const Vec2d delta =
+                (inspected.points[point_idx] -
+                 inspected.points[point_idx - 1]).cast<double>();
+            const double length = delta.norm();
+            const size_t samples = std::max<size_t>(
+                1, size_t(std::ceil(length / sample_step)));
+            const double interval = length / double(samples);
+            for (size_t sample_idx = 0;
+                 sample_idx < samples; ++sample_idx) {
+                const Vec2d position =
+                    start + delta *
+                                ((double(sample_idx) + 0.5) /
+                                 double(samples));
+                const Point sample(
+                    coord_t(std::lround(position.x())),
+                    coord_t(std::lround(position.y())));
+                const double distance_squared = std::accumulate(
+                    printed.begin(), printed.end(),
+                    std::numeric_limits<double>::max(),
+                    [&sample, &delta](double nearest, const Line &line) {
+                        const Vec2d printed_delta =
+                            (line.b - line.a).cast<double>();
+                        const double direction_norm_squared =
+                            delta.squaredNorm() *
+                            printed_delta.squaredNorm();
+                        const double dot =
+                            delta.dot(printed_delta);
+                        if (direction_norm_squared <= 0. ||
+                            dot * dot <
+                                0.82 * direction_norm_squared)
+                            return nearest;
+                        return std::min(
+                            nearest,
+                            line.distance_to_squared(sample));
+                    });
+                if (distance_squared <
+                    double(centerline_clearance) *
+                        double(centerline_clearance)) {
+                    close_run += interval;
+                    if (close_run >= minimum_run) {
+                        if (details != nullptr) {
+                            std::ostringstream message;
+                            message << "arc " << arc_idx
+                                    << " has a sustained "
+                                    << (trailing ? "trailing" : "leading")
+                                    << " retrace for "
+                                    << unscale<double>(close_run) << " mm";
+                            *details = message.str();
+                        }
+                        return true;
+                    }
+                } else {
+                    left_leading_contact = true;
+                    break;
+                }
+            }
+            if (left_leading_contact)
+                break;
+        }
+        append(printed, to_lines(arcs[arc_idx]));
+    }
+    return false;
+}
+
+static TriangleMesh make_arc_bridge_validation_model(double width, double length)
+{
+    constexpr double support_depth = 3.;
+    constexpr double support_height = 1.;
+    constexpr double roof_height = 0.6;
+    TriangleMesh model = make_cube(width, support_depth, support_height);
+    TriangleMesh opposite_support =
+        make_cube(width, support_depth, support_height);
+    opposite_support.translate(0., length - support_depth, 0.);
+    model.merge(opposite_support);
+    TriangleMesh roof = make_cube(width, length, roof_height);
+    roof.translate(0., 0., support_height);
+    model.merge(roof);
+    return model;
 }
 
 TEST_CASE("Arc overhang fill produces curved paths inside its bridge surface", "[Fill][ArcOverhang]")
@@ -145,6 +387,13 @@ TEST_CASE("Arc overhangs keep consecutive starts on the current side", "[Fill][A
     REQUIRE(paths.size() > 1);
     for (size_t idx = 1; idx < paths.size(); ++idx) {
         const Point previous = paths[idx - 1].last_point();
+        INFO("path index: " << idx
+             << ", previous: " << unscale<double>(previous.x())
+             << ", " << unscale<double>(previous.y())
+             << ", first: " << unscale<double>(paths[idx].first_point().x())
+             << ", " << unscale<double>(paths[idx].first_point().y())
+             << ", last: " << unscale<double>(paths[idx].last_point().x())
+             << ", " << unscale<double>(paths[idx].last_point().y()));
         CHECK((paths[idx].first_point() - previous).squaredNorm() <=
               (paths[idx].last_point() - previous).squaredNorm());
     }
@@ -233,6 +482,185 @@ TEST_CASE("Primary arc overhang starts at lower-layer support", "[Fill][ArcOverh
     REQUIRE_FALSE(paths.empty());
     CHECK(paths.front().first_point().x() >= scale_(26.9));
     CHECK(supported.front().contains(paths.front().first_point()));
+
+    const Polylines supported_portions = intersection_pl(
+        Polylines{paths.front()}, supported);
+    const auto anchored_portion = std::find_if(
+        supported_portions.begin(), supported_portions.end(),
+        [&paths](const Polyline &portion) {
+            return portion.first_point() == paths.front().first_point() ||
+                   portion.last_point() == paths.front().first_point();
+        });
+    REQUIRE(anchored_portion != supported_portions.end());
+    // Merely touching support at the first coordinate is not printable. Keep a
+    // meaningful part of the initial extrusion over the retained wall.
+    CHECK(anchored_portion->length() >= scale_(0.4));
+}
+
+TEST_CASE("Primary arc prefers the preceding layer perimeter footprint",
+          "[Fill][ArcOverhang][Anchor]")
+{
+    const ExPolygon expolygon(Points{
+        Point::new_scale(0., 0.),
+        Point::new_scale(30., 0.),
+        Point::new_scale(30., 20.),
+        Point::new_scale(0., 20.)
+    });
+    const ExPolygons broad_support{expolygon};
+    const ExPolygons previous_perimeter{
+        ExPolygon(Points{
+            Point::new_scale(27., 0.),
+            Point::new_scale(30., 0.),
+            Point::new_scale(30., 20.),
+            Point::new_scale(27., 20.)
+        })
+    };
+    Surface surface(stBottomBridge, expolygon);
+    surface.bridge_angle = 0.;
+
+    std::unique_ptr<Fill> filler(Fill::new_from_type("arc-overhang"));
+    REQUIRE(filler != nullptr);
+    filler->spacing = 0.45;
+    filler->bounding_box = get_extents(expolygon);
+
+    FillParams params;
+    params.density = 1.f;
+    params.resolution = 0.05f;
+    params.arc_anchor_regions = &broad_support;
+    params.arc_root_anchor_regions = &previous_perimeter;
+
+    const Polylines paths = filler->fill_surface(&surface, params);
+    REQUIRE_FALSE(paths.empty());
+    CHECK(paths.front().first_point().x() >= scale_(26.9));
+    CHECK(previous_perimeter.front().contains(paths.front().first_point()));
+
+    const Polylines supported_portions =
+        intersection_pl(Polylines{paths.front()}, previous_perimeter);
+    REQUIRE_FALSE(supported_portions.empty());
+    CHECK(std::any_of(
+        supported_portions.begin(), supported_portions.end(),
+        [](const Polyline &portion) {
+            return portion.length() >= scale_(0.4);
+        }));
+}
+
+TEST_CASE("Arc overhangs stop at retained perimeter paths", "[Fill][ArcOverhang][Collision]")
+{
+    const ExPolygon expolygon(Points{
+        Point::new_scale(0., 0.),
+        Point::new_scale(30., 0.),
+        Point::new_scale(30., 20.),
+        Point::new_scale(0., 20.)
+    });
+    const ExPolygons supported{
+        ExPolygon(Points{
+            Point::new_scale(0., 0.),
+            Point::new_scale(3., 0.),
+            Point::new_scale(3., 20.),
+            Point::new_scale(0., 20.)
+        })
+    };
+    const Polylines retained_perimeters{
+        Polyline(Points{
+            Point::new_scale(12., 2.),
+            Point::new_scale(12., 18.)
+        })
+    };
+    const ExPolygons retained_perimeter_cores =
+        union_ex(offset(retained_perimeters, float(scale_(0.1))));
+    Surface surface(stBottomBridge, expolygon);
+    surface.bridge_angle = 0.;
+
+    std::unique_ptr<Fill> filler(Fill::new_from_type("arc-overhang"));
+    REQUIRE(filler != nullptr);
+    filler->spacing = 0.45;
+    filler->bounding_box = get_extents(expolygon);
+
+    PrintRegionConfig config;
+    config.arc_overhang_recursive_fill.value = false;
+    FillParams params;
+    params.density = 1.f;
+    params.resolution           = 0.05f;
+    params.config               = &config;
+    params.arc_anchor_regions   = &supported;
+    params.arc_obstacle_paths   = &retained_perimeters;
+    params.arc_obstacle_regions = &retained_perimeter_cores;
+
+    const Polylines paths = filler->fill_surface(&surface, params);
+    REQUIRE_FALSE(paths.empty());
+    CHECK(std::all_of(paths.begin(), paths.end(), [](const Polyline &path) {
+        return path.length() >= scale_(0.75 * 0.45);
+    }));
+    Lines deposited                              = to_lines(retained_perimeters);
+    const double maximum_anchor_distance_squared =
+        std::pow(scale_(0.45 + params.resolution), 2);
+    for (const Polyline& path : paths) {
+        const bool end_on_lower_support  = std::any_of(supported.begin(), supported.end(),
+                                                       [&path](const ExPolygon& region) { return region.contains(path.last_point()); });
+        const bool end_on_deposited_path = std::any_of(deposited.begin(), deposited.end(),
+                                                       [&path, maximum_anchor_distance_squared](const Line& line) {
+                                                           return line.distance_to_squared(path.last_point()) <=
+                                                                  maximum_anchor_distance_squared;
+                                                       });
+        const bool end_is_supported      = end_on_lower_support || end_on_deposited_path;
+        CHECK(end_is_supported);
+        append(deposited, to_lines(path));
+    }
+    CHECK_FALSE(arc_paths_have_proper_crossing(paths));
+    CHECK(std::any_of(paths.begin(), paths.end(), [](const Polyline& path) {
+        return std::any_of(path.points.begin(), path.points.end(), [](const Point& point) { return point.x() > scale_(14.5); });
+    }));
+    CHECK(std::any_of(paths.begin(), paths.end(), [](const Polyline &path) {
+        const bool begins_at_perimeter =
+            path.first_point().x() >= scale_(12.09) &&
+            path.first_point().x() <= scale_(12.11);
+        return begins_at_perimeter &&
+               std::any_of(path.points.begin(), path.points.end(), [](const Point &point) {
+                   return point.x() > scale_(12.5);
+               });
+    }));
+    for (const Polyline &path : paths) {
+        const Polylines collision =
+            intersection_pl(Polylines{path}, retained_perimeter_cores);
+        CHECK(std::none_of(
+            collision.begin(), collision.end(),
+            [](const Polyline &portion) {
+                return portion.length() > SCALED_EPSILON;
+            }));
+    }
+    Polylines all_paths = paths;
+    append(all_paths, retained_perimeters);
+    CHECK_FALSE(arc_paths_have_proper_crossing(all_paths));
+
+    // Retained centerlines are authoritative even if polygon offsetting cannot
+    // produce a protected core (for example, for a very short wall fragment).
+    // The arc may terminate on the wall, but it must not continue through it.
+    const Polylines short_retained_perimeter{
+        Polyline(Points{
+            Point::new_scale(0.225, 0.),
+            Point::new_scale(0.225, 20.)
+        }),
+        Polyline(Points{
+            Point::new_scale(12., 9.9),
+            Point::new_scale(12., 10.1)
+        })
+    };
+    params.arc_obstacle_paths = &short_retained_perimeter;
+    params.arc_obstacle_regions = nullptr;
+    const Polylines centerline_clipped_paths =
+        filler->fill_surface(&surface, params);
+    REQUIRE_FALSE(centerline_clipped_paths.empty());
+    CHECK(std::all_of(
+        centerline_clipped_paths.begin(),
+        centerline_clipped_paths.end(),
+        [](const Polyline &path) {
+            return path.length() >= scale_(0.75 * 0.45);
+        }));
+    std::string crossing_details;
+    INFO(crossing_details);
+    CHECK_FALSE(arc_paths_cross_obstacles(
+        centerline_clipped_paths, short_retained_perimeter,
+        &crossing_details));
 }
 
 TEST_CASE("Narrow bridge uses multiple small supported arc families", "[Fill][ArcOverhang][Narrow]")
@@ -260,7 +688,329 @@ TEST_CASE("Narrow bridge uses multiple small supported arc families", "[Fill][Ar
     filler->bounding_box = get_extents(expolygon);
 
     PrintRegionConfig config;
+    FillParams params;
+    params.density = 1.f;
+    params.resolution = 0.05f;
+    params.config = &config;
+    params.arc_anchor_regions = &supported;
+
     config.arc_overhang_recursive_fill.value = false;
+    const Polylines primary_paths = filler->fill_surface(&surface, params);
+    config.arc_overhang_recursive_fill.value = true;
+    const Polylines paths = filler->fill_surface(&surface, params);
+    REQUIRE_FALSE(primary_paths.empty());
+    REQUIRE(paths.size() >= primary_paths.size());
+    for (size_t path_idx = 0; path_idx < primary_paths.size(); ++path_idx)
+        CHECK(paths[path_idx].points == primary_paths[path_idx].points);
+    if (paths.size() > primary_paths.size()) {
+        CHECK(std::any_of(
+            paths.begin() + primary_paths.size(), paths.end(),
+            [](const Polyline &path) {
+                return get_extents(path).size().y() <= scale_(8.);
+            }));
+    }
+
+    const coord_t spacing = scale_(filler->spacing);
+    const auto uncovered_area = [&expolygon, spacing](const Polylines &fill_paths) {
+        ExPolygons uncovered = diff_ex(
+            ExPolygons{expolygon}, union_ex(offset(fill_paths, float(0.52 * spacing))));
+        uncovered = opening_ex(uncovered, float(0.75 * spacing));
+        return std::accumulate(
+            uncovered.begin(), uncovered.end(), 0.,
+            [](double total, const ExPolygon &part) {
+                return total + std::abs(part.area());
+            });
+    };
+    CHECK(uncovered_area(primary_paths) < 0.05 * std::abs(expolygon.area()));
+    CHECK(uncovered_area(paths) <= uncovered_area(primary_paths));
+
+    Lines printed_bridge;
+    for (const Polyline &path : primary_paths) {
+        bool anchored = std::any_of(
+            supported.begin(), supported.end(),
+            [&path](const ExPolygon &region) {
+                return region.contains(path.first_point());
+            });
+        if (!anchored) {
+            double nearest_printed_distance_squared =
+                std::numeric_limits<double>::max();
+            for (const Line &line : printed_bridge)
+                nearest_printed_distance_squared = std::min(
+                    nearest_printed_distance_squared,
+                    line.distance_to_squared(path.first_point()));
+            anchored = nearest_printed_distance_squared <=
+                       double(spacing) * double(spacing);
+        }
+        CHECK(anchored);
+
+        if (path.points.size() >= 3) {
+            const Line chord(path.first_point(), path.last_point());
+            if (chord.length() >= 4. * spacing) {
+                double max_sagitta_squared = 0.;
+                for (const Point &point : path.points)
+                    max_sagitta_squared = std::max(
+                        max_sagitta_squared,
+                        chord.distance_to_squared(point));
+                CHECK(max_sagitta_squared >=
+                      double(spacing) * double(spacing));
+            }
+        }
+        append(printed_bridge, to_lines(path));
+    }
+}
+
+TEST_CASE("Four millimeter bridge uses anchored curved arches instead of shallow chords",
+          "[Fill][ArcOverhang][Narrow][Anchor]")
+{
+    // This is the important scale of the narrow slots seen in real printer
+    // test models. It is wider than the old eight-pitch cutoff, but expanding
+    // circles clipped to this long rectangle still flatten into bridge lines.
+    const ExPolygon expolygon(Points{
+        Point::new_scale(0., 0.),
+        Point::new_scale(4.5, 0.),
+        Point::new_scale(4.5, 40.),
+        Point::new_scale(0., 40.)
+    });
+    const ExPolygons supported{
+        ExPolygon(Points{
+            Point::new_scale(0., 0.),
+            Point::new_scale(0.6, 0.),
+            Point::new_scale(0.6, 40.),
+            Point::new_scale(0., 40.)
+        })
+    };
+    const Polylines retained_perimeters{
+        Polyline(Points{
+            Point::new_scale(0.225, 0.),
+            Point::new_scale(0.225, 40.)
+        })
+    };
+    const ExPolygons retained_perimeter_cores =
+        union_ex(offset(retained_perimeters, float(scale_(0.1))));
+    Surface surface(stBottomBridge, expolygon);
+    surface.bridge_angle = 0.;
+
+    std::unique_ptr<Fill> filler(Fill::new_from_type("arc-overhang"));
+    REQUIRE(filler != nullptr);
+    filler->spacing = 0.45;
+    filler->bounding_box = get_extents(expolygon);
+
+    PrintRegionConfig config;
+    config.arc_overhang_recursive_fill.value = false;
+    FillParams params;
+    params.density = 1.f;
+    params.resolution = 0.05f;
+    params.config = &config;
+    params.arc_anchor_regions = &supported;
+    params.arc_obstacle_paths = &retained_perimeters;
+    params.arc_obstacle_regions = &retained_perimeter_cores;
+
+    const Polylines paths = filler->fill_surface(&surface, params);
+    // Exact collision trimming may merge or discard a redundant terminal
+    // fragment, so validate deposited coverage rather than requiring the old
+    // implementation's exact path count.
+    REQUIRE(paths.size() >= 19);
+
+    const coord_t spacing = scale_(filler->spacing);
+    Lines printed;
+    const Lines perimeter_lines = to_lines(retained_perimeters);
+    for (const Polyline &path : paths) {
+        double anchor_distance_squared = std::numeric_limits<double>::max();
+        for (const Line &line : perimeter_lines)
+            anchor_distance_squared = std::min(
+                anchor_distance_squared,
+                line.distance_to_squared(path.first_point()));
+        for (const Line &line : printed)
+            anchor_distance_squared = std::min(
+                anchor_distance_squared,
+                line.distance_to_squared(path.first_point()));
+        CHECK(anchor_distance_squared <=
+              double(spacing) * double(spacing));
+
+        if (path.points.size() >= 3) {
+            const Line chord(path.first_point(), path.last_point());
+            const bool fully_laterally_supported =
+                std::all_of(
+                    path.points.begin(), path.points.end(),
+                    [&perimeter_lines, &printed,
+                     spacing](const Point &point) {
+                        double distance_squared =
+                            std::numeric_limits<double>::max();
+                        for (const Line &line :
+                             perimeter_lines)
+                            distance_squared = std::min(
+                                distance_squared,
+                                line.distance_to_squared(
+                                    point));
+                        for (const Line &line : printed)
+                            distance_squared = std::min(
+                                distance_squared,
+                                line.distance_to_squared(
+                                    point));
+                        return distance_squared <=
+                               double(spacing) *
+                                   double(spacing);
+                    });
+            if (chord.length() >= 4. * spacing &&
+                !fully_laterally_supported) {
+                double max_sagitta_squared = 0.;
+                for (const Point &point : path.points)
+                    max_sagitta_squared = std::max(
+                        max_sagitta_squared,
+                        chord.distance_to_squared(point));
+                CHECK(max_sagitta_squared >=
+                      double(spacing) * double(spacing));
+            }
+        }
+        append(printed, to_lines(path));
+    }
+    ExPolygons covered =
+        union_ex(offset(paths, float(0.52 * spacing)));
+    append(covered, supported);
+    ExPolygons uncovered =
+        diff_ex(ExPolygons{expolygon}, union_ex(covered));
+    uncovered = opening_ex(uncovered, float(0.75 * spacing));
+    const double uncovered_area = std::accumulate(
+        uncovered.begin(), uncovered.end(), 0.,
+        [](double total, const ExPolygon &part) {
+            return total + std::abs(part.area());
+        });
+    CHECK(uncovered_area < 0.08 * std::abs(expolygon.area()));
+    CHECK_FALSE(arc_paths_have_proper_crossing(paths));
+}
+
+TEST_CASE("Narrow bridge curvature and coverage hold across practical nozzle-scale widths",
+          "[Fill][ArcOverhang][Narrow][Coverage]")
+{
+    const double width = GENERATE(2.4, 3.2, 4.5, 5.8, 6.8);
+    const bool recursive_fill = GENERATE(false, true);
+    DYNAMIC_SECTION("width " << width << " mm, recursive " << recursive_fill)
+    {
+        constexpr double length = 40.;
+        const ExPolygon expolygon(Points{
+            Point::new_scale(0., 0.),
+            Point::new_scale(width, 0.),
+            Point::new_scale(width, length),
+            Point::new_scale(0., length)
+        });
+        const ExPolygons supported{
+            ExPolygon(Points{
+                Point::new_scale(0., 0.),
+                Point::new_scale(0.6, 0.),
+                Point::new_scale(0.6, length),
+                Point::new_scale(0., length)
+            })
+        };
+        Surface surface(stBottomBridge, expolygon);
+        surface.bridge_angle = 0.;
+
+        std::unique_ptr<Fill> filler(Fill::new_from_type("arc-overhang"));
+        REQUIRE(filler != nullptr);
+        filler->spacing = 0.45;
+        filler->bounding_box = get_extents(expolygon);
+
+        PrintRegionConfig config;
+        config.arc_overhang_recursive_fill.value = recursive_fill;
+        FillParams params;
+        params.density = 1.f;
+        params.resolution = 0.05f;
+        params.config = &config;
+        params.arc_anchor_regions = &supported;
+
+        const Polylines paths = filler->fill_surface(&surface, params);
+        REQUIRE_FALSE(paths.empty());
+        const coord_t spacing = scale_(filler->spacing);
+        Lines printed;
+        for (size_t path_idx = 0; path_idx < paths.size(); ++path_idx) {
+            const Polyline &path = paths[path_idx];
+            INFO("path index: " << path_idx
+                 << ", start: " << unscale<double>(path.first_point().x())
+                 << ", " << unscale<double>(path.first_point().y()));
+            bool anchored = std::any_of(
+                supported.begin(), supported.end(),
+                [&path](const ExPolygon &region) {
+                    return region.contains(path.first_point());
+                });
+            if (!anchored) {
+                double nearest_distance_squared =
+                    std::numeric_limits<double>::max();
+                for (const Line &line : printed)
+                    nearest_distance_squared = std::min(
+                        nearest_distance_squared,
+                        line.distance_to_squared(path.first_point()));
+                anchored = nearest_distance_squared <=
+                           double(spacing) * double(spacing);
+            }
+            CHECK(anchored);
+
+            const bool fully_supported = std::any_of(
+                supported.begin(), supported.end(),
+                [&path](const ExPolygon &region) {
+                    return region.contains(path);
+                });
+            if (!fully_supported) {
+                CHECK(path.points.size() >= 3);
+            }
+            if (!fully_supported && path.points.size() >= 3) {
+                const Line chord(path.first_point(), path.last_point());
+                if (chord.length() >= 2. * spacing) {
+                    double max_sagitta_squared = 0.;
+                    for (const Point &point : path.points)
+                        max_sagitta_squared = std::max(
+                            max_sagitta_squared,
+                            chord.distance_to_squared(point));
+                    const double minimum_sagitta =
+                        std::min(double(spacing), 0.10 * chord.length());
+                    CHECK(max_sagitta_squared >=
+                          minimum_sagitta * minimum_sagitta);
+                }
+            }
+            append(printed, to_lines(path));
+        }
+
+        ExPolygons covered =
+            union_ex(offset(paths, float(0.52 * spacing)));
+        append(covered, supported);
+        ExPolygons uncovered =
+            diff_ex(ExPolygons{expolygon}, union_ex(covered));
+        uncovered = opening_ex(uncovered, float(0.75 * spacing));
+        const double uncovered_area = std::accumulate(
+            uncovered.begin(), uncovered.end(), 0.,
+            [](double total, const ExPolygon &part) {
+                return total + std::abs(part.area());
+            });
+        CHECK(uncovered_area < 0.08 * std::abs(expolygon.area()));
+        CHECK_FALSE(arc_paths_have_proper_crossing(paths));
+    }
+}
+
+TEST_CASE("One-sided narrow overhang fills from supported arc origins",
+          "[Fill][ArcOverhang][Narrow][Anchor][Coverage]")
+{
+    const ExPolygon expolygon(Points{
+        Point::new_scale(0., 0.),
+        Point::new_scale(4.5, 0.),
+        Point::new_scale(4.5, 20.),
+        Point::new_scale(0., 20.)
+    });
+    const ExPolygons supported{
+        ExPolygon(Points{
+            Point::new_scale(0., 0.),
+            Point::new_scale(0.6, 0.),
+            Point::new_scale(0.6, 20.),
+            Point::new_scale(0., 20.)
+        })
+    };
+    Surface surface(stBottomBridge, expolygon);
+    surface.bridge_angle = 0.;
+
+    std::unique_ptr<Fill> filler(Fill::new_from_type("arc-overhang"));
+    REQUIRE(filler != nullptr);
+    filler->spacing = 0.45;
+    filler->bounding_box = get_extents(expolygon);
+
+    PrintRegionConfig config;
+    config.arc_overhang_recursive_fill.value = true;
     FillParams params;
     params.density = 1.f;
     params.resolution = 0.05f;
@@ -268,19 +1018,106 @@ TEST_CASE("Narrow bridge uses multiple small supported arc families", "[Fill][Ar
     params.arc_anchor_regions = &supported;
 
     const Polylines paths = filler->fill_surface(&surface, params);
-    REQUIRE(paths.size() > 3);
-    CHECK(std::all_of(paths.begin(), paths.end(), [](const Polyline &path) {
-        return get_extents(path).size().y() <= scale_(8.);
-    }));
-
+    REQUIRE_FALSE(paths.empty());
     const coord_t spacing = scale_(filler->spacing);
-    ExPolygons uncovered = diff_ex(
-        ExPolygons{expolygon}, union_ex(offset(paths, float(0.52 * spacing))));
+    const coord_t arc_pitch = scale_(
+        filler->spacing -
+        0.45 * config.arc_overhang_overlap.value / 100.);
+    const coord_t retrace_clearance =
+        std::max<coord_t>(
+            coord_t(std::lround(scale_(0.20 * 0.45))),
+            coord_t(std::lround(0.55 * double(arc_pitch))));
+    const double maximum_distance_squared =
+        std::pow(scale_(0.45 + params.resolution), 2);
+    Lines deposited;
+    const auto point_is_supported =
+        [&supported, &deposited,
+         maximum_distance_squared](const Point &point) {
+            if (std::any_of(
+                    supported.begin(), supported.end(),
+                    [&point](const ExPolygon &region) {
+                        return region.contains(point);
+                    }))
+                return true;
+            return std::any_of(
+                deposited.begin(), deposited.end(),
+                [&point, maximum_distance_squared](const Line &line) {
+                    return line.distance_to_squared(point) <=
+                           maximum_distance_squared;
+                });
+        };
+    const auto lead_is_supported =
+        [&point_is_supported](const Polyline &path) {
+            double remaining = scale_(0.75 * 0.45);
+            const double sample_step = scale_(0.20 * 0.45);
+            for (size_t point_idx = 1;
+                 point_idx < path.points.size() && remaining > 0.;
+                 ++point_idx) {
+                const Vec2d start =
+                    path.points[point_idx - 1].cast<double>();
+                const Vec2d delta =
+                    (path.points[point_idx] -
+                     path.points[point_idx - 1]).cast<double>();
+                const double length = delta.norm();
+                if (length <= 0.)
+                    continue;
+                const double checked = std::min(length, remaining);
+                const size_t samples = std::max<size_t>(
+                    1, size_t(std::ceil(checked / sample_step)));
+                for (size_t sample_idx = 0;
+                     sample_idx <= samples; ++sample_idx) {
+                    const Vec2d position =
+                        start + delta *
+                                    (checked * double(sample_idx) /
+                                     double(samples) / length);
+                    if (!point_is_supported(
+                            Point(coord_t(std::lround(position.x())),
+                                  coord_t(std::lround(position.y())))))
+                        return false;
+                }
+                remaining -= checked;
+            }
+            return true;
+        };
+
+    for (const Polyline &path : paths) {
+        // A centerline shorter than its deposited bead is a start/stop blob,
+        // not a useful recursive arc. Such fragments can overlap a retained
+        // perimeter without registering as a proper centerline crossing.
+        CHECK(path.length() >= scale_(0.45));
+        CHECK(lead_is_supported(path));
+        append(deposited, to_lines(path));
+    }
+
+    std::string retrace_details;
+    const bool has_sustained_leading_retrace =
+        arc_paths_have_sustained_endpoint_retrace(
+            paths, retrace_clearance,
+            scale_(0.65 * 0.45), false, &retrace_details);
+    INFO(retrace_details);
+    CHECK_FALSE(has_sustained_leading_retrace);
+
+    retrace_details.clear();
+    const bool has_sustained_trailing_retrace =
+        arc_paths_have_sustained_endpoint_retrace(
+            paths, retrace_clearance,
+            scale_(0.65 * 0.45), true, &retrace_details);
+    INFO(retrace_details);
+    CHECK_FALSE(has_sustained_trailing_retrace);
+
+    ExPolygons covered =
+        union_ex(offset(paths, float(0.52 * spacing)));
+    append(covered, supported);
+    ExPolygons uncovered =
+        diff_ex(ExPolygons{expolygon}, union_ex(covered));
     uncovered = opening_ex(uncovered, float(0.75 * spacing));
     const double uncovered_area = std::accumulate(
         uncovered.begin(), uncovered.end(), 0.,
-        [](double total, const ExPolygon &part) { return total + std::abs(part.area()); });
-    CHECK(uncovered_area < 0.05 * std::abs(expolygon.area()));
+        [](double total, const ExPolygon &part) {
+            return total + std::abs(part.area());
+        });
+    CHECK(uncovered_area < 0.08 * std::abs(expolygon.area()));
+    CHECK_FALSE(arc_paths_have_proper_crossing(paths));
 }
 
 TEST_CASE("Narrow bridge grows tight arcs from both supported ends", "[Fill][ArcOverhang][Narrow]")
@@ -331,6 +1168,7 @@ TEST_CASE("Narrow bridge grows tight arcs from both supported ends", "[Fill][Arc
     }));
 
     const double spacing = scale_(filler->spacing);
+    size_t tight_path_count = 0;
     for (const Polyline &path : paths) {
         if (path.points.size() < 3)
             continue;
@@ -340,8 +1178,219 @@ TEST_CASE("Narrow bridge grows tight arcs from both supported ends", "[Fill][Arc
         double max_sagitta_squared = 0.;
         for (const Point &point : path.points)
             max_sagitta_squared = std::max(max_sagitta_squared, chord.distance_to_squared(point));
-        CHECK(max_sagitta_squared >= std::pow(1.2 * spacing, 2));
+        if (max_sagitta_squared >= std::pow(1.2 * spacing, 2))
+            ++tight_path_count;
     }
+    // The complete large family is the printable backbone. The later family
+    // from the opposite support must still contribute tighter arches instead
+    // of leaving every narrow-span path as a shallow chord.
+    CHECK(tight_path_count > 0);
+
+    // Independently rounding both supported half-families down used to leave a
+    // complete missing arch where they met. The phase-aligned opposite family
+    // must reach within one deposited bead of the first family at the bridge
+    // midpoint; demanding a rectangular footprint here would incorrectly
+    // reject the deliberately curved space inside each arch.
+    const double midpoint_y = scale_(6.);
+    double lower_reach = std::numeric_limits<double>::lowest();
+    double upper_reach = std::numeric_limits<double>::max();
+    for (const Polyline &path : paths) {
+        for (const Point &point : path.points) {
+            const double y = point.y();
+            if (y <= midpoint_y)
+                lower_reach = std::max(lower_reach, y);
+            if (y >= midpoint_y)
+                upper_reach = std::min(upper_reach, y);
+        }
+    }
+    REQUIRE(lower_reach > std::numeric_limits<double>::lowest());
+    REQUIRE(upper_reach < std::numeric_limits<double>::max());
+    CHECK(upper_reach - lower_reach <= spacing);
+}
+
+TEST_CASE("Long narrow arc overhang retains complete primary coverage", "[Fill][ArcOverhang][Coverage][Performance]")
+{
+    const ExPolygon expolygon(Points{
+        Point::new_scale(0., 0.),
+        Point::new_scale(120., 0.),
+        Point::new_scale(120., 8.),
+        Point::new_scale(0., 8.)
+    });
+    const ExPolygons supported{
+        ExPolygon(Points{
+            Point::new_scale(0., 0.),
+            Point::new_scale(2., 0.),
+            Point::new_scale(2., 8.),
+            Point::new_scale(0., 8.)
+        }),
+        ExPolygon(Points{
+            Point::new_scale(118., 0.),
+            Point::new_scale(120., 0.),
+            Point::new_scale(120., 8.),
+            Point::new_scale(118., 8.)
+        })
+    };
+    Surface surface(stBottomBridge, expolygon);
+    surface.bridge_angle = 0.;
+
+    std::unique_ptr<Fill> filler(Fill::new_from_type("arc-overhang"));
+    REQUIRE(filler != nullptr);
+    filler->spacing = 0.45;
+    filler->bounding_box = get_extents(expolygon);
+
+    PrintRegionConfig config;
+    FillParams params;
+    params.density = 1.f;
+    params.resolution = 0.05f;
+    params.config = &config;
+    params.arc_anchor_regions = &supported;
+
+    const coord_t spacing = scale_(filler->spacing);
+    const auto check_coverage = [&](bool recursive_fill) {
+        INFO("recursive fill: " << recursive_fill);
+        config.arc_overhang_recursive_fill.value = recursive_fill;
+        const Polylines paths = filler->fill_surface(&surface, params);
+        REQUIRE_FALSE(paths.empty());
+        CHECK(std::any_of(paths.begin(), paths.end(), [](const Polyline &path) {
+            return path.first_point().x() <= scale_(2.05);
+        }));
+        CHECK(std::any_of(paths.begin(), paths.end(), [](const Polyline &path) {
+            return path.first_point().x() >= scale_(117.95);
+        }));
+
+        for (const Polyline &path : paths) {
+            if (path.points.size() < 3)
+                continue;
+            const Line chord(path.first_point(), path.last_point());
+            if (chord.length() < 4. * spacing)
+                continue;
+            double max_sagitta_squared = 0.;
+            for (const Point &point : path.points)
+                max_sagitta_squared = std::max(
+                    max_sagitta_squared, chord.distance_to_squared(point));
+            // Bounded-radius chained families must remain visibly curved. A
+            // long clipped segment with less than one line width of curvature
+            // behaves like the sagging straight bridges this pattern replaces.
+            CHECK(max_sagitta_squared >= double(spacing) * double(spacing));
+        }
+
+        ExPolygons covered = union_ex(offset(paths, float(0.52 * spacing)));
+        append(covered, supported);
+        ExPolygons uncovered = diff_ex(ExPolygons{expolygon}, union_ex(covered));
+        uncovered = opening_ex(uncovered, float(0.75 * spacing));
+        const double uncovered_area = std::accumulate(
+            uncovered.begin(), uncovered.end(), 0.,
+            [](double total, const ExPolygon &part) {
+                return total + std::abs(part.area());
+            });
+        CHECK(uncovered_area < 0.02 * std::abs(expolygon.area()));
+        CHECK_FALSE(arc_paths_have_proper_crossing(paths));
+    };
+    check_coverage(false);
+    check_coverage(true);
+}
+
+TEST_CASE("Arc overlap reduces free-air line pitch", "[Fill][ArcOverhang][Spacing]")
+{
+    const ExPolygon expolygon(Points{
+        Point::new_scale(0., 0.),
+        Point::new_scale(40., 0.),
+        Point::new_scale(40., 8.),
+        Point::new_scale(0., 8.)
+    });
+    const ExPolygons supported{
+        ExPolygon(Points{
+            Point::new_scale(0., 0.),
+            Point::new_scale(2., 0.),
+            Point::new_scale(2., 8.),
+            Point::new_scale(0., 8.)
+        }),
+        ExPolygon(Points{
+            Point::new_scale(38., 0.),
+            Point::new_scale(40., 0.),
+            Point::new_scale(40., 8.),
+            Point::new_scale(38., 8.)
+        })
+    };
+    Surface surface(stBottomBridge, expolygon);
+    surface.bridge_angle = 0.;
+
+    std::unique_ptr<Fill> filler(Fill::new_from_type("arc-overhang"));
+    REQUIRE(filler != nullptr);
+    filler->spacing = 0.45;
+    filler->bounding_box = get_extents(expolygon);
+
+    PrintRegionConfig config;
+    config.arc_overhang_recursive_fill.value = false;
+    FillParams params;
+    params.density = 1.f;
+    params.resolution = 0.05f;
+    params.config = &config;
+    params.arc_anchor_regions = &supported;
+
+    config.arc_overhang_overlap.value = 0.;
+    const Polylines touching_paths = filler->fill_surface(&surface, params);
+    config.arc_overhang_overlap.value = 20.;
+    const Polylines overlapping_paths = filler->fill_surface(&surface, params);
+
+    REQUIRE_FALSE(touching_paths.empty());
+    CHECK(overlapping_paths.size() > touching_paths.size());
+}
+
+TEST_CASE("Recursive arc refinement follows the complete large family", "[Fill][ArcOverhang][Recursive][Ordering]")
+{
+    const ExPolygon expolygon(Points{
+        Point::new_scale(0., 0.),
+        Point::new_scale(80., 0.),
+        Point::new_scale(80., 8.),
+        Point::new_scale(0., 8.)
+    });
+    const ExPolygons supported{
+        ExPolygon(Points{
+            Point::new_scale(0., 0.),
+            Point::new_scale(0.6, 0.),
+            Point::new_scale(0.6, 8.),
+            Point::new_scale(0., 8.)
+        })
+    };
+    Surface surface(stBottomBridge, expolygon);
+    surface.bridge_angle = 0.;
+
+    std::unique_ptr<Fill> filler(Fill::new_from_type("arc-overhang"));
+    REQUIRE(filler != nullptr);
+    filler->spacing = 0.45;
+    filler->bounding_box = get_extents(expolygon);
+
+    PrintRegionConfig config;
+    FillParams params;
+    params.density = 1.f;
+    params.resolution = 0.05f;
+    params.config = &config;
+    params.arc_anchor_regions = &supported;
+
+    config.arc_overhang_recursive_fill.value = false;
+    const Polylines primary_paths = filler->fill_surface(&surface, params);
+    config.arc_overhang_recursive_fill.value = true;
+    const Polylines recursive_paths = filler->fill_surface(&surface, params);
+
+    REQUIRE_FALSE(primary_paths.empty());
+    REQUIRE(recursive_paths.size() >= primary_paths.size());
+    // Recursive output is deliberately append-only: the complete large family
+    // remains the prefix, and smaller gap-filling arches follow it.
+    for (size_t path_idx = 0; path_idx < primary_paths.size(); ++path_idx)
+        CHECK(recursive_paths[path_idx].points == primary_paths[path_idx].points);
+
+    const coord_t spacing = scale_(filler->spacing);
+    ExPolygons covered = union_ex(offset(primary_paths, float(0.52 * spacing)));
+    append(covered, supported);
+    ExPolygons uncovered = diff_ex(ExPolygons{expolygon}, union_ex(covered));
+    uncovered = opening_ex(uncovered, float(0.75 * spacing));
+    const double uncovered_area = std::accumulate(
+        uncovered.begin(), uncovered.end(), 0.,
+        [](double total, const ExPolygon &part) {
+            return total + std::abs(part.area());
+        });
+    CHECK(uncovered_area < 0.02 * std::abs(expolygon.area()));
 }
 
 TEST_CASE("Recursive arc fill branches into uncovered space", "[Fill][ArcOverhang][Recursive]")
@@ -377,7 +1426,10 @@ TEST_CASE("Recursive arc fill branches into uncovered space", "[Fill][ArcOverhan
     config.arc_overhang_recursive_fill.value = true;
     const Polylines recursive_paths = filler->fill_surface(&surface, params);
 
-    CHECK(recursive_paths.size() >= root_paths.size());
+    // The complete root family may leave only sub-bead pockets around the
+    // hole. Recursive mode must preserve that family, but should not emit
+    // unprintable micro-arcs merely to increase the path count.
+    REQUIRE(recursive_paths.size() >= root_paths.size());
 
     const coord_t spacing = scale_(filler->spacing);
     const auto uncovered_regions = [&expolygon, spacing](const Polylines &paths) {
@@ -452,12 +1504,357 @@ TEST_CASE("Wide unsupported roofs reach the preview as arc overhangs", "[Fill][A
         return move.type == EMoveType::Extrude && move.extrusion_role == erArcOverhang;
     });
     REQUIRE(first_arc != preview.moves.end());
+    REQUIRE(first_arc != preview.moves.begin());
     CHECK(std::any_of(preview.moves.begin(), first_arc, [](const auto &move) {
         return move.type == EMoveType::Extrude && is_perimeter(move.extrusion_role);
     }));
     CHECK(std::none_of(preview.moves.begin(), preview.moves.end(), [](const auto &move) {
         return move.type == EMoveType::Extrude && move.extrusion_role == erOverhangPerimeter;
     }));
+
+    const Vec2d arc_start = std::prev(first_arc)->position.head<2>().cast<double>();
+    double minimum_bead_clearance = std::numeric_limits<double>::max();
+    double previous_layer_z = std::numeric_limits<double>::lowest();
+    for (auto move = preview.moves.begin(); move != first_arc; ++move)
+        if (move->type == EMoveType::Extrude &&
+            move->position.z() < first_arc->position.z() - 0.001)
+            previous_layer_z =
+                std::max(previous_layer_z, double(move->position.z()));
+    REQUIRE(previous_layer_z > std::numeric_limits<double>::lowest());
+    for (auto move = std::next(preview.moves.begin()); move != first_arc; ++move) {
+        if (move->type != EMoveType::Extrude ||
+            !is_perimeter(move->extrusion_role) ||
+            std::abs(move->position.z() - previous_layer_z) > 0.001)
+            continue;
+        const Vec2d line_start = std::prev(move)->position.head<2>().cast<double>();
+        const Vec2d line_delta =
+            move->position.head<2>().cast<double>() - line_start;
+        const double length_squared = line_delta.squaredNorm();
+        if (length_squared == 0.)
+            continue;
+        const double position = std::clamp(
+            (arc_start - line_start).dot(line_delta) / length_squared, 0., 1.);
+        const double centerline_distance =
+            (arc_start - line_start - position * line_delta).norm();
+        minimum_bead_clearance = std::min(
+            minimum_bead_clearance,
+            centerline_distance - 0.5 * (move->width + first_arc->width));
+    }
+    // The first arc bead must overlap the actual perimeter emitted immediately
+    // below it. A same-layer wall or broad lower-layer slice is not sufficient
+    // to establish the intended shape before the path enters free air.
+    INFO("first arc start: " << arc_start.x() << "," << arc_start.y()
+         << ", width: " << first_arc->width
+         << ", previous-layer bead clearance: "
+         << minimum_bead_clearance);
+    CHECK(minimum_bead_clearance <= 0.);
+}
+
+TEST_CASE("Narrow bridge G-code keeps every arc path anchored and curved",
+          "[Fill][ArcOverhang][GCode][Narrow]")
+{
+    const double width = GENERATE(3.2, 4.5, 6.8);
+    const bool recursive_fill = GENERATE(false, true);
+    DYNAMIC_SECTION("width " << width << " mm, recursive " << recursive_fill)
+    {
+        Print print;
+        Slic3r::Test::init_and_process_print(
+            {make_arc_bridge_validation_model(width, 30.)}, print, {
+                {"layer_height", "0.2"},
+                {"initial_layer_print_height", "0.2"},
+                {"wall_loops", "2"},
+                {"arc_overhang_enabled", "1"},
+                {"arc_overhang_bridge_distance", "0"},
+                {"arc_overhang_min_overhang_distance", "0"},
+                {"arc_overhang_recursive_fill", recursive_fill ? "1" : "0"},
+                {"enable_arc_fitting", "1"},
+                {"enable_support", "0"}
+            });
+        REQUIRE(print_has_arc_overhang(print));
+        for (const PrintObject *object : print.objects()) {
+            for (const Layer *layer : object->layers()) {
+                Polylines raw_arc_paths;
+                for (const LayerRegion *region : layer->regions()) {
+                    for (const ExtrusionEntity *entity :
+                         region->fills.flatten().entities) {
+                        if (const auto *path =
+                                dynamic_cast<const ExtrusionPath *>(entity);
+                            path != nullptr &&
+                            path->role() == erArcOverhang) {
+                            raw_arc_paths.emplace_back();
+                            for (const Point3 &point :
+                                 path->polyline.points)
+                                raw_arc_paths.back().append(
+                                    point.to_point());
+                        }
+                    }
+                }
+                if (!raw_arc_paths.empty()) {
+                    std::string crossing_details;
+                    const bool has_crossing =
+                        arc_paths_have_proper_crossing(
+                            raw_arc_paths, &crossing_details);
+                    INFO("raw arc-overhang layer " << layer->id());
+                    INFO(crossing_details);
+                    CHECK_FALSE(has_crossing);
+                }
+            }
+        }
+
+        ScopedTemporaryFile gcode_file(".gcode");
+        GCodeProcessorResult preview;
+        print.export_gcode(gcode_file.string(), &preview, nullptr);
+
+        std::ifstream stream(gcode_file.string());
+        REQUIRE(stream.good());
+        const std::string gcode(
+            (std::istreambuf_iterator<char>(stream)),
+            std::istreambuf_iterator<char>());
+        CHECK(gcode.find(";TYPE:Arc overhang") != std::string::npos);
+
+        struct PrintedSegment {
+            Vec2d a;
+            Vec2d b;
+            double width;
+            unsigned int layer_id;
+            ExtrusionRole role;
+            double print_z;
+        };
+        std::vector<PrintedSegment> printed_segments;
+        size_t arc_path_count = 0;
+        size_t arc_segment_count = 0;
+        std::map<unsigned int, Polylines> exported_arc_paths;
+        std::map<unsigned int, Polylines> exported_perimeter_paths;
+
+        for (size_t move_idx = 1; move_idx < preview.moves.size(); ++move_idx) {
+            const auto &previous = preview.moves[move_idx - 1];
+            const auto &move = preview.moves[move_idx];
+            const bool is_arc =
+                move.type == EMoveType::Extrude &&
+                move.extrusion_role == erArcOverhang;
+            const bool previous_is_arc =
+                previous.type == EMoveType::Extrude &&
+                previous.extrusion_role == erArcOverhang &&
+                previous.layer_id == move.layer_id;
+            const bool is_wall =
+                move.type == EMoveType::Extrude &&
+                is_perimeter(move.extrusion_role);
+            const bool previous_is_wall =
+                previous.type == EMoveType::Extrude &&
+                is_perimeter(previous.extrusion_role) &&
+                previous.layer_id == move.layer_id;
+
+            if (is_arc) {
+                ++arc_segment_count;
+                if (!previous_is_arc) {
+                    ++arc_path_count;
+                    const Vec2d start =
+                        previous.position.head<2>().cast<double>();
+                    exported_arc_paths[move.layer_id].emplace_back();
+                    exported_arc_paths[move.layer_id].back().append(
+                        Point::new_scale(start.x(), start.y()));
+                    double bead_clearance =
+                        std::numeric_limits<double>::max();
+                    double any_previous_clearance =
+                        std::numeric_limits<double>::max();
+                    double previous_layer_z =
+                        std::numeric_limits<double>::lowest();
+                    const double current_z = move.position.z();
+                    for (const PrintedSegment &anchor : printed_segments)
+                        if (anchor.print_z < current_z - 0.001)
+                            previous_layer_z =
+                                std::max(previous_layer_z, anchor.print_z);
+                    for (const PrintedSegment &anchor : printed_segments) {
+                        const Vec2d delta = anchor.b - anchor.a;
+                        const double length_squared = delta.squaredNorm();
+                        const double position = length_squared == 0. ? 0. :
+                            std::clamp((start - anchor.a).dot(delta) /
+                                           length_squared,
+                                       0., 1.);
+                        const double centerline_distance =
+                            (start - anchor.a - position * delta).norm();
+                        any_previous_clearance = std::min(
+                            any_previous_clearance,
+                            centerline_distance -
+                                0.5 * (move.width + anchor.width));
+                        const bool same_layer_anchor =
+                            std::abs(anchor.print_z - current_z) <= 0.001 &&
+                            (is_perimeter(anchor.role) ||
+                             anchor.role == erArcOverhang);
+                        const bool lower_layer_anchor =
+                            std::abs(anchor.print_z - previous_layer_z) <= 0.001;
+                        if (!same_layer_anchor && !lower_layer_anchor)
+                            continue;
+                        bead_clearance = std::min(
+                            bead_clearance,
+                            centerline_distance -
+                                0.5 * (move.width + anchor.width));
+                    }
+                    INFO("arc start " << start.x() << "," << start.y()
+                                      << " layer " << move.layer_id
+                                      << " clearance " << bead_clearance
+                                      << " any " << any_previous_clearance);
+                    CHECK(bead_clearance <= 0.051);
+                }
+                const Vec2d end = move.position.head<2>().cast<double>();
+                exported_arc_paths[move.layer_id].back().append(
+                    Point::new_scale(end.x(), end.y()));
+            }
+
+            if (is_wall) {
+                if (!previous_is_wall) {
+                    const Vec2d start =
+                        previous.position.head<2>().cast<double>();
+                    exported_perimeter_paths[move.layer_id].emplace_back();
+                    exported_perimeter_paths[move.layer_id].back().append(
+                        Point::new_scale(start.x(), start.y()));
+                }
+                const Vec2d end =
+                    move.position.head<2>().cast<double>();
+                exported_perimeter_paths[move.layer_id].back().append(
+                    Point::new_scale(end.x(), end.y()));
+            }
+
+            if (move.type == EMoveType::Extrude) {
+                printed_segments.push_back({
+                    previous.position.head<2>().cast<double>(),
+                    move.position.head<2>().cast<double>(),
+                    move.width,
+                    move.layer_id,
+                    move.extrusion_role,
+                    move.position.z()
+                });
+            }
+        }
+        for (const auto &[layer_id, paths] : exported_arc_paths) {
+            INFO("exported arc-overhang layer " << layer_id);
+            std::string crossing_details;
+            const bool has_crossing =
+                arc_paths_have_proper_crossing(paths, &crossing_details);
+            INFO(crossing_details);
+            CHECK_FALSE(has_crossing);
+            const auto walls = exported_perimeter_paths.find(layer_id);
+            if (walls != exported_perimeter_paths.end()) {
+                crossing_details.clear();
+                const bool crosses_wall = arc_paths_cross_obstacles(
+                    paths, walls->second, &crossing_details);
+                INFO(crossing_details);
+                CHECK_FALSE(crosses_wall);
+                crossing_details.clear();
+                const bool tracks_wall = arc_paths_track_obstacles(
+                    paths, walls->second, scale_(0.25), scale_(0.45),
+                    &crossing_details);
+                INFO(crossing_details);
+                CHECK_FALSE(tracks_wall);
+            }
+            // This validation model requests two walls. The inner one is
+            // replaced on the arc layer, exposing the previous layer as the
+            // supported runway while the external dimensional shell remains.
+            const unsigned int current_layer_id = layer_id;
+            CHECK_FALSE(std::any_of(
+                preview.moves.begin(), preview.moves.end(),
+                [current_layer_id](const auto &move) {
+                    return move.layer_id == current_layer_id &&
+                           move.type == EMoveType::Extrude &&
+                           move.extrusion_role == erPerimeter;
+                }));
+        }
+
+        bool arc_overhang_role = false;
+        double x = 0.;
+        double y = 0.;
+        size_t arc_command_count = 0;
+        std::istringstream lines(gcode);
+        std::string line;
+        while (std::getline(lines, line)) {
+            if (line.rfind(";TYPE:", 0) == 0) {
+                arc_overhang_role =
+                    line.find("Arc overhang") != std::string::npos;
+                continue;
+            }
+            std::istringstream words(line);
+            std::string command;
+            words >> command;
+            const bool is_motion =
+                command == "G0" || command == "G1" ||
+                command == "G2" || command == "G3";
+            if (!is_motion)
+                continue;
+
+            double next_x = x;
+            double next_y = y;
+            double i = 0.;
+            double j = 0.;
+            bool has_i = false;
+            bool has_j = false;
+            std::string word;
+            while (words >> word) {
+                if (word.size() < 2)
+                    continue;
+                try {
+                    const double value = std::stod(word.substr(1));
+                    switch (word.front()) {
+                    case 'X': next_x = value; break;
+                    case 'Y': next_y = value; break;
+                    case 'I': i = value; has_i = true; break;
+                    case 'J': j = value; has_j = true; break;
+                    default: break;
+                    }
+                } catch (const std::exception &) {
+                    // The remainder may be a comment rather than a G-code word.
+                    break;
+                }
+            }
+
+            if (arc_overhang_role &&
+                (command == "G2" || command == "G3") &&
+                (has_i || has_j)) {
+                ++arc_command_count;
+            }
+            x = next_x;
+            y = next_y;
+        }
+        CHECK(arc_path_count >= 4);
+        CHECK(arc_segment_count > arc_path_count);
+        // Global arc fitting remains enabled, but these topology-validated
+        // paths must retain their exact G1 polyline through final export.
+        CHECK(arc_command_count == 0);
+    }
+}
+
+TEST_CASE("Arc overhang keeps perimeter width while scaling volume", "[Fill][ArcOverhang][Flow]")
+{
+    TriangleMesh model = make_cube(10., 20., 5.);
+    TriangleMesh roof  = make_cube(30., 20., 2.);
+    roof.translate(-10., 0., 5.);
+    model.merge(roof);
+
+    constexpr double layer_height = 0.2;
+    constexpr double perimeter_width = 0.45;
+    constexpr double arc_flow_ratio = 0.8;
+    const bool thick_bridges = GENERATE(false, true);
+    Print print;
+    Slic3r::Test::init_and_process_print({model}, print, {
+        {"layer_height", std::to_string(layer_height)},
+        {"inner_wall_line_width", std::to_string(perimeter_width)},
+        {"bridge_flow", "1"},
+        {"thick_bridges", thick_bridges ? "1" : "0"},
+        {"arc_overhang_flow_ratio", std::to_string(arc_flow_ratio * 100.) + "%"},
+        {"arc_overhang_enabled", "1"},
+        {"arc_overhang_bridge_distance", "0"},
+        {"arc_overhang_min_overhang_distance", "0"},
+        {"enable_support", "0"}
+    });
+
+    const std::optional<ExtrusionPath> path = first_arc_overhang_path(print);
+    REQUIRE(path.has_value());
+    const double expected_area =
+        PI * perimeter_width * perimeter_width * 0.25 * arc_flow_ratio;
+    CHECK_THAT(path->mm3_per_mm, Catch::Matchers::WithinRel(expected_area, 1e-5));
+    CHECK_THAT(path->width, Catch::Matchers::WithinRel(perimeter_width, 1e-5));
+    CHECK(path->width >= path->height);
+    CHECK_THAT(path->height, Catch::Matchers::WithinRel(perimeter_width, 1e-5));
+    CHECK(path->height > layer_height);
 }
 
 TEST_CASE("Extra overhang perimeters do not consume arc overhang roofs", "[Fill][ArcOverhang][Regression]")

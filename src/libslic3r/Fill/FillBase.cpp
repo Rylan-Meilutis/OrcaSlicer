@@ -159,6 +159,12 @@ void Fill::fill_surface_extrusion(const Surface* surface, const FillParams& para
             flow_mm3_per_mm = new_flow.mm3_per_mm();
             flow_width = new_flow.width();
         }
+        if (params.extrusion_role == erArcOverhang && params.config != nullptr) {
+            // Arc width and pitch remain tied to the printable perimeter width.
+            // The user-facing percentage controls only deposited volume.
+            flow_mm3_per_mm *=
+                params.config->arc_overhang_flow_ratio.get_abs_value(1.);
+        }
         // Save into layer.
         ExtrusionEntityCollection* eec = nullptr;
         out.push_back(eec = new ExtrusionEntityCollection());
@@ -167,10 +173,16 @@ void Fill::fill_surface_extrusion(const Surface* surface, const FillParams& para
         // ORCA: special flag for flow rate calibration
         auto is_flow_calib = params.extrusion_role == erTopSolidInfill && this->print_object_config->has("calib_flowrate_topinfill_special_order") &&
                              this->print_object_config->option("calib_flowrate_topinfill_special_order")->getBool();
-        // Orca: a forced surface fill order must survive the G-code path planner, which would
-        // otherwise re-chain and possibly reverse the paths. The same applies to the flow rate
-        // calibration's special toolpath order.
-        const bool keep_fill_order = params.fill_order != SurfaceFillOrder::Default;
+        // Orca: a forced surface fill order must survive the G-code path
+        // planner, which would otherwise re-chain and possibly reverse the
+        // paths. Arc overhangs also have a structural order: the first path is
+        // attached to a wall and each later path may depend on an earlier arch.
+        // Re-sorting that collection by travel distance can select a middle,
+        // unsupported arch first. The same preservation applies to the flow
+        // rate calibration's special toolpath order.
+        const bool keep_fill_order =
+            params.fill_order != SurfaceFillOrder::Default ||
+            params.extrusion_role == erArcOverhang;
         if (is_flow_calib || keep_fill_order) {
             eec->no_sort = true;
         }

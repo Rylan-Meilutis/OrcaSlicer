@@ -24,11 +24,25 @@ TEST_CASE("New strength and overhang options preserve existing print defaults", 
 {
     const DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
 
+    CHECK_FALSE(config.opt_bool("seam_start_on_inner_wall"));
     CHECK_FALSE(config.opt_bool("arc_overhang_enabled"));
     CHECK(config.opt_bool("arc_overhang_bridges"));
     CHECK(config.opt_bool("arc_overhang_overhangs"));
     CHECK(config.opt_bool("arc_overhang_recursive_fill"));
-    CHECK_THAT(config.opt_float("arc_overhang_flow_ratio"), Catch::Matchers::WithinAbs(1.0, EPSILON));
+    CHECK_THAT(config.opt_float("arc_overhang_overlap"), Catch::Matchers::WithinAbs(0.0, EPSILON));
+    const auto *arc_overhang_flow = config.option<ConfigOptionPercent>("arc_overhang_flow_ratio");
+    REQUIRE(arc_overhang_flow != nullptr);
+    CHECK_THAT(arc_overhang_flow->value, Catch::Matchers::WithinAbs(100.0, EPSILON));
+    DynamicPrintConfig legacy_arc_flow = config;
+    REQUIRE_NOTHROW(legacy_arc_flow.set_deserialize_strict("arc_overhang_flow_ratio", "0.8"));
+    const auto *legacy_arc_overhang_flow = legacy_arc_flow.option<ConfigOptionPercent>("arc_overhang_flow_ratio");
+    REQUIRE(legacy_arc_overhang_flow != nullptr);
+    CHECK_THAT(legacy_arc_overhang_flow->value, Catch::Matchers::WithinAbs(80.0, EPSILON));
+    DynamicPrintConfig percent_arc_flow = config;
+    REQUIRE_NOTHROW(percent_arc_flow.set_deserialize_strict("arc_overhang_flow_ratio", "80%"));
+    const auto *percent_arc_overhang_flow = percent_arc_flow.option<ConfigOptionPercent>("arc_overhang_flow_ratio");
+    REQUIRE(percent_arc_overhang_flow != nullptr);
+    CHECK_THAT(percent_arc_overhang_flow->value, Catch::Matchers::WithinAbs(80.0, EPSILON));
     CHECK_THAT(config.opt_float("arc_overhang_speed"), Catch::Matchers::WithinAbs(5.0, EPSILON));
     CHECK_THAT(config.opt_float("arc_overhang_stabilization_speed"), Catch::Matchers::WithinAbs(5.0, EPSILON));
     const auto *arc_overhang_cooling = config.option<ConfigOptionPercents>("arc_overhang_cooling");
@@ -44,7 +58,21 @@ TEST_CASE("New strength and overhang options preserve existing print defaults", 
     CHECK(config.opt_int("arc_overhang_bridge_speed_layers") == 0);
     CHECK_THAT(config.opt_float("arc_overhang_bridge_distance"), Catch::Matchers::WithinAbs(0.0, EPSILON));
     CHECK_THAT(config.opt_float("arc_overhang_min_overhang_distance"), Catch::Matchers::WithinAbs(0.0, EPSILON));
-    CHECK_THAT(config.opt_float("third_wall_flow_ratio"), Catch::Matchers::WithinAbs(1.0, EPSILON));
+    const auto *inner_walls_flow = config.option<ConfigOptionPercent>("inner_walls_flow_ratio");
+    REQUIRE(inner_walls_flow != nullptr);
+    CHECK_THAT(inner_walls_flow->value, Catch::Matchers::WithinAbs(100.0, EPSILON));
+    DynamicPrintConfig legacy_third_wall_config = config;
+    REQUIRE_NOTHROW(legacy_third_wall_config.set_deserialize_strict("third_wall_flow_ratio", "1.25"));
+    const auto *legacy_inner_walls_flow =
+        legacy_third_wall_config.option<ConfigOptionPercent>("inner_walls_flow_ratio");
+    REQUIRE(legacy_inner_walls_flow != nullptr);
+    CHECK_THAT(legacy_inner_walls_flow->value, Catch::Matchers::WithinAbs(125.0, EPSILON));
+    DynamicPrintConfig percent_inner_walls_config = config;
+    REQUIRE_NOTHROW(percent_inner_walls_config.set_deserialize_strict("inner_walls_flow_ratio", "125%"));
+    const auto *percent_inner_walls_flow =
+        percent_inner_walls_config.option<ConfigOptionPercent>("inner_walls_flow_ratio");
+    REQUIRE(percent_inner_walls_flow != nullptr);
+    CHECK_THAT(percent_inner_walls_flow->value, Catch::Matchers::WithinAbs(125.0, EPSILON));
     CHECK(config.opt_int("support_interface_top_temperature") == 0);
     const ConfigOptionDef *spool_sync = print_config_def.get("sync_spool_manager_filament_names");
     REQUIRE(spool_sync != nullptr);

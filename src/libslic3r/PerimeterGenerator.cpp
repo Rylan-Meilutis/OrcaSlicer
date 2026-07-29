@@ -33,7 +33,7 @@ using namespace Slic3r::Feature::FuzzySkin;
 static WallSequence effective_wall_sequence(const PerimeterGenerator &generator)
 {
     if (generator.config->wall_loops.value >= 3 &&
-        generator.config->third_wall_flow_ratio > 1.0 + EPSILON &&
+        generator.config->inner_walls_flow_ratio.get_abs_value(1.) > 1.0 + EPSILON &&
         generator.layer_id > 0 && generator.upper_slices != nullptr)
         return WallSequence::InnerOuterInner;
     return generator.config->wall_sequence;

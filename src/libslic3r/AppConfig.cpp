@@ -206,6 +206,15 @@ void AppConfig::set_defaults()
     if (get("preview_dim_previous_layers").empty())
         set_bool("preview_dim_previous_layers", false);
 
+    // The old checkbox encoded "off" as no preview model at all. Preserve the
+    // user's gantry choice while migrating to an explicit nozzle/gantry mode.
+    if (get("preview_tool_model").empty()) {
+        const std::string legacy_gantry = get("preview_show_gantry_model");
+        set("preview_tool_model",
+            legacy_gantry == "true" || legacy_gantry == "1" ?
+                "gantry" : "nozzle");
+    }
+
     if (get("filaments_area_preferred_count").empty())
         set("filaments_area_preferred_count", "10");
 

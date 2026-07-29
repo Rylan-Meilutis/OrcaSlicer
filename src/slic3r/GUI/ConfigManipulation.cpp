@@ -642,15 +642,17 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, in
     }
 
     bool have_perimeters = config->opt_int("wall_loops") > 0;
+    const auto *inner_walls_flow = config->option<ConfigOptionPercent>("inner_walls_flow_ratio");
     const bool have_thicker_inner_walls =
         config->opt_int("wall_loops") >= 3 &&
-        config->opt_float("third_wall_flow_ratio") > 1.0 + EPSILON;
+        inner_walls_flow != nullptr && inner_walls_flow->get_abs_value(1.) > 1.0 + EPSILON;
     if (have_thicker_inner_walls &&
         config->opt_enum<WallSequence>("wall_sequence") != WallSequence::InnerOuterInner)
         config->set_key_value("wall_sequence", new ConfigOptionEnum<WallSequence>(WallSequence::InnerOuterInner));
     for (auto el : { "extra_perimeters_on_overhangs", "ensure_vertical_shell_thickness", "detect_thin_wall", "detect_overhang_wall",
         "seam_position", "staggered_inner_seams", "outer_wall_line_width" })
         toggle_field(el, have_perimeters);
+    toggle_field("seam_start_on_inner_wall", config->opt_int("wall_loops") >= 2);
     toggle_field("wall_sequence", have_perimeters && !have_thicker_inner_walls);
     for (auto el : { "inner_wall_speed", "outer_wall_speed", "small_perimeter_speed", "small_perimeter_threshold" })
         toggle_field(el, have_perimeters, variant_index);
@@ -971,7 +973,7 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, in
 
     const auto* arc_overhang_enabled = config->opt<ConfigOptionBool>("arc_overhang_enabled");
     const bool has_arc_overhangs = arc_overhang_enabled != nullptr && arc_overhang_enabled->value;
-    for (auto el : {"arc_overhang_bridges", "arc_overhang_overhangs", "arc_overhang_recursive_fill", "arc_overhang_flow_ratio",
+    for (auto el : {"arc_overhang_bridges", "arc_overhang_overhangs", "arc_overhang_recursive_fill", "arc_overhang_overlap", "arc_overhang_flow_ratio",
                     "arc_overhang_speed", "arc_overhang_stabilization_speed", "arc_overhang_layers",
                     "arc_overhang_overhang_speed_layers", "arc_overhang_bridge_speed_layers",
                     "arc_overhang_bridge_distance", "arc_overhang_min_overhang_distance"})

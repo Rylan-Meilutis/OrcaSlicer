@@ -1081,6 +1081,14 @@ void LayerRegion::simplify_path(ExtrusionPath* path)
     const bool enable_arc_fitting = print_config.enable_arc_fitting;
     const auto scaled_resolution = scaled<double>(print_config.resolution.value);
 
+    // Arc-overhang paths have already been clipped against previously emitted
+    // paths. Re-fitting or simplifying them may bow a segment outside that
+    // validated corridor and into a neighboring bead.
+    if (path->role() == erArcOverhang) {
+        path->polyline.fitting_result.clear();
+        return;
+    }
+
     if (enable_arc_fitting &&
         !spiral_mode) {
         if (path->role() == erInternalInfill)
@@ -1100,6 +1108,10 @@ void LayerRegion::simplify_multi_path(ExtrusionMultiPath* multipath)
     const auto scaled_resolution = scaled<double>(print_config.resolution.value);
 
     for (size_t i = 0; i < multipath->paths.size(); ++i) {
+        if (multipath->paths[i].role() == erArcOverhang) {
+            multipath->paths[i].polyline.fitting_result.clear();
+            continue;
+        }
         if (enable_arc_fitting &&
             !spiral_mode) {
             if (multipath->paths[i].role() == erInternalInfill)
@@ -1120,6 +1132,10 @@ void LayerRegion::simplify_loop(ExtrusionLoop* loop)
     const auto scaled_resolution = scaled<double>(print_config.resolution.value);
 
     for (size_t i = 0; i < loop->paths.size(); ++i) {
+        if (loop->paths[i].role() == erArcOverhang) {
+            loop->paths[i].polyline.fitting_result.clear();
+            continue;
+        }
         if (enable_arc_fitting &&
             !spiral_mode) {
             if (loop->paths[i].role() == erInternalInfill)

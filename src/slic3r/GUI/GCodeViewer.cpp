@@ -1326,7 +1326,8 @@ void GCodeViewer::refresh_marker_model()
     const auto* custom_geometry_opt = printer.config.opt<ConfigOptionString>("sequential_print_gantry_geometry");
     const auto* custom_model_opt = printer.config.opt<ConfigOptionString>("sequential_print_gantry_model");
     const bool complete_objects = complete_objects_opt != nullptr && complete_objects_opt->value;
-    const bool show_gantry_in_preview = get_app_config()->get_bool("preview_show_gantry_model");
+    const bool show_gantry_in_preview =
+        get_app_config()->get("preview_tool_model") == "gantry";
     const std::string printer_notes = printer_notes_opt == nullptr ? std::string() : printer_notes_opt->value;
     const std::string custom_geometry = custom_geometry_opt == nullptr ? std::string() : custom_geometry_opt->value;
     const std::string custom_model = custom_model_opt == nullptr ? std::string() : custom_model_opt->value;
@@ -1971,11 +1972,11 @@ void GCodeViewer::render(int canvas_width, int canvas_height, int right_margin)
 
     //BBS fixed bottom_margin for space to render horiz slider
     int bottom_margin = SLIDER_BOTTOM_MARGIN * GCODE_VIEWER_SLIDER_SCALE;
-    auto current = m_viewer.get_view_visible_range();
-    auto endpoints = m_viewer.get_view_full_range();
-    const bool keep_gantry_visible = m_sequential_view.marker.is_gantry_model();
-    m_sequential_view.m_show_marker = keep_gantry_visible ||
-        m_sequential_view.m_show_marker || (current.back() != endpoints.back() && !m_no_render_path);
+    // Keep the selected hotend/nozzle marker visible even when the optional
+    // full gantry is disabled. Previously only gantry models bypassed the
+    // slider-at-end check, leaving Prusa previews with no tool-position marker.
+    m_sequential_view.m_show_marker =
+        m_sequential_view.marker.has_model() && !m_no_render_path;
     const libvgcode::PathVertex& curr_vertex = m_viewer.get_current_vertex();
     m_sequential_view.marker.set_world_position(libvgcode::convert(curr_vertex.position));
     m_sequential_view.marker.set_z_offset(m_z_offset + 0.5f);

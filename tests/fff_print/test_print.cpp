@@ -26,6 +26,132 @@
 using namespace Slic3r;
 using namespace Slic3r::Test;
 
+namespace {
+
+std::vector<unsigned int> perimeter_inset_order(const LayerRegion &region)
+{
+    ExtrusionEntityCollection flattened = region.perimeters.flatten();
+    std::vector<unsigned int> order;
+    order.reserve(flattened.entities.size());
+    for (const ExtrusionEntity *entity : flattened.entities)
+        if (entity->is_loop())
+            order.push_back(entity->inset_idx);
+    return order;
+}
+
+} // namespace
+
+TEST_CASE("Inner wall seam preparation preserves the selected wall order", "[Print][Seam]")
+{
+    const std::string wall_generator = GENERATE("classic", "arachne");
+    const std::string wall_sequence = GENERATE("outer wall/inner wall", "inner wall/outer wall");
+    CAPTURE(wall_generator);
+    CAPTURE(wall_sequence);
+    DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+    config.set_deserialize_strict({
+        {"wall_generator", wall_generator},
+        {"wall_loops", 3},
+        {"wall_sequence", wall_sequence},
+        {"seam_start_on_inner_wall", true},
+        {"layer_height", 0.2},
+        {"initial_layer_print_height", 0.2}
+    });
+
+    Print print;
+    init_and_process_print({cube(20.0)}, print, config);
+
+    const Layer *layer = print.objects().front()->get_layer(1);
+    REQUIRE(layer != nullptr);
+    REQUIRE_FALSE(layer->regions().empty());
+    const std::vector<unsigned int> order = perimeter_inset_order(*layer->regions().front());
+    REQUIRE(order.size() >= 3);
+    if (wall_sequence == "outer wall/inner wall") {
+        CHECK(order[0] == 0);
+        CHECK(order[1] == 1);
+        CHECK(order[2] == 2);
+    } else {
+        CHECK(order[0] == 2);
+        CHECK(order[1] == 1);
+        CHECK(order[2] == 0);
+    }
+}
+
+TEST_CASE("Disabled inner wall seam start preserves the selected wall order", "[Print][Seam]")
+{
+    DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+    config.set_deserialize_strict({
+        {"wall_generator", "classic"},
+        {"wall_loops", 3},
+        {"wall_sequence", "outer wall/inner wall"},
+        {"seam_start_on_inner_wall", false},
+        {"layer_height", 0.2},
+        {"initial_layer_print_height", 0.2}
+    });
+
+    Print print;
+    init_and_process_print({cube(20.0)}, print, config);
+
+    const Layer *layer = print.objects().front()->get_layer(1);
+    REQUIRE(layer != nullptr);
+    REQUIRE_FALSE(layer->regions().empty());
+    const std::vector<unsigned int> order = perimeter_inset_order(*layer->regions().front());
+    REQUIRE(order.size() >= 3);
+    CHECK(order[0] == 0);
+}
+
+TEST_CASE("Inner wall seam preparation is a non-extruding outer-wall approach", "[Print][Seam]")
+{
+    const std::string wall_generator = GENERATE("classic", "arachne");
+    CAPTURE(wall_generator);
+    const auto generate_gcode = [&](bool prepare_outer_seam) {
+        return slice({cube(20.0)}, {
+            {"wall_generator", wall_generator},
+            {"wall_loops", 2},
+            {"wall_sequence", "outer wall/inner wall"},
+            {"seam_start_on_inner_wall", prepare_outer_seam},
+            {"seam_gap", 0.0},
+            {"gcode_comments", true},
+            {"skirt_loops", 0},
+            {"brim_type", "no_brim"},
+            {"layer_height", 0.2},
+            {"initial_layer_print_height", 0.2}
+        });
+    };
+    const std::string generated_gcode = generate_gcode(true);
+
+    size_t transitions = 0;
+    size_t prime_segments = 0;
+    double enabled_extrusion_length = 0.0;
+    GCodeReader reader;
+    reader.parse_buffer(generated_gcode, [&](GCodeReader &self, const GCodeReader::GCodeLine &line) {
+        if (line.extruding(self))
+            enabled_extrusion_length += line.dist_XY(self);
+        const std::string comment(line.comment());
+        if (line.travel() && line.dist_XY(self) > 0.0 &&
+            comment.find("outer wall seam transition") != std::string::npos) {
+            ++transitions;
+            CHECK_FALSE(line.extruding(self));
+        }
+        if (line.has_e() && line.dist_XY(self) > 0.0 &&
+            comment.find("outer wall seam prime") != std::string::npos) {
+            ++prime_segments;
+            CHECK(line.extruding(self));
+        }
+    });
+    CHECK(transitions > 0);
+    CHECK(prime_segments > 0);
+
+    double baseline_extrusion_length = 0.0;
+    GCodeReader baseline_reader;
+    baseline_reader.parse_buffer(
+        generate_gcode(false),
+        [&](GCodeReader &self, const GCodeReader::GCodeLine &line) {
+            if (line.extruding(self))
+                baseline_extrusion_length += line.dist_XY(self);
+        });
+    CHECK(enabled_extrusion_length == Catch::Approx(baseline_extrusion_length).epsilon(0.005));
+}
+
 SCENARIO("Changing the number of solid shell layers does not make all surfaces internal", "[Print]") {
     GIVEN("sliced 20mm cube and config with top_shell_layers = 2 and bottom_shell_layers = 1") {
         Slic3r::DynamicPrintConfig config = Slic3r::DynamicPrintConfig::full_print_config();

@@ -6,11 +6,14 @@
 #include "test_helpers.hpp" // get access to init_print, etc
 
 #include "libslic3r/Config.hpp"
+#include "libslic3r/GCode/GCodeProcessor.hpp"
 #include "libslic3r/Model.hpp"
 #include "libslic3r/Config.hpp"
 #include "libslic3r/GCodeReader.hpp"
 #include "libslic3r/Flow.hpp"
+#include "libslic3r/Print.hpp"
 #include "libslic3r/libslic3r.h"
+#include "test_utils.hpp"
 
 using namespace Slic3r::Test;
 using namespace Slic3r;
@@ -26,9 +29,9 @@ static double total_positive_extrusion(const std::string &gcode)
     return total;
 }
 
-TEST_CASE("Third wall flow changes only prints with at least three walls", "[Flow][Regression]")
+TEST_CASE("Intermediate inner wall flow changes only prints with at least three walls", "[Flow][Regression]")
 {
-    const auto extrusion_for = [](int walls, double third_wall_flow) {
+    const auto extrusion_for = [](int walls, double inner_walls_flow) {
         return total_positive_extrusion(slice({cube(10.)}, {
             {"wall_generator", "classic"},
             {"wall_loops", walls},
@@ -36,7 +39,7 @@ TEST_CASE("Third wall flow changes only prints with at least three walls", "[Flo
             {"bottom_shell_layers", 0},
             {"sparse_infill_density", "0%"},
             {"set_other_flow_ratios", 0},
-            {"third_wall_flow_ratio", third_wall_flow}
+            {"inner_walls_flow_ratio", std::to_string(inner_walls_flow * 100.) + "%"}
         }));
     };
 
@@ -44,9 +47,9 @@ TEST_CASE("Third wall flow changes only prints with at least three walls", "[Flo
     CHECK(extrusion_for(3, 1.5) > extrusion_for(3, 1.0));
 }
 
-TEST_CASE("Third wall flow preserves first and exposed top layers", "[Flow][Regression]")
+TEST_CASE("Intermediate inner wall flow preserves first and exposed top layers", "[Flow][Regression]")
 {
-    const auto extrusion_for = [](double height, double third_wall_flow) {
+    const auto extrusion_for = [](double height, double inner_walls_flow) {
         return total_positive_extrusion(slice({make_cube(10., 10., height)}, {
             {"layer_height", 0.2},
             {"initial_layer_print_height", 0.2},
@@ -56,12 +59,44 @@ TEST_CASE("Third wall flow preserves first and exposed top layers", "[Flow][Regr
             {"bottom_shell_layers", 3},
             {"sparse_infill_density", "0%"},
             {"set_other_flow_ratios", 0},
-            {"third_wall_flow_ratio", third_wall_flow}
+            {"inner_walls_flow_ratio", std::to_string(inner_walls_flow * 100.) + "%"}
         }));
     };
 
     CHECK_THAT(extrusion_for(0.4, 1.5), Catch::Matchers::WithinAbs(extrusion_for(0.4, 1.0), 1e-5));
     CHECK(extrusion_for(2.0, 1.5) > extrusion_for(2.0, 1.0));
+}
+
+TEST_CASE("Intermediate inner wall flow is represented by the G-code preview width", "[Flow][Preview][Regression]")
+{
+    const auto maximum_preview_width = [](double inner_walls_flow) {
+        Print print;
+        Slic3r::Test::init_and_process_print({make_cube(10., 10., 2.)}, print, {
+            {"layer_height", 0.2},
+            {"initial_layer_print_height", 0.2},
+            {"wall_generator", "classic"},
+            {"wall_loops", 3},
+            {"top_shell_layers", 0},
+            {"bottom_shell_layers", 0},
+            {"sparse_infill_density", "0%"},
+            {"set_other_flow_ratios", 0},
+            {"inner_walls_flow_ratio", std::to_string(inner_walls_flow * 100.) + "%"}
+        });
+
+        ScopedTemporaryFile gcode_file(".gcode");
+        GCodeProcessorResult preview;
+        print.export_gcode(gcode_file.string(), &preview, nullptr);
+
+        float maximum = 0.f;
+        for (const auto &move : preview.moves)
+            if (move.type == EMoveType::Extrude && move.extrusion_role == erPerimeter)
+                maximum = std::max(maximum, move.width);
+        return maximum;
+    };
+
+    const float normal_width = maximum_preview_width(1.);
+    CHECK(normal_width > 0.f);
+    CHECK(maximum_preview_width(1.5) > normal_width);
 }
 
 /// Test the expected behavior for auto-width,
