@@ -1081,10 +1081,10 @@ TEST_CASE("One-sided narrow overhang fills from supported arc origins",
         };
 
     for (const Polyline &path : paths) {
-        // A centerline shorter than its deposited bead is a start/stop blob,
-        // not a useful recursive arc. Such fragments can overlap a retained
-        // perimeter without registering as a proper centerline crossing.
-        CHECK(path.length() >= scale_(0.45));
+        // No sub-bead specks, but retain three-quarter-bead recursive
+        // fragments: their deposited width closes visible pockets which a
+        // full-bead centerline threshold would leave open.
+        CHECK(path.length() >= scale_(0.75 * 0.45));
         CHECK(lead_is_supported(path));
         append(deposited, to_lines(path));
     }

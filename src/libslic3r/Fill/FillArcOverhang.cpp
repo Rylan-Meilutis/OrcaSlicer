@@ -323,7 +323,7 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
                 // no longer emitted.
                 if (path.length() <
                     std::max(0.25 * double(spacing),
-                             double(line_width)))
+                             0.75 * double(line_width)))
                     return true;
                 if (!reject_shallow_paths || path.points.size() < 3)
                     return false;
@@ -1956,7 +1956,7 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
                     if (trimmed.length() <
                         std::max(
                             0.25 * double(spacing),
-                            double(line_width)))
+                            0.75 * double(line_width)))
                         continue;
                     printed_index.add(trimmed);
                     noncrossing_arcs.emplace_back(std::move(trimmed));
@@ -2168,7 +2168,7 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
                                 if (trimmed.length() <
                                         std::max(
                                             0.25 * double(spacing),
-                                            double(line_width)))
+                                            0.75 * double(line_width)))
                                     continue;
                                 candidate_group.emplace_back(
                                     std::move(trimmed));
@@ -2298,15 +2298,13 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
     Polylines sanitized_arcs;
     sanitized_arcs.reserve(arcs.size());
     size_t sanitized_primary_count = 0;
-    // A centerline shorter than most of one deposited bead cannot close a
-    // meaningful coverage gap. It instead becomes an isolated start/stop
-    // blob in G-code, particularly where a large circle is clipped several
-    // times by a retained wall or a supported island. Filter these remnants
-    // regardless of whether the final collision pass performed the clipping;
-    // generate_family() may already have produced the short fragment.
+    // Keep three-quarters of a bead of printable centerline. Short recursive
+    // fragments at this scale still close visible nozzle-width pockets on
+    // narrow bridges; the collision and sustained-retrace passes below reject
+    // fragments which would merely redraw a perimeter or an earlier arc.
     const double minimum_arc_length =
         std::max(0.25 * double(spacing),
-                 double(line_width));
+                 0.75 * double(line_width));
     const coord_t final_collision_tolerance =
         std::max<coord_t>(
             SCALED_EPSILON, gcode_coordinate_step);
@@ -2391,6 +2389,13 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
         }
 
         if (sanitized.length() < minimum_arc_length)
+            continue;
+        // The collision pass may shorten an otherwise curved arc until the
+        // surviving free-air portion is effectively a straight bridge. Keep
+        // short nozzle-scale gap fillers, but do not reintroduce the shallow
+        // spans rejected during family generation.
+        if (is_shallow_arc(sanitized) &&
+            !is_fully_supported(sanitized))
             continue;
         final_index.add(sanitized);
         sanitized_arcs.emplace_back(std::move(sanitized));
