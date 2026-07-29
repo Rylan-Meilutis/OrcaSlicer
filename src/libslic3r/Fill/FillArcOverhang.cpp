@@ -1028,7 +1028,6 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
         const double sample_step =
             std::max<double>(SCALED_EPSILON, 0.15 * line_width);
         const double maximum_duplicate_run = 0.65 * double(line_width);
-        constexpr double minimum_parallel_dot_squared = 0.82;
         double duplicate_run = 0.;
         double path_position = 0.;
         for (size_t point_idx = 1;
@@ -1059,6 +1058,8 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
                     Line(sample, sample), duplicate_clearance,
                     [&sample, &delta, &nearest_distance_squared](
                         const Line &printed) {
+                        constexpr double minimum_parallel_dot_squared =
+                            0.82;
                         const Vec2d printed_delta =
                             (printed.b - printed.a).cast<double>();
                         const double direction_norm_squared =
@@ -1470,6 +1471,16 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
     const coord_t lateral_support_distance =
         std::min(line_width, spacing) +
         coord_t(std::ceil(resolution));
+    const auto point_has_root_support =
+        [&params](const Point &point) {
+            return params.arc_root_anchor_regions != nullptr &&
+                   std::any_of(
+                       params.arc_root_anchor_regions->begin(),
+                       params.arc_root_anchor_regions->end(),
+                       [&point](const ExPolygon &region) {
+                           return region.contains(point);
+                       });
+        };
     const auto point_has_lateral_support =
         [lateral_support_distance, &params, &printed_index,
          &obstacle_index](const Point &point) {
@@ -1700,23 +1711,43 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
                !is_fully_emitted_bead_supported(path);
     };
     const auto split_from_supported_point =
-        [&point_has_lateral_support, spacing](Polyline path) {
+        [&point_has_lateral_support, &point_has_root_support,
+         &params, spacing](Polyline path) {
         const bool first_supported =
             point_has_lateral_support(path.first_point());
         const bool last_supported =
             point_has_lateral_support(path.last_point());
+        const bool has_root_context =
+            params.arc_root_anchor_regions != nullptr &&
+            !params.arc_root_anchor_regions->empty();
+        const bool root_endpoint_supported =
+            point_has_root_support(path.first_point()) ||
+            point_has_root_support(path.last_point());
         if (path.points.size() < 3 ||
-            (first_supported && last_supported))
+            (first_supported && last_supported &&
+             (!has_root_context || root_endpoint_supported)))
             return Polylines{std::move(path)};
 
-        size_t supported_idx = path.points.size();
-        for (size_t point_idx = 1;
-             point_idx + 1 < path.points.size(); ++point_idx) {
-            if (point_has_lateral_support(path.points[point_idx])) {
-                supported_idx = point_idx;
-                break;
-            }
-        }
+        const auto find_supported_idx =
+            [&path](const auto &is_supported) {
+                for (size_t point_idx = 1;
+                     point_idx + 1 < path.points.size(); ++point_idx)
+                    if (is_supported(path.points[point_idx]))
+                        return point_idx;
+                return path.points.size();
+            };
+        // When the preceding layer's actual perimeter footprint is known,
+        // start the root family there. A broader supported-slice mask is valid
+        // for later arcs, but choosing it first can place the initial bead one
+        // complete line width away from the perimeter that must establish the
+        // free-air shape.
+        size_t supported_idx =
+            has_root_context ?
+                find_supported_idx(point_has_root_support) :
+                path.points.size();
+        if (supported_idx == path.points.size())
+            supported_idx =
+                find_supported_idx(point_has_lateral_support);
         if (supported_idx == path.points.size())
             return Polylines{std::move(path)};
 
@@ -2308,6 +2339,74 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
     const coord_t final_collision_tolerance =
         std::max<coord_t>(
             SCALED_EPSILON, gcode_coordinate_step);
+    const bool has_final_support_context =
+        (params.arc_root_anchor_regions != nullptr &&
+         !params.arc_root_anchor_regions->empty()) ||
+        (params.arc_anchor_regions != nullptr &&
+         !params.arc_anchor_regions->empty()) ||
+        (params.arc_prior_paths != nullptr &&
+         !params.arc_prior_paths->empty()) ||
+        (params.arc_obstacle_paths != nullptr &&
+         !params.arc_obstacle_paths->empty());
+    const auto is_fully_supported_by_final_sequence =
+        [&params, &final_index, lateral_support_distance,
+         support_sample_step](const Polyline &path) {
+            const auto point_supported =
+                [&params, &final_index,
+                 lateral_support_distance](const Point &point) {
+                    const auto in_regions =
+                        [&point](const ExPolygons *regions) {
+                            return regions != nullptr &&
+                                   std::any_of(
+                                       regions->begin(), regions->end(),
+                                       [&point](const ExPolygon &region) {
+                                           return region.contains(point);
+                                       });
+                        };
+                    if (in_regions(params.arc_root_anchor_regions) ||
+                        in_regions(params.arc_anchor_regions))
+                        return true;
+
+                    double nearest_distance_squared =
+                        std::numeric_limits<double>::max();
+                    final_index.visit(
+                        Line(point, point), lateral_support_distance,
+                        [&nearest_distance_squared,
+                         &point](const Line &support) {
+                            nearest_distance_squared = std::min(
+                                nearest_distance_squared,
+                                support.distance_to_squared(point));
+                        });
+                    return nearest_distance_squared <=
+                           double(lateral_support_distance) *
+                               double(lateral_support_distance);
+                };
+
+            for (size_t point_idx = 1;
+                 point_idx < path.points.size(); ++point_idx) {
+                const Point &start = path.points[point_idx - 1];
+                const Point &end   = path.points[point_idx];
+                const Vec2d delta  = (end - start).cast<double>();
+                const double length = delta.norm();
+                if (length <= 0.)
+                    continue;
+                const size_t samples = std::max<size_t>(
+                    1, size_t(std::ceil(
+                           length / double(support_sample_step))));
+                for (size_t sample_idx = 0;
+                     sample_idx <= samples; ++sample_idx) {
+                    const Vec2d position =
+                        start.cast<double>() +
+                        delta * (double(sample_idx) /
+                                 double(samples));
+                    if (!point_supported(Point(
+                            coord_t(std::lround(position.x())),
+                            coord_t(std::lround(position.y())))))
+                        return false;
+                }
+            }
+            return true;
+        };
     for (size_t arc_idx = 0; arc_idx < arcs.size(); ++arc_idx) {
         Polyline &arc = arcs[arc_idx];
         if (arc.points.size() < 2)
@@ -2395,7 +2494,8 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
         // short nozzle-scale gap fillers, but do not reintroduce the shallow
         // spans rejected during family generation.
         if (is_shallow_arc(sanitized) &&
-            !is_fully_supported(sanitized))
+            has_final_support_context &&
+            !is_fully_supported_by_final_sequence(sanitized))
             continue;
         final_index.add(sanitized);
         sanitized_arcs.emplace_back(std::move(sanitized));
@@ -2427,22 +2527,24 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
         const double ordering_support_distance_squared =
             double(ordering_support_distance) *
             double(ordering_support_distance);
+        const auto point_in_regions =
+            [](const Point &point, const ExPolygons *regions) {
+                return regions != nullptr &&
+                       std::any_of(
+                           regions->begin(), regions->end(),
+                           [&point](const ExPolygon &region) {
+                               return region.contains(point);
+                           });
+            };
         const auto point_supported =
             [&params, &ordering_index,
+             &point_in_regions,
              ordering_support_distance,
              ordering_support_distance_squared](const Point &point) {
-                const auto in_regions =
-                    [&point](const ExPolygons *regions) {
-                        return regions != nullptr &&
-                               std::any_of(
-                                   regions->begin(),
-                                   regions->end(),
-                                   [&point](const ExPolygon &region) {
-                                       return region.contains(point);
-                                   });
-                    };
-                if (in_regions(params.arc_root_anchor_regions) ||
-                    in_regions(params.arc_anchor_regions))
+                if (point_in_regions(
+                        point, params.arc_root_anchor_regions) ||
+                    point_in_regions(
+                        point, params.arc_anchor_regions))
                     return true;
                 double nearest_distance_squared =
                     std::numeric_limits<double>::max();
@@ -2458,6 +2560,49 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
                     });
                 return nearest_distance_squared <=
                        ordering_support_distance_squared;
+            };
+        const auto has_root_supported_origin =
+            [&params, &point_in_regions, support_sample_step,
+             supported_lead_length](const Polyline &path) {
+                if (params.arc_root_anchor_regions == nullptr ||
+                    params.arc_root_anchor_regions->empty() ||
+                    path.points.size() < 2)
+                    return false;
+                coord_t remaining = supported_lead_length;
+                for (size_t point_idx = 1;
+                     point_idx < path.points.size() &&
+                     remaining > 0; ++point_idx) {
+                    const Point &start = path.points[point_idx - 1];
+                    const Point &end   = path.points[point_idx];
+                    const Vec2d delta  = (end - start).cast<double>();
+                    const double length = delta.norm();
+                    if (length <= 0.)
+                        continue;
+                    const double checked_length =
+                        std::min<double>(length, remaining);
+                    const size_t samples = std::max<size_t>(
+                        1, size_t(std::ceil(
+                               checked_length /
+                               double(support_sample_step))));
+                    for (size_t sample_idx = 0;
+                         sample_idx <= samples; ++sample_idx) {
+                        const Vec2d position =
+                            start.cast<double>() +
+                            delta *
+                                (checked_length *
+                                 double(sample_idx) /
+                                 double(samples) / length);
+                        if (!point_in_regions(
+                                Point(
+                                    coord_t(std::lround(position.x())),
+                                    coord_t(std::lround(position.y()))),
+                                params.arc_root_anchor_regions))
+                            return false;
+                    }
+                    remaining -= coord_t(
+                        std::lround(checked_length));
+                }
+                return true;
             };
         const auto longest_unsupported_run =
             [&point_supported,
@@ -2527,16 +2672,39 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
             };
         const auto order_group =
             [&ordering_index, &longest_unsupported_run,
-             &fully_supported, &point_supported]
+             &fully_supported, &point_supported,
+             &has_root_supported_origin]
             (Polylines pending, Polylines &ordered,
              bool seed_original_root) {
-                if (seed_original_root && !pending.empty() &&
-                    point_supported(
-                        pending.front().first_point())) {
-                    ordering_index.add(pending.front());
-                    ordered.emplace_back(
-                        std::move(pending.front()));
-                    pending.erase(pending.begin());
+                if (seed_original_root && !pending.empty()) {
+                    size_t root_idx =
+                        std::numeric_limits<size_t>::max();
+                    bool reverse_root = false;
+                    for (size_t path_idx = 0;
+                         path_idx < pending.size(); ++path_idx) {
+                        if (has_root_supported_origin(
+                                pending[path_idx])) {
+                            root_idx = path_idx;
+                            break;
+                        }
+                        Polyline reversed = pending[path_idx];
+                        reversed.reverse();
+                        if (has_root_supported_origin(reversed)) {
+                            root_idx = path_idx;
+                            reverse_root = true;
+                            break;
+                        }
+                    }
+                    if (root_idx !=
+                        std::numeric_limits<size_t>::max()) {
+                        if (reverse_root)
+                            pending[root_idx].reverse();
+                        ordering_index.add(pending[root_idx]);
+                        ordered.emplace_back(
+                            std::move(pending[root_idx]));
+                        pending.erase(
+                            pending.begin() + root_idx);
+                    }
                 }
                 while (!pending.empty()) {
                     Polylines deferred;
@@ -2678,6 +2846,7 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
         Polylines ordered;
         ordered.reserve(arcs.size());
         order_group(std::move(primary), ordered, true);
+        sanitized_primary_count = ordered.size();
         order_group(std::move(recursive), ordered, false);
         // Standalone fill callers do not provide the previous-layer support
         // map. Preserve their historical same-side traversal without
@@ -2713,9 +2882,18 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
         emitted_arc_lines, 4 * spacing);
     Polylines emitted_arcs;
     emitted_arcs.reserve(arcs.size());
-    for (Polyline &arc : arcs) {
+    for (size_t arc_idx = 0; arc_idx < arcs.size(); ++arc_idx) {
+        Polyline &arc = arcs[arc_idx];
         trim_sustained_retrace(arc, emitted_arc_index);
         if (arc.length() < minimum_arc_length)
+            continue;
+        // Proximity trimming happens in final print order and can shorten a
+        // valid recursive circle into a long, nearly straight chord. Such a
+        // remnant no longer provides the curved free-air support promised by
+        // the pattern; leave its residual for another child family instead of
+        // emitting a sag-prone bridge line.
+        if (arc_idx >= sanitized_primary_count &&
+            is_shallow_child_arc(arc))
             continue;
         emitted_arc_index.add(arc);
         emitted_arcs.emplace_back(std::move(arc));

@@ -3449,10 +3449,15 @@ void Sidebar::update_presets(Preset::Type preset_type)
         // Update dual extrudes
         auto* nozzle_diameter = dynamic_cast<const ConfigOptionFloats*>(printer_preset.config.option("nozzle_diameter"));
         auto extruder_variants = printer_preset.config.option<ConfigOptionStrings>("extruder_variant_list");
-        std::string printer_model = printer_preset.config.option<ConfigOptionString>("printer_model")->value;
+        const auto *printer_model_opt = printer_preset.config.option<ConfigOptionString>("printer_model");
+        const std::string printer_model = printer_model_opt != nullptr ? printer_model_opt->value : std::string();
 
         bool isBBL = preset_bundle.is_bbl_vendor();
-        bool is_dual_extruder = extruder_variants->size() == 2;
+        const bool is_dual_extruder =
+            nozzle_diameter != nullptr &&
+            nozzle_diameter->values.size() >= 2 &&
+            extruder_variants != nullptr &&
+            extruder_variants->values.size() >= 2;
         p->layout_printer(preset_bundle.use_bbl_network(), isBBL && is_dual_extruder);
 
         // Update nozzle titles from printer config (e.g. "Main Nozzle" / "Auxiliary Nozzle" for N6)
@@ -3474,16 +3479,41 @@ void Sidebar::update_presets(Preset::Type preset_type)
         auto extruder_max_nozzle_count = printer_preset.config.option<ConfigOptionIntsNullable>("extruder_max_nozzle_count");
         auto update_extruder_variant = [printer_model, extruders_def, extruders, nozzle_volumes_def, nozzle_volumes, extruder_variants,diameter,extruder_max_nozzle_count](ExtruderGroup & extruder, int index) {
             extruder.combo_flow->Clear();
+            if (extruders_def == nullptr || extruders == nullptr ||
+                nozzle_volumes_def == nullptr || nozzle_volumes == nullptr ||
+                nozzle_volumes_def->enum_keys_map == nullptr ||
+                extruder_variants == nullptr ||
+                index < 0 ||
+                size_t(index) >= extruders->values.size() ||
+                size_t(index) >= extruder_variants->values.size() ||
+                size_t(index) >= nozzle_volumes->values.size() ||
+                extruders->values[index] < 0 ||
+                size_t(extruders->values[index]) >=
+                    extruders_def->enum_labels.size()) {
+                extruder.combo_flow->SetSelection(wxNOT_FOUND);
+                return;
+            }
             auto type = extruders_def->enum_labels[extruders->values[index]];
             int select = -1;
-            for (size_t i = 0; i < nozzle_volumes_def->enum_labels.size(); ++i) {
+            const size_t nozzle_volume_count = std::min(
+                nozzle_volumes_def->enum_labels.size(),
+                nozzle_volumes_def->enum_values.size());
+            for (size_t i = 0; i < nozzle_volume_count; ++i) {
+                const auto nozzle_volume =
+                    nozzle_volumes_def->enum_keys_map->find(
+                        nozzle_volumes_def->enum_values[i]);
+                if (nozzle_volume ==
+                    nozzle_volumes_def->enum_keys_map->end())
+                    continue;
                 // get_at falls back to the first entry when a profile defines no per-extruder value,
                 // so extruders without an explicit sub-nozzle count never offer Hybrid. A nullable-int
                 // nil is INT_MAX (> 1) and would otherwise falsely pass the gate, so exclude it too.
                 if (boost::algorithm::contains(extruder_variants->values[index], type + " " + nozzle_volumes_def->enum_labels[i]) ||
-                    extruder_max_nozzle_count->get_at(index) > 1 && extruder_max_nozzle_count->get_at(index) != ConfigOptionIntsNullable::nil_value() &&
-                    nozzle_volumes_def->enum_keys_map->at(nozzle_volumes_def->enum_values[i]) == nvtHybrid) {
-                    if (nozzle_volumes_def->enum_keys_map->at(nozzle_volumes_def->enum_values[i]) == NozzleVolumeType::nvtHighFlow &&(diameter == "0.2" ||
+                    (extruder_max_nozzle_count != nullptr &&
+                     extruder_max_nozzle_count->get_at(index) > 1 &&
+                     extruder_max_nozzle_count->get_at(index) != ConfigOptionIntsNullable::nil_value() &&
+                     nozzle_volume->second == nvtHybrid)) {
+                    if (nozzle_volume->second == NozzleVolumeType::nvtHighFlow &&(diameter == "0.2" ||
                         is_skip_high_flow_printer(printer_model)))
                         continue;
                     if (nozzle_volumes->values[index] == i)
@@ -3496,13 +3526,23 @@ void Sidebar::update_presets(Preset::Type preset_type)
             extruder.combo_flow->SetSelection(select);
         };
 
-        auto update_extruder_diameter = [&diameters, &diameter, &nozzle_diameter](int extruder_index,ExtruderGroup & extruder) {
+        auto update_extruder_diameter = [&diameters, &nozzle_diameter](int extruder_index,ExtruderGroup & extruder) {
             extruder.combo_diameter->Clear();
             int select = -1;
+            if (nozzle_diameter == nullptr ||
+                extruder_index < 0 ||
+                size_t(extruder_index) >= nozzle_diameter->values.size()) {
+                extruder.combo_diameter->SetSelection(wxNOT_FOUND);
+                extruder.diameter.clear();
+                return;
+            }
             // ORCA get the actual nozzle diameter from printer config
             auto nozzle_dia = get_diameter_string(nozzle_diameter->values[extruder_index]);
             // ORCA try to add nozzle diameter from config if list is empty. fixes blank nozzle combo box when preset has no alias
-            if(diameters[0].empty() && !nozzle_dia.empty()){
+            if (diameters.empty()) {
+                if (!nozzle_dia.empty())
+                    diameters.push_back(nozzle_dia);
+            } else if (diameters.front().empty() && !nozzle_dia.empty()) {
                 diameters[0] = nozzle_dia;
             }
             // Orca: Check if the actual nozzle diameter exists in the list, if not add it as a custom option

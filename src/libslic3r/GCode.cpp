@@ -7003,7 +7003,7 @@ std::string GCode::extrude_loop(const ExtrusionLoop&        loop_ref,
                 const double endpoint_tolerance2 = scaled<double>(0.01) * scaled<double>(0.01);
                 const bool transition_crosses_inner_wall = std::any_of(
                     transition_intersections.begin(), transition_intersections.end(),
-                    [&](const auto &intersection) {
+                    [&inner_start, endpoint_tolerance2](const auto &intersection) {
                         return (intersection.first - inner_start).template cast<double>().squaredNorm() >
                                endpoint_tolerance2;
                     });

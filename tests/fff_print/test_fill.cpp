@@ -1258,7 +1258,8 @@ TEST_CASE("Long narrow arc overhang retains complete primary coverage", "[Fill][
             return path.first_point().x() >= scale_(117.95);
         }));
 
-        for (const Polyline &path : paths) {
+        for (size_t path_idx = 0; path_idx < paths.size(); ++path_idx) {
+            const Polyline &path = paths[path_idx];
             if (path.points.size() < 3)
                 continue;
             const Line chord(path.first_point(), path.last_point());
@@ -1271,6 +1272,9 @@ TEST_CASE("Long narrow arc overhang retains complete primary coverage", "[Fill][
             // Bounded-radius chained families must remain visibly curved. A
             // long clipped segment with less than one line width of curvature
             // behaves like the sagging straight bridges this pattern replaces.
+            INFO("path index: " << path_idx
+                 << ", path length: " << unscale<double>(path.length())
+                 << ", chord length: " << unscale<double>(chord.length()));
             CHECK(max_sagitta_squared >= double(spacing) * double(spacing));
         }
 
