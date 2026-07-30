@@ -1820,10 +1820,54 @@ TEST_CASE("Narrow bridge G-code keeps every arc path anchored and curved",
         }
         CHECK(arc_path_count >= 4);
         CHECK(arc_segment_count > arc_path_count);
-        // Global arc fitting remains enabled, but these topology-validated
-        // paths must retain their exact G1 polyline through final export.
-        CHECK(arc_command_count == 0);
+        // Arc-overhang geometry is fitted only after its paths have passed the
+        // generator's anchoring and collision checks. The parsed preview checks
+        // above exercise the emitted curves rather than just their source
+        // polylines, so fitted G2/G3 moves must retain those guarantees.
+        CHECK(arc_command_count > 0);
     }
+}
+
+TEST_CASE("Arc overhang fitting follows the global arc fitting setting",
+          "[Fill][ArcOverhang][GCode][ArcFitting]")
+{
+    Print print;
+    Slic3r::Test::init_and_process_print(
+        {make_arc_bridge_validation_model(4.5, 30.)}, print, {
+            {"layer_height", "0.2"},
+            {"initial_layer_print_height", "0.2"},
+            {"wall_loops", "2"},
+            {"arc_overhang_enabled", "1"},
+            {"arc_overhang_bridge_distance", "0"},
+            {"arc_overhang_min_overhang_distance", "0"},
+            {"arc_overhang_recursive_fill", "1"},
+            {"enable_arc_fitting", "0"},
+            {"enable_support", "0"}
+        });
+    REQUIRE(print_has_arc_overhang(print));
+
+    ScopedTemporaryFile gcode_file(".gcode");
+    GCodeProcessorResult preview;
+    print.export_gcode(gcode_file.string(), &preview, nullptr);
+
+    std::ifstream stream(gcode_file.string());
+    REQUIRE(stream.good());
+    bool arc_overhang_role = false;
+    size_t arc_command_count = 0;
+    for (std::string line; std::getline(stream, line);) {
+        if (line.rfind(";TYPE:", 0) == 0) {
+            arc_overhang_role = line == ";TYPE:Arc overhang";
+            continue;
+        }
+        if (!arc_overhang_role)
+            continue;
+        std::istringstream words(line);
+        std::string command;
+        words >> command;
+        if (command == "G2" || command == "G3")
+            ++arc_command_count;
+    }
+    CHECK(arc_command_count == 0);
 }
 
 TEST_CASE("Arc overhang keeps perimeter width while scaling volume", "[Fill][ArcOverhang][Flow]")

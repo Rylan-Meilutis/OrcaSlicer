@@ -1082,10 +1082,10 @@ void LayerRegion::simplify_path(ExtrusionPath* path)
     const auto scaled_resolution = scaled<double>(print_config.resolution.value);
 
     // Arc-overhang paths have already been clipped against previously emitted
-    // paths. Re-fitting or simplifying them may bow a segment outside that
-    // validated corridor and into a neighboring bead.
+    // paths. Preserve fitting data approved by the generator, but never fit or
+    // simplify one here: doing so without the generator's obstacle context may
+    // bow a segment outside its validated corridor.
     if (path->role() == erArcOverhang) {
-        path->polyline.fitting_result.clear();
         return;
     }
 
@@ -1109,7 +1109,6 @@ void LayerRegion::simplify_multi_path(ExtrusionMultiPath* multipath)
 
     for (size_t i = 0; i < multipath->paths.size(); ++i) {
         if (multipath->paths[i].role() == erArcOverhang) {
-            multipath->paths[i].polyline.fitting_result.clear();
             continue;
         }
         if (enable_arc_fitting &&
@@ -1133,7 +1132,6 @@ void LayerRegion::simplify_loop(ExtrusionLoop* loop)
 
     for (size_t i = 0; i < loop->paths.size(); ++i) {
         if (loop->paths[i].role() == erArcOverhang) {
-            loop->paths[i].polyline.fitting_result.clear();
             continue;
         }
         if (enable_arc_fitting &&

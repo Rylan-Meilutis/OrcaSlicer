@@ -298,6 +298,7 @@ public:
         for (const Point &pt : poly.points) {
             this->points.emplace_back(pt.x(), pt.y(), z);
         }
+        this->fitting_result = poly.fitting_result;
     }
 
     virtual Lines3 lines() const;

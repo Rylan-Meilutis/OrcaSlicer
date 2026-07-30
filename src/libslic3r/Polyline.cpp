@@ -677,6 +677,7 @@ Polyline Polyline3::to_polyline() const
     for (const Point3 &point : this->points) {
         out.points.emplace_back(point.x(), point.y());
     }
+    out.fitting_result = this->fitting_result;
     return out;
 }
 

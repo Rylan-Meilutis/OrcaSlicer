@@ -2887,8 +2887,14 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
     if (params.arc_obstacle_paths != nullptr)
         for (const Polyline &path : *params.arc_obstacle_paths)
             append(emitted_anchor_lines, path.lines());
+    Point previous_emitted_end;
+    bool has_previous_emitted_end = false;
+    const double supported_endpoint_distance_squared =
+        double(line_width) * double(line_width);
     const auto anchor_emitted_start =
-        [&emitted_anchor_lines](Polyline &arc) {
+        [&emitted_anchor_lines, &previous_emitted_end,
+         &has_previous_emitted_end,
+         supported_endpoint_distance_squared](Polyline &arc) {
             if (arc.points.size() < 2 || emitted_anchor_lines.empty())
                 return;
 
@@ -2926,7 +2932,19 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
                 nearest_anchor_distance_squared(arc.first_point());
             const double last_distance =
                 nearest_anchor_distance_squared(arc.last_point());
-            if (last_distance < first_distance)
+            // When both ends already touch printed material, keep the next
+            // extrusion on the current side instead of undoing dependency
+            // ordering and travelling across the bridge. If only one end is
+            // supported, anchoring remains the stronger requirement.
+            const bool both_supported =
+                first_distance <= supported_endpoint_distance_squared &&
+                last_distance <= supported_endpoint_distance_squared;
+            const bool last_is_nearer =
+                has_previous_emitted_end &&
+                (arc.last_point() - previous_emitted_end).squaredNorm() <
+                    (arc.first_point() - previous_emitted_end).squaredNorm();
+            if ((both_supported && last_is_nearer) ||
+                (!both_supported && last_distance < first_distance))
                 arc.reverse();
 
             // Choose the endpoint closest to a centerline that has actually
@@ -2941,6 +2959,10 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
         Polyline &arc = arcs[arc_idx];
         anchor_emitted_start(arc);
         trim_sustained_retrace(arc, emitted_arc_index);
+        // Trimming a leading retrace changes the candidate start and may move
+        // it farther away than the untouched opposite end. Re-evaluate the
+        // direction on the final shortened geometry.
+        anchor_emitted_start(arc);
         if (arc.length() < minimum_arc_length)
             continue;
         // Proximity trimming happens in final print order and can shorten a
@@ -2953,9 +2975,43 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
             continue;
         emitted_arc_index.add(arc);
         append(emitted_anchor_lines, arc.lines());
+        previous_emitted_end = arc.last_point();
+        has_previous_emitted_end = true;
         emitted_arcs.emplace_back(std::move(arc));
     }
     arcs = std::move(emitted_arcs);
+
+    // The retrace pass above may shorten a path after the dependency-ordering
+    // direction was chosen. Standalone fill callers have no mechanical
+    // support map to distinguish the endpoints, so restore the legacy
+    // same-side direction on the actual final paths.
+    if (params.arc_prior_paths == nullptr &&
+        params.arc_obstacle_paths == nullptr &&
+        params.arc_root_anchor_regions == nullptr &&
+        params.arc_anchor_regions == nullptr) {
+        for (size_t path_idx = 1; path_idx < arcs.size(); ++path_idx)
+            if ((arcs[path_idx].last_point() -
+                 arcs[path_idx - 1].last_point()).squaredNorm() <
+                (arcs[path_idx].first_point() -
+                 arcs[path_idx - 1].last_point()).squaredNorm())
+                arcs[path_idx].reverse();
+    }
+
+    // These paths were clipped and ordered using their polygonal
+    // representation. Fit them only after all geometry changes are complete,
+    // and use a much tighter tolerance than ordinary model-path fitting. This
+    // retains the exact endpoints and keeps the fitted centerline within a few
+    // microns of the collision-validated path. LayerRegion deliberately
+    // preserves this result instead of attempting a context-free re-fit.
+    const double arc_fitting_tolerance =
+        std::min(resolution, double(scale_(0.005)));
+    for (Polyline &arc : arcs) {
+        arc.fitting_result.clear();
+        if (arc.points.size() >= 3)
+            ArcFitter::do_arc_fitting(
+                arc.points, arc.fitting_result,
+                arc_fitting_tolerance);
+    }
 
     if (params.arc_prior_paths != nullptr)
         append(*params.arc_prior_paths, arcs);

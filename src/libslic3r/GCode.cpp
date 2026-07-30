@@ -8331,7 +8331,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
             }
             // BBS: use G1 if not enable arc fitting or has no arc fitting result or in spiral_mode mode or we are doing sloped extrusion
             // Attention: G2 and G3 is not supported in spiral_mode mode
-            if (!m_config.enable_arc_fitting || path.role() == erArcOverhang ||
+            if (!m_config.enable_arc_fitting ||
                 path.polyline.fitting_result.empty() || m_config.spiral_mode ||
                 sloped != nullptr || path.z_contoured) {
                 double path_length = 0.;
