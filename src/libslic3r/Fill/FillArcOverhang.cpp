@@ -3003,8 +3003,12 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
     // retains the exact endpoints and keeps the fitted centerline within a few
     // microns of the collision-validated path. LayerRegion deliberately
     // preserves this result instead of attempting a context-free re-fit.
-    const double arc_fitting_tolerance =
-        std::min(resolution, double(scale_(0.005)));
+    // The general path resolution may be set below the quantization and
+    // clipping error of generated arcs (a configured zero is normalized to
+    // 0.001 mm). Use a fixed, tightly bounded tolerance here: these paths have
+    // already passed the generator's collision checks, and 0.005 mm keeps the
+    // fitted centerline within the validated extrusion corridor.
+    const double arc_fitting_tolerance = double(scale_(0.005));
     for (Polyline &arc : arcs) {
         arc.fitting_result.clear();
         if (arc.points.size() >= 3)

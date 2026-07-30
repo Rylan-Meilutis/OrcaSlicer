@@ -152,6 +152,49 @@ TEST_CASE("Inner wall seam preparation is a non-extruding outer-wall approach", 
     CHECK(enabled_extrusion_length == Catch::Approx(baseline_extrusion_length).epsilon(0.005));
 }
 
+TEST_CASE("Inner wall seam preparation follows the configured seam position", "[Print][Seam]")
+{
+    const std::string seam_position =
+        GENERATE("nearest", "aligned", "aligned_back", "back", "random");
+    CAPTURE(seam_position);
+    const std::string generated_gcode = slice({cube(20.0)}, {
+        {"wall_generator", "classic"},
+        {"wall_loops", 2},
+        {"wall_sequence", "outer wall/inner wall"},
+        {"seam_position", seam_position},
+        {"seam_start_on_inner_wall", true},
+        {"seam_gap", 0.0},
+        {"gcode_comments", true},
+        {"skirt_loops", 0},
+        {"brim_type", "no_brim"},
+        {"layer_height", 0.2},
+        {"initial_layer_print_height", 0.2}
+    });
+
+    bool awaiting_outer_wall = false;
+    Vec2f transition_end = Vec2f::Zero();
+    size_t aligned_transitions = 0;
+    GCodeReader reader;
+    reader.parse_buffer(generated_gcode, [&](GCodeReader &self, const GCodeReader::GCodeLine &line) {
+        const std::string comment(line.comment());
+        if (line.travel() &&
+            comment.find("outer wall seam transition") != std::string::npos) {
+            transition_end = Vec2f(line.new_X(self), line.new_Y(self));
+            awaiting_outer_wall = true;
+        } else if (awaiting_outer_wall && line.extruding(self)) {
+            // The transition target is the outer-loop seam selected by
+            // SeamPlacer, so every placement strategy must begin extrusion at
+            // exactly that point.
+            CHECK(self.x() == Catch::Approx(transition_end.x()).margin(0.0015));
+            CHECK(self.y() == Catch::Approx(transition_end.y()).margin(0.0015));
+            awaiting_outer_wall = false;
+            ++aligned_transitions;
+        }
+    });
+    CHECK(aligned_transitions > 0);
+    CHECK_FALSE(awaiting_outer_wall);
+}
+
 SCENARIO("Changing the number of solid shell layers does not make all surfaces internal", "[Print]") {
     GIVEN("sliced 20mm cube and config with top_shell_layers = 2 and bottom_shell_layers = 1") {
         Slic3r::DynamicPrintConfig config = Slic3r::DynamicPrintConfig::full_print_config();
