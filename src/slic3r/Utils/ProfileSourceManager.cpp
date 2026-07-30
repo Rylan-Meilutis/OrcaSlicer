@@ -622,11 +622,39 @@ std::string preset_name(const std::string &section)
     return colon == std::string::npos ? section : section.substr(colon + 1);
 }
 
+std::string qualified_name(const std::string &name, const std::string &source_namespace)
+{
+    return source_namespace.empty() ? name : name + " [" + source_namespace + "]";
+}
+
+void qualify_section_reference(Section &section, const char *key, const std::set<std::string> &available,
+                               const std::string &source_namespace)
+{
+    auto found = section.find(key);
+    if (found == section.end() || available.empty())
+        return;
+    std::vector<std::string> values;
+    unescape_strings_cstyle(found->second, values);
+    if (values.size() <= 1 && found->second.find(';') != std::string::npos)
+        boost::split(values, found->second, boost::is_any_of(";"), boost::token_compress_off);
+    if (values.empty())
+        values.push_back(found->second);
+    bool changed = false;
+    for (std::string &value : values) {
+        if (available.count(value) != 0) {
+            value = qualified_name(value, source_namespace);
+            changed = true;
+        }
+    }
+    if (changed)
+        found->second = boost::join(values, ";");
+}
+
 bool write_preset(const fs::path &root, const std::string &section_name, const Section &input,
-                  ProfileSourceSyncResult &result)
+                  ProfileSourceSyncResult &result, const std::string &source_namespace = {})
 {
     const std::string type = preset_type(section_name);
-    const std::string name = preset_name(section_name);
+    const std::string name = qualified_name(preset_name(section_name), source_namespace);
     if (type.empty() || name.empty() || name.front() == '*')
         return true;
 
@@ -690,14 +718,18 @@ bool write_preset(const fs::path &root, const std::string &section_name, const S
         }
     }
     if (type == "filament")
-        output["filament_id"] = ProfileSourceManager::make_id(name, section_name);
+        output["filament_id"] = ProfileSourceManager::make_id(name, section_name + source_namespace);
 
     const char *subdir = type == "process" ? PRESET_PRINT_NAME :
                          type == "filament" ? PRESET_FILAMENT_NAME : PRESET_PRINTER_NAME;
     fs::create_directories(root / subdir);
     fs::path file = root / subdir / (sanitize(name) + ".json");
     boost::nowide::ofstream stream(file.string());
-    stream << output.dump(1, '\t') << '\n';
+    // Upstream INI files are not guaranteed to be UTF-8. A malformed vendor
+    // or preset description must not terminate OrcaSlicer while the daily
+    // profile refresh is running. Preserve the preset and replace only invalid
+    // input bytes in the generated JSON.
+    stream << output.dump(1, '\t', false, json::error_handler_t::replace) << '\n';
     if (!stream.good())
         return false;
     if (type == "process") ++result.processes;
@@ -735,7 +767,8 @@ std::vector<fs::path> selected_ini_files(const fs::path &root)
     return result;
 }
 
-ProfileSourceSyncResult convert_prusa_tree(const fs::path &input_root, const fs::path &output_root)
+ProfileSourceSyncResult convert_prusa_tree(const fs::path &input_root, const fs::path &output_root,
+                                           const std::string &source_namespace = {})
 {
     ProfileSourceSyncResult result;
     const auto files = selected_ini_files(input_root);
@@ -744,6 +777,8 @@ ProfileSourceSyncResult convert_prusa_tree(const fs::path &input_root, const fs:
         return result;
     }
     for (const fs::path &file : files) {
+        const std::string file_namespace = source_namespace.empty() ? std::string() :
+            source_namespace + " / " + file.parent_path().filename().string();
         std::string parse_error;
         Sections sections = read_sections(file, parse_error);
         if (!parse_error.empty())
@@ -756,12 +791,19 @@ ProfileSourceSyncResult convert_prusa_tree(const fs::path &input_root, const fs:
             if (!flat_type.empty()) {
                 const std::string name = flat.count("profile_name") ?
                     flat.at("profile_name") : file.stem().string();
-                if (!write_preset(output_root, flat_type + ":" + name, flat, result)) {
+                if (!write_preset(output_root, flat_type + ":" + name, flat, result, file_namespace)) {
                     result.error = "Could not write converted preset " + name;
                     return result;
                 }
             }
             continue;
+        }
+        std::map<std::string, std::set<std::string>> names;
+        for (const auto &[name, section] : sections) {
+            const std::string type = preset_type(name);
+            const std::string profile_name = preset_name(name);
+            if (!type.empty() && !profile_name.empty() && profile_name.front() != '*')
+                names[type].insert(profile_name);
         }
         std::set<std::string> visiting;
         std::map<std::string, Section> cache;
@@ -769,7 +811,11 @@ ProfileSourceSyncResult convert_prusa_tree(const fs::path &input_root, const fs:
             if (preset_type(name).empty())
                 continue;
             Section merged = flatten(name, sections, visiting, cache, result.skipped_options);
-            if (!write_preset(output_root, name, merged, result)) {
+            qualify_section_reference(merged, "compatible_printers", names["machine"], file_namespace);
+            qualify_section_reference(merged, "compatible_prints", names["process"], file_namespace);
+            qualify_section_reference(merged, "default_print_profile", names["process"], file_namespace);
+            qualify_section_reference(merged, "default_filament_profile", names["filament"], file_namespace);
+            if (!write_preset(output_root, name, merged, result, file_namespace)) {
                 result.error = "Could not write converted preset " + preset_name(name);
                 return result;
             }
@@ -780,14 +826,134 @@ ProfileSourceSyncResult convert_prusa_tree(const fs::path &input_root, const fs:
     return result;
 }
 
+struct NativePreset
+{
+    std::string category;
+    std::string vendor;
+    std::string name;
+    json        contents;
+};
+
+std::string preset_category(const fs::path &path, const fs::path &root, fs::path &category_path)
+{
+    for (fs::path parent = path.parent_path(); parent != root && !parent.empty(); parent = parent.parent_path()) {
+        const std::string name = parent.filename().string();
+        if (name == PRESET_PRINT_NAME || name == PRESET_FILAMENT_NAME || name == PRESET_PRINTER_NAME) {
+            category_path = parent;
+            return name;
+        }
+    }
+    return {};
+}
+
+void qualify_reference(json &contents, const char *key, const std::set<std::string> &available,
+                       const std::string &source_namespace)
+{
+    auto found = contents.find(key);
+    if (found == contents.end())
+        return;
+    auto qualify = [&](json &value) {
+        if (value.is_string()) {
+            const std::string name = value.get<std::string>();
+            if (available.count(name) != 0)
+                value = qualified_name(name, source_namespace);
+        }
+    };
+    if (found->is_array())
+        for (json &value : *found)
+            qualify(value);
+    else
+        qualify(*found);
+}
+
+ProfileSourceSyncResult import_native_tree(const fs::path &input_root, const fs::path &output_root,
+                                            const ProfileSource &source)
+{
+    ProfileSourceSyncResult result;
+    std::vector<NativePreset> presets;
+    if (!fs::exists(input_root)) {
+        result.error = "The extracted profile source is empty.";
+        return result;
+    }
+
+    for (fs::recursive_directory_iterator it(input_root), end; it != end; ++it) {
+        if (!fs::is_regular_file(it->path()) || it->path().extension() != ".json")
+            continue;
+        fs::path category_path;
+        const std::string category = preset_category(it->path(), input_root, category_path);
+        if (category.empty())
+            continue;
+        boost::nowide::ifstream stream(it->path().string());
+        json contents = json::parse(stream, nullptr, false, true);
+        if (contents.is_discarded() || !contents.is_object() ||
+            !contents.contains("name") || !contents["name"].is_string()) {
+            ++result.skipped_options;
+            continue;
+        }
+        presets.push_back({category, category_path.parent_path().filename().string(),
+                           contents["name"].get<std::string>(), std::move(contents)});
+    }
+
+    using PresetNames = std::map<std::pair<std::string, std::string>, std::set<std::string>>;
+    PresetNames names;
+    for (const NativePreset &preset : presets)
+        names[{preset.vendor, preset.category}].insert(preset.name);
+
+    for (NativePreset &preset : presets) {
+        const std::string preset_namespace = source.name + " / " + preset.vendor;
+        const auto names_for = [&](const std::string &category) -> const std::set<std::string> & {
+            static const std::set<std::string> empty;
+            auto found = names.find({preset.vendor, category});
+            return found == names.end() ? empty : found->second;
+        };
+
+        preset.contents["name"] = qualified_name(preset.name, preset_namespace);
+        qualify_reference(preset.contents, "inherits", names_for(preset.category), preset_namespace);
+        qualify_reference(preset.contents, "compatible_printers", names_for(PRESET_PRINTER_NAME), preset_namespace);
+        qualify_reference(preset.contents, "compatible_prints", names_for(PRESET_PRINT_NAME), preset_namespace);
+        qualify_reference(preset.contents, "default_print_profile", names_for(PRESET_PRINT_NAME), preset_namespace);
+        qualify_reference(preset.contents, "default_filament_profile", names_for(PRESET_FILAMENT_NAME), preset_namespace);
+        if (preset.category == PRESET_FILAMENT_NAME)
+            preset.contents["filament_id"] =
+                ProfileSourceManager::make_id(preset.name, source.id + '\n' + preset.vendor);
+
+        fs::create_directories(output_root / preset.category);
+        const fs::path destination = output_root / preset.category /
+            (sanitize(preset.vendor) + "__" + sanitize(preset.name) + ".json");
+        boost::nowide::ofstream stream(destination.string());
+        stream << preset.contents.dump(1, '\t', false, json::error_handler_t::replace) << '\n';
+        if (!stream.good()) {
+            result.error = "Could not write imported preset " + preset.name;
+            return result;
+        }
+        if (preset.category == PRESET_PRINT_NAME) ++result.processes;
+        else if (preset.category == PRESET_FILAMENT_NAME) ++result.filaments;
+        else ++result.printers;
+    }
+    return result;
+}
+
 } // namespace
 
 ProfileSourceManager::ProfileSourceManager(AppConfig &config) : m_config(config) {}
 
 ProfileSourceSyncResult ProfileSourceManager::convert_prusa_profiles(const std::string &input_root,
-                                                                      const std::string &output_root)
+                                                                      const std::string &output_root,
+                                                                      const std::string &source_namespace)
 {
-    return convert_prusa_tree(fs::path(input_root), fs::path(output_root));
+    return convert_prusa_tree(fs::path(input_root), fs::path(output_root), source_namespace);
+}
+
+ProfileSourceSyncResult ProfileSourceManager::convert_orca_profiles(const std::string &input_root,
+                                                                     const std::string &output_root,
+                                                                     const std::string &source_id,
+                                                                     const std::string &source_name)
+{
+    ProfileSource source;
+    source.id = source_id;
+    source.name = source_name;
+    source.format = ProfileSource::Format::Orca;
+    return import_native_tree(fs::path(input_root), fs::path(output_root), source);
 }
 
 std::vector<ProfileSource> ProfileSourceManager::sources() const
@@ -821,7 +987,7 @@ void ProfileSourceManager::set_sources(const std::vector<ProfileSource> &sources
         output.push_back({{"id", source.id}, {"name", source.name}, {"url", source.url},
                           {"format", source.format == ProfileSource::Format::Orca ? "orca" : "prusa"},
                           {"last_sync", source.last_sync}, {"enabled", source.enabled}});
-    m_config.set(CONFIG_KEY, output.dump());
+    m_config.set(CONFIG_KEY, output.dump(-1, ' ', false, json::error_handler_t::replace));
     m_config.save();
 }
 
@@ -849,7 +1015,7 @@ bool ProfileSourceManager::remove(const std::string &id, std::string &error)
     return !ec;
 }
 
-ProfileSourceSyncResult ProfileSourceManager::sync(const ProfileSource &source)
+ProfileSourceSyncResult ProfileSourceManager::sync(const ProfileSource &source) try
 {
     ProfileSourceSyncResult result;
     const std::string user = m_config.get("preset_folder").empty() ? DEFAULT_USER_FOLDER_NAME : m_config.get("preset_folder");
@@ -886,32 +1052,15 @@ ProfileSourceSyncResult ProfileSourceManager::sync(const ProfileSource &source)
         } else if (!extract_zip(body, extracted, result.error)) {
             return result;
         }
-        result = convert_prusa_tree(extracted, staging);
+        result = convert_prusa_tree(extracted, staging, source.name);
         if (!result.success())
             return result;
     } else {
         if (!extract_zip(body, extracted, result.error))
             return result;
-        for (fs::recursive_directory_iterator it(extracted), end; it != end; ++it) {
-            if (!fs::is_regular_file(it->path()) || it->path().extension() != ".json")
-                continue;
-            const std::string parent = it->path().parent_path().filename().string();
-            if (parent != PRESET_PRINT_NAME && parent != PRESET_FILAMENT_NAME && parent != PRESET_PRINTER_NAME)
-                continue;
-            fs::create_directories(staging / parent);
-            // Native repositories contain one machine/process/filament
-            // directory per vendor, and common files often share names.
-            // Local bundles are flat, so retain the vendor in the destination
-            // filename to prevent one fork or vendor from silently replacing
-            // another. Preset inheritance uses the JSON `name`, not filenames.
-            const std::string vendor = sanitize(it->path().parent_path().parent_path().filename().string());
-            const fs::path destination = staging / parent /
-                (vendor + "__" + it->path().filename().string());
-            fs::copy_file(it->path(), destination, fs::copy_option::overwrite_if_exists);
-            if (parent == PRESET_PRINT_NAME) ++result.processes;
-            else if (parent == PRESET_FILAMENT_NAME) ++result.filaments;
-            else ++result.printers;
-        }
+        result = import_native_tree(extracted, staging, source);
+        if (!result.success())
+            return result;
     }
 
     if (result.printers + result.filaments + result.processes == 0) {
@@ -955,6 +1104,16 @@ ProfileSourceSyncResult ProfileSourceManager::sync(const ProfileSource &source)
         if (item.id == source.id)
             item.last_sync = std::time(nullptr);
     set_sources(current);
+    return result;
+}
+catch (const std::exception &exception) {
+    ProfileSourceSyncResult result;
+    result.error = "Could not synchronize profile source: " + std::string(exception.what());
+    return result;
+}
+catch (...) {
+    ProfileSourceSyncResult result;
+    result.error = "Could not synchronize profile source because it contains invalid data.";
     return result;
 }
 

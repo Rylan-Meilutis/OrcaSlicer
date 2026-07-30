@@ -31,8 +31,11 @@ struct ProfileSourceSyncResult
 };
 
 // Stores source definitions in AppConfig and installs each source into its own
-// local preset bundle. This ownership boundary makes source removal safe: user
-// presets and presets installed by another source are never touched.
+// local preset bundle. Imported preset names are qualified by source (and by
+// vendor for native repositories), preventing name-based preset lookup from
+// confusing otherwise identical profiles from different upstreams. This
+// ownership boundary also makes source removal safe: user presets and presets
+// installed by another source are never touched.
 class ProfileSourceManager
 {
 public:
@@ -51,7 +54,12 @@ public:
     // Converts an extracted PrusaSlicer/SuperSlicer profile tree. Public so
     // conversion can be regression-tested without network access.
     static ProfileSourceSyncResult    convert_prusa_profiles(const std::string &input_root,
-                                                              const std::string &output_root);
+                                                              const std::string &output_root,
+                                                              const std::string &source_namespace = {});
+    static ProfileSourceSyncResult    convert_orca_profiles(const std::string &input_root,
+                                                             const std::string &output_root,
+                                                             const std::string &source_id,
+                                                             const std::string &source_name);
 
 private:
     AppConfig &m_config;
