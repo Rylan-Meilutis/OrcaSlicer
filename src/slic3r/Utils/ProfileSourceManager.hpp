@@ -17,6 +17,7 @@ struct ProfileSource
     Format      format {Format::Prusa};
     long long   last_sync {0};
     bool        enabled {false};
+    std::string revision;
 };
 
 struct ProfileSourceSyncResult
@@ -25,9 +26,17 @@ struct ProfileSourceSyncResult
     size_t      filaments {0};
     size_t      processes {0};
     size_t      skipped_options {0};
+    std::string revision;
     std::string error;
 
     bool success() const { return error.empty(); }
+};
+
+struct ProfileSourceUpdateResult
+{
+    bool        update_available {false};
+    std::string revision;
+    std::string error;
 };
 
 // Stores source definitions in AppConfig and installs each source into its own
@@ -45,12 +54,14 @@ public:
     void                       set_sources(const std::vector<ProfileSource> &sources);
     void                       add(const ProfileSource &source);
     bool                       remove(const std::string &id, std::string &error);
-    ProfileSourceSyncResult    sync(const ProfileSource &source);
+    ProfileSourceUpdateResult  check_for_update(const ProfileSource &source) const;
+    ProfileSourceSyncResult    sync(const ProfileSource &source, bool record_sync = true);
     std::vector<ProfileSource> stale_enabled_sources(long long max_age_seconds = 24 * 60 * 60) const;
 
     static std::vector<ProfileSource> prusa_sources();
     static std::vector<ProfileSource> default_sources();
     static std::string                make_id(const std::string &name, const std::string &url);
+    static bool                       has_update(const ProfileSource &source, const std::string &remote_revision);
     // Converts an extracted PrusaSlicer/SuperSlicer profile tree. Public so
     // conversion can be regression-tested without network access.
     static ProfileSourceSyncResult    convert_prusa_profiles(const std::string &input_root,

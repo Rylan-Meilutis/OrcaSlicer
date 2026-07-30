@@ -2685,6 +2685,9 @@ int GUI_App::OnExit()
 {
     stop_http_server();
     stop_sync_user_preset();
+    m_profile_source_sync_token.reset();
+    if (m_profile_source_thread.joinable())
+        m_profile_source_thread.join();
 
     if (m_device_manager) {
         delete m_device_manager;
@@ -9377,9 +9380,8 @@ bool GUI_App::run_wizard(ConfigWizard::RunReason reason, ConfigWizard::StartPage
     }
 #endif
 
-    // The printer selection page must be built from current source data.
-    // Explicitly opening it therefore refreshes all enabled upstreams even if
-    // the daily background check has already run.
+    // Opening printer selection also requests the daily metadata check. The
+    // shared timestamp keeps repeated wizard visits from causing more traffic.
     if (reason == ConfigWizard::RR_USER && start_page == ConfigWizard::SP_PRINTERS) {
         wxBusyCursor busy;
         refresh_profile_sources(true);
@@ -9421,6 +9423,8 @@ void GUI_App::refresh_profile_sources(bool force)
 {
     if (app_config == nullptr)
         return;
+    if (m_profile_source_thread.joinable())
+        return;
 
     ProfileSourceManager manager(*app_config);
     const std::vector<ProfileSource> candidates = force ?
@@ -9433,17 +9437,111 @@ void GUI_App::refresh_profile_sources(bool force)
         }() :
         manager.stale_enabled_sources();
 
-    bool changed = false;
-    for (const ProfileSource &source : candidates) {
-        const ProfileSourceSyncResult result = manager.sync(source);
-        if (result.success()) {
-            changed = true;
-        } else {
-            BOOST_LOG_TRIVIAL(warning) << "Profile source update failed for " << source.name << ": " << result.error;
+    if (candidates.empty())
+        return;
+
+    constexpr const char *last_check_key = "profile_sources_last_check";
+    constexpr long long check_interval = 24 * 60 * 60;
+    const long long now = std::time(nullptr);
+    const long long last_check = std::atoll(app_config->get(last_check_key).c_str());
+    if (last_check > 0 && now - last_check < check_interval)
+        return;
+
+    // HEAD requests fetch only archive metadata. The potentially large profile
+    // archives are not downloaded until the user accepts a prompt that names
+    // sources whose ETag or Last-Modified revision actually changed.
+    m_profile_source_sync_token = std::make_shared<int>(0);
+    std::weak_ptr<int> token = m_profile_source_sync_token;
+    m_profile_source_thread = boost::thread([this, candidates, token] {
+        std::vector<std::pair<ProfileSource, ProfileSourceUpdateResult>> checked;
+        ProfileSourceManager background_manager(*app_config);
+        for (const ProfileSource &source : candidates) {
+            if (token.expired())
+                return;
+            ProfileSourceUpdateResult result = background_manager.check_for_update(source);
+            if (result.error.empty())
+                checked.emplace_back(source, std::move(result));
+            else
+                BOOST_LOG_TRIVIAL(warning) << "Profile source update check failed for " << source.name << ": " << result.error;
         }
-    }
-    if (changed)
-        load_current_presets(false, false);
+        if (token.expired())
+            return;
+        CallAfter([this, checked = std::move(checked), token] {
+            if (token.expired() || is_closing())
+                return;
+
+            // The metadata worker has queued this callback and is about to
+            // return. Joining it here makes the thread member reusable for the
+            // archive downloads started below.
+            if (m_profile_source_thread.joinable())
+                m_profile_source_thread.join();
+
+            ProfileSourceManager manager(*app_config);
+            auto sources = manager.sources();
+            const long long now = std::time(nullptr);
+            std::vector<ProfileSource> updates;
+            for (const auto &[candidate, result] : checked) {
+                if (result.update_available) {
+                    updates.push_back(candidate);
+                    continue;
+                }
+                // Older configurations have no stored revision. Establish a
+                // baseline without prompting or downloading their archives.
+                for (ProfileSource &source : sources)
+                    if (source.id == candidate.id && source.revision.empty())
+                        source.revision = result.revision;
+            }
+            app_config->set("profile_sources_last_check", std::to_string(now));
+            manager.set_sources(sources);
+
+            if (updates.empty())
+                return;
+
+            wxString source_names;
+            for (const ProfileSource &source : updates)
+                source_names += "\n - " + from_u8(source.name);
+            const int answer = wxMessageBox(
+                _L("Profile updates are available. Download and import updated machine, filament, and process profiles "
+                   "from the following sources?") +
+                    source_names,
+                _L("Profile source updates"), wxYES_NO | wxICON_QUESTION, mainframe);
+            if (answer != wxYES)
+                return;
+
+            m_profile_source_thread = boost::thread([this, updates = std::move(updates), token] {
+                std::vector<std::pair<std::string, std::string>> synchronized;
+                ProfileSourceManager background_manager(*app_config);
+                for (const ProfileSource &source : updates) {
+                    if (token.expired())
+                        return;
+                    const ProfileSourceSyncResult result = background_manager.sync(source, false);
+                    if (result.success())
+                        synchronized.emplace_back(source.id, result.revision);
+                    else
+                        BOOST_LOG_TRIVIAL(warning) << "Profile source update failed for " << source.name << ": " << result.error;
+                }
+                if (token.expired() || synchronized.empty())
+                    return;
+                CallAfter([this, synchronized = std::move(synchronized), token] {
+                    if (token.expired() || is_closing())
+                        return;
+                    ProfileSourceManager manager(*app_config);
+                    auto sources = manager.sources();
+                    const long long now = std::time(nullptr);
+                    for (ProfileSource &source : sources) {
+                        auto found = std::find_if(synchronized.begin(), synchronized.end(),
+                            [&](const auto &item) { return item.first == source.id; });
+                        if (found != synchronized.end()) {
+                            source.last_sync = now;
+                            source.revision = found->second;
+                        }
+                    }
+                    manager.set_sources(sources);
+                    load_current_presets(false, false);
+                });
+            });
+        });
+    });
 }
 
 void GUI_App::show_desktop_integration_dialog()

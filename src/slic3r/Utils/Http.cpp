@@ -860,6 +860,14 @@ Http Http::get(std::string url)
     return Http{std::move(url)};
 }
 
+Http Http::head(std::string url)
+{
+	Http http{std::move(url)};
+	http.p->method = "HEAD";
+	curl_easy_setopt(http.p->curl, CURLOPT_NOBODY, 1L);
+	return http;
+}
+
 Http Http::post(std::string url)
 {
 	Http http{std::move(url)};

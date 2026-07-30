@@ -80,6 +80,7 @@ public:
 	// These are the primary constructors that create a HTTP object
 	// for a GET and a POST request respectively.
 	static Http get(std::string url);
+	static Http head(std::string url);
 	static Http post(std::string url);
 	static Http put(std::string url);
 	static Http del(std::string url);

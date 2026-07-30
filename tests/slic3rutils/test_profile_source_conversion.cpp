@@ -120,6 +120,48 @@ TEST_CASE("Prusa profile sources replace malformed UTF-8 without terminating syn
     CHECK(filament.at("notes").get<std::string>().find("\xef\xbf\xbd") != std::string::npos);
 }
 
+TEST_CASE("Prusa custom G-code uses Orca placeholders", "[ProfileSources][Regression]")
+{
+    TemporaryDirectory temporary;
+    const fs::path input = temporary.path / "input";
+    const fs::path output = temporary.path / "output";
+
+    write_file(input / "PrusaResearch" / "printer.ini",
+        "[printer:Converted INDX]\n"
+        "nozzle_diameter = 0.4,0.4\n"
+        "start_gcode = {if is_extruder_used[0]}M862.1 T0 P{nozzle_diameter[0]} "
+            "A{(filament_abrasive[0] ? 1 : 0)} F{(nozzle_high_flow[0] ? 1 : 0)}{endif}\\n"
+            "G1 E{retract_length[0]} F{deretract_speed[0] * 60}\\n"
+            "M201 E{default_acceleration * extrusion_width * layer_height}\\n"
+            "M574 F{external_perimeter_speed * external_perimeter_extrusion_width}\\n"
+            "M106 S{max_fan_speed[0]} ; preserve temperature comment\\n"
+            "{if wipe_tower}M117 Prime tower enabled{endif}\\n\n"
+        "toolchange_gcode = G1 E{filament_retract_length_toolchange[next_extruder]} "
+            "F{retract_speed[next_extruder] * 60}\\n\n");
+
+    const Slic3r::ProfileSourceSyncResult result =
+        Slic3r::ProfileSourceManager::convert_prusa_profiles(input.string(), output.string());
+
+    REQUIRE(result.success());
+    REQUIRE(result.printers == 1);
+    const json printer = read_json(output / "machine" / "Converted_INDX.json");
+    const std::string start = printer.at("machine_start_gcode");
+    CHECK(start.find("filament_abrasive") == std::string::npos);
+    CHECK(start.find("nozzle_high_flow") == std::string::npos);
+    CHECK(start.find("M862.1 T0 P{nozzle_diameter[0]}") != std::string::npos);
+    CHECK(start.find("retraction_length[0]") != std::string::npos);
+    CHECK(start.find("deretraction_speed[0]") != std::string::npos);
+    CHECK(start.find("line_width * layer_height") != std::string::npos);
+    CHECK(start.find("outer_wall_speed * outer_wall_line_width") != std::string::npos);
+    CHECK(start.find("fan_max_speed[0]") != std::string::npos);
+    CHECK(start.find("{if enable_prime_tower}") != std::string::npos);
+    CHECK(start.find("preserve temperature comment") != std::string::npos);
+
+    const std::string toolchange = printer.at("change_filament_gcode");
+    CHECK(toolchange.find("retract_length_toolchange[next_extruder]") != std::string::npos);
+    CHECK(toolchange.find("retraction_speed[next_extruder]") != std::string::npos);
+}
+
 TEST_CASE("Imported profile names are isolated by source", "[ProfileSources][Regression]")
 {
     TemporaryDirectory temporary;
@@ -186,4 +228,19 @@ TEST_CASE("Native profile sources preserve namespaced dependencies", "[ProfileSo
     const json process = read_json(output / "process" / "Example__Shared_process.json");
     CHECK(process.at("compatible_printers") ==
           std::vector<std::string>{"Derived machine [Example source / Example]"});
+}
+
+TEST_CASE("Profile source prompts are limited to new remote revisions", "[ProfileSources][Regression]")
+{
+    Slic3r::ProfileSource source;
+    source.last_sync = 100;
+
+    CHECK_FALSE(Slic3r::ProfileSourceManager::has_update(source, R"("revision-a")"));
+
+    source.revision = R"("revision-a")";
+    CHECK_FALSE(Slic3r::ProfileSourceManager::has_update(source, R"("revision-a")"));
+    CHECK(Slic3r::ProfileSourceManager::has_update(source, R"("revision-b")"));
+
+    source.last_sync = 0;
+    CHECK(Slic3r::ProfileSourceManager::has_update(source, R"("revision-a")"));
 }

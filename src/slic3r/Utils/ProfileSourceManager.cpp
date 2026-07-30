@@ -48,14 +48,41 @@ std::string sanitize(std::string value)
     return value.empty() ? "source" : value;
 }
 
-std::string download(const std::string &url, std::string &error)
+std::string header_value(const std::string &headers, const std::string &name)
+{
+    std::istringstream input(headers);
+    std::string line;
+    std::string value;
+    const std::string prefix = boost::to_lower_copy(name) + ':';
+    while (std::getline(input, line)) {
+        boost::trim_right_if(line, boost::is_any_of("\r"));
+        const std::string lower = boost::to_lower_copy(line);
+        if (!boost::starts_with(lower, prefix))
+            continue;
+        value = line.substr(prefix.size());
+        boost::trim(value);
+    }
+    return value;
+}
+
+std::string revision_from_headers(const std::string &headers)
+{
+    std::string revision = header_value(headers, "etag");
+    if (revision.empty())
+        revision = header_value(headers, "last-modified");
+    return revision;
+}
+
+std::string download(const std::string &url, std::string &error, std::string *revision = nullptr)
 {
     std::string body;
+    std::string headers;
     Http::get(url)
         .timeout_connect(15)
         .timeout_max(120)
         .size_limit(512 * 1024 * 1024)
         .tls_verify(true)
+        .on_header_callback([&](std::string response_headers) { headers = std::move(response_headers); })
         .on_complete([&](std::string response, unsigned status) {
             if (status >= 200 && status < 300)
                 body = std::move(response);
@@ -66,7 +93,29 @@ std::string download(const std::string &url, std::string &error)
             error = message.empty() ? "HTTP " + std::to_string(status) : std::move(message);
         })
         .perform_sync();
+    if (revision != nullptr)
+        *revision = revision_from_headers(headers);
     return body;
+}
+
+std::string remote_revision(const std::string &url, std::string &error)
+{
+    std::string headers;
+    Http::head(url)
+        .timeout_connect(15)
+        .timeout_max(30)
+        .size_limit(64 * 1024)
+        .tls_verify(true)
+        .on_header_callback([&](std::string response_headers) { headers = std::move(response_headers); })
+        .on_complete([&](std::string, unsigned) {})
+        .on_error([&](std::string, std::string message, unsigned status) {
+            error = message.empty() ? "HTTP " + std::to_string(status) : std::move(message);
+        })
+        .perform_sync();
+    const std::string revision = revision_from_headers(headers);
+    if (error.empty() && revision.empty())
+        error = "The server did not provide an ETag or Last-Modified revision.";
+    return revision;
 }
 
 bool safe_archive_name(const std::string &name)
@@ -418,6 +467,88 @@ const std::unordered_map<std::string, std::string> &key_map()
     return map;
 }
 
+bool is_custom_gcode(const std::string &key)
+{
+    static const std::set<std::string> keys {
+        "before_layer_gcode", "end_filament_gcode", "end_gcode", "feature_gcode",
+        "layer_gcode", "pause_print_gcode", "start_filament_gcode", "start_gcode",
+        "toolchange_gcode"
+    };
+    return keys.count(key) != 0;
+}
+
+void erase_unsupported_gcode_argument(std::string &gcode, const std::string &argument,
+                                      const std::string &identifier)
+{
+    size_t identifier_pos = 0;
+    while ((identifier_pos = gcode.find(identifier, identifier_pos)) != std::string::npos) {
+        const size_t argument_pos = gcode.rfind(argument, identifier_pos);
+        if (argument_pos == std::string::npos ||
+            gcode.find('\n', argument_pos) < identifier_pos) {
+            identifier_pos += identifier.size();
+            continue;
+        }
+        const size_t argument_end = gcode.find(")}", identifier_pos + identifier.size());
+        if (argument_end == std::string::npos ||
+            gcode.find('\n', identifier_pos) < argument_end) {
+            identifier_pos += identifier.size();
+            continue;
+        }
+        gcode.erase(argument_pos, argument_end + 2 - argument_pos);
+        identifier_pos = argument_pos;
+    }
+}
+
+std::string converted_custom_gcode(const std::string &value)
+{
+    std::string result = value;
+
+    // These are Prusa INDX-only vectors. Orca has no equivalent per-tool
+    // properties, so retain the nozzle diameter check while omitting only the
+    // unsupported optional firmware arguments.
+    erase_unsupported_gcode_argument(result, " A{(", "filament_abrasive[");
+    erase_unsupported_gcode_argument(result, " F{(", "nozzle_high_flow[");
+
+    static const std::unordered_map<std::string, std::string> placeholder_map = [] {
+        auto map = key_map();
+        map.emplace("filament_retract_length_toolchange", "retract_length_toolchange");
+        return map;
+    }();
+
+    std::string converted;
+    converted.reserve(result.size());
+    int curly_depth = 0;
+    int square_depth = 0;
+    for (size_t pos = 0; pos < result.size();) {
+        const unsigned char ch = static_cast<unsigned char>(result[pos]);
+        if (!std::isalpha(ch) && result[pos] != '_') {
+            if (result[pos] == '{')
+                ++curly_depth;
+            else if (result[pos] == '}' && curly_depth > 0)
+                --curly_depth;
+            else if (result[pos] == '[')
+                ++square_depth;
+            else if (result[pos] == ']' && square_depth > 0)
+                --square_depth;
+            converted.push_back(result[pos++]);
+            continue;
+        }
+        size_t end = pos + 1;
+        while (end < result.size()) {
+            const unsigned char next = static_cast<unsigned char>(result[end]);
+            if (!std::isalnum(next) && result[end] != '_')
+                break;
+            ++end;
+        }
+        const std::string identifier = result.substr(pos, end - pos);
+        const auto mapped = curly_depth > 0 || square_depth > 0 ?
+            placeholder_map.find(identifier) : placeholder_map.end();
+        converted += mapped == placeholder_map.end() ? identifier : mapped->second;
+        pos = end;
+    }
+    return converted;
+}
+
 bool is_percent(const std::string &value)
 {
     return !value.empty() && value.back() == '%';
@@ -483,6 +614,8 @@ std::string converted_value(const std::string &source_key, const std::string &va
         {"teacup", "reprapfirmware"}, {"sprinter", "reprapfirmware"},
         {"no-extrusion", "reprapfirmware"}
     };
+    if (is_custom_gcode(source_key))
+        return converted_custom_gcode(value);
     if (source_key == "filament_type") {
         auto found = filament_types.find(value);
         return found == filament_types.end() ? value : found->second;
@@ -971,6 +1104,7 @@ std::vector<ProfileSource> ProfileSourceManager::sources() const
             source.format    = entry.value("format", "prusa") == "orca" ? ProfileSource::Format::Orca : ProfileSource::Format::Prusa;
             source.last_sync = entry.value("last_sync", 0LL);
             source.enabled   = entry.value("enabled", false);
+            source.revision  = entry.value("revision", "");
             if (!source.id.empty() && !source.url.empty())
                 result.push_back(std::move(source));
         }
@@ -986,7 +1120,8 @@ void ProfileSourceManager::set_sources(const std::vector<ProfileSource> &sources
     for (const ProfileSource &source : sources)
         output.push_back({{"id", source.id}, {"name", source.name}, {"url", source.url},
                           {"format", source.format == ProfileSource::Format::Orca ? "orca" : "prusa"},
-                          {"last_sync", source.last_sync}, {"enabled", source.enabled}});
+                          {"last_sync", source.last_sync}, {"enabled", source.enabled},
+                          {"revision", source.revision}});
     m_config.set(CONFIG_KEY, output.dump(-1, ' ', false, json::error_handler_t::replace));
     m_config.save();
 }
@@ -1015,7 +1150,20 @@ bool ProfileSourceManager::remove(const std::string &id, std::string &error)
     return !ec;
 }
 
-ProfileSourceSyncResult ProfileSourceManager::sync(const ProfileSource &source) try
+ProfileSourceUpdateResult ProfileSourceManager::check_for_update(const ProfileSource &source) const
+{
+    ProfileSourceUpdateResult result;
+    result.revision = remote_revision(archive_url(source.url), result.error);
+    if (!result.error.empty())
+        return result;
+    // A never-synchronized source represents newly available profiles. For
+    // migrated configurations, establish the current revision as a baseline
+    // without claiming an update when the installed source has no old ETag.
+    result.update_available = has_update(source, result.revision);
+    return result;
+}
+
+ProfileSourceSyncResult ProfileSourceManager::sync(const ProfileSource &source, bool record_sync) try
 {
     ProfileSourceSyncResult result;
     const std::string user = m_config.get("preset_folder").empty() ? DEFAULT_USER_FOLDER_NAME : m_config.get("preset_folder");
@@ -1030,13 +1178,14 @@ ProfileSourceSyncResult ProfileSourceManager::sync(const ProfileSource &source) 
     }
 
     std::string error;
-    std::string body = download(archive_url(source.url), error);
+    std::string downloaded_revision;
+    std::string body = download(archive_url(source.url), error, &downloaded_revision);
     if (!error.empty() && boost::starts_with(source.url, "https://github.com/") &&
         !boost::ends_with(source.url, ".zip")) {
         error.clear();
         std::string head_url = source.url;
         boost::trim_right_if(head_url, boost::is_any_of("/"));
-        body = download(head_url + "/archive/HEAD.zip", error);
+        body = download(head_url + "/archive/HEAD.zip", error, &downloaded_revision);
     }
     if (!error.empty()) {
         result.error = error;
@@ -1062,6 +1211,7 @@ ProfileSourceSyncResult ProfileSourceManager::sync(const ProfileSource &source) 
         if (!result.success())
             return result;
     }
+    result.revision = std::move(downloaded_revision);
 
     if (result.printers + result.filaments + result.processes == 0) {
         result.error = "No compatible printer, filament, or process profiles were found in the source.";
@@ -1099,11 +1249,15 @@ ProfileSourceSyncResult ProfileSourceManager::sync(const ProfileSource &source) 
         return result;
     }
     fs::remove_all(backup, ec);
-    auto current = sources();
-    for (ProfileSource &item : current)
-        if (item.id == source.id)
-            item.last_sync = std::time(nullptr);
-    set_sources(current);
+    if (record_sync) {
+        auto current = sources();
+        for (ProfileSource &item : current)
+            if (item.id == source.id) {
+                item.last_sync = std::time(nullptr);
+                item.revision = result.revision;
+            }
+        set_sources(current);
+    }
     return result;
 }
 catch (const std::exception &exception) {
@@ -1160,6 +1314,12 @@ std::string ProfileSourceManager::make_id(const std::string &name, const std::st
     output << sanitize(name) << '_';
     output << std::hex << digest[0] << digest[1];
     return output.str();
+}
+
+bool ProfileSourceManager::has_update(const ProfileSource &source, const std::string &remote_revision)
+{
+    return source.last_sync == 0 ||
+        (!source.revision.empty() && source.revision != remote_revision);
 }
 
 } // namespace Slic3r

@@ -340,6 +340,8 @@ private:
     HttpServer       m_http_server;
     bool             m_show_gcode_window{true};
     boost::thread    m_check_network_thread;
+    boost::thread    m_profile_source_thread;
+    std::shared_ptr<int> m_profile_source_sync_token;
 public:
     //try again when subscription fails
     void            on_start_subscribe_again(std::string dev_id);
