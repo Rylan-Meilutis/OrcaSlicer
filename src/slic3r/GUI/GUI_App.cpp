@@ -94,6 +94,7 @@
 #include "DeviceCore/DevManager.h"
 
 #include "../Utils/PresetUpdater.hpp"
+#include "../Utils/ProfileSourceManager.hpp"
 #include "../Utils/PrintHost.hpp"
 #include "../Utils/Process.hpp"
 #include "../Utils/wxInspectorPlugins/Registration.hpp"
@@ -3462,6 +3463,10 @@ bool GUI_App::on_init_inner()
                        "The OrcaSlicer configuration file may be corrupted and cannot be parsed.\nOrcaSlicer has attempted to recreate the "
                        "configuration file.\nPlease note, application settings will be lost, but printer profiles will not be affected."));
     }
+    // Profile-source updates are opt-in. Checking them after startup keeps
+    // bundled/default profiles available immediately and refreshes enabled
+    // upstreams no more than once per day.
+    CallAfter([this] { refresh_profile_sources(false); });
     return true;
 }
 
@@ -9372,6 +9377,14 @@ bool GUI_App::run_wizard(ConfigWizard::RunReason reason, ConfigWizard::StartPage
     }
 #endif
 
+    // The printer selection page must be built from current source data.
+    // Explicitly opening it therefore refreshes all enabled upstreams even if
+    // the daily background check has already run.
+    if (reason == ConfigWizard::RR_USER && start_page == ConfigWizard::SP_PRINTERS) {
+        wxBusyCursor busy;
+        refresh_profile_sources(true);
+    }
+
     //if (reason == ConfigWizard::RR_USER) {
     //    //TODO: turn off it currently, maybe need to turn on in the future
     //    if (preset_updater->config_update(app_config->orig_version(), PresetUpdater::UpdateParams::FORCED_BEFORE_WIZARD) == PresetUpdater::R_ALL_CANCELED)
@@ -9402,6 +9415,35 @@ bool GUI_App::run_wizard(ConfigWizard::RunReason reason, ConfigWizard::StartPage
     }
 
     return res;
+}
+
+void GUI_App::refresh_profile_sources(bool force)
+{
+    if (app_config == nullptr)
+        return;
+
+    ProfileSourceManager manager(*app_config);
+    const std::vector<ProfileSource> candidates = force ?
+        [&manager] {
+            std::vector<ProfileSource> enabled;
+            for (const ProfileSource &source : manager.sources())
+                if (source.enabled)
+                    enabled.push_back(source);
+            return enabled;
+        }() :
+        manager.stale_enabled_sources();
+
+    bool changed = false;
+    for (const ProfileSource &source : candidates) {
+        const ProfileSourceSyncResult result = manager.sync(source);
+        if (result.success()) {
+            changed = true;
+        } else {
+            BOOST_LOG_TRIVIAL(warning) << "Profile source update failed for " << source.name << ": " << result.error;
+        }
+    }
+    if (changed)
+        load_current_presets(false, false);
 }
 
 void GUI_App::show_desktop_integration_dialog()

@@ -20,6 +20,11 @@
 #include "slic3r/Utils/NetworkAgent.hpp"
 #include "NetworkPluginDialog.hpp"
 #include "DownloadProgressDialog.hpp"
+#include "slic3r/Utils/ProfileSourceManager.hpp"
+
+#include <wx/choicdlg.h>
+#include <wx/listctrl.h>
+#include <wx/textdlg.h>
 
 #ifdef __WINDOWS__
 #ifdef _MSW_DARK_MODE
@@ -38,6 +43,198 @@ public:
         long style = wxVSCROLL) : wxScrolledWindow(parent, id, pos, size, style) {}
 
     bool ShouldScrollToChildOnFocus(wxWindow* child) override { return false; }
+};
+
+class ProfileSourcesDialog final : public DPIDialog
+{
+public:
+    explicit ProfileSourcesDialog(wxWindow *parent, AppConfig &config)
+        : DPIDialog(parent, wxID_ANY, _L("Profile sources"), wxDefaultPosition, wxSize(FromDIP(780), FromDIP(460)),
+                    wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER)
+        , m_manager(config)
+    {
+        auto *root = new wxBoxSizer(wxVERTICAL);
+        auto *help = new wxStaticText(this, wxID_ANY,
+            _L("Profile sources are synchronized into separate local bundles. PrusaSlicer INI profiles are converted "
+               "to OrcaSlicer settings; unsupported source-only options are skipped and reported."));
+        help->Wrap(FromDIP(740));
+        root->Add(help, 0, wxEXPAND | wxALL, FromDIP(10));
+
+        m_list = new wxListCtrl(this, wxID_ANY, wxDefaultPosition, wxDefaultSize,
+                               wxLC_REPORT | wxLC_SINGLE_SEL | wxBORDER_SIMPLE);
+        m_list->AppendColumn(_L("Automatic updates"), wxLIST_FORMAT_LEFT, FromDIP(125));
+        m_list->AppendColumn(_L("Name"), wxLIST_FORMAT_LEFT, FromDIP(180));
+        m_list->AppendColumn(_L("Format"), wxLIST_FORMAT_LEFT, FromDIP(90));
+        m_list->AppendColumn(_L("Source URL"), wxLIST_FORMAT_LEFT, FromDIP(290));
+        m_list->AppendColumn(_L("Last sync"), wxLIST_FORMAT_LEFT, FromDIP(110));
+        root->Add(m_list, 1, wxEXPAND | wxLEFT | wxRIGHT, FromDIP(10));
+
+        auto *buttons = new wxBoxSizer(wxHORIZONTAL);
+        auto add_button = [&](const wxString &label, auto handler) {
+            auto *button = new wxButton(this, wxID_ANY, label);
+            button->Bind(wxEVT_BUTTON, handler);
+            buttons->Add(button, 0, wxRIGHT, FromDIP(6));
+        };
+        add_button(_L("Add"), [this](wxCommandEvent &) { add_source(); });
+        add_button(_L("Restore defaults"), [this](wxCommandEvent &) { add_default_sources(); });
+        add_button(_L("Remove"), [this](wxCommandEvent &) { remove_source(); });
+        add_button(_L("Enable/disable"), [this](wxCommandEvent &) { toggle_source(); });
+        add_button(_L("Sync"), [this](wxCommandEvent &) { sync_source(); });
+        add_button(_L("Sync all"), [this](wxCommandEvent &) { sync_all(); });
+        buttons->AddStretchSpacer();
+        auto *close = new wxButton(this, wxID_CLOSE, _L("Close"));
+        close->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { EndModal(wxID_OK); });
+        buttons->Add(close);
+        root->Add(buttons, 0, wxEXPAND | wxALL, FromDIP(10));
+        SetSizer(root);
+        refresh();
+        CenterOnParent();
+    }
+
+private:
+    ProfileSourceManager m_manager;
+    wxListCtrl          *m_list {nullptr};
+    std::vector<ProfileSource> m_sources;
+
+    void on_dpi_changed(const wxRect &suggested_rect) override
+    {
+        SetSize(suggested_rect);
+        Layout();
+    }
+
+    int selected() const
+    {
+        return static_cast<int>(m_list->GetNextItem(-1, wxLIST_NEXT_ALL, wxLIST_STATE_SELECTED));
+    }
+
+    void refresh()
+    {
+        m_sources = m_manager.sources();
+        m_list->DeleteAllItems();
+        for (size_t i = 0; i < m_sources.size(); ++i) {
+            const ProfileSource &source = m_sources[i];
+            const long row = m_list->InsertItem(static_cast<long>(i), source.enabled ? _L("Enabled") : _L("Disabled"));
+            m_list->SetItem(row, 1, from_u8(source.name));
+            m_list->SetItem(row, 2, source.format == ProfileSource::Format::Prusa ? "PrusaSlicer" : "OrcaSlicer");
+            m_list->SetItem(row, 3, from_u8(source.url));
+            if (source.last_sync != 0) {
+                wxDateTime time(static_cast<time_t>(source.last_sync));
+                m_list->SetItem(row, 4, time.FormatISOCombined(' '));
+            } else {
+                m_list->SetItem(row, 4, _L("Never"));
+            }
+        }
+    }
+
+    void add_source()
+    {
+        wxTextEntryDialog name_dialog(this, _L("Enter a display name for this profile source."), _L("Add profile source"));
+        if (name_dialog.ShowModal() != wxID_OK || name_dialog.GetValue().Trim().empty())
+            return;
+        wxTextEntryDialog url_dialog(this, _L("Enter an HTTPS URL to an Orca bundle, PrusaSlicer INI, or GitHub profile repository."),
+                                     _L("Add profile source"));
+        if (url_dialog.ShowModal() != wxID_OK)
+            return;
+        const std::string url = into_u8(url_dialog.GetValue().Trim());
+        if (!boost::starts_with(url, "https://")) {
+            show_error(this, _L("Profile source URLs must use HTTPS."));
+            return;
+        }
+        const wxArrayString choices {_L("PrusaSlicer profiles (INI)"), _L("OrcaSlicer profiles (ZIP)")};
+        wxSingleChoiceDialog format_dialog(this, _L("Choose the source profile format."), _L("Profile format"), choices);
+        if (format_dialog.ShowModal() != wxID_OK)
+            return;
+        ProfileSource source;
+        source.name   = into_u8(name_dialog.GetValue().Trim());
+        source.url    = url;
+        source.id     = ProfileSourceManager::make_id(source.name, source.url);
+        source.format = format_dialog.GetSelection() == 0 ? ProfileSource::Format::Prusa : ProfileSource::Format::Orca;
+        source.enabled = true;
+        m_manager.add(source);
+        refresh();
+    }
+
+    void toggle_source()
+    {
+        const int index = selected();
+        if (index < 0 || index >= static_cast<int>(m_sources.size()))
+            return;
+        m_sources[index].enabled = !m_sources[index].enabled;
+        m_manager.set_sources(m_sources);
+        refresh();
+    }
+
+    void add_default_sources()
+    {
+        for (const ProfileSource &source : ProfileSourceManager::default_sources())
+            m_manager.add(source);
+        refresh();
+    }
+
+    void remove_source()
+    {
+        const int index = selected();
+        if (index < 0 || index >= static_cast<int>(m_sources.size()))
+            return;
+        if (wxMessageBox(_L("Remove this source and all profiles installed by it? User-created profiles will not be removed."),
+                         _L("Remove profile source"), wxYES_NO | wxICON_QUESTION, this) != wxYES)
+            return;
+        std::string error;
+        if (!m_manager.remove(m_sources[index].id, error)) {
+            show_error(this, from_u8(error));
+            return;
+        }
+        wxGetApp().load_current_presets(false, false);
+        refresh();
+    }
+
+    void sync_source()
+    {
+        const int index = selected();
+        if (index < 0 || index >= static_cast<int>(m_sources.size()))
+            return;
+        wxBusyCursor busy;
+        const ProfileSourceSyncResult result = m_manager.sync(m_sources[index]);
+        if (!result.success()) {
+            show_error(this, _L("Profile synchronization failed:") + "\n" + from_u8(result.error));
+            return;
+        }
+        wxGetApp().load_current_presets(false, false);
+        wxMessageBox(wxString::Format(_L("Synchronized %zu printer, %zu filament, and %zu process profiles.\n"
+                                         "%zu unsupported source options were skipped."),
+                                      result.printers, result.filaments, result.processes, result.skipped_options),
+                     _L("Profile source synchronized"), wxOK | wxICON_INFORMATION, this);
+        refresh();
+    }
+
+    void sync_all()
+    {
+        wxBusyCursor busy;
+        size_t failed = 0;
+        size_t printers = 0;
+        size_t filaments = 0;
+        size_t processes = 0;
+        std::string errors;
+        for (const ProfileSource &source : m_sources) {
+            const ProfileSourceSyncResult result = m_manager.sync(source);
+            if (!result.success()) {
+                ++failed;
+                errors += source.name + ": " + result.error + "\n";
+            } else {
+                printers += result.printers;
+                filaments += result.filaments;
+                processes += result.processes;
+            }
+        }
+        wxGetApp().load_current_presets(false, false);
+        refresh();
+        if (failed != 0)
+            show_error(this, _L("Some profile sources could not be synchronized:") + "\n" + from_u8(errors));
+        else
+            wxMessageBox(wxString::Format(_L("Synchronized %zu printer, %zu filament, and %zu process profiles."),
+                                          printers, filaments, processes),
+                         _L("Profile sources synchronized"), wxOK | wxICON_INFORMATION, this);
+    }
 };
 
 // TODO before replacing with HyperLink class
@@ -1718,6 +1915,12 @@ void PreferencesDialog::create_items()
     auto item_shared_profiles  = create_item_checkbox(_L("Show shared profiles notification"), _L("Show a notification with a link to browse shared profiles when the selected printer is changed."), "show_shared_profiles_notification");
     g_sizer->Add(item_shared_profiles);
 
+    auto item_profile_sources = create_item_button(
+        _L("Profile sources"), _L("Manage"),
+        _L("Add, remove, and synchronize external OrcaSlicer or PrusaSlicer profile repositories."),
+        _L("Manage profile sources"), [this]() { manage_profile_sources(); });
+    g_sizer->Add(item_profile_sources);
+
     //// GENERAL > Features
     g_sizer->Add(create_item_title(_L("Features")), 1, wxEXPAND);
 
@@ -2290,6 +2493,12 @@ void PreferencesDialog::UpdateSidebarLayout()
     sidebar.Thaw();
 
     plater->PostSizeEvent();
+}
+
+void PreferencesDialog::manage_profile_sources()
+{
+    ProfileSourcesDialog dialog(this, *app_config);
+    dialog.ShowModal();
 }
 
 }} // namespace Slic3r::GUI

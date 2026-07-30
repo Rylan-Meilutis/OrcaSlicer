@@ -107,6 +107,7 @@ public:
 
     void create_items();
     void create_sync_page();
+    void manage_profile_sources();
     wxBoxSizer* create_debug_page();
 
     void UpdateSidebarLayout();

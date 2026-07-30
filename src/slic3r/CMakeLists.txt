@@ -725,6 +725,8 @@ set(SLIC3R_GUI_SOURCES
     Utils/OctoPrint.hpp
     Utils/PresetUpdater.cpp
     Utils/PresetUpdater.hpp
+    Utils/ProfileSourceManager.cpp
+    Utils/ProfileSourceManager.hpp
     Utils/PrintHost.cpp
     Utils/PrintHost.hpp
     Utils/Process.cpp

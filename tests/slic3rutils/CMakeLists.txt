@@ -3,6 +3,7 @@ add_executable(${_TEST_NAME}_tests
     ${_TEST_NAME}_tests_main.cpp
     test_dev_mapping.cpp
     test_network_versions.cpp
+    test_profile_source_conversion.cpp
     test_action_source.cpp
     test_plugin_host_api.cpp
     test_plugin_capability_config.cpp

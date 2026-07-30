@@ -2880,10 +2880,66 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
     Lines emitted_arc_lines;
     PrintedArcIndex emitted_arc_index(
         emitted_arc_lines, 4 * spacing);
+    Lines emitted_anchor_lines;
+    if (params.arc_prior_paths != nullptr)
+        for (const Polyline &path : *params.arc_prior_paths)
+            append(emitted_anchor_lines, path.lines());
+    if (params.arc_obstacle_paths != nullptr)
+        for (const Polyline &path : *params.arc_obstacle_paths)
+            append(emitted_anchor_lines, path.lines());
+    const auto anchor_emitted_start =
+        [&emitted_anchor_lines](Polyline &arc) {
+            if (arc.points.size() < 2 || emitted_anchor_lines.empty())
+                return;
+
+            const auto nearest_anchor_distance_squared =
+                [&emitted_anchor_lines](const Point &point) {
+                    double nearest_distance_squared =
+                        std::numeric_limits<double>::max();
+                    for (const Line &line : emitted_anchor_lines) {
+                        const Vec2d start = line.a.cast<double>();
+                        const Vec2d delta =
+                            (line.b - line.a).cast<double>();
+                        const double length_squared =
+                            delta.squaredNorm();
+                        const double position =
+                            length_squared == 0. ? 0. :
+                            std::clamp(
+                                (point.cast<double>() - start)
+                                        .dot(delta) /
+                                    length_squared,
+                                0., 1.);
+                        const Vec2d projected =
+                            start + position * delta;
+                        const double distance_squared =
+                            (point.cast<double>() - projected)
+                                .squaredNorm();
+                        if (distance_squared <
+                            nearest_distance_squared)
+                            nearest_distance_squared =
+                                distance_squared;
+                    }
+                    return nearest_distance_squared;
+                };
+
+            const double first_distance =
+                nearest_anchor_distance_squared(arc.first_point());
+            const double last_distance =
+                nearest_anchor_distance_squared(arc.last_point());
+            if (last_distance < first_distance)
+                arc.reverse();
+
+            // Choose the endpoint closest to a centerline that has actually
+            // been emitted. Do not synthesize a connecting extrusion here:
+            // even a short chord may cross a neighboring arc or wall. The arc
+            // generator owns geometry; this final ordering pass only chooses
+            // its printable direction.
+        };
     Polylines emitted_arcs;
     emitted_arcs.reserve(arcs.size());
     for (size_t arc_idx = 0; arc_idx < arcs.size(); ++arc_idx) {
         Polyline &arc = arcs[arc_idx];
+        anchor_emitted_start(arc);
         trim_sustained_retrace(arc, emitted_arc_index);
         if (arc.length() < minimum_arc_length)
             continue;
@@ -2896,6 +2952,7 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
             is_shallow_child_arc(arc))
             continue;
         emitted_arc_index.add(arc);
+        append(emitted_anchor_lines, arc.lines());
         emitted_arcs.emplace_back(std::move(arc));
     }
     arcs = std::move(emitted_arcs);
