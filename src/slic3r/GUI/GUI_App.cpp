@@ -9458,7 +9458,8 @@ void GUI_App::refresh_profile_sources(bool force)
         for (const ProfileSource &source : candidates) {
             if (token.expired())
                 return;
-            ProfileSourceUpdateResult result = background_manager.check_for_update(source);
+            ProfileSourceUpdateResult result = background_manager.check_for_update(
+                source, [token] { return token.expired(); });
             if (result.error.empty())
                 checked.emplace_back(source, std::move(result));
             else
@@ -9514,7 +9515,8 @@ void GUI_App::refresh_profile_sources(bool force)
                 for (const ProfileSource &source : updates) {
                     if (token.expired())
                         return;
-                    const ProfileSourceSyncResult result = background_manager.sync(source, false);
+                    const ProfileSourceSyncResult result = background_manager.sync(
+                        source, false, [token] { return token.expired(); });
                     if (result.success())
                         synchronized.emplace_back(source.id, result.revision);
                     else

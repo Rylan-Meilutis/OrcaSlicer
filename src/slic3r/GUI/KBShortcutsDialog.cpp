@@ -262,7 +262,7 @@ void KBShortcutsDialog::fill_shortcuts()
             { "T", L("Gizmo text emboss/engrave") },
             { "U", L("Gizmo measure") },
             { "Y", L("Gizmo assemble") },
-            { "E", L("Gizmo brim ears") },
+            { "E", L("Gizmo brim painting") },
             { "I", L("Zoom in") },
             { "O", L("Zoom out") },
             { "V", L("Toggle printable for object/part") },

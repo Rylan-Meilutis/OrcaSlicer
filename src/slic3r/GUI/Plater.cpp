@@ -15876,10 +15876,21 @@ int GUI::Plater::close_with_confirm(std::function<bool(bool)> second_check)
         return wxID_NO;
     }
 
-    MessageDialog dlg(static_cast<wxWindow*>(this), _L("The current project has unsaved changes. Would you like to save before continuing\?"),
+    // Parent the close confirmation to the top-level frame. On macOS a modal
+    // dialog parented to the nested Plater panel may be placed behind the
+    // frame, leaving the application apparently unresponsive while its modal
+    // event loop waits for an invisible answer.
+    wxWindow *dialog_parent = wxGetApp().mainframe != nullptr ?
+        static_cast<wxWindow *>(wxGetApp().mainframe) : static_cast<wxWindow *>(this);
+    MessageDialog dlg(dialog_parent, _L("The current project has unsaved changes. Would you like to save before continuing\?"),
         wxString(SLIC3R_APP_FULL_NAME) + " - " + _L("Save"), wxYES_NO | wxCANCEL | wxYES_DEFAULT | wxCENTRE);
     dlg.show_dsa_button(_L("Remember my choice."));
     auto choise = wxGetApp().app_config->get("save_project_choise");
+    if (choise.empty()) {
+        dialog_parent->Raise();
+        dlg.CentreOnParent();
+        dlg.Raise();
+    }
     auto result = choise.empty() ? dlg.ShowModal() : choise == "yes" ? wxID_YES : wxID_NO;
     if (result == wxID_CANCEL)
         return result;

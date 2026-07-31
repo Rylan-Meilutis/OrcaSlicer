@@ -14,6 +14,7 @@
 #include <cctype>
 #include <ctime>
 #include <iomanip>
+#include <limits>
 #include <map>
 #include <optional>
 #include <set>
@@ -73,7 +74,13 @@ std::string revision_from_headers(const std::string &headers)
     return revision;
 }
 
-std::string download(const std::string &url, std::string &error, std::string *revision = nullptr)
+bool cancelled(const ProfileSourceManager::CancelFn &cancel)
+{
+    return cancel && cancel();
+}
+
+std::string download(const std::string &url, std::string &error, std::string *revision,
+                     const ProfileSourceManager::CancelFn &cancel)
 {
     std::string body;
     std::string headers;
@@ -92,13 +99,15 @@ std::string download(const std::string &url, std::string &error, std::string *re
         .on_error([&](std::string, std::string message, unsigned status) {
             error = message.empty() ? "HTTP " + std::to_string(status) : std::move(message);
         })
+        .on_progress([&](Http::Progress, bool &cancel_http) { cancel_http = cancelled(cancel); })
         .perform_sync();
     if (revision != nullptr)
         *revision = revision_from_headers(headers);
     return body;
 }
 
-std::string remote_revision(const std::string &url, std::string &error)
+std::string remote_revision(const std::string &url, std::string &error,
+                            const ProfileSourceManager::CancelFn &cancel)
 {
     std::string headers;
     Http::head(url)
@@ -111,6 +120,7 @@ std::string remote_revision(const std::string &url, std::string &error)
         .on_error([&](std::string, std::string message, unsigned status) {
             error = message.empty() ? "HTTP " + std::to_string(status) : std::move(message);
         })
+        .on_progress([&](Http::Progress, bool &cancel_http) { cancel_http = cancelled(cancel); })
         .perform_sync();
     const std::string revision = revision_from_headers(headers);
     if (error.empty() && revision.empty())
@@ -129,7 +139,8 @@ bool safe_archive_name(const std::string &name)
     return true;
 }
 
-bool extract_zip(const std::string &body, const fs::path &destination, std::string &error)
+bool extract_zip(const std::string &body, const fs::path &destination, std::string &error,
+                 const ProfileSourceManager::CancelFn &cancel = {})
 {
     mz_zip_archive archive {};
     if (!mz_zip_reader_init_mem(&archive, body.data(), body.size(), 0)) {
@@ -138,6 +149,11 @@ bool extract_zip(const std::string &body, const fs::path &destination, std::stri
     }
     const int count = static_cast<int>(mz_zip_reader_get_num_files(&archive));
     for (int i = 0; i < count; ++i) {
+        if (cancelled(cancel)) {
+            error = "Profile source synchronization was cancelled.";
+            mz_zip_reader_end(&archive);
+            return false;
+        }
         mz_zip_archive_file_stat stat {};
         if (!mz_zip_reader_file_stat(&archive, i, &stat))
             continue;
@@ -901,7 +917,8 @@ std::vector<fs::path> selected_ini_files(const fs::path &root)
 }
 
 ProfileSourceSyncResult convert_prusa_tree(const fs::path &input_root, const fs::path &output_root,
-                                           const std::string &source_namespace = {})
+                                           const std::string &source_namespace = {},
+                                           const ProfileSourceManager::CancelFn &cancel = {})
 {
     ProfileSourceSyncResult result;
     const auto files = selected_ini_files(input_root);
@@ -910,6 +927,10 @@ ProfileSourceSyncResult convert_prusa_tree(const fs::path &input_root, const fs:
         return result;
     }
     for (const fs::path &file : files) {
+        if (cancelled(cancel)) {
+            result.error = "Profile source synchronization was cancelled.";
+            return result;
+        }
         const std::string file_namespace = source_namespace.empty() ? std::string() :
             source_namespace + " / " + file.parent_path().filename().string();
         std::string parse_error;
@@ -941,6 +962,10 @@ ProfileSourceSyncResult convert_prusa_tree(const fs::path &input_root, const fs:
         std::set<std::string> visiting;
         std::map<std::string, Section> cache;
         for (const auto &[name, section] : sections) {
+            if (cancelled(cancel)) {
+                result.error = "Profile source synchronization was cancelled.";
+                return result;
+            }
             if (preset_type(name).empty())
                 continue;
             Section merged = flatten(name, sections, visiting, cache, result.skipped_options);
@@ -1000,7 +1025,8 @@ void qualify_reference(json &contents, const char *key, const std::set<std::stri
 }
 
 ProfileSourceSyncResult import_native_tree(const fs::path &input_root, const fs::path &output_root,
-                                            const ProfileSource &source)
+                                            const ProfileSource &source,
+                                            const ProfileSourceManager::CancelFn &cancel = {})
 {
     ProfileSourceSyncResult result;
     std::vector<NativePreset> presets;
@@ -1009,22 +1035,57 @@ ProfileSourceSyncResult import_native_tree(const fs::path &input_root, const fs:
         return result;
     }
 
+    // Fork repositories commonly contain generated build/resource copies of
+    // the same profiles. Import only canonical resources/profiles trees when
+    // they exist, otherwise retain support for a custom tree rooted directly
+    // at machine/process/filament directories.
+    std::vector<fs::path> profile_roots;
+    size_t shallowest_depth = std::numeric_limits<size_t>::max();
     for (fs::recursive_directory_iterator it(input_root), end; it != end; ++it) {
-        if (!fs::is_regular_file(it->path()) || it->path().extension() != ".json")
-            continue;
-        fs::path category_path;
-        const std::string category = preset_category(it->path(), input_root, category_path);
-        if (category.empty())
-            continue;
-        boost::nowide::ifstream stream(it->path().string());
-        json contents = json::parse(stream, nullptr, false, true);
-        if (contents.is_discarded() || !contents.is_object() ||
-            !contents.contains("name") || !contents["name"].is_string()) {
-            ++result.skipped_options;
-            continue;
+        if (cancelled(cancel)) {
+            result.error = "Profile source synchronization was cancelled.";
+            return result;
         }
-        presets.push_back({category, category_path.parent_path().filename().string(),
-                           contents["name"].get<std::string>(), std::move(contents)});
+        if (!fs::is_directory(it->path()))
+            continue;
+        const std::string directory = boost::to_lower_copy(it->path().filename().string());
+        const std::string parent = boost::to_lower_copy(it->path().parent_path().filename().string());
+        if (directory == "profiles" && parent == "resources") {
+            const fs::path relative = it->path().lexically_relative(input_root);
+            const size_t depth = static_cast<size_t>(std::distance(relative.begin(), relative.end()));
+            if (depth < shallowest_depth) {
+                profile_roots.clear();
+                shallowest_depth = depth;
+            }
+            if (depth == shallowest_depth)
+                profile_roots.push_back(it->path());
+        }
+    }
+    if (profile_roots.empty())
+        profile_roots.push_back(input_root);
+
+    for (const fs::path &profile_root : profile_roots) {
+        for (fs::recursive_directory_iterator it(profile_root), end; it != end; ++it) {
+            if (cancelled(cancel)) {
+                result.error = "Profile source synchronization was cancelled.";
+                return result;
+            }
+            if (!fs::is_regular_file(it->path()) || it->path().extension() != ".json")
+                continue;
+            fs::path category_path;
+            const std::string category = preset_category(it->path(), profile_root, category_path);
+            if (category.empty())
+                continue;
+            boost::nowide::ifstream stream(it->path().string());
+            json contents = json::parse(stream, nullptr, false, true);
+            if (contents.is_discarded() || !contents.is_object() ||
+                !contents.contains("name") || !contents["name"].is_string()) {
+                ++result.skipped_options;
+                continue;
+            }
+            presets.push_back({category, category_path.parent_path().filename().string(),
+                               contents["name"].get<std::string>(), std::move(contents)});
+        }
     }
 
     using PresetNames = std::map<std::pair<std::string, std::string>, std::set<std::string>>;
@@ -1033,6 +1094,10 @@ ProfileSourceSyncResult import_native_tree(const fs::path &input_root, const fs:
         names[{preset.vendor, preset.category}].insert(preset.name);
 
     for (NativePreset &preset : presets) {
+        if (cancelled(cancel)) {
+            result.error = "Profile source synchronization was cancelled.";
+            return result;
+        }
         const std::string preset_namespace = source.name + " / " + preset.vendor;
         const auto names_for = [&](const std::string &category) -> const std::set<std::string> & {
             static const std::set<std::string> empty;
@@ -1072,21 +1137,23 @@ ProfileSourceManager::ProfileSourceManager(AppConfig &config) : m_config(config)
 
 ProfileSourceSyncResult ProfileSourceManager::convert_prusa_profiles(const std::string &input_root,
                                                                       const std::string &output_root,
-                                                                      const std::string &source_namespace)
+                                                                      const std::string &source_namespace,
+                                                                      const CancelFn &cancel)
 {
-    return convert_prusa_tree(fs::path(input_root), fs::path(output_root), source_namespace);
+    return convert_prusa_tree(fs::path(input_root), fs::path(output_root), source_namespace, cancel);
 }
 
 ProfileSourceSyncResult ProfileSourceManager::convert_orca_profiles(const std::string &input_root,
                                                                      const std::string &output_root,
                                                                      const std::string &source_id,
-                                                                     const std::string &source_name)
+                                                                     const std::string &source_name,
+                                                                     const CancelFn &cancel)
 {
     ProfileSource source;
     source.id = source_id;
     source.name = source_name;
     source.format = ProfileSource::Format::Orca;
-    return import_native_tree(fs::path(input_root), fs::path(output_root), source);
+    return import_native_tree(fs::path(input_root), fs::path(output_root), source, cancel);
 }
 
 std::vector<ProfileSource> ProfileSourceManager::sources() const
@@ -1150,10 +1217,11 @@ bool ProfileSourceManager::remove(const std::string &id, std::string &error)
     return !ec;
 }
 
-ProfileSourceUpdateResult ProfileSourceManager::check_for_update(const ProfileSource &source) const
+ProfileSourceUpdateResult ProfileSourceManager::check_for_update(const ProfileSource &source,
+                                                                  const CancelFn &cancel) const
 {
     ProfileSourceUpdateResult result;
-    result.revision = remote_revision(archive_url(source.url), result.error);
+    result.revision = remote_revision(archive_url(source.url), result.error, cancel);
     if (!result.error.empty())
         return result;
     // A never-synchronized source represents newly available profiles. For
@@ -1163,14 +1231,36 @@ ProfileSourceUpdateResult ProfileSourceManager::check_for_update(const ProfileSo
     return result;
 }
 
-ProfileSourceSyncResult ProfileSourceManager::sync(const ProfileSource &source, bool record_sync) try
+ProfileSourceSyncResult ProfileSourceManager::sync(const ProfileSource &source, bool record_sync,
+                                                    const CancelFn &cancel) try
 {
     ProfileSourceSyncResult result;
     const std::string user = m_config.get("preset_folder").empty() ? DEFAULT_USER_FOLDER_NAME : m_config.get("preset_folder");
     const fs::path target = fs::path(data_dir()) / PRESET_USER_DIR / user / PRESET_LOCAL_DIR / ("profile_source_" + sanitize(source.id));
-    const fs::path staging = target.string() + ".staging";
+    // Keep transient trees outside _local. Preset loading enumerates that
+    // directory, and an interrupted large import must never look like an
+    // installed bundle or burden startup with tens of thousands of files.
+    const fs::path work_root = fs::path(data_dir()) / "cache" / "profile_sources" / sanitize(user);
+    const fs::path staging = work_root / ("profile_source_" + sanitize(source.id) + ".staging");
+    const fs::path backup = work_root / ("profile_source_" + sanitize(source.id) + ".backup");
+    const fs::path extracted = work_root / ("profile_source_" + sanitize(source.id) + ".download");
     boost::system::error_code ec;
+    fs::create_directories(work_root, ec);
+    if (ec) {
+        result.error = ec.message();
+        return result;
+    }
+    if (!fs::exists(target) && fs::exists(backup)) {
+        fs::rename(backup, target, ec);
+        if (ec) {
+            result.error = ec.message();
+            return result;
+        }
+    }
     fs::remove_all(staging, ec);
+    ec.clear();
+    fs::remove_all(extracted, ec);
+    ec.clear();
     fs::create_directories(staging, ec);
     if (ec) {
         result.error = ec.message();
@@ -1179,39 +1269,39 @@ ProfileSourceSyncResult ProfileSourceManager::sync(const ProfileSource &source, 
 
     std::string error;
     std::string downloaded_revision;
-    std::string body = download(archive_url(source.url), error, &downloaded_revision);
+    std::string body = download(archive_url(source.url), error, &downloaded_revision, cancel);
     if (!error.empty() && boost::starts_with(source.url, "https://github.com/") &&
         !boost::ends_with(source.url, ".zip")) {
         error.clear();
         std::string head_url = source.url;
         boost::trim_right_if(head_url, boost::is_any_of("/"));
-        body = download(head_url + "/archive/HEAD.zip", error, &downloaded_revision);
+        body = download(head_url + "/archive/HEAD.zip", error, &downloaded_revision, cancel);
     }
     if (!error.empty()) {
         result.error = error;
         return result;
     }
 
-    fs::path extracted = staging / "download";
     fs::create_directories(extracted);
     if (source.format == ProfileSource::Format::Prusa) {
         if (boost::ends_with(boost::to_lower_copy(source.url), ".ini")) {
             boost::nowide::ofstream stream((extracted / "source.ini").string(), std::ios::binary);
             stream.write(body.data(), body.size());
-        } else if (!extract_zip(body, extracted, result.error)) {
+        } else if (!extract_zip(body, extracted, result.error, cancel)) {
             return result;
         }
-        result = convert_prusa_tree(extracted, staging, source.name);
+        result = convert_prusa_tree(extracted, staging, source.name, cancel);
         if (!result.success())
             return result;
     } else {
-        if (!extract_zip(body, extracted, result.error))
+        if (!extract_zip(body, extracted, result.error, cancel))
             return result;
-        result = import_native_tree(extracted, staging, source);
+        result = import_native_tree(extracted, staging, source, cancel);
         if (!result.success())
             return result;
     }
     result.revision = std::move(downloaded_revision);
+    fs::remove_all(extracted, ec);
 
     if (result.printers + result.filaments + result.processes == 0) {
         result.error = "No compatible printer, filament, or process profiles were found in the source.";
@@ -1230,7 +1320,6 @@ ProfileSourceSyncResult ProfileSourceManager::sync(const ProfileSource &source, 
         return result;
     }
 
-    const fs::path backup = target.string() + ".backup";
     fs::remove_all(backup, ec);
     ec.clear();
     if (fs::exists(target)) {

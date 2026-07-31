@@ -24,8 +24,10 @@
 
 #include <algorithm>
 #include <fstream>
+#include <mutex>
 #include <stdexcept>
 #include <unordered_map>
+#include <unordered_set>
 #include <boost/format.hpp>
 #include <boost/filesystem.hpp>
 #include <boost/filesystem/fstream.hpp>
@@ -828,11 +830,27 @@ bool is_compatible_with_printer(const PresetWithVendorProfile &preset, const Pre
     auto *compatible_printers     = dynamic_cast<const ConfigOptionStrings*>(preset.preset.config.option("compatible_printers"));
     bool  has_compatible_printers = compatible_printers != nullptr && ! compatible_printers->values.empty();
     if (! has_compatible_printers && ! condition.empty()) {
+        // A syntactically invalid condition cannot become valid for a
+        // different printer. Remember it after the first failure so preset
+        // refreshes do not repeatedly compile and log the same broken regex.
+        static std::mutex invalid_conditions_mutex;
+        static std::unordered_set<std::string> invalid_conditions;
+        {
+            std::lock_guard<std::mutex> lock(invalid_conditions_mutex);
+            if (invalid_conditions.count(condition) != 0)
+                return true;
+        }
         try {
             return PlaceholderParser::evaluate_boolean_expression(condition, active_printer.preset.config, extra_config);
         } catch (const std::runtime_error &err) {
             //FIXME in case of an error, return "compatible with everything".
-            BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << boost::format(": parsing error of compatible_printers_condition %1%: %2%")%active_printer.preset.name %err.what();
+            bool first_failure = false;
+            {
+                std::lock_guard<std::mutex> lock(invalid_conditions_mutex);
+                first_failure = invalid_conditions.insert(condition).second;
+            }
+            if (first_failure)
+                BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << boost::format(": parsing error of compatible_printers_condition %1%: %2%")%active_printer.preset.name %err.what();
             return true;
         }
     }

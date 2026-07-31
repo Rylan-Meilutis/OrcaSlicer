@@ -57,7 +57,7 @@ bool GLGizmoBrimEars::on_init()
     m_desc["create"]                = _L("Create");
     m_desc["auto_generate"]         = _L("Auto-generate");
     m_desc["auto-generate-tooltip"] = _L("Generate brim ears using Max angle and Detection radius");
-    m_desc["paint_brim"]            = _L("Paint brim");
+    m_desc["paint_brim"]            = _L("Brim painting");
     m_desc["paint-brim-tooltip"]    = _L("Drag along the model outline to paint a continuous custom brim");
     m_desc["section_view"]          = _L("Section view");
 
@@ -386,7 +386,7 @@ bool GLGizmoBrimEars::gizmo_event(SLAGizmoEventType action, const Vec2d &mouse_p
 
         // If there is some selection, don't add new point and deselect everything instead.
         if (m_paint_brim_mode && m_selection_empty) {
-            Plater::TakeSnapshot snapshot(wxGetApp().plater(), "Paint brim");
+            Plater::TakeSnapshot snapshot(wxGetApp().plater(), "Brim painting");
             if (!paint_point_at(mouse_position))
                 return false;
             m_painting_stroke = true;
@@ -865,9 +865,9 @@ bool GLGizmoBrimEars::on_is_activable() const
 std::string GLGizmoBrimEars::on_get_name() const
 {
     if (!on_is_activable() && m_state == EState::Off) {
-        return _u8L("Brim Ears") + ":\n" + _u8L("Please select single object.");
+        return _u8L("Brim Painting") + ":\n" + _u8L("Please select single object.");
     } else {
-        return _u8L("Brim Ears");
+        return _u8L("Brim Painting");
     }
 }
 
@@ -900,7 +900,7 @@ void GLGizmoBrimEars::on_set_state()
     }
     if (m_state == Off && m_old_state != Off) {
         // the gizmo was just turned Off
-        Plater::TakeSnapshot snapshot(wxGetApp().plater(), "Brim ears edit");
+        Plater::TakeSnapshot snapshot(wxGetApp().plater(), "Brim painting edit");
         update_model_object();
         wxGetApp().plater()->leave_gizmos_stack();
         // wxGetApp().mainframe->update_slice_print_status(MainFrame::SlicePrintEventType::eEventSliceUpdate, true, true);

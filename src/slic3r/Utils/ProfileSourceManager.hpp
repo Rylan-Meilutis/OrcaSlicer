@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -48,14 +49,16 @@ struct ProfileSourceUpdateResult
 class ProfileSourceManager
 {
 public:
+    using CancelFn = std::function<bool()>;
+
     explicit ProfileSourceManager(AppConfig &config);
 
     std::vector<ProfileSource> sources() const;
     void                       set_sources(const std::vector<ProfileSource> &sources);
     void                       add(const ProfileSource &source);
     bool                       remove(const std::string &id, std::string &error);
-    ProfileSourceUpdateResult  check_for_update(const ProfileSource &source) const;
-    ProfileSourceSyncResult    sync(const ProfileSource &source, bool record_sync = true);
+    ProfileSourceUpdateResult  check_for_update(const ProfileSource &source, const CancelFn &cancel = {}) const;
+    ProfileSourceSyncResult    sync(const ProfileSource &source, bool record_sync = true, const CancelFn &cancel = {});
     std::vector<ProfileSource> stale_enabled_sources(long long max_age_seconds = 24 * 60 * 60) const;
 
     static std::vector<ProfileSource> prusa_sources();
@@ -66,11 +69,13 @@ public:
     // conversion can be regression-tested without network access.
     static ProfileSourceSyncResult    convert_prusa_profiles(const std::string &input_root,
                                                               const std::string &output_root,
-                                                              const std::string &source_namespace = {});
+                                                              const std::string &source_namespace = {},
+                                                              const CancelFn &cancel = {});
     static ProfileSourceSyncResult    convert_orca_profiles(const std::string &input_root,
                                                              const std::string &output_root,
                                                              const std::string &source_id,
-                                                             const std::string &source_name);
+                                                             const std::string &source_name,
+                                                             const CancelFn &cancel = {});
 
 private:
     AppConfig &m_config;

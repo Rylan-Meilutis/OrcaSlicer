@@ -210,6 +210,10 @@ TEST_CASE("Native profile sources preserve namespaced dependencies", "[ProfileSo
         R"({"name":"Shared process","type":"process","compatible_printers":["Derived machine"]})");
     write_file(vendor / "filament" / "filament.json",
         R"({"name":"Shared filament","type":"filament","compatible_printers":["Derived machine"]})");
+    // Packaged/build copies must not be imported alongside the repository's
+    // canonical resources/profiles tree.
+    write_file(input / "build" / "package" / "resources" / "profiles" / "Example" / "machine" / "duplicate.json",
+        R"({"name":"Packaged duplicate","type":"machine","nozzle_diameter":["0.4"]})");
 
     const Slic3r::ProfileSourceSyncResult result =
         Slic3r::ProfileSourceManager::convert_orca_profiles(
@@ -228,6 +232,24 @@ TEST_CASE("Native profile sources preserve namespaced dependencies", "[ProfileSo
     const json process = read_json(output / "process" / "Example__Shared_process.json");
     CHECK(process.at("compatible_printers") ==
           std::vector<std::string>{"Derived machine [Example source / Example]"});
+}
+
+TEST_CASE("Profile source conversion can be cancelled between presets", "[ProfileSources][Regression]")
+{
+    TemporaryDirectory temporary;
+    const fs::path input = temporary.path / "input";
+    const fs::path output = temporary.path / "output";
+    write_file(input / "profiles.ini",
+        "[printer:Printer]\n"
+        "nozzle_diameter = 0.4\n"
+        "bed_shape = 0x0,200x0,200x200,0x200\n"
+        "max_print_height = 200\n");
+
+    const Slic3r::ProfileSourceSyncResult result =
+        Slic3r::ProfileSourceManager::convert_prusa_profiles(
+            input.string(), output.string(), {}, [] { return true; });
+    CHECK_FALSE(result.success());
+    CHECK(result.error == "Profile source synchronization was cancelled.");
 }
 
 TEST_CASE("Profile source prompts are limited to new remote revisions", "[ProfileSources][Regression]")
