@@ -113,6 +113,9 @@ private:
     std::optional<CacheEntry> render_hover_point;
 
     bool m_link_text_hover = false;
+    bool m_paint_brim_mode = false;
+    bool m_painting_stroke = false;
+    Vec3f m_last_painted_position = Vec3f::Zero();
     
     PickingModel m_cylinder;
 
@@ -177,6 +180,7 @@ protected:
     //void update_single_mesh_pick(GLVolume* v);
     void reset_all_pick();
     bool add_point_to_cache(Vec3f pos, float head_radius, bool selected, Vec3f normal);
+    bool paint_point_at(const Vec2d &mouse_position);
     float get_brim_default_radius() const;
     ExPolygon make_polygon(BrimPoint point, const Geometry::Transformation &trsf);
     void find_single();

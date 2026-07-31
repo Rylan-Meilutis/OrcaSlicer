@@ -11,6 +11,33 @@
 using namespace Slic3r::Test;
 using namespace Slic3r;
 
+TEST_CASE("Floating extrusion islands warn only without supports", "[SupportMaterial][Warnings]")
+{
+    TriangleMesh model = make_cube(12., 12., 2.);
+    TriangleMesh floating = make_cube(4., 4., 2.);
+    floating.translate(Vec3f(4.f, 4.f, 5.f));
+    model.merge(floating);
+
+    auto has_midair_warning = [](const Print &print) {
+        const auto state = print.objects().front()->step_state_with_warnings(posSupportMaterial);
+        return std::any_of(state.warnings.begin(), state.warnings.end(), [](const PrintStateBase::Warning &warning) {
+            return warning.current && warning.message.find("starting in midair") != std::string::npos;
+        });
+    };
+
+    SECTION("unsupported island is reported") {
+        Print print;
+        init_and_process_print({model}, print, {{"enable_support", false}});
+        REQUIRE(has_midair_warning(print));
+    }
+
+    SECTION("enabled supports suppress the warning") {
+        Print print;
+        init_and_process_print({model}, print, {{"enable_support", true}});
+        REQUIRE_FALSE(has_midair_warning(print));
+    }
+}
+
 TEST_CASE("Three raft layers are created", "[SupportMaterial]")
 {
 	Slic3r::Print print;

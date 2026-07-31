@@ -915,6 +915,25 @@ void PrintObject::detect_overhangs_for_lift()
     }
 }
 
+static std::optional<coordf_t> first_unsupported_extrusion_island(const LayerPtrs &layers)
+{
+    // A newly appearing connected island has no printable path into it. A
+    // bridge remains part of an island touching the preceding layer at one or
+    // both ends, so it is deliberately not reported here.
+    const double min_reported_area = sqr(double(scale_(0.4)));
+    for (size_t layer_idx = 1; layer_idx < layers.size(); ++layer_idx) {
+        const Layer &layer = *layers[layer_idx];
+        const ExPolygons lower_support = offset_ex(layers[layer_idx - 1]->lslices, scale_(0.05));
+        for (const ExPolygon &island : layer.lslices) {
+            if (island.area() <= min_reported_area)
+                continue;
+            if (intersection_ex(ExPolygons{island}, lower_support).empty())
+                return layer.print_z;
+        }
+    }
+    return std::nullopt;
+}
+
 void PrintObject::generate_support_material()
 {
     if (this->set_started(posSupportMaterial)) {
@@ -928,12 +947,21 @@ void PrintObject::generate_support_material()
             typedef std::chrono::duration<double, std::ratio<1> > second_;
             std::chrono::time_point<clock_> t0{ clock_::now() };
 
+            const std::optional<coordf_t> unsupported_layer = first_unsupported_extrusion_island(m_layers);
+            if (unsupported_layer) {
+                const std::string warning_message = Slic3r::format(
+                    L("Object %s contains an extrusion island starting in midair at approximately Z %.2f mm. Enable supports or re-orient the object."),
+                    this->model_object()->name, *unsupported_layer);
+                this->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL, warning_message,
+                                              PrintStateBase::SlicingNeedSupportOn);
+            }
+
             SupportNecessaryType sntype = this->is_support_necessary();
 
             double duration{ std::chrono::duration_cast<second_>(clock_::now() - t0).count() };
             BOOST_LOG_TRIVIAL(info) << std::fixed << std::setprecision(0) << "is_support_necessary takes " << duration << " secs.";
 
-            if (sntype != NoNeedSupp) {
+            if (sntype != NoNeedSupp && !unsupported_layer) {
                 std::map<SupportNecessaryType, std::string> reasons = {
                     {SharpTail,L("floating regions")},
                     {Cantilever,L("floating cantilever")},

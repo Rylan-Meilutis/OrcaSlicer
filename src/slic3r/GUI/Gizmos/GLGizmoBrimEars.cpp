@@ -57,6 +57,8 @@ bool GLGizmoBrimEars::on_init()
     m_desc["create"]                = _L("Create");
     m_desc["auto_generate"]         = _L("Auto-generate");
     m_desc["auto-generate-tooltip"] = _L("Generate brim ears using Max angle and Detection radius");
+    m_desc["paint_brim"]            = _L("Paint brim");
+    m_desc["paint-brim-tooltip"]    = _L("Drag along the model outline to paint a continuous custom brim");
     m_desc["section_view"]          = _L("Section view");
 
     m_shortcuts = {
@@ -377,13 +379,20 @@ bool GLGizmoBrimEars::gizmo_event(SLAGizmoEventType action, const Vec2d &mouse_p
         return true;
     }
 
-    // left down without selection rectangle - place point on the mesh:
+    // left down without selection rectangle - place a point or start a painted brim stroke:
     if (action == SLAGizmoEventType::LeftDown && !m_selection_rectangle.is_dragging() && !shift_down) {
         // If any point is in hover state, this should initiate its move - return control back to GLCanvas:
         if (m_hover_id != -1) return false;
 
         // If there is some selection, don't add new point and deselect everything instead.
-        if (m_selection_empty) {
+        if (m_paint_brim_mode && m_selection_empty) {
+            Plater::TakeSnapshot snapshot(wxGetApp().plater(), "Paint brim");
+            if (!paint_point_at(mouse_position))
+                return false;
+            m_painting_stroke = true;
+            m_wait_for_up_event = false;
+            return true;
+        } else if (m_selection_empty) {
             std::pair<Vec3f, Vec3f> pos_and_normal;
             if (unproject_on_mesh2(mouse_position, pos_and_normal)) {
                 // we got an intersection
@@ -448,12 +457,18 @@ bool GLGizmoBrimEars::gizmo_event(SLAGizmoEventType action, const Vec2d &mouse_p
 
     // left up with no selection rectangle
     if (action == SLAGizmoEventType::LeftUp) {
+        m_painting_stroke = false;
+        m_last_painted_position.setZero();
         if (m_wait_for_up_event) { m_wait_for_up_event = false; }
         return true;
     }
 
     // dragging the selection rectangle:
     if (action == SLAGizmoEventType::Dragging) {
+        if (m_painting_stroke) {
+            paint_point_at(mouse_position);
+            return true;
+        }
         if (m_wait_for_up_event)
             return true; // point has been placed and the button not released yet
                          // this prevents GLCanvas from starting scene rotation
@@ -725,6 +740,15 @@ void GLGizmoBrimEars::on_render_input_window(float x, float y, float bottom_limi
     if (m_imgui->button(m_desc["auto_generate"], m_desc["auto-generate-tooltip"])) {
         auto_generate();
     }
+
+    ImGui::SameLine();
+    if (m_imgui->bbl_checkbox(m_desc["paint_brim"], m_paint_brim_mode)) {
+        select_point(NoPoints);
+        m_painting_stroke = false;
+        m_last_painted_position.setZero();
+    }
+    if (ImGui::IsItemHovered())
+        m_imgui->tooltip(m_desc["paint-brim-tooltip"], ImGui::GetFontSize() * 20.f);
 
     ImGui::AlignTextToFramePadding();
     m_imgui->text(m_desc["remove"]);
@@ -1087,6 +1111,41 @@ bool GLGizmoBrimEars::add_point_to_cache(Vec3f pos, float head_radius, bool sele
     }
     m_editing_cache.emplace_back(point, selected, normal);
     update_model_object();
+    return true;
+}
+
+bool GLGizmoBrimEars::paint_point_at(const Vec2d &mouse_position)
+{
+    std::pair<Vec3f, Vec3f> pos_and_normal;
+    if (!unproject_on_mesh2(mouse_position, pos_and_normal))
+        return false;
+
+    const Selection &selection = m_parent.get_selection();
+    if (selection.get_volume_idxs().empty())
+        return false;
+    const GLVolume *volume = selection.get_volume(*selection.get_volume_idxs().begin());
+    if (volume == nullptr)
+        return false;
+
+    const Transform3d trsf = volume->get_instance_transformation().get_matrix();
+    const Transform3d inverse_trsf = volume->get_instance_transformation().get_matrix_no_offset().inverse();
+    Vec3d world_pos = trsf * pos_and_normal.first.cast<double>();
+    world_pos.z() = -0.0001;
+    const Vec3f object_pos = (trsf.inverse() * world_pos).cast<float>();
+
+    // Adjacent circular stamps overlap, producing a continuous brim region
+    // while retaining the existing backwards-compatible brim-point format.
+    const float spacing = std::max(0.25f, m_new_point_head_diameter * 0.2f);
+    if (!m_last_painted_position.isZero() &&
+        (object_pos.head<2>() - m_last_painted_position.head<2>()).norm() < spacing)
+        return true;
+
+    if (add_point_to_cache(object_pos, m_new_point_head_diameter / 2.f, false,
+                           (inverse_trsf * m_world_normal).cast<float>())) {
+        m_last_painted_position = object_pos;
+        find_single();
+        m_parent.set_as_dirty();
+    }
     return true;
 }
 

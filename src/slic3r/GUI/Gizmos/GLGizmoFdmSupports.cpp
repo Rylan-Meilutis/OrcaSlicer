@@ -13,6 +13,7 @@
 #include "slic3r/GUI/GUI_ObjectList.hpp"
 #include "slic3r/GUI/format.hpp"
 #include "slic3r/GUI/GUI.hpp"
+#include "slic3r/GUI/MsgDialog.hpp"
 #include "slic3r/Utils/UndoRedo.hpp"
 #include "GLGizmoUtils.hpp"
 
@@ -81,6 +82,8 @@ bool GLGizmoFdmSupports::on_init()
     m_shortcut_key = WXK_CONTROL_L;
 
     m_desc["perform"]            = _L("Apply");
+    m_desc["autopaint"]          = _L("Automatic painting");
+    m_desc["autopaint_tooltip"]  = _L("Automatically paint support enforcers using the configured support threshold angle");
     m_desc["on_overhangs_only"]  = _L("On highlighted overhangs only");
     m_desc["remove_all"]         = _L("Erase all");
     m_desc["highlight_by_angle"] = _L("Highlight overhangs");
@@ -302,6 +305,11 @@ void GLGizmoFdmSupports::on_render_input_window(float x, float y, float bottom_l
         this->tool_changed(old_tool, m_current_tool);
 
     ImGui::Dummy(ImVec2(0.0f, ImGui::GetFontSize() * 0.1));
+
+    if (m_imgui->button(m_desc.at("autopaint"), m_desc.at("autopaint_tooltip")))
+        auto_generate();
+
+    ImGui::Separator();
 
     if (m_current_tool == ImGui::CircleButtonIcon) {
         m_cursor_type = TriangleSelector::CursorType::CIRCLE;
@@ -580,10 +588,40 @@ void GLGizmoFdmSupports::select_facets_by_angle(float threshold_deg, bool block)
         }
     }
 
-    Plater::TakeSnapshot snapshot(wxGetApp().plater(), block ? "Block supports by angle"
-                                                    : "Add supports by angle");
     update_model_object();
     m_parent.set_as_dirty();
+}
+
+void GLGizmoFdmSupports::auto_generate()
+{
+    ModelObject *mo = m_c->selection_info()->model_object();
+    if (mo == nullptr)
+        return;
+
+    const bool has_paint = std::any_of(mo->volumes.begin(), mo->volumes.end(), [](const ModelVolume *volume) {
+        return volume->is_model_part() && !volume->supported_facets.empty();
+    });
+    if (has_paint) {
+        MessageDialog dialog(wxGetApp().plater(),
+            _L("Automatic painting will erase all currently painted support areas. Continue?"),
+            _L("Automatic painting"), wxICON_WARNING | wxYES | wxNO);
+        if (dialog.ShowModal() != wxID_YES)
+            return;
+    }
+
+    Plater::TakeSnapshot snapshot(wxGetApp().plater(), "Automatic painting support areas", UndoRedo::SnapshotType::GizmoAction);
+    for (auto &selector : m_triangle_selectors) {
+        selector->reset();
+        selector->request_update_render_data(true);
+    }
+
+    // Use the active automatic-support threshold, matching the support setup
+    // that will consume these enforcer facets. Manual-support profiles retain
+    // the current highlighted angle as a useful fallback.
+    int threshold = get_selection_support_threshold_angle();
+    if (threshold <= 0)
+        threshold = m_highlight_by_angle_threshold_deg > 0.f ? int(std::lround(m_highlight_by_angle_threshold_deg)) : 45;
+    select_facets_by_angle(float(threshold), false);
 }
 
 //BBS: remove const

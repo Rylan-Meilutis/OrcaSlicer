@@ -58,6 +58,7 @@ private:
     PainterGizmoType get_painter_type() const override;
 
     void select_facets_by_angle(float threshold, bool block);
+    void auto_generate();
     // BBS
     int get_selection_support_threshold_angle();
 
