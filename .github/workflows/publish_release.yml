@@ -1,8 +1,8 @@
 name: Publish to draft release
 
-# Manually pulls the platform binaries produced by a "Build all" run and uploads
-# them to an existing DRAFT release. Decoupled from the build so you can test a
-# build first, then publish exactly that run's artifacts once you're happy.
+# Pulls the platform binaries produced by a successful manually dispatched
+# "Build all" run and uploads them to the matching DRAFT release. It may also be
+# dispatched manually to retry or publish a deliberately partial build.
 #
 # Trigger: Actions tab -> "Publish to draft release" -> Run workflow.
 # Locked to a single person: the first step aborts unless the actor matches the
@@ -10,6 +10,9 @@ name: Publish to draft release
 # change that variable: gh variable set RELEASE_PUBLISHER --body "<login>".
 
 on:
+  workflow_run:
+    workflows: ["Build all"]
+    types: [completed]
   workflow_dispatch:
     inputs:
       run_id:
@@ -28,27 +31,63 @@ permissions:
 jobs:
   publish:
     name: Publish binaries to draft release
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.event == 'workflow_dispatch' &&
+       github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      RUN_ID: ${{ inputs.run_id }}
+      RUN_ID: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.id || inputs.run_id }}
       TAG: ${{ inputs.tag }}
     steps:
       - name: Restrict to the release publisher
         env:
           PUBLISHER: ${{ vars.RELEASE_PUBLISHER }}
+          REQUESTOR: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.actor.login || github.actor }}
         run: |
           if [ -z "$PUBLISHER" ]; then
             echo "::error::RELEASE_PUBLISHER repo variable is not set."
             exit 1
           fi
-          if [ "${{ github.actor }}" != "$PUBLISHER" ]; then
-            echo "::error::Only @$PUBLISHER may run this workflow (you are @${{ github.actor }})."
+          if [ "$REQUESTOR" != "$PUBLISHER" ]; then
+            echo "::error::Only @$PUBLISHER may run this workflow (requestor is @$REQUESTOR)."
             exit 1
           fi
-          echo "Authorized: @${{ github.actor }}"
+          echo "Authorized: @$REQUESTOR"
+
+      - name: Resolve matching draft release
+        if: github.event_name == 'workflow_run'
+        env:
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          short_sha=${HEAD_SHA:0:10}
+          matches=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" | jq -s \
+            --arg branch "$HEAD_BRANCH" --arg sha "$HEAD_SHA" --arg short_sha "$short_sha" \
+            '[.[][] | select(.draft == true) |
+              select(.target_commitish == $branch or .target_commitish == $sha) |
+              select((.body // "") | contains($short_sha))]')
+          count=$(jq 'length' <<< "$matches")
+          if [ "$count" -eq 0 ]; then
+            echo "::notice::No draft release matches $HEAD_BRANCH at $short_sha; nothing to upload."
+            exit 0
+          fi
+          if [ "$count" -ne 1 ]; then
+            echo "::error::$count draft releases match $HEAD_BRANCH at $short_sha; refusing an ambiguous upload."
+            exit 1
+          fi
+          tag=$(jq -r '.[0].tag_name' <<< "$matches")
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+          echo "Matched draft release: $tag"
+
+      - name: Stop when no matching draft exists
+        if: github.event_name == 'workflow_run' && env.TAG == ''
+        run: echo "No matching draft release was found."
 
       - name: Verify target is a draft release
+        if: env.TAG != ''
         run: |
           if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft >/dev/null 2>&1; then
             echo "::error::Release '$TAG' not found. Create the draft (with this tag) first."
@@ -61,6 +100,7 @@ jobs:
           fi
 
       - name: Verify source build run
+        if: env.TAG != ''
         run: |
           info=$(gh run view "$RUN_ID" --repo "$GITHUB_REPOSITORY" --json workflowName,conclusion,headBranch)
           name=$(echo "$info" | jq -r '.workflowName')
@@ -72,6 +112,7 @@ jobs:
           fi
 
       - name: Download release artifacts from build run
+        if: env.TAG != ''
         run: |
           # Windows_V* (not Windows_*) keeps the MSIX Store artifact out: it goes to Partner Center, not GitHub releases.
           gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" --dir artifacts \
@@ -84,6 +125,7 @@ jobs:
           ls -1 artifacts
 
       - name: Assemble release assets
+        if: env.TAG != ''
         run: |
           set -euo pipefail
           mkdir -p upload
@@ -125,6 +167,7 @@ jobs:
           fi
 
       - name: Upload assets to draft release
+        if: env.TAG != ''
         run: |
           gh release upload "$TAG" upload/* --repo "$GITHUB_REPOSITORY" --clobber
           echo "Uploaded to draft release: $TAG"
