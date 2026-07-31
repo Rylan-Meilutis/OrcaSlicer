@@ -915,7 +915,29 @@ void PrintObject::detect_overhangs_for_lift()
     }
 }
 
-static std::optional<coordf_t> first_unsupported_extrusion_island(const LayerPtrs &layers)
+static bool extrusion_island_has_generated_support(
+    const ExPolygon &island, const Layer &layer, const SupportLayerPtrs &support_layers, coordf_t max_support_gap)
+{
+    const double min_support_area = sqr(double(scale_(0.4)));
+    const coordf_t island_bottom_z = layer.bottom_z();
+    for (auto support_it = support_layers.rbegin(); support_it != support_layers.rend(); ++support_it) {
+        const SupportLayer &support_layer = **support_it;
+        if (support_layer.print_z > island_bottom_z + EPSILON)
+            continue;
+        if (island_bottom_z - support_layer.print_z > max_support_gap + 0.05)
+            break;
+        if (support_layer.support_islands.empty())
+            continue;
+
+        const ExPolygons support_area = offset_ex(support_layer.support_islands, scale_(0.05));
+        if (area(intersection_ex(ExPolygons{island}, support_area)) > min_support_area)
+            return true;
+    }
+    return false;
+}
+
+static std::optional<coordf_t> first_unsupported_extrusion_island(
+    const LayerPtrs &layers, const SupportLayerPtrs &support_layers, coordf_t max_support_gap)
 {
     // A newly appearing connected island has no printable path into it. A
     // bridge remains part of an island touching the preceding layer at one or
@@ -927,7 +949,8 @@ static std::optional<coordf_t> first_unsupported_extrusion_island(const LayerPtr
         for (const ExPolygon &island : layer.lslices) {
             if (island.area() <= min_reported_area)
                 continue;
-            if (intersection_ex(ExPolygons{island}, lower_support).empty())
+            if (intersection_ex(ExPolygons{island}, lower_support).empty() &&
+                !extrusion_island_has_generated_support(island, layer, support_layers, max_support_gap))
                 return layer.print_z;
         }
     }
@@ -947,14 +970,8 @@ void PrintObject::generate_support_material()
             typedef std::chrono::duration<double, std::ratio<1> > second_;
             std::chrono::time_point<clock_> t0{ clock_::now() };
 
-            const std::optional<coordf_t> unsupported_layer = first_unsupported_extrusion_island(m_layers);
-            if (unsupported_layer) {
-                const std::string warning_message = Slic3r::format(
-                    L("Object %s contains an extrusion island starting in midair at approximately Z %.2f mm. Enable supports or re-orient the object."),
-                    this->model_object()->name, *unsupported_layer);
-                this->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL, warning_message,
-                                              PrintStateBase::SlicingNeedSupportOn);
-            }
+            const std::optional<coordf_t> unsupported_layer =
+                first_unsupported_extrusion_island(m_layers, {}, m_config.support_top_z_distance.value);
 
             SupportNecessaryType sntype = this->is_support_necessary();
 
@@ -1005,6 +1022,21 @@ void PrintObject::generate_support_material()
                         }
                     });
                 m_print->throw_if_canceled();
+            }
+        }
+
+        if (!m_print->get_no_check_flag()) {
+            const std::optional<coordf_t> unsupported_layer =
+                first_unsupported_extrusion_island(m_layers, m_support_layers, m_config.support_top_z_distance.value);
+            if (unsupported_layer) {
+                const std::string remedy = has_support() ?
+                    L("Adjust the support settings or re-orient the object.") :
+                    L("Enable supports or re-orient the object.");
+                const std::string warning_message = Slic3r::format(
+                    L("Object %s contains an extrusion island starting in midair at approximately Z %.2f mm. %s"),
+                    this->model_object()->name, *unsupported_layer, remedy);
+                this->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL, warning_message,
+                                              PrintStateBase::SlicingNeedSupportOn);
             }
         }
         this->set_done(posSupportMaterial);

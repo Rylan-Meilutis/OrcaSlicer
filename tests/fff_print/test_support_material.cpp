@@ -11,7 +11,7 @@
 using namespace Slic3r::Test;
 using namespace Slic3r;
 
-TEST_CASE("Floating extrusion islands warn only without supports", "[SupportMaterial][Warnings]")
+TEST_CASE("Floating extrusion islands warn unless generated support reaches the island", "[SupportMaterial][Warnings]")
 {
     TriangleMesh model = make_cube(12., 12., 2.);
     TriangleMesh floating = make_cube(4., 4., 2.);
@@ -35,6 +35,15 @@ TEST_CASE("Floating extrusion islands warn only without supports", "[SupportMate
         Print print;
         init_and_process_print({model}, print, {{"enable_support", true}});
         REQUIRE_FALSE(has_midair_warning(print));
+    }
+
+    SECTION("enabled supports still warn when no support reaches the island") {
+        Print print;
+        init_and_process_print({model}, print, {
+            {"enable_support", true},
+            {"support_type",  std::string("normal(manual)")},
+        });
+        REQUIRE(has_midair_warning(print));
     }
 }
 
