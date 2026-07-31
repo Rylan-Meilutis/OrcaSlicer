@@ -202,7 +202,7 @@ void AppConfig::set_defaults()
     if (get("seq_top_layer_only").empty())
         set("seq_top_layer_only", "1");
 
-    // ORCA: darken layers below the current one while scrubbing the preview (ported from preFlight)
+    // ORCA: darken the layers the preview layer slider is not scrubbed to
     if (get("preview_dim_previous_layers").empty())
         set_bool("preview_dim_previous_layers", false);
 
@@ -213,6 +213,21 @@ void AppConfig::set_defaults()
         set("preview_tool_model",
             legacy_gantry == "true" || legacy_gantry == "1" ?
                 "gantry" : "nozzle");
+    }
+
+    // ORCA: brightness of those dimmed layers, in percent. 0 = black, capped at 99 because
+    // 100 would render them unchanged, which is what disabling the option already does
+    if (get("preview_dim_previous_layers_brightness").empty())
+        set("preview_dim_previous_layers_brightness", "40");
+    else {
+        int brightness = 40;
+        try {
+            brightness = std::stoi(get("preview_dim_previous_layers_brightness"));
+        }
+        catch (...) {
+            brightness = 40;
+        }
+        set("preview_dim_previous_layers_brightness", std::to_string(std::max(0, std::min(brightness, 99))));
     }
 
     if (get("filaments_area_preferred_count").empty())
