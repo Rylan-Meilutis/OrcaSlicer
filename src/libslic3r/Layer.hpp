@@ -341,6 +341,11 @@ protected:
     std::vector<AreaGroup>                    area_groups;
 };
 
+// Returns the generated support layer whose print Z corresponds to the support
+// contact below this object layer, or nullptr when no support layer is close
+// enough to affect its toolpaths. Support layers are ordered by print Z.
+const SupportLayer *support_layer_below(const Layer &layer);
+
 template<typename LayerContainer>
 inline std::vector<float> zs_from_layers(const LayerContainer &layers)
 {

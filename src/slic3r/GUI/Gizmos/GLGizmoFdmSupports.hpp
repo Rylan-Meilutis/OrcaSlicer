@@ -9,6 +9,7 @@
 #include "slic3r/GUI/I18N.hpp"
 
 #include <boost/thread.hpp>
+#include <atomic>
 
 namespace Slic3r::GUI {
 
@@ -59,6 +60,7 @@ private:
 
     void select_facets_by_angle(float threshold, bool block);
     void auto_generate();
+    void apply_auto_paint_result();
     // BBS
     int get_selection_support_threshold_angle();
 
@@ -78,7 +80,12 @@ private:
     GLVolume *m_support_volume = NULL;
     mutable bool m_volume_ready = false;
     bool m_is_tree_support = false;
-    bool m_cancel = false;
+    std::atomic_bool m_cancel{false};
+    std::atomic_bool m_auto_paint_running{false};
+    std::atomic_bool m_auto_paint_ready{false};
+    std::atomic_bool m_auto_paint_failed{false};
+    std::vector<TriangleSelector::TriangleSplittingData> m_auto_paint_result;
+    ObjectID m_auto_paint_object_id;
     size_t m_object_id;
     std::vector<ObjectBase::Timestamp> m_volume_timestamps;
     PrintInstance m_print_instance;

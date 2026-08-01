@@ -1010,11 +1010,18 @@ void PrintObject::generate_support_material()
             for (size_t region_id = 0; region_id < num_printing_regions() && !has_arc_overhangs; ++region_id)
                 has_arc_overhangs = printing_region(region_id).config().arc_overhang_enabled.value;
             if (has_arc_overhangs && !m_support_layers.empty()) {
+                std::vector<size_t> affected_layers;
+                affected_layers.reserve(std::min(m_layers.size(), m_support_layers.size()));
+                for (size_t layer_idx = 0; layer_idx < m_layers.size(); ++layer_idx)
+                    if (support_layer_below(*m_layers[layer_idx]) != nullptr)
+                        affected_layers.emplace_back(layer_idx);
+
                 tbb::parallel_for(
-                    tbb::blocked_range<size_t>(0, m_layers.size()),
-                    [this](const tbb::blocked_range<size_t> &range) {
-                        for (size_t layer_idx = range.begin(); layer_idx < range.end(); ++layer_idx) {
+                    tbb::blocked_range<size_t>(0, affected_layers.size()),
+                    [this, &affected_layers](const tbb::blocked_range<size_t> &range) {
+                        for (size_t affected_idx = range.begin(); affected_idx < range.end(); ++affected_idx) {
                             m_print->throw_if_canceled();
+                            const size_t layer_idx = affected_layers[affected_idx];
                             m_layers[layer_idx]->make_fills(
                                 m_adaptive_fill_octrees.first.get(),
                                 m_adaptive_fill_octrees.second.get(),

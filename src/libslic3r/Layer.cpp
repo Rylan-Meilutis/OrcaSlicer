@@ -10,6 +10,29 @@
 
 namespace Slic3r {
 
+const SupportLayer *support_layer_below(const Layer &layer)
+{
+    const auto support_layers = layer.object()->support_layers();
+    if (support_layers.empty())
+        return nullptr;
+
+    const double target_print_z = layer.bottom_z() - layer.object()->config().support_top_z_distance.value;
+    const auto upper = std::lower_bound(
+        support_layers.begin(), support_layers.end(), target_print_z,
+        [](const SupportLayer *support_layer, double print_z) { return support_layer->print_z < print_z; });
+
+    const SupportLayer *nearest = nullptr;
+    if (upper != support_layers.begin())
+        nearest = *(upper - 1);
+    if (upper != support_layers.end() &&
+        (nearest == nullptr || std::abs((*upper)->print_z - target_print_z) < std::abs(nearest->print_z - target_print_z)))
+        nearest = *upper;
+
+    return nearest != nullptr &&
+            std::abs(nearest->print_z - target_print_z) <= std::max(layer.height, nearest->height) + EPSILON ?
+        nearest : nullptr;
+}
+
 Layer::~Layer()
 {
     this->lower_layer = this->upper_layer = nullptr;

@@ -1954,6 +1954,52 @@ TEST_CASE("Arc bridge and overhang selectors can be disabled independently", "[F
     CHECK_FALSE(print_has_arc_overhang(print));
 }
 
+TEST_CASE("Generated support contact keeps supported bottom surfaces out of arc overhang fill",
+          "[Fill][ArcOverhang][Support][Regression]")
+{
+    TriangleMesh post = make_cube(5., 20., 5.);
+    TriangleMesh roof = make_cube(30., 20., 2.);
+    roof.translate(-12.5, 0., 5.);
+    post.merge(roof);
+
+    Print print;
+    Slic3r::Test::init_and_process_print({post}, print, {
+        {"arc_overhang_enabled", "1"},
+        {"arc_overhang_bridge_distance", "0"},
+        {"arc_overhang_min_overhang_distance", "0"},
+        {"enable_support", "1"},
+        {"support_type", "normal(auto)"},
+        {"support_threshold_angle", "30"},
+        {"support_top_z_distance", "0"}
+    });
+
+    CHECK_FALSE(print_has_arc_overhang(print));
+}
+
+TEST_CASE("A middle support applies the arc threshold to each unsupported bridge span",
+          "[Fill][ArcOverhang][Support][Regression]")
+{
+    TriangleMesh left_post = make_cube(5., 20., 5.);
+    TriangleMesh middle_post = make_cube(5., 20., 5.);
+    middle_post.translate(22.5, 0., 0.);
+    left_post.merge(middle_post);
+    TriangleMesh right_post = make_cube(5., 20., 5.);
+    right_post.translate(45., 0., 0.);
+    left_post.merge(right_post);
+    TriangleMesh roof = make_cube(50., 20., 2.);
+    roof.translate(0., 0., 5.);
+    left_post.merge(roof);
+
+    Print print;
+    Slic3r::Test::init_and_process_print({left_post}, print, {
+        {"arc_overhang_enabled", "1"},
+        {"arc_overhang_bridge_distance", "25"},
+        {"enable_support", "0"}
+    });
+
+    CHECK_FALSE(print_has_arc_overhang(print));
+}
+
 #if 0
 TEST_CASE("Adjusted solid distance", "[Fill]") {
     int surface_width = 250;
