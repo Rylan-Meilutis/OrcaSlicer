@@ -1,12 +1,12 @@
-name: Publish to draft release
+name: Publish release artifacts
 
 # Pulls the platform binaries produced by a successful manually dispatched
-# "Build all" run and uploads them to the matching DRAFT release. It may also be
+# "Build all" run and uploads them to the matching release. It may also be
 # dispatched manually to retry or publish a deliberately partial build.
 #
-# Trigger: Actions tab -> "Publish to draft release" -> Run workflow.
+# Trigger: Actions tab -> "Publish release artifacts" -> Run workflow.
 # Locked to a single person: the first step aborts unless the actor matches the
-# `RELEASE_PUBLISHER` repo variable (set to "SoftFever"). To allow someone else,
+# `RELEASE_PUBLISHER` repo variable. To allow someone else,
 # change that variable: gh variable set RELEASE_PUBLISHER --body "<login>".
 
 on:
@@ -20,7 +20,7 @@ on:
         required: true
         type: string
       tag:
-        description: 'Tag of the draft release to upload to (e.g. v2.4.0-beta)'
+        description: 'Tag of the release to upload to (e.g. v2.4.0-beta)'
         required: true
         type: string
 
@@ -30,7 +30,7 @@ permissions:
 
 jobs:
   publish:
-    name: Publish binaries to draft release
+    name: Publish binaries to release
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (github.event.workflow_run.event == 'workflow_dispatch' &&
@@ -56,7 +56,7 @@ jobs:
           fi
           echo "Authorized: @$REQUESTOR"
 
-      - name: Resolve matching draft release
+      - name: Resolve matching release
         if: github.event_name == 'workflow_run'
         env:
           HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
@@ -66,36 +66,30 @@ jobs:
           short_sha=${HEAD_SHA:0:10}
           matches=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" | jq -s \
             --arg branch "$HEAD_BRANCH" --arg sha "$HEAD_SHA" --arg short_sha "$short_sha" \
-            '[.[][] | select(.draft == true) |
-              select(.target_commitish == $branch or .target_commitish == $sha) |
+            '[.[][] | select(.target_commitish == $branch or .target_commitish == $sha) |
               select((.body // "") | contains($short_sha))]')
           count=$(jq 'length' <<< "$matches")
           if [ "$count" -eq 0 ]; then
-            echo "::notice::No draft release matches $HEAD_BRANCH at $short_sha; nothing to upload."
+            echo "::notice::No release matches $HEAD_BRANCH at $short_sha; nothing to upload."
             exit 0
           fi
           if [ "$count" -ne 1 ]; then
-            echo "::error::$count draft releases match $HEAD_BRANCH at $short_sha; refusing an ambiguous upload."
+            echo "::error::$count releases match $HEAD_BRANCH at $short_sha; refusing an ambiguous upload."
             exit 1
           fi
           tag=$(jq -r '.[0].tag_name' <<< "$matches")
           echo "TAG=$tag" >> "$GITHUB_ENV"
-          echo "Matched draft release: $tag"
+          echo "Matched release: $tag"
 
-      - name: Stop when no matching draft exists
+      - name: Stop when no matching release exists
         if: github.event_name == 'workflow_run' && env.TAG == ''
-        run: echo "No matching draft release was found."
+        run: echo "No matching release was found."
 
-      - name: Verify target is a draft release
+      - name: Verify target release exists
         if: env.TAG != ''
         run: |
-          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft >/dev/null 2>&1; then
-            echo "::error::Release '$TAG' not found. Create the draft (with this tag) first."
-            exit 1
-          fi
-          is_draft=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft')
-          if [ "$is_draft" != "true" ]; then
-            echo "::error::Release '$TAG' is published, not a draft. Aborting to avoid touching a live release."
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json tagName >/dev/null 2>&1; then
+            echo "::error::Release '$TAG' not found. Create it first."
             exit 1
           fi
 
@@ -166,9 +160,9 @@ jobs:
             exit 1
           fi
 
-      - name: Upload assets to draft release
+      - name: Upload assets to release
         if: env.TAG != ''
         run: |
           gh release upload "$TAG" upload/* --repo "$GITHUB_REPOSITORY" --clobber
-          echo "Uploaded to draft release: $TAG"
+          echo "Uploaded to release: $TAG"
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name'
