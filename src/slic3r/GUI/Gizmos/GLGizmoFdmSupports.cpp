@@ -166,10 +166,10 @@ bool GLGizmoFdmSupports::on_init()
 
     m_desc["perform"]            = _L("Apply");
     m_desc["autopaint"]          = _L("Automatic painting");
-    m_desc["autopaint_tooltip"]  = _L("Add localized support enforcers where the model has no material underneath");
+    m_desc["autopaint_tooltip"]  = _L("Add localized support enforcers at or below the automatic painting angle where the model has no material underneath");
     m_desc["on_overhangs_only"]  = _L("On highlighted overhangs only");
     m_desc["remove_all"]         = _L("Erase all");
-    m_desc["highlight_by_angle"] = _L("Highlight overhangs");
+    m_desc["highlight_by_angle"] = _L("Automatic painting angle");
     m_desc["tool_type"]          = _L("Tool type");
     m_desc["gap_fill"]           = _L("Gap fill");
     m_desc["reset_direction"]    = _L("Reset direction");
@@ -287,13 +287,15 @@ void GLGizmoFdmSupports::on_render_input_window(float x, float y, float bottom_l
     // BBS
     wchar_t old_tool = m_current_tool;
 
-    int support_threshold_angle = get_selection_support_threshold_angle();
-    // when support painting tool is on, reset highlight threshold angle
+    const int support_threshold_angle = get_selection_support_threshold_angle();
+    // Seed the painter-local control from the process profile when the gizmo is
+    // opened. Subsequent edits belong to the painter and do not mutate or get
+    // overwritten by the process profile.
     if (m_support_threshold_angle == -1) {
-        m_highlight_by_angle_threshold_deg = support_threshold_angle;
+        m_highlight_by_angle_threshold_deg = support_threshold_angle > 0 ? float(support_threshold_angle) : 45.f;
         m_parent.set_slope_normal_angle(90.f - m_highlight_by_angle_threshold_deg);
     }
-    m_support_threshold_angle = support_threshold_angle;
+    m_support_threshold_angle = int(std::lround(m_highlight_by_angle_threshold_deg));
 
     const float approx_height = m_imgui->scaled(23.f);
     y = std::min(y, bottom_limit - approx_height);
@@ -320,9 +322,6 @@ void GLGizmoFdmSupports::on_render_input_window(float x, float y, float bottom_l
     const float smart_fill_angle_txt_width = m_imgui->calc_text_size(m_desc.at("smart_fill_angle")).x + m_imgui->scaled(1.5f);
     const float buttons_width           = filter_btn_width + m_imgui->scaled(1.5f);
     const float empty_button_width      = m_imgui->calc_button_size("").x;
-
-    const float tips_width           = m_imgui->calc_text_size(_L("Auto support threshold angle: ") + " 90 ").x + m_imgui->scaled(1.5f);
-    const float minimal_slider_width = m_imgui->scaled(4.f);
 
     float caption_max    = 0.f;
     float total_text_max = 0.f;
@@ -514,24 +513,13 @@ void GLGizmoFdmSupports::on_render_input_window(float x, float y, float bottom_l
 
     std::string format_str = std::string("%.f");
     ImGui::PushItemWidth(sliders_width);
-    wxString tooltip = _L("Highlight faces according to overhang angle.");
+    wxString tooltip = _L("Set the maximum slope angle used by Automatic painting. Faces at exactly this angle are included. This also controls overhang highlighting.");
     if (m_imgui->bbl_slider_float_style("##angle_threshold_deg", &m_highlight_by_angle_threshold_deg, 0.f, 90.f, format_str.data(), 1.0f, true, tooltip)) {
         m_parent.set_slope_normal_angle(90.f - m_highlight_by_angle_threshold_deg);
         if (!m_parent.is_using_slope()) {
             m_parent.use_slope(true);
             m_parent.set_as_dirty();
         }
-    }
-    if (ImGui::IsItemHovered()) {
-        ImGui::BeginTooltip();
-        if (m_support_threshold_angle != 0) {
-            wxString str_tooltip = (_L("Auto support threshold angle: ") + std::to_string(m_support_threshold_angle));
-            m_imgui->text_colored(ImGuiWrapper::COL_WINDOW_BG, str_tooltip);
-        } else {
-            wxString s_tooltip = (_L("No auto support"));
-            m_imgui->text_colored(ImGuiWrapper::COL_WINDOW_BG, s_tooltip);
-        }
-        ImGui::EndTooltip();
     }
     ImGui::SameLine(drag_left_width + sliders_left_width);
     ImGui::PushItemWidth(1.5 * slider_icon_width);
@@ -634,12 +622,9 @@ int GLGizmoFdmSupports::get_selection_support_threshold_angle()
 
     const DynamicPrintConfig& obj_cfg = sel_info->model_object()->config.get();
     const DynamicPrintConfig& glb_cfg = wxGetApp().preset_bundle->prints.get_edited_preset().config;
-    bool enable_support = obj_cfg.option("enable_support") ? obj_cfg.opt_bool("enable_support") : glb_cfg.opt_bool("enable_support");
-    SupportType support_type = obj_cfg.option("support_type") ? obj_cfg.opt_enum<SupportType>("support_type") : glb_cfg.opt_enum<SupportType>("support_type");
     int support_threshold_angle = obj_cfg.option("support_threshold_angle") ? obj_cfg.opt_int("support_threshold_angle") : glb_cfg.opt_int("support_threshold_angle");
 
-    bool auto_support = enable_support && is_auto(support_type);
-    return auto_support ? support_threshold_angle : 0;
+    return support_threshold_angle;
 }
 
 void GLGizmoFdmSupports::select_facets_by_angle(float threshold_deg, bool block)
@@ -666,7 +651,7 @@ void GLGizmoFdmSupports::select_facets_by_angle(float threshold_deg, bool block)
         int idx = 0;
         const indexed_triangle_set &its = mv->mesh().its;
         for (const stl_triangle_vertex_indices &face : its.indices) {
-            if (its_face_normal(its, face).dot(down) > dot_limit) {
+            if (its_face_normal(its, face).dot(down) >= dot_limit - 1e-6f) {
                 m_triangle_selectors[mesh_id]->set_facet(idx, block ? EnforcerBlockerType::BLOCKER : EnforcerBlockerType::ENFORCER);
                 m_triangle_selectors.back()->request_update_render_data();
             }
@@ -697,9 +682,7 @@ void GLGizmoFdmSupports::auto_generate()
         return;
     }
 
-    int threshold = get_selection_support_threshold_angle();
-    if (threshold <= 0)
-        threshold = m_highlight_by_angle_threshold_deg > 0.f ? int(std::lround(m_highlight_by_angle_threshold_deg)) : 45;
+    const float threshold = m_highlight_by_angle_threshold_deg > 0.f ? m_highlight_by_angle_threshold_deg : 45.f;
 
     const ModelInstance *instance = mo->instances[selection.get_instance_idx()];
     std::vector<AutoPaintVolume> volumes;
@@ -731,7 +714,7 @@ void GLGizmoFdmSupports::auto_generate()
     Plater::TakeSnapshot snapshot(wxGetApp().plater(), "Automatic painting support areas",
                                   UndoRedo::SnapshotType::GizmoAction);
 
-    const float threshold_rad = float(M_PI) / 180.f * float(threshold);
+    const float threshold_rad = float(M_PI) / 180.f * threshold;
     const float spot_radius = 1.5f;
     const float spot_spacing = 6.f;
     const float layer_height = m_print_instance.print_object != nullptr ?
@@ -770,7 +753,11 @@ void GLGizmoFdmSupports::auto_generate()
                     if (m_cancel)
                         return;
                     const stl_triangle_vertex_indices &face = volume.triangles.indices[face_idx];
-                    if (its_face_normal(volume.triangles, face).dot(down) <= dot_limit)
+                    // Match support generation's inclusive threshold. Exact-angle test
+                    // facets (for example a 15 degree overhang with a 15 degree
+                    // painter threshold) must not disappear due to strict comparison
+                    // or floating-point rounding.
+                    if (its_face_normal(volume.triangles, face).dot(down) < dot_limit - 1e-6f)
                         continue;
 
                     for (const Vec3f &local_point : support_spot_samples(volume.triangles, face, spot_spacing)) {
