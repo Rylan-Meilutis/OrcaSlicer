@@ -125,6 +125,8 @@ const std::string GCodeProcessor::Machine_End_GCode_Start_Tag = " MACHINE_END_GC
 const std::string GCodeProcessor::Nozzle_Change_Start_Tag      = " NOZZLE_CHANGE_START";
 const std::string GCodeProcessor::Nozzle_Change_End_Tag        = " NOZZLE_CHANGE_END";
 const std::string GCodeProcessor::Toolchange_Wipe_Tag          = " CP_TOOLCHANGE_WIPE";
+const std::string GCodeProcessor::Nonplanar_Transition_Layer_Tag =
+    " NONPLANAR_TRANSITION_LAYER_CHANGE";
 
 const float GCodeProcessor::Wipe_Width = 0.05f;
 const float GCodeProcessor::Wipe_Height = 0.05f;
@@ -1643,6 +1645,8 @@ void GCodeProcessor::run_post_process()
                         // strip leading ';'
                         tag_line.remove_prefix(1);
                         if (tag_line == reserved_tag(ETags::Layer_Change))
+                            ++current_layer_id;
+                        else if (tag_line == Nonplanar_Transition_Layer_Tag)
                             ++current_layer_id;
                         // Collect [start,end] output-line-id ranges of each SKIPPABLE region for the
                         // pre-heat injector. The `!empty()` guard on END avoids dereferencing .back()
@@ -4362,6 +4366,12 @@ void GCodeProcessor::process_tags(const std::string_view comment, bool producers
     }
 
     // layer change tag
+    if (comment == Nonplanar_Transition_Layer_Tag) {
+        ++m_layer_id;
+        return;
+    }
+
+    // layer change tag
     if (comment == reserved_tag(ETags::Layer_Change)) {
         ++m_layer_id;
         return;
@@ -4976,7 +4986,7 @@ void GCodeProcessor::process_G1(const std::array<std::optional<double>, 4>& axes
             // cross section: rectangle
             m_width = delta_pos[E] * static_cast<float>(M_PI * sqr(1.05f * filament_radius)) / (delta_xyz * m_height);
         else if (m_extrusion_role == erBridgeInfill || m_extrusion_role == erInternalBridgeInfill ||
-                 m_extrusion_role == erArcOverhang || m_extrusion_role == erNone)
+                 is_arc_fill(m_extrusion_role) || m_extrusion_role == erNone)
             // cross section: circle
             m_width = static_cast<float>(m_result.filament_diameters[filament_id]) * std::sqrt(delta_pos[E] / delta_xyz);
         else

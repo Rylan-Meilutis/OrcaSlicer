@@ -120,6 +120,8 @@ bool Print::invalidate_state_by_config_options(const ConfigOptionResolver & /* n
         "overhang_fan_speed",
         "overhang_fan_threshold",
         "slow_down_for_layer_cooling",
+        "hull_line_mitigation",
+        "hull_line_max_layer_time_variation",
         "default_acceleration",
         "deretraction_speed",
         "close_fan_the_first_x_layers",
@@ -4657,6 +4659,7 @@ const std::string PrintStatistics::TotalFilamentUsedWipeTowerValueMask = "; tota
 #define JSON_SURF_THICKNESS_LAYER   "thickness_layers"
 #define JSON_SURF_BRIDGE_ANGLE       "bridge_angle"
 #define JSON_SURF_EXTRA_PERIMETERS   "extra_perimeters"
+#define JSON_SURF_HULL_LINE_TRANSITION "hull_line_transition"
 
 #define JSON_ARC_DATA                "arc_data"
 #define JSON_ARC_START_INDEX         "start_index"
@@ -4733,6 +4736,7 @@ static void to_json(json& j, const Surface& surf) {
     j[JSON_SURF_THICKNESS_LAYER] = surf.thickness_layers;
     j[JSON_SURF_BRIDGE_ANGLE] = surf.bridge_angle;
     j[JSON_SURF_EXTRA_PERIMETERS] = surf.extra_perimeters;
+    j[JSON_SURF_HULL_LINE_TRANSITION] = surf.hull_line_transition;
 }
 
 static void to_json(json& j, const ArcSegment& arc_seg) {
@@ -5007,6 +5011,9 @@ static void from_json(const json& j, Surface& surf) {
     surf.thickness_layers = j[JSON_SURF_THICKNESS_LAYER];
     surf.bridge_angle = j[JSON_SURF_BRIDGE_ANGLE];
     surf.extra_perimeters = j[JSON_SURF_EXTRA_PERIMETERS];
+    // Older caches predate the marker. They remain readable and simply
+    // retain the historical, unexpanded behavior.
+    surf.hull_line_transition = j.value(JSON_SURF_HULL_LINE_TRANSITION, false);
 
     return;
 }

@@ -22,11 +22,13 @@
 #include "Utils.hpp"
 #include "Fill/FillAdaptive.hpp"
 #include "Fill/FillLightning.hpp"
+#include "NonplanarSurface.hpp"
 #include "Format/STL.hpp"
 #include "format.hpp"
 #include "AABBTreeLines.hpp"
 
 #include <cstddef>
+#include <atomic>
 #include <float.h>
 #include <iterator>
 #include <mutex>
@@ -460,8 +462,24 @@ void PrintObject::make_perimeters()
     if (! this->set_started(posPerimeters))
         return;
 
-    m_print->set_status(15, L("Generating walls"));
-    BOOST_LOG_TRIVIAL(info) << "Generating walls..." << log_memory_info();
+    bool smooth_outer_walls = false;
+    bool interlocking_walls = false;
+    for (size_t region_id = 0; region_id < this->num_printing_regions(); ++region_id) {
+        if (this->printing_region(region_id).config().perimeter_layering.value ==
+            PerimeterLayeringMode::SmoothOuterWall)
+            smooth_outer_walls = true;
+        if (this->printing_region(region_id).config().perimeter_layering.value ==
+                PerimeterLayeringMode::InterlockingWalls ||
+            this->printing_region(region_id).config().perimeter_layering.value ==
+                PerimeterLayeringMode::Nonplanar)
+            interlocking_walls = true;
+    }
+    m_print->set_status(15, smooth_outer_walls ?
+        L("Generating independent outer-wall courses") : interlocking_walls ?
+        L("Generating non-planar interlocking inner walls") : L("Generating walls"));
+    BOOST_LOG_TRIVIAL(info) << (smooth_outer_walls ?
+        "Generating independent outer-wall courses..." : interlocking_walls ?
+        "Generating non-planar interlocking inner walls..." : "Generating walls...") << log_memory_info();
 
     // Revert the typed slices into untyped slices.
     if (m_typed_slices) {
@@ -481,19 +499,38 @@ void PrintObject::make_perimeters()
     // hollow objects
     for (size_t region_id = 0; region_id < this->num_printing_regions(); ++ region_id) {
         const PrintRegion &region = this->printing_region(region_id);
-        //BBS: remove extra_perimeters, always false
-        //if (! region.config().extra_perimeters || region.config().wall_loops == 0 || region.config().sparse_infill_density == 0 || this->layer_count() < 2)
+        const LocalizedShrinkageStrategy shrinkage_strategy =
+            region.config().localized_shrinkage_strategy.value;
+        const int shrinkage_extra_perimeters = localized_shrinkage_reinforcement_walls(
+            shrinkage_strategy, region.config().hull_line_extra_perimeters.value);
+        const double shrinkage_expansion = localized_shrinkage_contour_compensation(
+            shrinkage_strategy, region.config().hull_line_perimeter_expansion.value);
+        const double shrinkage_relief = localized_shrinkage_wall_relief(
+            shrinkage_strategy, region.config().localized_shrinkage_infill_wall_gap.value);
+        const double shrinkage_section_width = localized_shrinkage_section_width(
+            shrinkage_strategy, region.config().localized_shrinkage_section_width.value);
+        const double shrinkage_section_spacing = localized_shrinkage_section_spacing(
+            shrinkage_strategy, region.config().localized_shrinkage_section_spacing.value);
+        const double shrinkage_perforation_diameter = localized_shrinkage_perforation_diameter(
+            shrinkage_strategy, region.config().localized_shrinkage_perforation_diameter.value);
+        const double shrinkage_perforation_spacing = localized_shrinkage_perforation_spacing(
+            shrinkage_strategy, region.config().localized_shrinkage_perforation_spacing.value);
+        if ((shrinkage_extra_perimeters == 0 && shrinkage_expansion <= 0. && shrinkage_relief <= 0. &&
+             (shrinkage_section_width <= 0. || shrinkage_section_spacing <= 0.) &&
+             (shrinkage_perforation_diameter <= 0. || shrinkage_perforation_spacing <= 0.)) ||
+            region.config().wall_loops == 0 || this->layer_count() < 2)
             continue;
 
         BOOST_LOG_TRIVIAL(debug) << "Generating extra perimeters for region " << region_id << " in parallel - start";
         tbb::parallel_for(
             tbb::blocked_range<size_t>(0, m_layers.size() - 1),
-            [this, &region, region_id](const tbb::blocked_range<size_t>& range) {
+            [this, &region, region_id, shrinkage_extra_perimeters](const tbb::blocked_range<size_t>& range) {
                 for (size_t layer_idx = range.begin(); layer_idx < range.end(); ++ layer_idx) {
                     m_print->throw_if_canceled();
                     LayerRegion &layerm                     = *m_layers[layer_idx]->get_region(region_id);
                     const LayerRegion &upper_layerm         = *m_layers[layer_idx+1]->get_region(region_id);
                     const Polygons upper_layerm_polygons    = to_polygons(upper_layerm.slices.surfaces);
+                    const ExPolygons upper_layerm_expolygons = union_ex(upper_layerm_polygons);
                     // Filter upper layer polygons in intersection_ppl by their bounding boxes?
                     // my $upper_layerm_poly_bboxes= [ map $_->bounding_box, @{$upper_layerm_polygons} ];
                     const double total_loop_length      = total_length(upper_layerm_polygons);
@@ -503,34 +540,37 @@ void PrintObject::make_perimeters()
                     const coord_t ext_perimeter_spacing = ext_perimeter_flow.scaled_spacing();
 
                     for (Surface &slice : layerm.slices.surfaces) {
-                        for (;;) {
-                            // compute the total thickness of perimeters
-                            const coord_t perimeters_thickness = ext_perimeter_width/2 + ext_perimeter_spacing/2
-                                + (region.config().wall_loops-1 + slice.extra_perimeters) * perimeter_spacing;
-                            // define a critical area where we don't want the upper slice to fall into
-                            // (it should either lay over our perimeters or outside this area)
-                            const coord_t critical_area_depth = coord_t(perimeter_spacing * 1.5);
-                            const Polygons critical_area = diff(
-                                offset(slice.expolygon, float(- perimeters_thickness)),
-                                offset(slice.expolygon, float(- perimeters_thickness - critical_area_depth))
-                            );
-                            // check whether a portion of the upper slices falls inside the critical area
-                            const Polylines intersection = intersection_pl(to_polylines(upper_layerm_polygons), critical_area);
-                            // only add an additional loop if at least 30% of the slice loop would benefit from it
-                            if (total_length(intersection) <=  total_loop_length*0.3)
-                                break;
-                            /*
-                            if (0) {
-                                require "Slic3r/SVG.pm";
-                                Slic3r::SVG::output(
-                                    "extra.svg",
-                                    no_arrows   => 1,
-                                    expolygons  => union_ex($critical_area),
-                                    polylines   => [ map $_->split_at_first_point, map $_->p, @{$upper_layerm->slices} ],
-                                );
-                            }
-                            */
-                            ++ slice.extra_perimeters;
+                        // Detect abrupt geometry loading of the perimeter band:
+                        // a broad floor becoming a cavity/wall, or an upper
+                        // deck contour beginning inside the current shell. This
+                        // is based on neighboring geometry, not model height, so
+                        // it also covers storage boxes and trays.
+                        const coord_t perimeters_thickness = ext_perimeter_width / 2 +
+                            ext_perimeter_spacing / 2 +
+                            (region.config().wall_loops - 1) * perimeter_spacing;
+                        const coord_t critical_area_depth = coord_t(perimeter_spacing * 1.5);
+                        const Polygons critical_area = diff(
+                            offset(slice.expolygon, float(-perimeters_thickness)),
+                            offset(slice.expolygon, float(-perimeters_thickness - critical_area_depth)));
+                        const Polylines transition_contact = intersection_pl(
+                            to_polylines(upper_layerm_polygons), critical_area);
+                        const double slice_area = std::abs(slice.area());
+                        const double upper_overlap_area = std::abs(area(intersection_ex(
+                            ExPolygons{slice.expolygon}, upper_layerm_expolygons)));
+                        // A large flat floor changing into a cavity may put the new
+                        // inner contour far from the outer perimeter band. Detect
+                        // that common box/tray transition from the overlap loss.
+                        // The area floor avoids classifying small decorative steps.
+                        const bool broad_area_transition =
+                            slice_area >= Slic3r::sqr(scale_(10.)) &&
+                            upper_overlap_area < slice_area * 0.8;
+                        const bool perimeter_band_transition = total_loop_length > 0. &&
+                            total_length(transition_contact) > total_loop_length * 0.3;
+                        if (broad_area_transition || perimeter_band_transition) {
+                            slice.hull_line_transition = true;
+                            slice.extra_perimeters = static_cast<unsigned short>(std::min<int>(
+                                std::numeric_limits<unsigned short>::max(),
+                                int(slice.extra_perimeters) + shrinkage_extra_perimeters));
                         }
                         #ifdef DEBUG
                             if (slice.extra_perimeters > 0)
@@ -817,7 +857,11 @@ bool PrintObject::need_z_contouring() const
 {
     size_t num_regions = this->num_printing_regions();
     for (size_t region_id = 0; region_id < num_regions; region_id++) {
-        if (this->printing_region(region_id).config().zaa_enabled)
+        const PrintRegionConfig &config = this->printing_region(region_id).config();
+        if ((config.zaa_enabled &&
+             config.perimeter_layering.value == PerimeterLayeringMode::Standard &&
+             !nonplanar_perimeters_enabled(config)) ||
+            nonplanar_perimeters_enabled(config))
             return true;
     }
 
@@ -830,8 +874,18 @@ void PrintObject::contour_z()
         return;
     }
 
-    m_print->set_status(40, L("Z contouring"));
-    BOOST_LOG_TRIVIAL(debug) << "Contouring in parallel - start";
+    bool has_nonplanar_surfaces = false;
+    bool has_hybrid_surface_fallback = false;
+    for (size_t region_id = 0; region_id < num_printing_regions(); ++region_id)
+    {
+        const PrintRegionConfig &config = printing_region(region_id).config();
+        has_nonplanar_surfaces |= nonplanar_perimeters_enabled(config);
+        has_hybrid_surface_fallback |= config.top_surface_z_mode.value ==
+            TopSurfaceZMode::NonplanarWithZContouringFallback;
+    }
+    m_print->set_status(40, has_nonplanar_surfaces ?
+        L("Analyzing non-planar surfaces") : L("Surface path generation"));
+    BOOST_LOG_TRIVIAL(debug) << "Surface path generation in parallel - start";
 
     TriangleMesh mesh = this->m_model_object->raw_mesh();
     if (m_model_object->instances.size() != 1) {
@@ -849,6 +903,47 @@ void PrintObject::contour_z()
     sla::IndexedMesh imesh(mesh);
     imesh.ground_level_offset(-z);
 
+    // Facet connectivity and area are model properties, not layer properties.
+    // Resolve them once here instead of rediscovering a surface with thousands
+    // of unrelated ray hits on every layer.
+    const double nozzle_diameter = m_print->config().nozzle_diameter.values.empty() ? 0.4 :
+        *std::max_element(m_print->config().nozzle_diameter.values.begin(),
+                          m_print->config().nozzle_diameter.values.end());
+
+    std::vector<std::vector<uint8_t>> selected_nonplanar_facets(m_print->num_print_regions());
+    for (size_t region_id = 0; region_id < num_printing_regions(); ++region_id) {
+        const PrintRegion &region = printing_region(region_id);
+        const PrintRegionConfig &config = region.config();
+        if (!nonplanar_perimeters_enabled(config))
+            continue;
+        const double resolution = std::max(0.05, config.nonplanar_top_surface_resolution.value);
+        // Perimeter-only details may be only one bead footprint in projected
+        // area. This is common at the shallow crown of a round window, wheel,
+        // hole rim or small post. Let those connected curved components reach
+        // the detailed gantry/support analysis instead of discarding them at
+        // discovery time. A nozzle-scaled floor still filters sub-bead mesh
+        // tessellation slivers; unsafe or incomplete components are rejected
+        // atomically by the later all-depth checks.
+        const double minimum_area = std::max(4. * resolution * resolution,
+                                             nozzle_diameter * nozzle_diameter);
+        selected_nonplanar_facets[region.print_region_id()] = select_nonplanar_surface_facets(
+            imesh, config.nonplanar_top_surface_max_angle.value,
+            config.nonplanar_top_surface_min_height.value, minimum_area);
+    }
+    if (has_nonplanar_surfaces)
+        m_print->set_status(41, L("Generating non-planar surface paths"));
+
+    std::vector<std::pair<double, double>> nonplanar_projection_z_ranges;
+    nonplanar_projection_z_ranges.reserve(m_layers.size());
+    for (const Layer *layer : m_layers) {
+        const double lower = imesh.ground_level() + layer->slice_z - 0.02;
+        nonplanar_projection_z_ranges.emplace_back(
+            lower, lower + std::max(nozzle_diameter, double(layer->height)) + 0.04);
+    }
+    const std::vector<std::vector<ExPolygons>> selected_nonplanar_projections =
+        project_nonplanar_surface_facets(
+            imesh, selected_nonplanar_facets, nonplanar_projection_z_ranges);
+
     std::mutex mtx;
     size_t completed = 0;
     tbb::parallel_for(
@@ -858,16 +953,102 @@ void PrintObject::contour_z()
             for (size_t layer_idx = range.begin(); layer_idx < range.end(); layer_idx++) {
                 m_print->throw_if_canceled();
                 m_layers[layer_idx]->make_contour_z(imesh);
+                m_layers[layer_idx]->make_nonplanar_top_surfaces(
+                    imesh, selected_nonplanar_facets,
+                    selected_nonplanar_projections);
 
                 std::scoped_lock lock(mtx);
                 completed++;
-                std::string msg = (boost::format("Z contoured layer %d/%d (%d%%)") % (completed) % m_layers.size() % int(double(completed) / m_layers.size() * 100)).str();
-                m_print->set_status(40, msg);
+                const int percent = has_nonplanar_surfaces ?
+                    41 + int(3. * double(completed) /
+                             double(std::max<size_t>(1, m_layers.size() - 1))) : 40;
+                std::string msg = has_nonplanar_surfaces ?
+                    (boost::format(L("Generating non-planar surface paths: layer %1% of %2%")) %
+                        completed % (m_layers.size() - 1)).str() :
+                    (boost::format("Surface paths layer %d/%d (%d%%)") % completed %
+                        m_layers.size() % int(double(completed) / m_layers.size() * 100)).str();
+                m_print->set_status(percent, msg);
             }
         }
     );
     m_print->throw_if_canceled();
-    BOOST_LOG_TRIVIAL(debug) << "Contouring in parallel - end";
+    int last_nonplanar_percent = -1;
+    NonplanarProgressStage last_nonplanar_stage =
+        NonplanarProgressStage::SurfaceTopology;
+    size_t last_nonplanar_current = std::numeric_limits<size_t>::max();
+    size_t last_nonplanar_total = std::numeric_limits<size_t>::max();
+    consolidate_nonplanar_top_surfaces(
+        m_layers, imesh, selected_nonplanar_facets,
+        has_nonplanar_surfaces ?
+        std::function<void(const NonplanarProgress &)>([&](const NonplanarProgress &event) {
+            const int percent = 44 + int(std::clamp(event.progress, 0., 1.) * 5.);
+            if (percent != last_nonplanar_percent ||
+                event.stage != last_nonplanar_stage ||
+                event.current != last_nonplanar_current ||
+                event.total != last_nonplanar_total) {
+                last_nonplanar_percent = percent;
+                last_nonplanar_stage = event.stage;
+                last_nonplanar_current = event.current;
+                last_nonplanar_total = event.total;
+                std::string message;
+                switch (event.stage) {
+                case NonplanarProgressStage::SurfaceTopology:
+                    message = (boost::format(L("Analyzing non-planar surface topology: region %1% of %2%")) %
+                               event.current % event.total).str();
+                    break;
+                case NonplanarProgressStage::SurfaceProjection:
+                    message = (boost::format(L("Projecting non-planar surface: patch %1% of %2%")) %
+                               event.current % event.total).str();
+                    break;
+                case NonplanarProgressStage::BoundaryRepair:
+                    message = (boost::format(L("Repairing non-planar boundary gaps: patch %1% of %2%")) %
+                               event.current % event.total).str();
+                    break;
+                case NonplanarProgressStage::ShellClearance:
+                    message = (boost::format(L("Checking non-planar shell clearance: shell %1% of %2%")) %
+                               event.current % event.total).str();
+                    break;
+                case NonplanarProgressStage::FeatureScheduling:
+                    message = (boost::format(L("Scheduling attached non-planar features: patch %1% of %2%")) %
+                               event.current % event.total).str();
+                    break;
+                case NonplanarProgressStage::FeatureProjection:
+                    message = (boost::format(L("Projecting attached feature transitions: course %1% of %2%")) %
+                               event.current % event.total).str();
+                    break;
+                case NonplanarProgressStage::FeatureClearance:
+                    message = (boost::format(L("Checking attached feature clearance: course %1% of %2%")) %
+                               event.current % event.total).str();
+                    break;
+                case NonplanarProgressStage::Commit:
+                    message = (boost::format(L("Scheduling validated non-planar paths: layer %1% of %2%")) %
+                               event.current % event.total).str();
+                    break;
+                }
+                m_print->set_status(percent, message);
+            }
+            m_print->throw_if_canceled();
+        }) : std::function<void(const NonplanarProgress &)>{});
+
+    // Hybrid mode deliberately runs in two passes. Consolidation first owns
+    // and replaces every collision-safe non-planar patch. Z contouring then
+    // sees only the conventional paths left behind by rejected patches; the
+    // path-level guard in make_contour_z() prevents accepted non-planar paths
+    // from being transformed or emitted twice.
+    if (has_hybrid_surface_fallback) {
+        m_print->set_status(49, L("Z contouring rejected non-planar surfaces"));
+        tbb::parallel_for(
+            tbb::blocked_range<size_t>(1, m_layers.size()),
+            [&, this](const tbb::blocked_range<size_t> &range) {
+                for (size_t layer_idx = range.begin(); layer_idx < range.end();
+                     ++layer_idx) {
+                    m_print->throw_if_canceled();
+                    m_layers[layer_idx]->make_contour_z(imesh, true);
+                }
+            });
+        m_print->throw_if_canceled();
+    }
+    BOOST_LOG_TRIVIAL(debug) << "Surface path generation in parallel - end";
 
     this->set_done(posContouring);
 }
@@ -943,18 +1124,53 @@ static std::optional<coordf_t> first_unsupported_extrusion_island(
     // bridge remains part of an island touching the preceding layer at one or
     // both ends, so it is deliberately not reported here.
     const double min_reported_area = sqr(double(scale_(0.4)));
-    for (size_t layer_idx = 1; layer_idx < layers.size(); ++layer_idx) {
-        const Layer &layer = *layers[layer_idx];
-        const ExPolygons lower_support = offset_ex(layers[layer_idx - 1]->lslices, scale_(0.05));
-        for (const ExPolygon &island : layer.lslices) {
-            if (island.area() <= min_reported_area)
-                continue;
-            if (intersection_ex(ExPolygons{island}, lower_support).empty() &&
-                !extrusion_island_has_generated_support(island, layer, support_layers, max_support_gap))
-                return layer.print_z;
-        }
-    }
-    return std::nullopt;
+    std::atomic<size_t> first_unsupported {layers.size()};
+    // Each layer depends only on immutable slices from itself, its predecessor
+    // and the already-generated support stack. Detailed curved models can
+    // spend seconds offsetting these contours serially even though the result
+    // is just the lowest failing layer. Evaluate layers concurrently and use
+    // an atomic minimum to retain deterministic first-layer reporting.
+    tbb::parallel_for(
+        tbb::blocked_range<size_t>(1, layers.size()),
+        [&](const tbb::blocked_range<size_t> &range) {
+            for (size_t layer_idx = range.begin(); layer_idx < range.end(); ++layer_idx) {
+                if (layer_idx >= first_unsupported.load(std::memory_order_relaxed))
+                    continue;
+                const Layer &layer = *layers[layer_idx];
+                coord_t bead_support_radius = scale_(0.2);
+                for (const LayerRegion *region : layer.regions())
+                    bead_support_radius = std::max(
+                        bead_support_radius,
+                        coord_t(std::lround(
+                            0.5 * region->flow(frExternalPerimeter).scaled_width())));
+                // Consecutive contours on a curved hull need not overlap as
+                // ideal polygons. They are connected when the new centerline
+                // lands on the deposited footprint of the preceding bead.
+                const ExPolygons lower_support = offset_ex(
+                    layers[layer_idx - 1]->lslices,
+                    float(bead_support_radius));
+                bool unsupported = false;
+                for (const ExPolygon &island : layer.lslices) {
+                    if (island.area() <= min_reported_area)
+                        continue;
+                    if (intersection_ex(ExPolygons{island}, lower_support).empty() &&
+                        !extrusion_island_has_generated_support(
+                            island, layer, support_layers, max_support_gap)) {
+                        unsupported = true;
+                        break;
+                    }
+                }
+                if (!unsupported)
+                    continue;
+                size_t current = first_unsupported.load(std::memory_order_relaxed);
+                while (layer_idx < current &&
+                       !first_unsupported.compare_exchange_weak(
+                           current, layer_idx, std::memory_order_relaxed)) {}
+            }
+        });
+    const size_t first = first_unsupported.load(std::memory_order_relaxed);
+    return first < layers.size() ?
+        std::optional<coordf_t>{layers[first]->print_z} : std::nullopt;
 }
 
 void PrintObject::generate_support_material()
@@ -1002,6 +1218,39 @@ void PrintObject::generate_support_material()
 
             this->_generate_support_material();
             m_print->throw_if_canceled();
+
+            if (m_config.support_ironing.value &&
+                m_config.support_ironing_nonplanar.value &&
+                !m_support_layers.empty()) {
+                m_print->set_status(70, L("Analyzing surface-following support ironing"));
+                TriangleMesh mesh = m_model_object->raw_mesh();
+                if (m_model_object->instances.size() != 1)
+                    throw RuntimeError("Support ironing: unexpected number of instances");
+                ModelInstance *instance = m_model_object->instances.front();
+                Geometry::Transformation transformation = instance->get_transformation();
+                const Point center = center_offset();
+                transformation.set_offset(Vec3d(
+                    -unscale<double>(center.x()), -unscale<double>(center.y()), 0.));
+                mesh.transform(transformation.get_matrix());
+                sla::IndexedMesh indexed_mesh(mesh);
+                indexed_mesh.ground_level_offset(-m_model_object->min_z());
+
+                project_nonplanar_support_interface(
+                    m_layers, m_support_layers, indexed_mesh,
+                    m_config.support_top_z_distance.value,
+                    m_config.support_ironing_nonplanar_max_angle.value,
+                    m_config.support_ironing_nonplanar_resolution.value,
+                    [this](size_t current, size_t total) {
+                        const int percent = 69 + int(double(current) /
+                            double(std::max<size_t>(1, total)));
+                        m_print->set_status(
+                            percent,
+                            (boost::format(L("Projecting support ironing onto model underside: layer %1% of %2%")) %
+                                current % total).str());
+                        m_print->throw_if_canceled();
+                    });
+                m_print->throw_if_canceled();
+            }
 
             // Arc selection needs the final support toolpaths. Support generation itself
             // consumes the preliminary fills, so refresh fills once afterward; make_fills()
@@ -1288,6 +1537,14 @@ bool PrintObject::invalidate_state_by_config_options(
         } else if (
                opt_key == "wall_loops"
             || opt_key == "alternate_extra_wall"
+            || opt_key == "hull_line_extra_perimeters"
+            || opt_key == "hull_line_perimeter_expansion"
+            || opt_key == "localized_shrinkage_strategy"
+            || opt_key == "localized_shrinkage_infill_wall_gap"
+            || opt_key == "localized_shrinkage_section_width"
+            || opt_key == "localized_shrinkage_section_spacing"
+            || opt_key == "localized_shrinkage_perforation_diameter"
+            || opt_key == "localized_shrinkage_perforation_spacing"
             || opt_key == "top_one_wall_type"
             || opt_key == "min_width_top_surface"
             || opt_key == "only_one_wall_first_layer"
@@ -1405,6 +1662,9 @@ bool PrintObject::invalidate_state_by_config_options(
             || opt_key == "support_ironing_pattern"
             || opt_key == "support_ironing_flow"
             || opt_key == "support_ironing_spacing"
+            || opt_key == "support_ironing_nonplanar"
+            || opt_key == "support_ironing_nonplanar_max_angle"
+            || opt_key == "support_ironing_nonplanar_resolution"
             || opt_key == "raft_expansion"
             || opt_key == "raft_first_layer_density"
             || opt_key == "raft_first_layer_expansion"
@@ -1541,6 +1801,21 @@ bool PrintObject::invalidate_state_by_config_options(
             if (is_approx(old_density->value, 0.) || is_approx(new_density->value, 0.))
                 steps.emplace_back(posPerimeters);
             steps.emplace_back(posInfill);
+        } else if (opt_key == "perimeter_layering" ||
+                   opt_key == "smooth_outer_wall_layer_height" ||
+                   opt_key == "interlocking_wall_amplitude" ||
+                   opt_key == "interlocking_wall_wavelength" ||
+                   opt_key == "interlocking_wall_resolution") {
+            // Switching course geometry changes both the perimeter graph and
+            // the optional surface-following projection.
+            steps.emplace_back(posPerimeters);
+            steps.emplace_back(posContouring);
+        } else if (opt_key == "nonplanar_top_surface"
+                   || opt_key == "nonplanar_top_surface_max_angle"
+                   || opt_key == "nonplanar_top_surface_layers"
+                   || opt_key == "nonplanar_top_surface_resolution"
+                   || opt_key == "nonplanar_top_surface_min_height") {
+            steps.emplace_back(posContouring);
         } else if (opt_key == "top_surface_expansion") {
             // ORCA: without the expansion the top fill never reaches the space freed by only_one_wall_top, so the
             // walls over top surfaces are kept. Only crossing zero matters; posPerimeters cascades to posPrepareInfill.
@@ -1637,6 +1912,9 @@ bool PrintObject::invalidate_state_by_config_options(
             || opt_key == "outer_wall_flow_ratio"
             || opt_key == "inner_wall_flow_ratio"
             || opt_key == "inner_walls_flow_ratio"
+            || opt_key == "staggered_perimeters"
+            || opt_key == "staggered_perimeters_inner_only"
+            || opt_key == "staggered_perimeter_offset"
             || opt_key == "overhang_flow_ratio"
             || opt_key == "sparse_infill_flow_ratio"
             || opt_key == "internal_solid_infill_flow_ratio"
@@ -2489,7 +2767,10 @@ void PrintObject::discover_vertical_shells()
                         }
                     };
                     static constexpr const bool one_more_layer_below_top_bottom_surfaces = false;
-			        if (int n_top_layers = region_config.top_shell_layers.value; n_top_layers > 0) {
+			        if (int n_top_layers = nonplanar_perimeters_enabled(region_config) ?
+                            std::max(region_config.top_shell_layers.value,
+                                     region_config.nonplanar_top_surface_layers.value) :
+                            region_config.top_shell_layers.value; n_top_layers > 0) {
                         // Gather top regions projected to this layer.
                         coordf_t print_z = layer->print_z;
                         int i = int(idx_layer) + 1;
@@ -4259,7 +4540,12 @@ void PrintObject::discover_horizontal_shells()
             for (size_t idx_surface_type = 0; idx_surface_type < 3; ++ idx_surface_type) {
                 m_print->throw_if_canceled();
                 SurfaceType type = (idx_surface_type == 0) ? stTop : (idx_surface_type == 1) ? stBottom : stBottomBridge;
-                int num_solid_layers = (type == stTop) ? region_config.top_shell_layers.value : region_config.bottom_shell_layers.value;
+                int num_solid_layers = (type == stTop) ?
+                    (nonplanar_perimeters_enabled(region_config) ?
+                        std::max(region_config.top_shell_layers.value,
+                                 region_config.nonplanar_top_surface_layers.value) :
+                        region_config.top_shell_layers.value) :
+                    region_config.bottom_shell_layers.value;
                 if (num_solid_layers == 0)
                 	continue;
                 // Find slices of current type for current layer.

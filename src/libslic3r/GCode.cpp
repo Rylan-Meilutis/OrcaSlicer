@@ -96,6 +96,43 @@ static const float g_purge_volume_one_time = 135.f;
 static const int g_max_flush_count = 4;
 static const size_t g_max_label_object = 64;
 
+static uint64_t toolhead_clearance_grid_key(int x, int y)
+{
+    return (uint64_t(uint32_t(x)) << 32) | uint32_t(y);
+}
+
+static bool has_variable_z_path(const ExtrusionEntity &entity)
+{
+    if (const auto *path = dynamic_cast<const ExtrusionPath *>(&entity))
+        return path->z_contoured;
+    if (const auto *multipath = dynamic_cast<const ExtrusionMultiPath *>(&entity))
+        return std::any_of(multipath->paths.begin(), multipath->paths.end(),
+            [](const ExtrusionPath &path) { return path.z_contoured; });
+    if (const auto *loop = dynamic_cast<const ExtrusionLoop *>(&entity))
+        return std::any_of(loop->paths.begin(), loop->paths.end(),
+            [](const ExtrusionPath &path) { return path.z_contoured; });
+    if (const auto *collection = dynamic_cast<const ExtrusionEntityCollection *>(&entity))
+        return std::any_of(collection->entities.begin(), collection->entities.end(),
+            [](const ExtrusionEntity *child) { return has_variable_z_path(*child); });
+    return false;
+}
+
+static bool has_nonplanar_surface_path(const ExtrusionEntity &entity)
+{
+    if (const auto *path = dynamic_cast<const ExtrusionPath *>(&entity))
+        return path->nonplanar_surface;
+    if (const auto *multipath = dynamic_cast<const ExtrusionMultiPath *>(&entity))
+        return std::any_of(multipath->paths.begin(), multipath->paths.end(),
+            [](const ExtrusionPath &path) { return path.nonplanar_surface; });
+    if (const auto *loop = dynamic_cast<const ExtrusionLoop *>(&entity))
+        return std::any_of(loop->paths.begin(), loop->paths.end(),
+            [](const ExtrusionPath &path) { return path.nonplanar_surface; });
+    if (const auto *collection = dynamic_cast<const ExtrusionEntityCollection *>(&entity))
+        return std::any_of(collection->entities.begin(), collection->entities.end(),
+            [](const ExtrusionEntity *child) { return has_nonplanar_surface_path(*child); });
+    return false;
+}
+
 static bool is_bambu_x2d_printer(const FullPrintConfig &config)
 {
     return config.printer_model.value == "Bambu Lab X2D";
@@ -2912,6 +2949,56 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
     m_arc_overhang_stabilization_until.clear();
     m_arc_overhang_overhang_start.clear();
     m_arc_overhang_bridge_start.clear();
+    m_dissimilar_support_interface_start.clear();
+    // Clearance validation needs ordered occupancy only on a variable-Z layer
+    // and on the physical layer immediately below it. Building grids for every
+    // extrusion on every other layer dominates export time on tall models.
+    std::set<coord_t> all_layer_z;
+    std::set<coord_t> variable_layer_z;
+    for (const PrintObject *object : print.objects()) {
+        for (const Layer *layer : object->layers()) {
+            const coord_t z = scale_(layer->print_z);
+            all_layer_z.insert(z);
+            if (std::any_of(layer->regions().begin(), layer->regions().end(),
+                    [](const LayerRegion *region) {
+                        return has_variable_z_path(region->fills) ||
+                               has_variable_z_path(region->perimeters);
+                    }))
+                variable_layer_z.insert(z);
+        }
+        for (const SupportLayer *layer : object->support_layers())
+            all_layer_z.insert(scale_(layer->print_z));
+    }
+    m_toolhead_clearance_record_layers.clear();
+    m_toolhead_clearance_candidate_marks.clear();
+    m_toolhead_clearance_candidate_generation = 0;
+    for (coord_t z : variable_layer_z) {
+        const auto layer = all_layer_z.find(z);
+        assert(layer != all_layer_z.end());
+        m_toolhead_clearance_record_layers.insert(z);
+        if (layer != all_layer_z.begin())
+            m_toolhead_clearance_record_layers.insert(*std::prev(layer));
+    }
+    m_toolhead_clearance_enabled = !variable_layer_z.empty();
+    m_toolhead_clearance_geometry = m_toolhead_clearance_enabled ?
+        load_sequential_gantry_geometry(print.config()) : SequentialGantryGeometry{};
+    if (m_toolhead_clearance_enabled &&
+        print.config().sequential_print_gantry_geometry.value.empty() &&
+        !print.config().nozzle_diameter.values.empty()) {
+        const double nozzle_diameter = *std::max_element(
+            print.config().nozzle_diameter.values.begin(),
+            print.config().nozzle_diameter.values.end());
+        m_toolhead_clearance_geometry.set_nozzle_tip_diameter(nozzle_diameter);
+    }
+    m_toolhead_clearance_fallback = make_nonplanar_clearance_cone(print.config());
+    m_toolhead_clearance_previous_obstacles.clear();
+    m_toolhead_clearance_obstacles.clear();
+    m_toolhead_clearance_previous_grid.clear();
+    m_toolhead_clearance_grid.clear();
+    m_toolhead_clearance_previous_top_z = -std::numeric_limits<double>::max();
+    m_toolhead_clearance_top_z = -std::numeric_limits<double>::max();
+    m_toolhead_clearance_record_this_layer = false;
+    m_nonplanar_clearance_active_this_layer = false;
 
     m_fan_mover.release();
     m_ordering_cache.clear();
@@ -5581,6 +5668,17 @@ LayerResult GCode::process_layer(
 
     // BBS: don't use lazy_raise when enable spiral vase
     gcode += this->change_layer(print_z);  // this will increase m_layer_index
+    if (m_toolhead_clearance_enabled) {
+        m_toolhead_clearance_previous_obstacles = std::move(m_toolhead_clearance_obstacles);
+        m_toolhead_clearance_obstacles.clear();
+        m_toolhead_clearance_previous_grid = std::move(m_toolhead_clearance_grid);
+        m_toolhead_clearance_grid.clear();
+        m_toolhead_clearance_previous_top_z = m_toolhead_clearance_top_z;
+        m_toolhead_clearance_top_z = -std::numeric_limits<double>::max();
+    }
+    m_toolhead_clearance_record_this_layer =
+        m_toolhead_clearance_record_layers.count(scale_(print_z)) > 0;
+    m_nonplanar_clearance_active_this_layer = false;
     update_layer_related_config(m_layer_index);
     update_placeholder_parser_with_variant_params();
     m_layer = &layer;
@@ -6495,6 +6593,51 @@ LayerResult GCode::process_layer(
                             island_order.emplace_back(i);
                     }
                 }
+                // Schedule early non-planar work across the complete visit,
+                // not independently inside each island. A single physical
+                // course may be partitioned into several islands by the
+                // conventional 2D layer grouping; island-local scheduling
+                // could therefore emit a late horizontal course followed by
+                // an earlier sloped course from a neighboring island.
+                for (size_t island_idx : island_order) {
+                    ObjectByExtruder::Island &island = islands[island_idx];
+                    const auto &regions = is_anything_overridden ?
+                        island.by_region_per_copy(
+                            by_region_per_copy_cache,
+                            static_cast<unsigned int>(instance_to_print.instance_id),
+                            extruder_id, print_wipe_extrusions != 0) :
+                        island.by_region;
+                    gcode += this->extrude_nonplanar_surface(print, regions, true);
+                }
+                size_t early_feature_courses = 0;
+                for (size_t island_idx : island_order)
+                    early_feature_courses = std::max(
+                        early_feature_courses,
+                        this->maximum_nonplanar_feature_course(
+                            islands[island_idx].by_region, true));
+                for (size_t course = 1; course <= early_feature_courses; ++course) {
+                    const bool leveling_course = std::any_of(
+                        island_order.begin(), island_order.end(),
+                        [&](size_t island_idx) {
+                            return this->is_nonplanar_leveling_course(
+                                islands[island_idx].by_region, true, course);
+                        });
+                    if (leveling_course)
+                        gcode += ";" +
+                            GCodeProcessor::Nonplanar_Transition_Layer_Tag + "\n";
+                    for (size_t island_idx : island_order) {
+                        ObjectByExtruder::Island &island = islands[island_idx];
+                        const auto &regions = is_anything_overridden ?
+                            island.by_region_per_copy(
+                                by_region_per_copy_cache,
+                                static_cast<unsigned int>(instance_to_print.instance_id),
+                                extruder_id, print_wipe_extrusions != 0) :
+                            island.by_region;
+                        gcode += this->extrude_nonplanar_surface(
+                            print, regions, true, course);
+                    }
+                }
+
                 for (size_t island_idx : island_order) {
                     ObjectByExtruder::Island &island = islands[island_idx];
                     const auto& by_region_specific = is_anything_overridden ? island.by_region_per_copy(by_region_per_copy_cache, static_cast<unsigned int>(instance_to_print.instance_id), extruder_id, print_wipe_extrusions != 0) : island.by_region;
@@ -6518,16 +6661,44 @@ LayerResult GCode::process_layer(
                         by_region_specific.begin(), by_region_specific.end(),
                         [](const ObjectByExtruder::Island::Region &region) {
                             return std::any_of(region.infills.begin(), region.infills.end(),
-                                [](const ExtrusionEntity *entity) { return entity->role() == erArcOverhang; });
+                                [](const ExtrusionEntity *entity) { return is_arc_fill(entity->role()); });
                         });
+                    bool bridge_overhang_before_walls = false;
+                    for (size_t region_id = 0; region_id < by_region_specific.size(); ++region_id) {
+                        const ObjectByExtruder::Island::Region &region = by_region_specific[region_id];
+                        if (print.get_print_region(region_id).config().bridge_overhang_before_walls.value &&
+                            std::any_of(region.infills.begin(), region.infills.end(),
+                                [](const ExtrusionEntity *entity) { return is_bridge_or_arc_fill(entity->role()); })) {
+                            bridge_overhang_before_walls = true;
+                            break;
+                        }
+                    }
                     {
+                        // Some otherwise valid draped paths are blocked only
+                        // by walls assigned to this same nominal layer. Their
+                        // clearance was validated against completed lower
+                        // layers, so emit them before this island's ordinary
+                        // paths. The replacement footprint has already been
+                        // removed, preventing later overlap.
+                        // This is deliberately island-local. A counterbore or arc-overhang
+                        // may need its spanning extrusion before an inner wall can be laid
+                        // down, while unrelated islands on the same Z should retain their
+                        // configured wall/infill order.
+                        if (bridge_overhang_before_walls) {
+                            gcode += this->extrude_infill(print, by_region_specific, false, erBridgeInfill, false, true);
+                            gcode += this->extrude_infill(print, by_region_specific, false, erInternalBridgeInfill, false, true);
+                            gcode += this->extrude_infill(print, by_region_specific, false, erArcOverhang, false, true);
+                            gcode += this->extrude_infill(print, by_region_specific, false, erArcBridge, false, true);
+                        }
                         // Print perimeters of regions that has is_infill_first == false
                         gcode += this->extrude_perimeters(print, by_region_specific, first_layer, false);
                         // Arc overhangs replace only the innermost unsupported
                         // wall. Print the retained outer walls first so each arc
                         // starts on an existing perimeter ledge.
-                        if (has_arc_overhang)
+                        if (has_arc_overhang && !bridge_overhang_before_walls) {
                             gcode += this->extrude_infill(print, by_region_specific, false, erArcOverhang);
+                            gcode += this->extrude_infill(print, by_region_specific, false, erArcBridge);
+                        }
                         if (!has_wipe_tower && need_insert_timelapse_gcode_for_traditional && printer_structure == PrinterStructure::psI3
                             && !has_insert_timelapse_gcode && has_infill(by_region_specific)) {
                             gcode += this->retract(false, false, auto_lift_type, true);
@@ -6537,7 +6708,8 @@ LayerResult GCode::process_layer(
                         }
                         // Then print infill
                         gcode += this->extrude_infill(print, by_region_specific, false,
-                            has_arc_overhang ? erCount : erMixed);
+                            has_arc_overhang && !bridge_overhang_before_walls ? erCount : erMixed,
+                            bridge_overhang_before_walls);
                         // Then print perimeters of regions that has is_infill_first == true
                         gcode += this->extrude_perimeters(print, by_region_specific, first_layer, true);
                     }
@@ -6568,6 +6740,71 @@ LayerResult GCode::process_layer(
                         } else if (gflavor == gcfMarlinLegacy || gflavor == gcfMarlinFirmware || gflavor == gcfRepRapFirmware) {
                             m_writer.set_object_end_str(std::string("M486 S-1\n"));
                         }
+                    }
+                }
+            }
+
+            // Emit the draped skin only after every visit and island has
+            // completed its conventional walls, fill, and ironing. A visit may
+            // cover only one island, so doing this in the visit loop still let
+            // the next visit cross an already raised XYZ surface.
+            for (const InstanceVisit &visit : instance_visits) {
+                InstanceToPrint &instance_to_print = instances_to_print[visit.instance_idx];
+                const LayerToPrint &layer_to_print = layers[instance_to_print.layer_id];
+                m_layer = layer_to_print.layer();
+                m_object_layer_over_raft = m_layer && m_layer->id() > 0 &&
+                    instance_to_print.print_object.slicing_parameters().raft_layers() == m_layer->id();
+                const Point &offset = instance_to_print.print_object.instances()[instance_to_print.instance_id].shift;
+                this->set_origin(unscale(offset));
+
+                std::vector<ObjectByExtruder::Island> &islands = instance_to_print.object_by_extruder.islands;
+                std::vector<size_t> island_order = visit.islands;
+                if (island_order.empty()) {
+                    island_order.reserve(islands.size());
+                    for (size_t island_idx = 0; island_idx < islands.size(); ++island_idx)
+                        if (!islands[island_idx].by_region.empty())
+                            island_order.emplace_back(island_idx);
+                }
+                // Emit every draped skin in the visit first, then advance all
+                // continuing features through each shared sloped/leveling
+                // course together. This is the cross-island dependency order
+                // required by a roof intersected by a chimney or boss.
+                for (size_t island_idx : island_order) {
+                    ObjectByExtruder::Island &island = islands[island_idx];
+                    const auto &by_region_specific = is_anything_overridden ?
+                        island.by_region_per_copy(by_region_per_copy_cache,
+                            static_cast<unsigned int>(instance_to_print.instance_id),
+                            extruder_id, print_wipe_extrusions != 0) :
+                        island.by_region;
+                    gcode += this->extrude_nonplanar_surface(
+                        print, by_region_specific, false);
+                }
+                size_t feature_courses = 0;
+                for (size_t island_idx : island_order)
+                    feature_courses = std::max(
+                        feature_courses,
+                        this->maximum_nonplanar_feature_course(
+                            islands[island_idx].by_region, false));
+                for (size_t course = 1; course <= feature_courses; ++course) {
+                    const bool leveling_course = std::any_of(
+                        island_order.begin(), island_order.end(),
+                        [&](size_t island_idx) {
+                            return this->is_nonplanar_leveling_course(
+                                islands[island_idx].by_region, false, course);
+                        });
+                    if (leveling_course)
+                        gcode += ";" +
+                            GCodeProcessor::Nonplanar_Transition_Layer_Tag + "\n";
+                    for (size_t island_idx : island_order) {
+                        ObjectByExtruder::Island &island = islands[island_idx];
+                        const auto &by_region_specific = is_anything_overridden ?
+                            island.by_region_per_copy(
+                                by_region_per_copy_cache,
+                                static_cast<unsigned int>(instance_to_print.instance_id),
+                                extruder_id, print_wipe_extrusions != 0) :
+                            island.by_region;
+                        gcode += this->extrude_nonplanar_surface(
+                            print, by_region_specific, false, course);
                     }
                 }
             }
@@ -6874,6 +7111,11 @@ std::string GCode::extrude_loop(const ExtrusionLoop&        loop_ref,
     // get a copy; don't modify the orientation of the original loop object otherwise
     // next copies (if any) would not detect the correct orientation
     ExtrusionLoop loop = loop_ref;
+    // Non-planar loops carry a surface-derived seam whose coincident endpoints
+    // are also the planar/non-planar transition boundary. Moving that seam
+    // after projection relocates the zero-Z samples into the middle of the
+    // loop, producing two apparent laps and an abrupt entry at the new start.
+    const bool preserve_nonplanar_loop = has_nonplanar_surface_path(loop);
 
     bool is_hole = (loop.loop_role() & elrHole) == elrHole;
 
@@ -6892,17 +7134,24 @@ std::string GCode::extrude_loop(const ExtrusionLoop&        loop_ref,
     // or, if `start_point` is specified, start the loop at point closest to it
     Point last_pos = start_point ? *start_point : this->last_pos();
     float seam_overhang = std::numeric_limits<float>::lowest();
-    if (!m_config.spiral_mode && description == "perimeter") {
+    if (!preserve_nonplanar_loop && !m_config.spiral_mode && description == "perimeter") {
         assert(m_layer != nullptr);
         const bool stagger_inner_seam =
             !(m_config.seam_start_on_inner_wall && loop.role() == erPerimeter && loop.inset_idx == 1);
         m_seam_placer.place_seam(m_layer, loop, last_pos, seam_overhang, stagger_inner_seam);
-    } else
+    } else if (!preserve_nonplanar_loop)
         loop.split_at(last_pos, false);
 
+    // A non-planar loop already owns its complete three-dimensional seam.
+    // Passing it through the planar scarf generator creates a second lap with
+    // another Z ramp, while applying the ordinary seam gap opens the connected
+    // planar/non-planar wall that the surface generator deliberately closed.
+    // Preserve the loop verbatim; its entry and exit blend is generated from
+    // the projected surface before G-code ordering and clearance validation.
     const auto seam_scarf_type = m_config.seam_slope_type.value;
     bool enable_seam_slope = ((seam_scarf_type == SeamScarfType::External && !is_hole) || seam_scarf_type == SeamScarfType::All) &&
         !m_config.spiral_mode &&
+        !preserve_nonplanar_loop &&
         (loop.role() == erExternalPerimeter || (loop.role() == erPerimeter && m_config.seam_slope_inner_walls)) &&
         layer_id() > 0;
     const auto nozzle_diameter = EXTRUDER_CONFIG(nozzle_diameter);
@@ -6920,12 +7169,77 @@ std::string GCode::extrude_loop(const ExtrusionLoop&        loop_ref,
     // if polyline was shorter than the clipping distance we'd get a null polyline, so
     // we discard it in that case
     const double seam_gap = scale_(m_config.seam_gap.get_abs_value(nozzle_diameter));
-    const bool seam_gap_applied = enable_seam_slope || m_enable_loop_clipping;
+    const bool seam_gap_applied = !preserve_nonplanar_loop &&
+        (enable_seam_slope || m_enable_loop_clipping);
     const double seam_gap_distance_mm = seam_gap_applied ? unscale_(seam_gap) : 0.0;
     double seam_scarf_distance_mm = 0.0;
-    double clip_length = m_enable_loop_clipping && !enable_seam_slope ? seam_gap : 0;
-    if (m_config.seam_start_on_inner_wall && loop.role() == erPerimeter && loop.inset_idx == 1)
-        clip_length = std::min(scale_(nozzle_diameter), loop.length() * 0.25);
+    double clip_length = m_enable_loop_clipping && !enable_seam_slope &&
+        !preserve_nonplanar_loop ? seam_gap : 0;
+    const bool adjacent_inner_seam =
+        m_config.seam_start_on_inner_wall && loop.role() == erPerimeter && loop.inset_idx == 1;
+    if (adjacent_inner_seam) {
+        const double maximum_outer_distance2 =
+            scaled<double>(2.0 * nozzle_diameter) * scaled<double>(2.0 * nozzle_diameter);
+        const double on_loop_tolerance2 =
+            scaled<double>(0.05) * scaled<double>(0.05);
+        size_t pending_prime_idx = size_t(-1);
+        for (size_t idx = 0; idx < m_pending_inner_seam_primes.size(); ++idx) {
+            const ExtrusionPaths &pending = m_pending_inner_seam_primes[idx];
+            if (pending.empty())
+                continue;
+            const Point pending_end = pending.back().last_point();
+            const Point loop_point =
+                loop.get_closest_path_and_point(pending_end, false).foot_pt;
+            if ((loop_point - pending_end).cast<double>().squaredNorm() <=
+                on_loop_tolerance2) {
+                pending_prime_idx = idx;
+                break;
+            }
+        }
+
+        if (pending_prime_idx != size_t(-1)) {
+            // Outer-first ordering already deposited this exact inner-wall
+            // segment. Make it the inner loop's seam tail and omit precisely
+            // its printed length, so the inner wall cannot run over it.
+            const ExtrusionPaths pending =
+                std::move(m_pending_inner_seam_primes[pending_prime_idx]);
+            m_pending_inner_seam_primes.erase(
+                m_pending_inner_seam_primes.begin() + pending_prime_idx);
+            loop.split_at(pending.back().last_point(), false);
+            clip_length = 0.;
+            for (const ExtrusionPath &path : pending)
+                clip_length += path.length();
+            clip_length = std::min(clip_length, loop.length() * 0.25);
+        } else {
+            const bool outer_was_already_emitted = std::any_of(
+                m_unprimed_outer_seams.begin(), m_unprimed_outer_seams.end(),
+                [&loop, maximum_outer_distance2](const Point &outer_seam) {
+                    const Point inner_point =
+                        loop.get_closest_path_and_point(outer_seam, false).foot_pt;
+                    return (inner_point - outer_seam).cast<double>().squaredNorm() <=
+                           maximum_outer_distance2;
+                });
+            if (!outer_was_already_emitted) {
+                clip_length = std::min(scale_(nozzle_diameter), loop.length() * 0.25);
+
+                // Save the exact tail removed from this seam-placed loop. The
+                // external wall may print this gap once; deriving a fresh tail
+                // from the original loop can choose another seam and lay a
+                // prime line over material that is already present.
+                ExtrusionLoop gap_source = loop;
+                gap_source.reverse();
+                ExtrusionPaths gap_paths;
+                gap_source.clip_end(gap_source.length() - clip_length, &gap_paths);
+                std::reverse(gap_paths.begin(), gap_paths.end());
+                for (ExtrusionPath &gap_path : gap_paths) {
+                    gap_path.reverse();
+                    gap_path.inset_idx = 1;
+                }
+                if (!gap_paths.empty())
+                    m_inner_seam_prime_gaps.emplace_back(std::move(gap_paths));
+            }
+        }
+    }
 
     // get paths
     ExtrusionPaths paths;
@@ -6933,6 +7247,8 @@ std::string GCode::extrude_loop(const ExtrusionLoop&        loop_ref,
     if (paths.empty()) return "";
     for (ExtrusionPath &path : paths)
         path.inset_idx = loop.inset_idx;
+    if (adjacent_inner_seam)
+        m_emitted_inner_seam_loops.emplace(&loop_ref);
 
     // SoftFever: check loop lenght for small perimeter. 
     double small_peri_speed = -1;
@@ -7034,8 +7350,48 @@ std::string GCode::extrude_loop(const ExtrusionLoop&        loop_ref,
     // point projection makes the transition leave the inner wall directly
     // outwards. Reject ambiguous geometry where that short transition would
     // intersect an inner wall anywhere except its starting point.
+    const bool variable_z_wall_loop = std::any_of(
+        paths.begin(), paths.end(),
+        [](const ExtrusionPath &path) { return path.z_contoured; });
+    const bool variable_z_wall_features =
+        brick_perimeters_enabled(m_config) ||
+        nonplanar_perimeters_enabled(m_config);
     if (m_config.seam_start_on_inner_wall && paths.front().role() == erExternalPerimeter &&
-        !region_perimeters.empty()) {
+        !region_perimeters.empty() && !variable_z_wall_loop &&
+        !variable_z_wall_features) {
+        const auto align_prime_with_outer_entry = [&paths](ExtrusionPaths &primer_paths) {
+            // The first stored point may be the nominal seam endpoint while
+            // the first deposited segment immediately descends into the flat
+            // anchor of a surface-following wall. Use the local entry range,
+            // not just point zero, so the primer can never sit above the
+            // extrusion that follows it.
+            const Point entry_xy = paths.front().first_point();
+            coord_t target_z = paths.front().first_point3().z();
+            const bool surface_following_outer = std::any_of(
+                paths.begin(), paths.end(),
+                [](const ExtrusionPath &path) { return path.nonplanar_surface; });
+            const double entry_radius2 = scaled<double>(2.0 * paths.front().width) *
+                                         scaled<double>(2.0 * paths.front().width);
+            for (const ExtrusionPath &outer_path : paths)
+                for (const Point3 &point : outer_path.polyline.points)
+                    if (surface_following_outer ||
+                        (point.to_point() - entry_xy).cast<double>().squaredNorm() <=
+                            entry_radius2)
+                        target_z = std::min(target_z, point.z());
+            const float target_height = paths.front().height;
+            for (ExtrusionPath &primer : primer_paths) {
+                const float source_height = std::max(primer.height, float(EPSILON));
+                primer.mm3_per_mm *= target_height / source_height;
+                primer.height = target_height;
+                for (Point3 &point : primer.polyline.points)
+                    point.z() = target_z;
+                primer.z_contoured = target_z != 0;
+                primer.staggered_perimeter = false;
+                primer.nonplanar_surface = false;
+                primer.set_extrusion_role(erPerimeter);
+                primer.polyline.fitting_result.clear();
+            }
+        };
         Lines adjacent_inner_wall_lines;
         Lines all_inner_wall_lines;
         std::vector<const ExtrusionLoop *> adjacent_inner_wall_loops;
@@ -7047,7 +7403,7 @@ std::string GCode::extrude_loop(const ExtrusionLoop&        loop_ref,
             } else if (entity.inset_idx > 0 && entity.role() == erPerimeter) {
                 if (entity.inset_idx == 1)
                     if (const auto *inner_loop = dynamic_cast<const ExtrusionLoop *>(&entity))
-                        adjacent_inner_wall_loops.push_back(inner_loop);
+                        adjacent_inner_wall_loops.emplace_back(inner_loop);
                 Polylines polylines;
                 entity.collect_polylines(polylines);
                 for (const Polyline &polyline : polylines) {
@@ -7066,14 +7422,38 @@ std::string GCode::extrude_loop(const ExtrusionLoop&        loop_ref,
             AABBTreeLines::LinesDistancer<Line> adjacent_inner_wall_distancer{adjacent_inner_wall_lines};
             const auto [distance, line_idx, nearest] =
                 adjacent_inner_wall_distancer.distance_from_lines_extra<false>(outer_start);
-            const Point inner_start = nearest.cast<coord_t>();
+            Point inner_start = nearest.cast<coord_t>();
             const double max_transition_length = scale_(2.0 * nozzle_diameter);
 
-            if (line_idx != size_t(-1) && distance > scaled<double>(0.05) &&
-                distance <= max_transition_length) {
+            size_t prime_gap_idx = size_t(-1);
+            double prime_gap_distance2 = std::numeric_limits<double>::max();
+            for (size_t idx = 0; idx < m_inner_seam_prime_gaps.size(); ++idx) {
+                const ExtrusionPaths &gap = m_inner_seam_prime_gaps[idx];
+                if (gap.empty())
+                    continue;
+                const double candidate_distance2 =
+                    (gap.back().last_point() - outer_start).cast<double>().squaredNorm();
+                if (candidate_distance2 < prime_gap_distance2) {
+                    prime_gap_distance2 = candidate_distance2;
+                    prime_gap_idx = idx;
+                }
+            }
+            if (prime_gap_idx != size_t(-1) &&
+                prime_gap_distance2 <= max_transition_length * max_transition_length)
+                inner_start = m_inner_seam_prime_gaps[prime_gap_idx].back().last_point();
+
+            ExtrusionPaths planned_outer_first_prime;
+            if (prime_gap_idx == size_t(-1) ||
+                prime_gap_distance2 > max_transition_length * max_transition_length) {
                 const ExtrusionLoop *source_inner_loop = nullptr;
                 double source_distance2 = std::numeric_limits<double>::max();
                 for (const ExtrusionLoop *candidate : adjacent_inner_wall_loops) {
+                    // A previously emitted inner loop may have supplied one
+                    // exact saved gap to an earlier outer contour. Reusing
+                    // its source geometry here would deposit a second prime
+                    // over that already printed inner wall.
+                    if (m_emitted_inner_seam_loops.count(candidate) != 0)
+                        continue;
                     const Point candidate_point =
                         candidate->get_closest_path_and_point(inner_start, false).foot_pt;
                     const double candidate_distance2 =
@@ -7084,24 +7464,78 @@ std::string GCode::extrude_loop(const ExtrusionLoop&        loop_ref,
                     }
                 }
 
-                // The adjacent inner loop omits exactly this nozzle-length tail
-                // when it is emitted. Print that tail once here as the pressure
-                // preparation path, regardless of the selected wall order.
+                bool loop_already_reserved = false;
                 if (source_inner_loop != nullptr) {
+                    const double on_loop_tolerance2 =
+                        scaled<double>(0.05) * scaled<double>(0.05);
+                    loop_already_reserved = std::any_of(
+                        m_pending_inner_seam_primes.begin(),
+                        m_pending_inner_seam_primes.end(),
+                        [source_inner_loop, on_loop_tolerance2](const ExtrusionPaths &pending) {
+                            if (pending.empty())
+                                return false;
+                            const Point endpoint = pending.back().last_point();
+                            const Point loop_point = source_inner_loop
+                                ->get_closest_path_and_point(endpoint, false).foot_pt;
+                            return (loop_point - endpoint).cast<double>().squaredNorm() <=
+                                   on_loop_tolerance2;
+                        });
+                }
+
+                if (source_inner_loop != nullptr && !loop_already_reserved) {
                     ExtrusionLoop primer_source = *source_inner_loop;
                     primer_source.split_at(inner_start, false);
                     primer_source.reverse();
                     const double primer_length = std::min(
                         scale_(nozzle_diameter), primer_source.length() * 0.25);
-                    ExtrusionPaths primer_paths;
-                    primer_source.clip_end(primer_source.length() - primer_length, &primer_paths);
-                    std::reverse(primer_paths.begin(), primer_paths.end());
-                    for (ExtrusionPath &primer_path : primer_paths) {
+                    primer_source.clip_end(
+                        primer_source.length() - primer_length,
+                        &planned_outer_first_prime);
+                    std::reverse(planned_outer_first_prime.begin(),
+                                 planned_outer_first_prime.end());
+                    for (ExtrusionPath &primer_path : planned_outer_first_prime) {
                         primer_path.reverse();
                         primer_path.inset_idx = 1;
+                    }
+                    if (!planned_outer_first_prime.empty()) {
+                        // A raised brick or surface-following inner wall may
+                        // supply this omitted seam tail. The prime belongs to
+                        // the lower outer-wall dependency, so align the whole
+                        // tail to the outer entry instead of emitting a high
+                        // bead and immediately descending through it.
+                        align_prime_with_outer_entry(planned_outer_first_prime);
+                        inner_start = planned_outer_first_prime.back().last_point();
+                    }
+                }
+            }
+
+            const double transition_distance =
+                (inner_start - outer_start).cast<double>().norm();
+
+            if (line_idx != size_t(-1) && transition_distance > scaled<double>(0.05) &&
+                transition_distance <= max_transition_length) {
+                if (prime_gap_idx != size_t(-1) &&
+                    prime_gap_distance2 <= max_transition_length * max_transition_length) {
+                    ExtrusionPaths primer_paths =
+                        std::move(m_inner_seam_prime_gaps[prime_gap_idx]);
+                    m_inner_seam_prime_gaps.erase(
+                        m_inner_seam_prime_gaps.begin() + prime_gap_idx);
+                    align_prime_with_outer_entry(primer_paths);
+                    for (const ExtrusionPath &primer_path : primer_paths)
                         gcode += this->_extrude(
                             primer_path, "outer wall seam prime", speed_for_path(primer_path));
-                    }
+                } else if (!planned_outer_first_prime.empty()) {
+                    for (const ExtrusionPath &primer_path : planned_outer_first_prime)
+                        gcode += this->_extrude(
+                            primer_path, "outer wall seam prime", speed_for_path(primer_path));
+                    m_pending_inner_seam_primes.emplace_back(
+                        planned_outer_first_prime);
+                } else {
+                    // Outer-first order has no already omitted material to
+                    // prime safely. Remember it so the adjacent inner wall
+                    // keeps its ordinary seam gap instead of creating a gap
+                    // that could only be filled by overprinting another line.
+                    m_unprimed_outer_seams.emplace_back(outer_start);
                 }
 
                 AABBTreeLines::LinesDistancer<Line> all_inner_wall_distancer{all_inner_wall_lines};
@@ -7329,9 +7763,122 @@ std::string GCode::extrude_entity(const ExtrusionEntity&      entity,
         return this->extrude_multi_path(*multipath, description, speed);
     else if (const ExtrusionLoop* loop = dynamic_cast<const ExtrusionLoop*>(&entity))
         return this->extrude_loop(*loop, description, speed, region_perimeters);
+    else if (const auto *collection = dynamic_cast<const ExtrusionEntityCollection *>(&entity)) {
+        std::string gcode;
+        for (const ExtrusionEntity *child : collection->entities)
+            if (child != nullptr)
+                gcode += this->extrude_entity(*child, description, speed, region_perimeters);
+        return gcode;
+    }
     else
         throw Slic3r::InvalidArgument("Invalid argument supplied to extrude()");
     return "";
+}
+
+std::string GCode::extrude_entity_nonplanar_filtered(
+    const ExtrusionEntity &entity, const std::string &description,
+    bool nonplanar, const ExtrusionEntitiesPtr &region_perimeters,
+    std::optional<bool> before_current_layer,
+    std::optional<bool> feature_transition,
+    std::optional<size_t> feature_course)
+{
+    if (!has_nonplanar_surface_path(entity))
+        return nonplanar ? std::string{} :
+            this->extrude_entity(entity, description, -1., region_perimeters);
+
+    const auto path_is_in_requested_schedule = [&](const ExtrusionPath &path) {
+        return (!before_current_layer ||
+                path.nonplanar_before_current_layer == *before_current_layer) &&
+               (!feature_transition ||
+                path.nonplanar_feature_transition == *feature_transition) &&
+               (!feature_course ||
+                path.nonplanar_feature_course == *feature_course);
+    };
+
+    if (const auto *path = dynamic_cast<const ExtrusionPath *>(&entity))
+        return path->nonplanar_surface == nonplanar &&
+            (!before_current_layer ||
+             path->nonplanar_before_current_layer == *before_current_layer) &&
+            (!feature_transition ||
+             path->nonplanar_feature_transition == *feature_transition) &&
+            (!feature_course ||
+             path->nonplanar_feature_course == *feature_course) ?
+            this->extrude_path(*path, description, -1.) : std::string{};
+
+    std::string gcode;
+    if (const auto *multipath = dynamic_cast<const ExtrusionMultiPath *>(&entity)) {
+        const bool any_nonplanar = std::any_of(
+            multipath->paths.begin(), multipath->paths.end(),
+            [](const ExtrusionPath &path) { return path.nonplanar_surface; });
+        const bool all_nonplanar = std::all_of(
+            multipath->paths.begin(), multipath->paths.end(),
+            [](const ExtrusionPath &path) { return path.nonplanar_surface; });
+        const bool all_in_requested_schedule = std::all_of(
+            multipath->paths.begin(), multipath->paths.end(),
+            path_is_in_requested_schedule);
+        // A mixed perimeter is one topological wall. Emitting its planar
+        // children during the conventional pass and its contoured children in
+        // the later surface pass inserts a retract/travel at both transition
+        // boundaries and turns one wall into two weak shells. Defer the whole
+        // entity to the schedule owned by its non-planar children, then write
+        // it once as a continuous multipath.
+        if (any_nonplanar && !all_nonplanar) {
+            const auto owner = std::find_if(
+                multipath->paths.begin(), multipath->paths.end(),
+                [](const ExtrusionPath &path) { return path.nonplanar_surface; });
+            return nonplanar && path_is_in_requested_schedule(*owner) ?
+                this->extrude_multi_path(*multipath, description, -1.) :
+                std::string{};
+        }
+        if (all_nonplanar == nonplanar && all_in_requested_schedule)
+            return this->extrude_multi_path(*multipath, description, -1.);
+        for (const ExtrusionPath &path : multipath->paths)
+            if (path.nonplanar_surface == nonplanar &&
+                (!before_current_layer ||
+                 path.nonplanar_before_current_layer == *before_current_layer) &&
+                (!feature_transition ||
+                 path.nonplanar_feature_transition == *feature_transition) &&
+                (!feature_course ||
+                 path.nonplanar_feature_course == *feature_course))
+                gcode += this->extrude_path(path, description, -1.);
+    } else if (const auto *loop = dynamic_cast<const ExtrusionLoop *>(&entity)) {
+        const bool any_nonplanar = std::any_of(
+            loop->paths.begin(), loop->paths.end(),
+            [](const ExtrusionPath &path) { return path.nonplanar_surface; });
+        const bool all_nonplanar = std::all_of(
+            loop->paths.begin(), loop->paths.end(),
+            [](const ExtrusionPath &path) { return path.nonplanar_surface; });
+        const bool all_in_requested_schedule = std::all_of(
+            loop->paths.begin(), loop->paths.end(),
+            path_is_in_requested_schedule);
+        if (any_nonplanar && !all_nonplanar) {
+            const auto owner = std::find_if(
+                loop->paths.begin(), loop->paths.end(),
+                [](const ExtrusionPath &path) { return path.nonplanar_surface; });
+            return nonplanar && path_is_in_requested_schedule(*owner) ?
+                this->extrude_loop(
+                    *loop, description, -1., region_perimeters) :
+                std::string{};
+        }
+        if (all_nonplanar == nonplanar && all_in_requested_schedule)
+            return this->extrude_loop(*loop, description, -1., region_perimeters);
+        for (const ExtrusionPath &path : loop->paths)
+            if (path.nonplanar_surface == nonplanar &&
+                (!before_current_layer ||
+                 path.nonplanar_before_current_layer == *before_current_layer) &&
+                (!feature_transition ||
+                 path.nonplanar_feature_transition == *feature_transition) &&
+                (!feature_course ||
+                 path.nonplanar_feature_course == *feature_course))
+                gcode += this->extrude_path(path, description, -1.);
+    } else if (const auto *collection = dynamic_cast<const ExtrusionEntityCollection *>(&entity)) {
+        for (const ExtrusionEntity *child : collection->entities)
+            if (child != nullptr)
+                gcode += this->extrude_entity_nonplanar_filtered(
+                    *child, description, nonplanar, region_perimeters,
+                    before_current_layer, feature_transition, feature_course);
+    }
+    return gcode;
 }
 
 std::string GCode::extrude_path(const ExtrusionPath& path, const std::string& description, double speed)
@@ -7367,10 +7914,16 @@ std::string GCode::extrude_perimeters(const Print &print, const std::vector<Obje
     std::string gcode;
     for (const ObjectByExtruder::Island::Region &region : by_region)
         if (! region.perimeters.empty()) {
+            // Seam-prime gaps are owned by one perimeter collection. Never
+            // match a nearby loop from another region/island.
+            m_inner_seam_prime_gaps.clear();
+            m_pending_inner_seam_primes.clear();
+            m_emitted_inner_seam_loops.clear();
+            m_unprimed_outer_seams.clear();
             m_config.apply(print.get_print_region(&region - &by_region.front()).config());
             const bool replace_unsupported_perimeters = std::any_of(
                 region.infills.begin(), region.infills.end(),
-                [](const ExtrusionEntity *entity) { return entity->role() == erArcOverhang; });
+                [](const ExtrusionEntity *entity) { return is_arc_fill(entity->role()); });
             // BBS: for first layer, we always print wall firstly to get better bed adhesive force
             // This behaviour is same with cura
             // Arc anchors always precede the arcs, irrespective of the ordinary
@@ -7381,7 +7934,8 @@ std::string GCode::extrude_perimeters(const Print &print, const std::vector<Obje
 
             if (!replace_unsupported_perimeters) {
                 for (const ExtrusionEntity* ee : region.perimeters)
-                    gcode += this->extrude_entity(*ee, "perimeter", -1., region.perimeters);
+                    gcode += this->extrude_entity_nonplanar_filtered(
+                        *ee, "perimeter", false, region.perimeters);
                 continue;
             }
 
@@ -7401,7 +7955,7 @@ std::string GCode::extrude_perimeters(const Print &print, const std::vector<Obje
                     // Arc fill replaces every wall fragment that would itself
                     // need bridge/overhang extrusion. Supported fragments remain
                     // and are emitted first as the arc's physical anchor.
-                    if (path->role() != erOverhangPerimeter)
+                    if (path->role() != erOverhangPerimeter && !path->nonplanar_surface)
                         gcode += this->extrude_path(*path, "perimeter", -1.);
                 } else if (const auto *multipath = dynamic_cast<const ExtrusionMultiPath *>(&entity)) {
                     for (const ExtrusionPath &path : multipath->paths)
@@ -7424,19 +7978,25 @@ std::string GCode::extrude_perimeters(const Print &print, const std::vector<Obje
 
 // Chain the paths hierarchically by a greedy algorithm to minimize a travel distance.
 std::string GCode::extrude_infill(const Print &print, const std::vector<ObjectByExtruder::Island::Region> &by_region, bool ironing,
-                                  ExtrusionRole role_filter)
+                                  ExtrusionRole role_filter, bool exclude_bridge_or_arc_fill,
+                                  bool enabled_bridge_order_regions_only)
 {
     std::string 		 gcode;
     ExtrusionEntitiesPtr extrusions;
     const char*          extrusion_name = ironing ? "ironing" : "infill";
     for (const ObjectByExtruder::Island::Region &region : by_region)
         if (! region.infills.empty()) {
+            const bool bridge_order_enabled = print.get_print_region(&region - &by_region.front())
+                                                  .config().bridge_overhang_before_walls.value;
+            if (enabled_bridge_order_regions_only && !bridge_order_enabled)
+                continue;
             extrusions.clear();
             extrusions.reserve(region.infills.size());
             for (ExtrusionEntity *ee : region.infills)
                 if ((ee->role() == erIroning) == ironing &&
+                    (!exclude_bridge_or_arc_fill || !bridge_order_enabled || !is_bridge_or_arc_fill(ee->role())) &&
                     (role_filter == erMixed ||
-                     (role_filter == erCount ? ee->role() != erArcOverhang : ee->role() == role_filter)))
+                     (role_filter == erCount ? !is_arc_fill(ee->role()) : ee->role() == role_filter)))
                     extrusions.emplace_back(ee);
             if (! extrusions.empty()) {
                 m_config.apply(print.get_print_region(&region - &by_region.front()).config());
@@ -7444,13 +8004,13 @@ std::string GCode::extrude_infill(const Print &print, const std::vector<ObjectBy
                 // prior_arc_paths and may therefore depend on their generation
                 // order. Preserve that order just as we preserve paths inside
                 // each collection.
-                if (role_filter != erArcOverhang)
+                if (!is_arc_fill(role_filter))
                     chain_and_reorder_extrusion_entities(
                         extrusions, m_last_pos.to_point());
                 for (const ExtrusionEntity *fill : extrusions) {
                     auto *eec = dynamic_cast<const ExtrusionEntityCollection*>(fill);
                     if (eec) {
-                        if (fill->role() == erArcOverhang && eec->no_sort) {
+                        if (is_arc_fill(fill->role()) && eec->no_sort) {
                             // Arc families are dependency ordered: root arcs
                             // precede large backbone arcs, which precede their
                             // breadth-first children. chained_path_from() always
@@ -7458,21 +8018,135 @@ std::string GCode::extrude_infill(const Print &print, const std::vector<ObjectBy
                             // so using it here can print a recursive child before
                             // the arc that supports its lead-in.
                             for (const ExtrusionEntity *ee : eec->entities)
-                                gcode += this->extrude_entity(
-                                    *ee, extrusion_name);
+                                gcode += this->extrude_entity_nonplanar_filtered(
+                                    *ee, extrusion_name, false);
                         } else {
                             for (ExtrusionEntity *ee :
                                  eec->chained_path_from(
                                      m_last_pos.to_point()).entities)
-                                gcode += this->extrude_entity(
-                                    *ee, extrusion_name);
+                                gcode += this->extrude_entity_nonplanar_filtered(
+                                    *ee, extrusion_name, false);
                         }
                     } else
-                        gcode += this->extrude_entity(*fill, extrusion_name);
+                        gcode += this->extrude_entity_nonplanar_filtered(
+                            *fill, extrusion_name, false);
                 }
             }
         }
     return gcode;
+}
+
+std::string GCode::extrude_nonplanar_surface(
+    const Print &print, const std::vector<ObjectByExtruder::Island::Region> &by_region,
+    bool before_current_layer, std::optional<size_t> feature_course)
+{
+    std::string gcode;
+    if (!feature_course) {
+        for (const ObjectByExtruder::Island::Region &region : by_region) {
+            m_config.apply(print.get_print_region(&region - &by_region.front()).config());
+            for (const ExtrusionEntity *entity : region.perimeters)
+                gcode += this->extrude_entity_nonplanar_filtered(
+                    *entity, "non-planar perimeter", true, region.perimeters,
+                    before_current_layer, false);
+        }
+        for (const ObjectByExtruder::Island::Region &region : by_region) {
+            m_config.apply(print.get_print_region(&region - &by_region.front()).config());
+            for (const ExtrusionEntity *entity : region.infills)
+                if (entity->role() != erIroning)
+                    gcode += this->extrude_entity_nonplanar_filtered(
+                        *entity, "non-planar top surface", true, {},
+                        before_current_layer, false);
+        }
+        for (const ObjectByExtruder::Island::Region &region : by_region) {
+            m_config.apply(print.get_print_region(&region - &by_region.front()).config());
+            for (const ExtrusionEntity *entity : region.infills)
+                if (entity->role() == erIroning)
+                    gcode += this->extrude_entity_nonplanar_filtered(
+                        *entity, "non-planar ironing", true, {},
+                        before_current_layer, false);
+        }
+        return gcode;
+    }
+
+    for (const ObjectByExtruder::Island::Region &region : by_region) {
+        m_config.apply(print.get_print_region(&region - &by_region.front()).config());
+        for (const ExtrusionEntity *entity : region.perimeters)
+            gcode += this->extrude_entity_nonplanar_filtered(
+                *entity, "surface-following feature perimeter", true,
+                region.perimeters, before_current_layer, true, feature_course);
+        for (const ExtrusionEntity *entity : region.infills)
+            if (entity->role() != erIroning)
+                gcode += this->extrude_entity_nonplanar_filtered(
+                    *entity, "surface-following feature fill", true, {},
+                    before_current_layer, true, feature_course);
+    }
+    return gcode;
+}
+
+size_t GCode::maximum_nonplanar_feature_course(
+    const std::vector<ObjectByExtruder::Island::Region> &by_region,
+    bool before_current_layer) const
+{
+    std::function<size_t(const ExtrusionEntity &)> maximum_course;
+    maximum_course = [&](const ExtrusionEntity &entity) -> size_t {
+        if (const auto *path = dynamic_cast<const ExtrusionPath *>(&entity))
+            return path->nonplanar_feature_transition &&
+                path->nonplanar_before_current_layer == before_current_layer ?
+                path->nonplanar_feature_course : 0;
+        size_t result = 0;
+        if (const auto *multipath = dynamic_cast<const ExtrusionMultiPath *>(&entity))
+            for (const ExtrusionPath &path : multipath->paths)
+                result = std::max(result, maximum_course(path));
+        else if (const auto *loop = dynamic_cast<const ExtrusionLoop *>(&entity))
+            for (const ExtrusionPath &path : loop->paths)
+                result = std::max(result, maximum_course(path));
+        else if (const auto *collection = dynamic_cast<const ExtrusionEntityCollection *>(&entity))
+            for (const ExtrusionEntity *child : collection->entities)
+                result = std::max(result, maximum_course(*child));
+        return result;
+    };
+
+    size_t result = 0;
+    for (const ObjectByExtruder::Island::Region &region : by_region) {
+        for (const ExtrusionEntity *entity : region.perimeters)
+            result = std::max(result, maximum_course(*entity));
+        for (const ExtrusionEntity *entity : region.infills)
+            result = std::max(result, maximum_course(*entity));
+    }
+    return result;
+}
+
+bool GCode::is_nonplanar_leveling_course(
+    const std::vector<ObjectByExtruder::Island::Region> &by_region,
+    bool before_current_layer, size_t feature_course) const
+{
+    std::function<bool(const ExtrusionEntity &)> matches;
+    matches = [&](const ExtrusionEntity &entity) -> bool {
+        if (const auto *path = dynamic_cast<const ExtrusionPath *>(&entity))
+            return path->nonplanar_feature_transition &&
+                path->nonplanar_leveling_transition &&
+                path->nonplanar_before_current_layer == before_current_layer &&
+                path->nonplanar_feature_course == feature_course;
+        if (const auto *multipath = dynamic_cast<const ExtrusionMultiPath *>(&entity))
+            return std::any_of(multipath->paths.begin(), multipath->paths.end(),
+                [&](const ExtrusionPath &path) { return matches(path); });
+        if (const auto *loop = dynamic_cast<const ExtrusionLoop *>(&entity))
+            return std::any_of(loop->paths.begin(), loop->paths.end(),
+                [&](const ExtrusionPath &path) { return matches(path); });
+        if (const auto *collection = dynamic_cast<const ExtrusionEntityCollection *>(&entity))
+            return std::any_of(collection->entities.begin(), collection->entities.end(),
+                [&](const ExtrusionEntity *child) { return matches(*child); });
+        return false;
+    };
+
+    for (const ObjectByExtruder::Island::Region &region : by_region) {
+        if (std::any_of(region.perimeters.begin(), region.perimeters.end(),
+                [&](const ExtrusionEntity *entity) { return matches(*entity); }) ||
+            std::any_of(region.infills.begin(), region.infills.end(),
+                [&](const ExtrusionEntity *entity) { return matches(*entity); }))
+            return true;
+    }
+    return false;
 }
 
 std::string GCode::extrude_support(const ExtrusionEntityCollection &support_fills, const ExtrusionRole support_extrusion_role)
@@ -7689,15 +8363,144 @@ double GCode::calc_max_volumetric_speed(const double layer_height, const double 
     return res;
 }
 
-std::string GCode::_extrude(const ExtrusionPath &path, std::string description, double speed)
+std::string GCode::_extrude(const ExtrusionPath &input_path, std::string description, double speed,
+                            bool validate_nonplanar_clearance)
 {
     std::string gcode;
+    auto machine_points = [this](const ExtrusionPath &candidate, bool planar) {
+        std::vector<Vec3d> points;
+        points.reserve(candidate.polyline.points.size());
+        for (const Point3 &point : candidate.polyline.points) {
+            const Vec2d xy = this->point_to_gcode(point.to_point());
+            points.emplace_back(xy.x(), xy.y(), m_nominal_z +
+                (planar ? 0. : unscale_(point.z())));
+        }
+        return points;
+    };
+    auto toolpath_collision = [this, &machine_points](const ExtrusionPath &candidate,
+                                                       bool planar) {
+        const std::vector<Vec3d> points = machine_points(candidate, planar);
+        for (size_t idx = 1; idx < points.size(); ++idx) {
+            const std::vector<Vec3d> segment{points[idx - 1], points[idx]};
+            const auto previous_candidates = toolhead_clearance_candidates(
+                segment, m_toolhead_clearance_previous_obstacles,
+                m_toolhead_clearance_previous_grid,
+                m_toolhead_clearance_previous_top_z);
+            double support_contact = std::max(1e-4, double(candidate.height));
+            const double xy_distance = (segment.back().head<2>() -
+                segment.front().head<2>()).norm();
+            if (xy_distance > EPSILON) {
+                const double local_slope = std::abs(
+                    segment.back().z() - segment.front().z()) / xy_distance;
+                const double nozzle_tip_reach = m_toolhead_clearance_geometry.empty() ?
+                    m_toolhead_clearance_fallback.radius :
+                    m_toolhead_clearance_geometry.maximum_xy_reach(0.001);
+                const double lateral_reach = nozzle_tip_reach +
+                    0.5 * double(candidate.width);
+                if (lateral_reach > 0.) {
+                    // A draped bead intentionally rides on the planar
+                    // staircase below it. Across the nozzle/bead radius that
+                    // support rises with the local surface slope; treating the
+                    // whole rise as a collision flattened every valid sloped
+                    // move. This allowance applies to the nozzle-tip
+                    // envelope. Detailed upper toolhead slices
+                    // retain their geometry and height offsets.
+                    support_contact += lateral_reach * local_slope;
+                }
+            }
+            ToolheadCollision collision = check_toolhead_clearance(
+                segment.front(), segment.back(), m_toolhead_clearance_geometry,
+                previous_candidates, m_toolhead_clearance_fallback,
+                support_contact);
+            if (collision)
+                return collision;
+
+            // Raster lines belonging to one generated surface are mutually
+            // adjacent by construction, just like ordinary planar infill.
+            // Recording one as a foreign obstacle made every subsequent line
+            // fail at its intended bead contact. Previous-layer/model geometry
+            // is still checked above, and non-surface Z paths retain the full
+            // same-layer obstacle check here.
+            if (!candidate.nonplanar_surface) {
+                const auto current_candidates = toolhead_clearance_candidates(
+                    segment, m_toolhead_clearance_obstacles, m_toolhead_clearance_grid,
+                    m_toolhead_clearance_top_z);
+                collision = check_toolhead_clearance(
+                    segment.front(), segment.back(), m_toolhead_clearance_geometry,
+                    current_candidates, m_toolhead_clearance_fallback,
+                    support_contact);
+                if (collision)
+                    return collision;
+            }
+        }
+        return ToolheadCollision{};
+    };
+
+    // Coherent non-planar surface paths have already been inset by the full
+    // configured fallback cone during projected-domain generation. Rechecking
+    // them against the planar staircase cannot distinguish intended support
+    // contact from a collision and used to flatten the entire skin. A detailed
+    // gantry model adds real 3D information, so retain the segment check when
+    // one is available.
+    const bool needs_segment_clearance =
+        !input_path.nonplanar_clearance_validated;
+    if (input_path.nonplanar_surface &&
+        validate_nonplanar_clearance && needs_segment_clearance) {
+        const ToolheadCollision collision = toolpath_collision(input_path, false);
+        if (collision) {
+            enum class ClearanceMode : int8_t { Unsafe = -1, Planar, Nonplanar };
+            std::vector<std::pair<ClearanceMode, ExtrusionPath>> runs;
+            const Points3 &points = input_path.polyline.points;
+
+            for (size_t idx = 1; idx < points.size(); ++idx) {
+                ExtrusionPath segment = input_path;
+                segment.polyline.points = {points[idx - 1], points[idx]};
+                ClearanceMode mode = ClearanceMode::Nonplanar;
+                if (toolpath_collision(segment, false)) {
+                    segment.z_contoured = false;
+                    // This is still part of the final non-planar top-surface
+                    // operation even when collision handling flattens its Z.
+                    // Retain the feature role so preview coloring and ordering
+                    // do not incorrectly present it as a late ordinary wall.
+                    segment.nonplanar_surface = true;
+                    for (Point3 &point : segment.polyline.points)
+                        point.z() = 0;
+                    mode = toolpath_collision(segment, true) ?
+                        ClearanceMode::Unsafe : ClearanceMode::Planar;
+                }
+
+                if (mode == ClearanceMode::Unsafe)
+                    continue;
+                if (!runs.empty() && runs.back().first == mode &&
+                    runs.back().second.last_point3() == segment.first_point3()) {
+                    runs.back().second.polyline.points.push_back(segment.last_point3());
+                } else {
+                    runs.emplace_back(mode, std::move(segment));
+                }
+            }
+
+            if (runs.empty())
+                return "; Variable-Z path trimmed for toolhead clearance\n";
+
+            for (const auto &[mode, run] : runs) {
+                if (mode == ClearanceMode::Planar)
+                    gcode += "; Variable-Z path section flattened for toolhead clearance\n";
+                // Every run was checked immediately above. Rechecking it here
+                // makes clearance generation quadratic for heavily segmented
+                // non-planar skins and cannot change the result.
+                gcode += this->_extrude(run, description, speed, false);
+            }
+            return gcode;
+        }
+    }
+    const ExtrusionPath &path = input_path;
+
     const PrintObject *print_object = m_layer == nullptr ? nullptr : m_layer->object();
-    if (path.role() == erArcOverhang && print_object != nullptr)
+    if (is_arc_fill(path.role()) && print_object != nullptr)
         m_arc_overhang_stabilization_until[print_object] =
             layer_id() + std::max(1, m_config.arc_overhang_layers.value) - 1;
-    if (path.role() == erArcOverhang && print_object != nullptr) {
-        if (m_layer->has_one_sided_arc_overhang)
+    if (is_arc_fill(path.role()) && print_object != nullptr) {
+        if (path.role() == erArcOverhang)
             m_arc_overhang_overhang_start[print_object] = layer_id();
         else
             m_arc_overhang_bridge_start[print_object] = layer_id();
@@ -7722,6 +8525,42 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
         m_arc_overhang_overhang_start, m_config.arc_overhang_overhang_speed_layers.value);
     const std::optional<double> bridge_speed_blend = arc_speed_blend(
         m_arc_overhang_bridge_start, m_config.arc_overhang_bridge_speed_layers.value);
+
+    std::optional<double> dissimilar_interface_speed_blend;
+    const unsigned int current_filament_id = m_writer.filament() == nullptr ?
+        unsigned(-1) : m_writer.filament()->id();
+    const auto dissimilar_interface_key = std::make_pair(print_object, current_filament_id);
+    if (m_config.slow_down_layer_above_dissimilar_support_interface.value &&
+        print_object != nullptr && m_layer != nullptr && !is_support(path.role()) &&
+        current_filament_id != unsigned(-1)) {
+        const int interface_filament = print_object->config().support_interface_filament.value - 1;
+        const SupportLayer *support_layer = support_layer_below(*m_layer);
+        if (interface_filament >= 0 &&
+            size_t(interface_filament) < m_config.filament_type.values.size() &&
+            current_filament_id < m_config.filament_type.values.size() &&
+            support_layer != nullptr &&
+            support_layer->has_top_interface_contact) {
+            // support_interface_filament and Filament::id() address the filament slots
+            // directly. Do not pass the former through the dynamic nozzle-group mapping:
+            // doing so may resolve two distinct slots to the same physical nozzle.
+            const std::string &model_material = m_config.filament_type.get_at(current_filament_id);
+            const std::string &interface_material = m_config.filament_type.get_at(interface_filament);
+            if (!model_material.empty() && !interface_material.empty() &&
+                model_material != interface_material)
+                m_dissimilar_support_interface_start[dissimilar_interface_key] = layer_id();
+        }
+
+        const auto start_it = m_dissimilar_support_interface_start.find(dissimilar_interface_key);
+        if (start_it != m_dissimilar_support_interface_start.end()) {
+            const int elapsed_layers = layer_id() - start_it->second;
+            const int recovery_layers = m_config.dissimilar_support_interface_speed_layers.value;
+            if (elapsed_layers == 0)
+                dissimilar_interface_speed_blend = 0.;
+            else if (elapsed_layers > 0 && elapsed_layers <= recovery_layers)
+                dissimilar_interface_speed_blend = std::clamp(
+                    double(elapsed_layers) / double(recovery_layers), 0., 1.);
+        }
+    }
 
     if (is_bridge(path.role()))
         description += " (bridge)";
@@ -7752,7 +8591,64 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
             z = unscale_(path.polyline.lines().begin()->a.z()) + m_nominal_z;
         }
 
-        gcode += this->travel_to(first_point, path.role(), "move to first " + description + " point", z);
+        if (m_last_pos_defined &&
+            (input_path.nonplanar_surface ||
+             m_nonplanar_clearance_active_this_layer)) {
+            const Vec2d target_xy = point_to_gcode(first_point);
+            const double target_z = z == DBL_MAX ? m_nominal_z : z;
+            // Arachne and clipping may divide one continuous variable-width
+            // wall into adjacent ExtrusionPaths whose endpoints differ by a
+            // few microns.  These are not independent travel moves: the
+            // preceding bead is the path's intended neighbor and therefore
+            // necessarily intersects the toolhead-clearance envelope.  Do
+            // not turn that expected contact into a clearance lift between
+            // every width segment.  Restrict the exception to a genuinely
+            // coincident XYZ continuation; larger XY gaps and Z steps still
+            // receive the full collision check below.
+            constexpr double nonplanar_join_tolerance = 0.05;
+            const Vec3d current_position = m_writer.get_position();
+            const bool nearby_nonplanar_continuation =
+                input_path.nonplanar_surface &&
+                (current_position.head<2>() - target_xy).norm() <=
+                    nonplanar_join_tolerance &&
+                std::abs(current_position.z() - target_z) <=
+                    nonplanar_join_tolerance;
+            const std::vector<Vec3d> direct_travel{
+                current_position, Vec3d(target_xy.x(), target_xy.y(), target_z)};
+            ToolheadCollision travel_collision;
+            if (!nearby_nonplanar_continuation) {
+                const auto previous_candidates = toolhead_clearance_candidates(
+                    direct_travel, m_toolhead_clearance_previous_obstacles,
+                    m_toolhead_clearance_previous_grid,
+                    m_toolhead_clearance_previous_top_z);
+                travel_collision = check_toolpath_clearance(
+                    direct_travel, m_toolhead_clearance_geometry,
+                    previous_candidates, m_toolhead_clearance_fallback);
+                if (!travel_collision) {
+                    const auto current_candidates = toolhead_clearance_candidates(
+                        direct_travel, m_toolhead_clearance_obstacles,
+                        m_toolhead_clearance_grid, m_toolhead_clearance_top_z);
+                    travel_collision = check_toolpath_clearance(
+                        direct_travel, m_toolhead_clearance_geometry,
+                        current_candidates, m_toolhead_clearance_fallback);
+                }
+            }
+            if (travel_collision) {
+                // The maxima are maintained as paths are recorded and when a
+                // physical layer rolls over. Re-scanning every emitted path
+                // here makes non-planar G-code export quadratic on detailed
+                // models while producing exactly the same clearance height.
+                const double clearance_z = std::max({m_writer.get_position().z(), target_z,
+                    m_toolhead_clearance_previous_top_z + 0.001,
+                    m_toolhead_clearance_top_z + 0.001});
+                gcode += m_writer.travel_to_z(
+                    clearance_z, "raise for non-planar toolhead clearance", true);
+                z = clearance_z;
+            }
+        }
+
+        gcode += this->travel_to(first_point, path.role(),
+                                 "move to first " + description + " point", z);
 
         // Orca: ensure Z matches planned layer height
         if (!slope_need_z_travel && (_last_pos_undefined || m_need_change_layer_lift_z)) {
@@ -7767,13 +8663,13 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
         double current_z = m_writer.get_position().z();
         double first_z = unscale_(path.polyline.lines().begin()->a.z()) + m_nominal_z;
         if (GCodeFormatter::quantize_xyzf(first_z) != GCodeFormatter::quantize_xyzf(current_z)) {
-            gcode += m_writer.travel_to_z(first_z, "set Z for contouring", true);
+            gcode += m_writer.travel_to_z(first_z, "set Z for variable-Z surface", true);
         }
     }
     if (!path.z_contoured && sloped == nullptr) {
         double current_z = m_writer.get_position().z();
         if (GCodeFormatter::quantize_xyzf(current_z) != GCodeFormatter::quantize_xyzf(m_nominal_z)) {
-            gcode += this->writer().travel_to_z(m_nominal_z, "reset Z after contouring", true);
+            gcode += this->writer().travel_to_z(m_nominal_z, "reset Z after variable-Z surface", true);
         }
     }
 
@@ -7898,7 +8794,8 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
     // both the outermost and innermost walls at normal flow; only walls
     // between those boundaries receive the additional material.
     const bool use_inner_walls_flow =
-        !this->on_first_layer() && !layer_has_top_surface && !layer_has_bridge_surface &&
+        !this->on_first_layer() &&
+        ((!layer_has_top_surface && !layer_has_bridge_surface) || path.staggered_perimeter) &&
         m_config.wall_loops.value >= 3 && path.role() == erPerimeter &&
         path.inset_idx > 0 && path.inset_idx < m_config.wall_loops.value - 1;
     const double inner_walls_flow = m_config.inner_walls_flow_ratio.get_abs_value(1.);
@@ -7922,7 +8819,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
             if (sloped) {
                 speed = std::min(speed, m_config.scarf_joint_speed.get_abs_value(speed));
             }
-        } else if (path.role() == erArcOverhang) {
+        } else if (is_arc_fill(path.role())) {
             speed = m_config.arc_overhang_speed.value;
         } else if(path.role() == erInternalBridgeInfill) {
             speed = m_config.get_abs_value_at("internal_bridge_speed", get_nozzle_config_index(m_writer.filament()->id()));
@@ -8006,6 +8903,10 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
         if (blend)
             speed = std::min(speed, Slic3r::lerp(
                 m_config.arc_overhang_stabilization_speed.value, speed, *blend));
+    if (dissimilar_interface_speed_blend) {
+        const double slowed_speed = m_config.dissimilar_support_interface_speed.get_abs_value(speed);
+        speed = std::min(speed, Slic3r::lerp(slowed_speed, speed, *dissimilar_interface_speed_blend));
+    }
     //BBS: remove this config
     //else if (this->object_layer_over_raft())
     //    speed = m_config.get_abs_value("first_layer_speed_over_raft", speed);
@@ -8198,8 +9099,24 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
     char buf[64];
     assert(is_decimal_separator_point());
 
-    if (path.role() != m_last_processor_extrusion_role) {
-        m_last_processor_extrusion_role = path.role();
+    // Buried draped skins and the exposed finishing skin are distinct preview
+    // features. A continuing feature remains a real perimeter or fill while
+    // its Z field follows and then levels away from that skin, so retain its
+    // structural role in the preview instead of painting the whole chimney as
+    // transition material.
+    const bool surface_following_support = path.nonplanar_surface &&
+        (path.role() == erSupportMaterialInterface || path.role() == erIroning);
+    const ExtrusionRole processor_role =
+        (path.nonplanar_feature_transition || surface_following_support) ? path.role() :
+        (path.nonplanar_transition ? erNonplanarSupport :
+        (path.nonplanar_surface ? erNonplanarSurface :
+        (path.nonplanar_infill ? erNonplanarInfill :
+        (path.shrinkage_compensation ? erShrinkageCompensation :
+        (path.staggered_perimeter ? erStaggeredPerimeter :
+        (path.smooth_outer_wall ? erSmoothOuterWall :
+        (path.nonplanar_interlocking_wall ? erNonplanarInterlockingWall : path.role())))))));
+    if (processor_role != m_last_processor_extrusion_role) {
+        m_last_processor_extrusion_role = processor_role;
         sprintf(buf, ";%s%s\n", GCodeProcessor::reserved_tag(GCodeProcessor::ETags::Role).c_str(), ExtrusionEntity::role_to_string(m_last_processor_extrusion_role).c_str());
         gcode += buf;
     }
@@ -8469,7 +9386,9 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                         coordf_t z_diff = unscale_(line.b.z());
 
                         double extrusion_ratio = 1;
-                        if (path.role() != erIroning) {
+                        if (!path.nonplanar_surface && !path.staggered_perimeter &&
+                            !path.nonplanar_infill &&
+                            path.role() != erIroning) {
                             extrusion_ratio = (path.height + z_diff) / path.height;
                         }
 
@@ -8679,7 +9598,12 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                 coordf_t z_diff = unscale_(processed_point.p.z());
 
                 double extrusion_ratio = 1;
-                if (path.role() != erIroning) {
+                // A non-planar skin's local Z offset changes the deposited
+                // shell thickness. Brick/staggered walls are merely shifted
+                // bodily upward, so their volume must come exclusively from
+                // the existing inner_walls_flow_ratio setting.
+                if (!path.nonplanar_surface && path.role() != erIroning &&
+                    !path.staggered_perimeter) {
                     extrusion_ratio = (path.height + z_diff) / path.height;
                 }
 
@@ -8717,8 +9641,102 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
       m_last_notgapfill_extrusion_role = path.role();
     }
 
+    if (m_toolhead_clearance_record_this_layer) {
+        const std::vector<Vec3d> points = machine_points(path, !path.z_contoured);
+        if (path.z_contoured) {
+            // A variable-Z path cannot be represented by one footprint at its
+            // global maximum Z: doing so turns the low end of a shallow slope
+            // into a false tall obstacle. Keep each segment's local top Z.
+            for (size_t idx = 1; idx < points.size(); ++idx)
+                record_toolhead_clearance_obstacle(make_printed_toolpath_obstacle(
+                    {points[idx - 1], points[idx]}, path.width));
+        } else {
+            record_toolhead_clearance_obstacle(make_printed_toolpath_obstacle(points, path.width));
+        }
+    }
+    m_nonplanar_clearance_active_this_layer |= path.nonplanar_surface;
+
     this->set_last_pos(path.last_point());
     return gcode;
+}
+
+void GCode::record_toolhead_clearance_obstacle(PrintedToolpathObstacle obstacle)
+{
+    if (obstacle.empty())
+        return;
+
+    // Variable-Z paths are recorded per segment so their local height remains
+    // exact. A coarse cell makes every short segment compare against hundreds
+    // of unrelated neighbors; 2 mm keeps the same conservative query envelope
+    // while sharply reducing the narrow-phase work.
+    constexpr double grid_cell_size = 2.;
+    const auto grid_coord = [](coord_t value) {
+        return int(std::floor(unscale_(value) / grid_cell_size));
+    };
+    const size_t obstacle_index = m_toolhead_clearance_obstacles.size();
+    for (int x = grid_coord(obstacle.bbox.min.x()); x <= grid_coord(obstacle.bbox.max.x()); ++x)
+        for (int y = grid_coord(obstacle.bbox.min.y()); y <= grid_coord(obstacle.bbox.max.y()); ++y)
+            m_toolhead_clearance_grid[toolhead_clearance_grid_key(x, y)].push_back(obstacle_index);
+    m_toolhead_clearance_top_z = std::max(m_toolhead_clearance_top_z, obstacle.top_z);
+    m_toolhead_clearance_obstacles.emplace_back(std::move(obstacle));
+}
+
+std::vector<const PrintedToolpathObstacle *> GCode::toolhead_clearance_candidates(
+    const std::vector<Vec3d> &points,
+    const std::vector<PrintedToolpathObstacle> &obstacles,
+    const ToolheadClearanceGrid &grid,
+    double maximum_obstacle_top_z)
+{
+    std::vector<const PrintedToolpathObstacle *> candidates;
+    if (points.empty() || obstacles.empty() || grid.empty())
+        return candidates;
+
+    BoundingBox query_bbox;
+    double minimum_path_z = std::numeric_limits<double>::max();
+    for (const Vec3d &point : points)
+    {
+        query_bbox.merge(Point::new_scale(point.x(), point.y()));
+        minimum_path_z = std::min(minimum_path_z, point.z());
+    }
+    const double relative_height = maximum_obstacle_top_z - minimum_path_z + 1e-4;
+    if (relative_height < 0.)
+        return candidates;
+    double xy_reach = 0.;
+    if (!m_toolhead_clearance_geometry.empty()) {
+        xy_reach = m_toolhead_clearance_geometry.maximum_xy_reach(relative_height);
+    } else {
+        const double angle = std::clamp(m_toolhead_clearance_fallback.angle_degrees, 0., 89.) * PI / 180.;
+        xy_reach = m_toolhead_clearance_fallback.radius +
+            std::min(relative_height, m_toolhead_clearance_fallback.height) * std::tan(angle);
+    }
+    query_bbox.offset(scale_(xy_reach));
+
+    constexpr double grid_cell_size = 2.;
+    const auto grid_coord = [](coord_t value) {
+        return int(std::floor(unscale_(value) / grid_cell_size));
+    };
+    if (m_toolhead_clearance_candidate_marks.size() < obstacles.size())
+        m_toolhead_clearance_candidate_marks.resize(obstacles.size(), 0);
+    if (++m_toolhead_clearance_candidate_generation == 0) {
+        std::fill(m_toolhead_clearance_candidate_marks.begin(),
+                  m_toolhead_clearance_candidate_marks.end(), 0);
+        m_toolhead_clearance_candidate_generation = 1;
+    }
+    const uint32_t generation = m_toolhead_clearance_candidate_generation;
+    for (int x = grid_coord(query_bbox.min.x()); x <= grid_coord(query_bbox.max.x()); ++x) {
+        for (int y = grid_coord(query_bbox.min.y()); y <= grid_coord(query_bbox.max.y()); ++y) {
+            const auto found = grid.find(toolhead_clearance_grid_key(x, y));
+            if (found == grid.end())
+                continue;
+            for (size_t index : found->second) {
+                if (m_toolhead_clearance_candidate_marks[index] == generation)
+                    continue;
+                m_toolhead_clearance_candidate_marks[index] = generation;
+                candidates.push_back(&obstacles[index]);
+            }
+        }
+    }
+    return candidates;
 }
 
 //Orca: get string name of extrusion role. used for change_extruder_role_gcode
@@ -8735,6 +9753,14 @@ std::string GCode::extrusion_role_to_string_for_parser(const ExtrusionRole & rol
         case erBridgeInfill:
         case erInternalBridgeInfill: return "BridgeInfill";
         case erArcOverhang: return "ArcOverhang";
+        case erArcBridge: return "ArcBridge";
+        case erNonplanarSurface: return "NonplanarSurface";
+        case erNonplanarSupport: return "NonplanarSupport";
+        case erNonplanarInfill: return "NonplanarInfill";
+        case erStaggeredPerimeter: return "StaggeredPerimeter";
+        case erSmoothOuterWall: return "SmoothOuterWall";
+        case erNonplanarInterlockingWall: return "NonplanarInterlockingWall";
+        case erShrinkageCompensation: return "ShrinkageCompensation";
         case erGapFill: return "GapFill";
         case erIroning: return "Ironing";
         case erSkirt: return "Skirt";

@@ -9541,9 +9541,9 @@ void GUI_App::refresh_profile_sources(bool force)
     if (last_check > 0 && now - last_check < check_interval)
         return;
 
-    // HEAD requests fetch only archive metadata. The potentially large profile
-    // archives are not downloaded until the user accepts a prompt that names
-    // sources whose ETag or Last-Modified revision actually changed.
+    // Fetch only revision metadata here. The potentially large profile archives
+    // are not downloaded until the user accepts a prompt naming sources whose
+    // profile-tree revision actually changed.
     m_profile_source_sync_token = std::make_shared<int>(0);
     std::weak_ptr<int> token = m_profile_source_sync_token;
     m_profile_source_thread = boost::thread([this, candidates, token] {

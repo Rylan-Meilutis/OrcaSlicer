@@ -2761,10 +2761,23 @@ void TabPrint::build()
         optgroup->append_single_option_line("ironing_angle_fixed", "quality_settings_ironing#fixed-angle");
 
         optgroup = page->new_optgroup(L("Z contouring"), L"param_z_contouring");
-        optgroup->append_single_option_line("zaa_enabled", "quality_settings_z_contouring");
+        optgroup->append_single_option_line("top_surface_z_mode", "quality_settings_z_contouring");
         optgroup->append_single_option_line("zaa_minimize_perimeter_height", "quality_settings_z_contouring#minimize-wall-height-angle");
         optgroup->append_single_option_line("zaa_min_z", "quality_settings_z_contouring#minimum-z-height");
         optgroup->append_single_option_line("zaa_dont_alternate_fill_direction", "quality_settings_z_contouring#dont-alternate-fill-direction");
+        optgroup->append_single_option_line("nonplanar_top_surface_max_angle");
+        optgroup->append_single_option_line("nonplanar_top_surface_layers");
+        optgroup->append_single_option_line("nonplanar_top_surface_resolution");
+        optgroup->append_single_option_line("nonplanar_top_surface_min_height");
+
+        optgroup = page->new_optgroup(L("Perimeter layering"), L"param_z_contouring");
+        optgroup->append_single_option_line("perimeter_layering");
+        optgroup->append_single_option_line("smooth_outer_wall_layer_height");
+        optgroup->append_single_option_line("interlocking_wall_amplitude");
+        optgroup->append_single_option_line("interlocking_wall_wavelength");
+        optgroup->append_single_option_line("interlocking_wall_resolution");
+        optgroup->append_single_option_line("staggered_perimeters_inner_only");
+        optgroup->append_single_option_line("staggered_perimeter_offset");
         // Orca: it's not used yet, so hide it in UI for now
         // optgroup->append_single_option_line("ironing_expansion");
 
@@ -2811,6 +2824,16 @@ void TabPrint::build()
         option.opt.height = 15;
         optgroup->append_single_option_line(option, "quality_settings_wall_and_surfaces#small-area-flow-compensation");
 
+        optgroup = page->new_optgroup(L("Localized shrinkage mitigation"), L"param_shrinkage");
+        optgroup->append_single_option_line("localized_shrinkage_strategy");
+        optgroup->append_single_option_line("hull_line_extra_perimeters");
+        optgroup->append_single_option_line("hull_line_perimeter_expansion");
+        optgroup->append_single_option_line("localized_shrinkage_infill_wall_gap");
+        optgroup->append_single_option_line("localized_shrinkage_section_width");
+        optgroup->append_single_option_line("localized_shrinkage_section_spacing");
+        optgroup->append_single_option_line("localized_shrinkage_perforation_diameter");
+        optgroup->append_single_option_line("localized_shrinkage_perforation_spacing");
+
         optgroup = page->new_optgroup(L("Bridging"), L"param_bridge");
         optgroup->append_single_option_line("bridge_flow", "quality_settings_bridging#flow-ratio");
         optgroup->append_single_option_line("internal_bridge_flow", "quality_settings_bridging#flow-ratio");
@@ -2821,6 +2844,7 @@ void TabPrint::build()
         optgroup->append_single_option_line("enable_extra_bridge_layer", "quality_settings_bridging#extra-bridge-layers");
         optgroup->append_single_option_line("dont_filter_internal_bridges", "quality_settings_bridging#filter-out-small-internal-bridges");
         optgroup->append_single_option_line("counterbore_hole_bridging", "quality_settings_bridging#bridge-counterbore-hole");
+        optgroup->append_single_option_line("bridge_overhang_before_walls");
 
         optgroup = page->new_optgroup(L("Arc overhangs"), L"param_arc_overhang");
         optgroup->append_single_option_line("arc_overhang_enabled");
@@ -2880,6 +2904,10 @@ void TabPrint::build()
         optgroup->append_single_option_line("sparse_infill_density", "strength_settings_infill#sparse-infill-density");
         optgroup->append_single_option_line("fill_multiline", "strength_settings_infill#fill-multiline");
         optgroup->append_single_option_line("sparse_infill_pattern", "strength_settings_infill#sparse-infill-pattern");
+        optgroup->append_single_option_line("nonplanar_infill");
+        optgroup->append_single_option_line("nonplanar_infill_amplitude");
+        optgroup->append_single_option_line("nonplanar_infill_wavelength");
+        optgroup->append_single_option_line("nonplanar_infill_resolution");
         optgroup->append_single_option_line("gyroid_optimized", "strength_settings_patterns#gyroid-optimized");
         optgroup->append_single_option_line("sparse_infill_smooth_factor", "strength_settings_patterns#sparse-infill-smooth-factor");
         optgroup->append_single_option_line("infill_direction", "strength_settings_infill#direction");
@@ -3020,6 +3048,9 @@ void TabPrint::build()
         optgroup->append_single_option_line("support_ironing_pattern", "support_settings_ironing#pattern");
         optgroup->append_single_option_line("support_ironing_flow", "support_settings_ironing#flow");
         optgroup->append_single_option_line("support_ironing_spacing", "support_settings_ironing#line-spacing");
+        optgroup->append_single_option_line("support_ironing_nonplanar", "support_settings_ironing#surface-following");
+        optgroup->append_single_option_line("support_ironing_nonplanar_max_angle", "support_settings_ironing#maximum-slope");
+        optgroup->append_single_option_line("support_ironing_nonplanar_resolution", "support_settings_ironing#surface-resolution");
 
         //optgroup = page->new_optgroup(L("Options for support material and raft"));
 
@@ -3033,6 +3064,9 @@ void TabPrint::build()
         optgroup->append_single_option_line("support_angle", "support_settings_advanced#pattern-angle");
         optgroup->append_single_option_line("support_interface_top_layers", "support_settings_advanced#interface-layers");
         optgroup->append_single_option_line("support_interface_top_temperature");
+        optgroup->append_single_option_line("slow_down_layer_above_dissimilar_support_interface");
+        optgroup->append_single_option_line("dissimilar_support_interface_speed");
+        optgroup->append_single_option_line("dissimilar_support_interface_speed_layers");
         optgroup->append_single_option_line("support_interface_bottom_layers", "support_settings_advanced#interface-layers");
         optgroup->append_single_option_line("support_interface_pattern", "support_settings_advanced#interface-pattern");
         optgroup->append_single_option_line("support_interface_spacing", "support_settings_advanced#interface-spacing");
@@ -3164,6 +3198,7 @@ void TabPrint::build()
         optgroup->append_single_option_line("fuzzy_skin_ripple_offset", "others_settings_fuzzy_skin#ripple-offset");
         optgroup->append_single_option_line("fuzzy_skin_layers_between_ripple_offset", "others_settings_fuzzy_skin#layers-between-ripple-offset");
         optgroup->append_single_option_line("fuzzy_skin_first_layer", "others_settings_fuzzy_skin#apply-fuzzy-skin-to-first-layer");
+        optgroup->append_single_option_line("fuzzy_skin_top_surface");
 
         optgroup = page->new_optgroup(L("G-code output"), L"param_gcode");
         optgroup->append_single_option_line("reduce_infill_retraction", "others_settings_g_code_output#reduce-infill-retraction");
@@ -3268,6 +3303,26 @@ void TabPrint::toggle_options()
     }
 
     m_config_manipulation.toggle_print_fff_options(m_config, int(intptr_t(m_extruder_switch->GetClientData())), m_type < Preset::TYPE_COUNT);
+
+    const LocalizedShrinkageStrategy shrinkage_strategy =
+        m_config->opt_enum<LocalizedShrinkageStrategy>("localized_shrinkage_strategy");
+    const bool custom_shrinkage = shrinkage_strategy == LocalizedShrinkageStrategy::Custom;
+    toggle_option("hull_line_extra_perimeters", custom_shrinkage ||
+        shrinkage_strategy == LocalizedShrinkageStrategy::ReinforcedWalls ||
+        shrinkage_strategy == LocalizedShrinkageStrategy::Balanced);
+    toggle_option("hull_line_perimeter_expansion", custom_shrinkage ||
+        shrinkage_strategy == LocalizedShrinkageStrategy::DimensionalCompensation ||
+        shrinkage_strategy == LocalizedShrinkageStrategy::Balanced);
+    toggle_option("localized_shrinkage_infill_wall_gap", custom_shrinkage ||
+        shrinkage_strategy == LocalizedShrinkageStrategy::ReducedWallCoupling ||
+        shrinkage_strategy == LocalizedShrinkageStrategy::Balanced ||
+        shrinkage_strategy == LocalizedShrinkageStrategy::FullWallDecoupling);
+    const bool sectioned_shrinkage = shrinkage_strategy == LocalizedShrinkageStrategy::SectionedSolidInfill;
+    toggle_option("localized_shrinkage_section_width", custom_shrinkage || sectioned_shrinkage);
+    toggle_option("localized_shrinkage_section_spacing", custom_shrinkage || sectioned_shrinkage);
+    const bool perforated_shrinkage = shrinkage_strategy == LocalizedShrinkageStrategy::PerforatedWallRelief;
+    toggle_option("localized_shrinkage_perforation_diameter", custom_shrinkage || perforated_shrinkage);
+    toggle_option("localized_shrinkage_perforation_spacing", custom_shrinkage || perforated_shrinkage);
 
     Field *field = m_active_page->get_field("support_style");
     auto   support_type = m_config->opt_enum<SupportType>("support_type");
@@ -4567,6 +4622,11 @@ void TabFilament::build()
         optgroup->append_single_option_line("dont_slow_down_outer_wall", "material_cooling#dont-slow-down-outer-walls");
         optgroup->append_single_option_line("slow_down_min_speed", "material_cooling#min-print-speed");
 
+        optgroup = page->new_optgroup(L("Localized shrinkage mitigation"));
+        optgroup->append_single_option_line("hull_line_mitigation");
+        optgroup->append_single_option_line("hull_line_max_layer_time_variation");
+
+        optgroup = page->new_optgroup(L("Overhang and bridge cooling"));
         optgroup->append_single_option_line("enable_overhang_bridge_fan", "material_cooling#force-cooling-for-overhangs-and-bridges");
         optgroup->append_single_option_line("overhang_fan_threshold", "material_cooling#overhang-cooling-activation-threshold");
         optgroup->append_single_option_line("overhang_fan_speed", "material_cooling#overhangs-and-external-bridges-fan-speed");
@@ -4773,6 +4833,9 @@ void TabFilament::toggle_options()
         // Orca: toggle dont slow down for external perimeters if
         bool has_slow_down_for_layer_cooling = m_config->opt_bool("slow_down_for_layer_cooling", 0);
         toggle_option("dont_slow_down_outer_wall", has_slow_down_for_layer_cooling);
+
+        const bool hull_line_mitigation = m_config->opt_bool("hull_line_mitigation", 0);
+        toggle_option("hull_line_max_layer_time_variation", hull_line_mitigation);
 
         // ORCA: First layer fan speed override only makes sense when no layers are gated off ("No cooling for
         // the first" == 0). Otherwise the override would set layer 0 to a non-zero value while the gate forces
@@ -5203,6 +5266,7 @@ void TabPrinter::build_fff()
         optgroup->append_single_option_line("extruder_clearance_radius", "printer_basic_information_extruder_clearance#radius");
         optgroup->append_single_option_line("extruder_clearance_height_to_rod", "printer_basic_information_extruder_clearance#height-to-rod");
         optgroup->append_single_option_line("extruder_clearance_height_to_lid", "printer_basic_information_extruder_clearance#height-to-lid");
+        optgroup->append_single_option_line("nonplanar_toolhead_clearance_angle");
         optgroup->append_single_option_line("sequential_print_gantry_geometry");
         optgroup->append_single_option_line("sequential_print_gantry_model");
 

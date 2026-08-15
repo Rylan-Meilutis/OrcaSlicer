@@ -54,7 +54,8 @@ TEST_CASE("SpoolManager embeds explicit metadata without legacy note markers", "
 
     const std::string updated = SpoolManagerMetadata::update_gcode_tail(
         tail, {{"Purple PLA", "PLA", "#800080", "Purple"}});
-    CHECK_THAT(updated, Catch::Matchers::ContainsSubstring("; filament_notes = ordinary note"));
+    CHECK_THAT(updated, Catch::Matchers::ContainsSubstring(
+                            "; filament_notes = ordinary note [sm_name = Purple PLA]"));
     CHECK_THAT(updated, Catch::Matchers::ContainsSubstring("; spool_manager_filament_names = Purple PLA"));
 }
 
@@ -66,9 +67,70 @@ TEST_CASE("SpoolManager embeds explicit metadata without filament notes", "[GCod
 
     const std::string updated = SpoolManagerMetadata::update_gcode_tail(
         tail, {{"Purple PLA", "PLA", "#800080", "Purple"}});
+    CHECK_THAT(updated, Catch::Matchers::ContainsSubstring(
+                            "; filament_notes = [sm_name = Purple PLA]"));
     CHECK_THAT(updated, Catch::Matchers::ContainsSubstring("; spool_manager_filament_names = Purple PLA"));
     CHECK_THAT(updated, Catch::Matchers::ContainsSubstring("; spool_manager_filament_materials = PLA"));
     CHECK_THAT(updated, Catch::Matchers::ContainsSubstring("; spool_manager_filament_colors = #800080"));
+}
+
+TEST_CASE("Spoolman metadata uses the Nozzle Filament Validator stable identifier",
+          "[GCodeWriter][SpoolManager]")
+{
+    const std::string tail =
+        "; filament_type = PLA\n"
+        "; filament used [mm] = 10\n"
+        "; filament_notes = Keep this [sm_name = old value]\n";
+    SpoolManagerMetadata::Filament filament;
+    filament.name = "Galaxy Black";
+    filament.material = "PLA";
+    filament.spool_id = "42";
+    filament.provider = "Spoolman";
+
+    const std::string updated = SpoolManagerMetadata::update_gcode_tail(tail, {filament});
+    CHECK_THAT(updated, Catch::Matchers::ContainsSubstring(
+                            "; filament_notes = Keep this [sm_name = spoolman:42]"));
+    CHECK_THAT(updated, Catch::Matchers::ContainsSubstring(
+                            "; spool_manager_filament_spool_ids = 42"));
+    CHECK_THAT(updated, Catch::Matchers::ContainsSubstring(
+                            "; spool_manager_filament_providers = Spoolman"));
+    CHECK_THAT(updated, Catch::Matchers::ContainsSubstring(
+                            "; spool_manager_filament_validation_ids = spoolman:42"));
+}
+
+TEST_CASE("RME compatibility metadata uses its provider-qualified validator identifier",
+          "[GCodeWriter][SpoolManager]")
+{
+    const std::string tail =
+        "; filament_type = PLA;PETG\n"
+        "; filament used [mm] = 10, 20\n"
+        "; filament_notes = [sm_name = old];[sm_name = old]\n";
+    SpoolManagerMetadata::Filament internal;
+    internal.name = "RME PLA";
+    internal.spool_id = "4";
+    internal.provider = "RME compatibility";
+    internal.inventory_provider = "internal";
+    SpoolManagerMetadata::Filament delegated;
+    delegated.name = "External PETG";
+    delegated.spool_id = "91";
+    delegated.provider = "RME compatibility";
+    delegated.inventory_provider = "Spoolman Cloud";
+
+    const std::string updated = SpoolManagerMetadata::update_gcode_tail(
+        tail, {internal, delegated});
+    CHECK_THAT(updated, Catch::Matchers::ContainsSubstring(
+                            "; filament_notes = [sm_name = rme:internal:4];[sm_name = rme:spoolman-cloud:91]"));
+    CHECK_THAT(updated, Catch::Matchers::ContainsSubstring(
+                            "; spool_manager_filament_spool_ids = 4;91"));
+    CHECK_THAT(updated, Catch::Matchers::ContainsSubstring(
+                            "; spool_manager_filament_validation_ids = rme:internal:4;rme:spoolman-cloud:91"));
+
+    // Upload retry/reprocessing must replace the metadata block, not append a
+    // second set of identifiers that a host could parse ambiguously.
+    const std::string repeated = SpoolManagerMetadata::update_gcode_tail(updated, {internal, delegated});
+    const std::string key = "; spool_manager_filament_validation_ids = ";
+    REQUIRE(repeated.find(key) != std::string::npos);
+    CHECK(repeated.find(key, repeated.find(key) + key.size()) == std::string::npos);
 }
 
 TEST_CASE("SpoolManager selected spool parser preserves tool slot indices", "[GCodeWriter][SpoolManager]")
@@ -84,7 +146,8 @@ TEST_CASE("SpoolManager selected spool parser preserves tool slot indices", "[GC
     std::vector<SpoolManagerMetadata::Filament> slots;
     std::string error;
 
-    REQUIRE(SpoolManagerMetadata::parse_selected_spools(response, slots, error));
+    REQUIRE(SpoolManagerMetadata::parse_selected_spools(
+        response, slots, error, "RME compatibility"));
     REQUIRE(slots.size() == 3);
     CHECK(slots[0].name == "Galaxy PLA");
     CHECK(slots[0].material == "PLA");
@@ -103,6 +166,128 @@ TEST_CASE("SpoolManager selected spool parser rejects an unassigned machine", "[
         R"({"allSpools":[],"selectedSpools":[null,null]})", slots, error));
     CHECK_FALSE(error.empty());
     CHECK(slots.empty());
+}
+
+TEST_CASE("Spoolman tool assignments resolve against its spool inventory", "[GCodeWriter][SpoolManager]")
+{
+    const std::string response = R"({
+        "selectedSpoolIds":{"0":{"spoolId":"42"},"2":{"spoolId":"73"}},
+        "spools":[
+            {"id":42,"filament":{"name":"Galaxy Black","material":"PLA","color_hex":"112233",
+             "vendor":{"id":8,"name":"Prusament"}}},
+            {"id":73,"filament":{"name":"Signal Orange","material":"PETG","color_hex":"FF6600",
+             "vendor":{"name":"Polymaker"}}}
+        ]
+    })";
+    std::vector<SpoolManagerMetadata::Filament> slots;
+    std::string error;
+
+    REQUIRE(SpoolManagerMetadata::parse_selected_spools(response, slots, error));
+    REQUIRE(slots.size() == 3);
+    CHECK(slots[0].name == "Galaxy Black");
+    CHECK(slots[0].vendor == "Prusament");
+    CHECK(slots[0].material == "PLA");
+    CHECK(slots[0].color == "112233");
+    CHECK(slots[0].spool_id == "42");
+    CHECK(slots[0].provider == "Spoolman");
+    CHECK(slots[1].name.empty());
+    CHECK(slots[2].name == "Signal Orange");
+}
+
+TEST_CASE("generic OctoPrint filament providers preserve tool indices", "[GCodeWriter][SpoolManager]")
+{
+    const std::string response = R"({
+        "provider":"RME compatibility",
+        "data":{"tools":{
+            "1":{"spool":{"id":"roll-b","name":"Blue TPU","material":"TPU",
+                  "color":"#0000FF","manufacturer":"Example Filament"}},
+            "3":null
+        }}
+    })";
+    std::vector<SpoolManagerMetadata::Filament> slots;
+    std::string error;
+
+    REQUIRE(SpoolManagerMetadata::parse_selected_spools(response, slots, error));
+    REQUIRE(slots.size() == 4);
+    CHECK(slots[0].name.empty());
+    CHECK(slots[1].name == "Blue TPU");
+    CHECK(slots[1].vendor == "Example Filament");
+    CHECK(slots[1].spool_id == "roll-b");
+    CHECK(slots[1].provider == "RME compatibility");
+    CHECK(slots[3].name.empty());
+}
+
+TEST_CASE("RME compatibility supplies its provider name when omitted",
+          "[GCodeWriter][SpoolManager]")
+{
+    const std::string response = R"({"data":{"tools":{"0":{
+        "spool":{"id":"rme-roll-7","name":"RME PLA","material":"PLA"}
+    }}}})";
+    std::vector<SpoolManagerMetadata::Filament> slots;
+    std::string error;
+
+    REQUIRE(SpoolManagerMetadata::parse_selected_spools(
+        response, slots, error, "RME compatibility"));
+    REQUIRE(slots.size() == 1);
+    CHECK(slots[0].spool_id == "rme-roll-7");
+    CHECK(slots[0].provider == "RME compatibility");
+}
+
+TEST_CASE("RME compatibility preserves the inventory provider namespace",
+          "[GCodeWriter][SpoolManager]")
+{
+    const std::string response = R"({"schema":"rme-filament-report-v1","provider":"spoolmanager","data":{"tools":[{
+        "spool_id":"27","name":"RME delegated PLA","material":"PLA"
+    }]}})";
+    std::vector<SpoolManagerMetadata::Filament> slots;
+    std::string error;
+
+    REQUIRE(SpoolManagerMetadata::parse_selected_spools(response, slots, error));
+    REQUIRE(slots.size() == 1);
+    CHECK(slots[0].spool_id == "27");
+    CHECK(slots[0].provider == "RME compatibility");
+    CHECK(slots[0].inventory_provider == "spoolmanager");
+}
+
+TEST_CASE("FilamentManager selections expose nested spool profiles", "[GCodeWriter][SpoolManager]")
+{
+    const std::string response = R"({"selections":[
+        {"tool":0,"spool":{"id":9,"name":"Workshop Black","profile":{
+            "vendor":"Generic","material":"ABS","color":"#202020"}}},
+        {"tool":1,"spool":null}
+    ]})";
+    std::vector<SpoolManagerMetadata::Filament> slots;
+    std::string error;
+
+    REQUIRE(SpoolManagerMetadata::parse_selected_spools(response, slots, error));
+    REQUIRE(slots.size() == 2);
+    CHECK(slots[0].name == "Workshop Black");
+    CHECK(slots[0].material == "ABS");
+    CHECK(slots[0].vendor == "Generic");
+    CHECK(slots[0].spool_id == "9");
+    CHECK(slots[0].provider == "FilamentManager");
+    CHECK(slots[1].name.empty());
+}
+
+TEST_CASE("OctoPrint spool mappings prefer a roll over material and default", "[GCodeWriter][SpoolManager]")
+{
+    SpoolManagerMetadata::Filament filament;
+    filament.spool_id = "42";
+    filament.provider = "Spoolman";
+    filament.vendor = "Prusament";
+    filament.material = "PLA";
+
+    CHECK(SpoolManagerMetadata::mapped_profile_name(
+              filament,
+              {"spoolman:42=Exact Roll PLA", "42=Fallback Roll PLA"},
+              {"prusament|pla=Brand PLA", "pla=Generic PLA"},
+              "Default PLA") == "Exact Roll PLA");
+    filament.spool_id = "99";
+    CHECK(SpoolManagerMetadata::mapped_profile_name(
+              filament, {}, {" PRUSAMENT | PLA = Brand PLA"}, "Default PLA") == "Brand PLA");
+    filament.vendor = "Unknown";
+    CHECK(SpoolManagerMetadata::mapped_profile_name(
+              filament, {}, {}, "Default PLA") == "Default PLA");
 }
 
 // Arrange on a finite bed, not an unbounded InfiniteBed: the latter places items

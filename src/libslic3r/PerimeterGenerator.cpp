@@ -39,6 +39,100 @@ static WallSequence effective_wall_sequence(const PerimeterGenerator &generator)
     return generator.config->wall_sequence;
 }
 
+static void mark_shrinkage_compensation(ExtrusionEntity &entity)
+{
+    if (auto *path = dynamic_cast<ExtrusionPath *>(&entity)) {
+        path->shrinkage_compensation = true;
+    } else if (auto *multipath = dynamic_cast<ExtrusionMultiPath *>(&entity)) {
+        for (ExtrusionPath &path : multipath->paths)
+            path.shrinkage_compensation = true;
+    } else if (auto *loop = dynamic_cast<ExtrusionLoop *>(&entity)) {
+        for (ExtrusionPath &path : loop->paths)
+            path.shrinkage_compensation = true;
+    } else if (auto *collection = dynamic_cast<ExtrusionEntityCollection *>(&entity)) {
+        for (ExtrusionEntity *child : collection->entities)
+            mark_shrinkage_compensation(*child);
+    }
+}
+
+// Divide a broad buried solid region into shorter spans so its cooling stress
+// is not accumulated across the full island. Visible top regions are unioned
+// back by the callers after this operation, keeping the exterior watertight.
+static ExPolygons section_shrinkage_infill(const ExPolygons &infill,
+                                           coord_t section_spacing,
+                                           coord_t channel_width)
+{
+    if (infill.empty() || section_spacing <= 0 || channel_width <= 0)
+        return infill;
+
+    const BoundingBox bbox = get_extents(infill);
+    const Point size = bbox.size();
+    const bool cut_across_x = size.x() >= size.y();
+    const coord_t span = cut_across_x ? size.x() : size.y();
+    if (span < 2 * section_spacing + channel_width)
+        return infill;
+
+    Polygons channels;
+    const coord_t half_width = std::max<coord_t>(1, channel_width / 2);
+    const coord_t start = cut_across_x ? bbox.min.x() : bbox.min.y();
+    const coord_t end = cut_across_x ? bbox.max.x() : bbox.max.y();
+    for (coord_t position = start + section_spacing;
+         position + half_width < end;
+         position += section_spacing) {
+        if (cut_across_x) {
+            channels.emplace_back(Points{
+                {position - half_width, bbox.min.y()},
+                {position + half_width, bbox.min.y()},
+                {position + half_width, bbox.max.y()},
+                {position - half_width, bbox.max.y()}});
+        } else {
+            channels.emplace_back(Points{
+                {bbox.min.x(), position - half_width},
+                {bbox.max.x(), position - half_width},
+                {bbox.max.x(), position + half_width},
+                {bbox.min.x(), position + half_width}});
+        }
+    }
+    return channels.empty() ? infill : diff_ex(infill, channels);
+}
+
+// Interrupt the solid-to-wall stress path with small periodic pockets while
+// retaining bonded material between them. Pockets are centered on the actual
+// infill boundary, so the operation follows arbitrary outer contours and hole
+// walls instead of assuming an axis-aligned box. Callers restore visible top
+// fill afterward; these pockets therefore remain an internal relief feature.
+static ExPolygons perforate_shrinkage_interface(const ExPolygons &infill,
+                                                coord_t pocket_spacing,
+                                                coord_t pocket_diameter)
+{
+    if (infill.empty() || pocket_spacing <= 0 || pocket_diameter <= 0)
+        return infill;
+
+    // Always retain a real ligament between neighboring pockets, even if an
+    // old or hand-edited profile supplies spacing smaller than the diameter.
+    pocket_spacing = std::max(pocket_spacing,
+                              coord_t(std::ceil(1.5 * pocket_diameter)));
+    const double radius = 0.5 * double(pocket_diameter);
+    const Polygon pocket_template = make_circle(
+        radius, std::max(1., 0.08 * radius));
+    Polygons pockets;
+    const auto add_boundary_pockets = [&](const Polygon &boundary) {
+        const Points centers = boundary.equally_spaced_points(double(pocket_spacing));
+        pockets.reserve(pockets.size() + centers.size());
+        for (const Point &center : centers) {
+            Polygon pocket = pocket_template;
+            pocket.translate(center);
+            pockets.emplace_back(std::move(pocket));
+        }
+    };
+    for (const ExPolygon &polygon : infill) {
+        add_boundary_pockets(polygon.contour);
+        for (const Polygon &hole : polygon.holes)
+            add_boundary_pockets(hole);
+    }
+    return pockets.empty() ? infill : diff_ex(infill, pockets);
+}
+
 // Hierarchy of perimeters.
 class PerimeterGeneratorLoop {
 public:
@@ -610,13 +704,12 @@ static bool has_bottom_shell_layers(const PrintRegionConfig &config)
     return config.bottom_shell_layers.value > 0;
 }
 
-// ORCA: the inner walls are only given up when a top fill takes their space, and it has to actually reach it -
-// a 0% top surface density leaves no fill at all, and without top_surface_expansion the fill never grows over
-// them. Either way the original generation is kept (re-onion the not-top region), which is what users of
-// only_one_wall_top alone have always got.
+// ORCA: the inner walls are only given up when an explicitly expanded top fill takes their space.
+// Non-planar top surfaces retain the normal perimeter structure.
 static bool top_fill_replaces_inner_walls(const PrintRegionConfig &config)
 {
-    return has_top_shell_layers(config) && config.top_surface_density.value > 0 && config.top_surface_expansion.value > 0;
+    return has_top_shell_layers(config) && config.top_surface_density.value > 0 &&
+           config.top_surface_expansion.value > 0;
 }
 
 // ORCA: only_one_wall_top - cheap per-vertex classification of a wall against the top surface. Only Partial
@@ -1401,13 +1494,39 @@ void PerimeterGenerator::process_classic()
     for (const Surface &surface : all_surfaces)
         surface_exp.push_back(surface.expolygon);
     std::vector<size_t> surface_order = chain_expolygons(surface_exp);
-    // ORCA: neither one-wall option has a surface to act on without the shell behind it, see
+    // ORCA: neither one-wall mode has a surface to act on without the shell behind it, see
     // has_top_shell_layers() / has_bottom_shell_layers(). Gated here so every use below - including the
     // topmost and first layers - sees the same answer.
-    const bool only_one_wall_top         = this->config->only_one_wall_top && has_top_shell_layers(*this->config);
+    const bool only_one_wall_top         = this->config->only_one_wall_top &&
+                                           has_top_shell_layers(*this->config);
     const bool only_one_wall_first_layer = this->config->only_one_wall_first_layer && has_bottom_shell_layers(*this->config);
     for (size_t order_idx = 0; order_idx < surface_order.size(); order_idx++) {
         const Surface &surface = all_surfaces[surface_order[order_idx]];
+        const LocalizedShrinkageStrategy shrinkage_strategy =
+            this->config->localized_shrinkage_strategy.value;
+        const double shrinkage_expansion = surface.hull_line_transition ?
+            localized_shrinkage_contour_compensation(
+                shrinkage_strategy, this->config->hull_line_perimeter_expansion.value) : 0.;
+        const coord_t shrinkage_relief = surface.hull_line_transition ?
+            scale_(localized_shrinkage_wall_relief(
+                shrinkage_strategy, this->config->localized_shrinkage_infill_wall_gap.value)) : 0;
+        const coord_t shrinkage_section_width = surface.hull_line_transition ?
+            scale_(localized_shrinkage_section_width(
+                shrinkage_strategy, this->config->localized_shrinkage_section_width.value)) : 0;
+        const coord_t shrinkage_section_spacing = surface.hull_line_transition ?
+            scale_(localized_shrinkage_section_spacing(
+                shrinkage_strategy, this->config->localized_shrinkage_section_spacing.value)) : 0;
+        const coord_t shrinkage_perforation_diameter = surface.hull_line_transition ?
+            scale_(localized_shrinkage_perforation_diameter(
+                shrinkage_strategy, this->config->localized_shrinkage_perforation_diameter.value)) : 0;
+        const coord_t shrinkage_perforation_spacing = surface.hull_line_transition ?
+            scale_(localized_shrinkage_perforation_spacing(
+                shrinkage_strategy, this->config->localized_shrinkage_perforation_spacing.value)) : 0;
+        const bool shrinkage_preview = surface.hull_line_transition &&
+            (shrinkage_expansion > 0. || shrinkage_relief > 0 ||
+             shrinkage_section_width > 0 || shrinkage_perforation_diameter > 0 ||
+             (surface.extra_perimeters > 0 &&
+              shrinkage_strategy != LocalizedShrinkageStrategy::Disabled));
         // detect how many perimeters must be generated for this island
         int loop_number = this->config->wall_loops + surface.extra_perimeters - 1;  // 0-indexed loops
         int sparse_infill_density = this->config->sparse_infill_density.value;
@@ -1419,7 +1538,10 @@ void PerimeterGenerator::process_classic()
         if (loop_number > 0 && only_one_wall_top && this->upper_slices == nullptr)
             loop_number = 0;
 
-        ExPolygons last        = union_ex(surface.expolygon.simplify_p(surface_simplify_resolution));
+        ExPolygons last = shrinkage_expansion > 0. ?
+            offset_ex(surface.expolygon.simplify_p(surface_simplify_resolution),
+                      scale_(shrinkage_expansion)) :
+            union_ex(surface.expolygon.simplify_p(surface_simplify_resolution));
         ExPolygons gaps;
         ExPolygons top_fills;
         ExPolygons fill_clip;
@@ -1810,8 +1932,11 @@ void PerimeterGenerator::process_classic()
             }
             
             // append perimeters for this slice as a collection
-            if (! entities.empty())
+            if (!entities.empty()) {
+                if (shrinkage_preview)
+                    mark_shrinkage_compensation(entities);
                 this->loops->append(entities);
+            }
 
         } // for each loop of an island
 
@@ -1895,6 +2020,8 @@ void PerimeterGenerator::process_classic()
                 infill_peri_overlap = coord_t(scale_(this->config->infill_wall_overlap.get_abs_value(unscale<double>(inset + solid_infill_spacing / 2))));
                 top_infill_peri_overlap = coord_t(scale_(this->config->top_bottom_infill_wall_overlap.get_abs_value(unscale<double>(inset + solid_infill_spacing / 2))));
             }
+            infill_peri_overlap -= shrinkage_relief;
+            top_infill_peri_overlap -= shrinkage_relief;
             inset -= infill_peri_overlap;
         }
         // simplify infill contours according to resolution
@@ -1909,6 +2036,11 @@ void PerimeterGenerator::process_classic()
             not_filled_exp,
             float(-inset - min_perimeter_infill_spacing / 2.),
             float(min_perimeter_infill_spacing / 2.));
+        infill_exp = section_shrinkage_infill(
+            infill_exp, shrinkage_section_spacing, shrinkage_section_width);
+        infill_exp = perforate_shrinkage_interface(
+            infill_exp, shrinkage_perforation_spacing,
+            shrinkage_perforation_diameter);
         // append infill areas to fill_surfaces
         //if any top_fills, grow them by ext_perimeter_spacing/2 to have the real un-anchored fill
         ExPolygons top_infill_exp = intersection_ex(fill_clip, offset_ex(top_fills, double(ext_perimeter_spacing / 2)));
@@ -1993,6 +2125,13 @@ void PerimeterGenerator::process_no_bridge(Surfaces& all_surfaces, coord_t perim
 
         for (size_t surface_idx = 0; surface_idx < all_surfaces.size(); surface_idx++) {
             Surface* surface = &all_surfaces[surface_idx];
+            // Sacrificial counterbore bridging can only modify a surface
+            // containing a hole (the accepted bridgeable result is already
+            // discarded below when holes is empty). Avoid constructing and
+            // scanning a multi-angle BridgeDetector for ordinary hull and
+            // wall surfaces where the operation is provably a no-op.
+            if (surface->expolygon.holes.empty())
+                continue;
             ExPolygons last = { surface->expolygon };
             //compute our unsupported surface
             ExPolygons unsupported = diff_ex(last, *this->lower_slices, ApplySafetyOffset::Yes);
@@ -2385,14 +2524,40 @@ void PerimeterGenerator::process_arachne()
     process_no_bridge(all_surfaces, perimeter_spacing, ext_perimeter_width);
     // BBS: don't simplify too much which influence arc fitting when export gcode if arc_fitting is enabled
     double surface_simplify_resolution = (print_config->enable_arc_fitting && !this->has_fuzzy_skin) ? 0.2 * m_scaled_resolution : m_scaled_resolution;
-    // ORCA: neither one-wall option has a surface to act on without the shell behind it, see
+    // ORCA: neither one-wall mode has a surface to act on without the shell behind it, see
     // has_top_shell_layers() / has_bottom_shell_layers(). Gated here so every use below - including the
     // topmost and first layers - sees the same answer.
-    const bool only_one_wall_top         = this->config->only_one_wall_top && has_top_shell_layers(*this->config);
+    const bool only_one_wall_top         = this->config->only_one_wall_top &&
+                                           has_top_shell_layers(*this->config);
     const bool only_one_wall_first_layer = this->config->only_one_wall_first_layer && has_bottom_shell_layers(*this->config);
     // we need to process each island separately because we might have different
     // extra perimeters for each one
     for (const Surface& surface : all_surfaces) {
+        const LocalizedShrinkageStrategy shrinkage_strategy =
+            this->config->localized_shrinkage_strategy.value;
+        const double shrinkage_expansion_mm = surface.hull_line_transition ?
+            localized_shrinkage_contour_compensation(
+                shrinkage_strategy, this->config->hull_line_perimeter_expansion.value) : 0.;
+        const coord_t shrinkage_relief = surface.hull_line_transition ?
+            scale_(localized_shrinkage_wall_relief(
+                shrinkage_strategy, this->config->localized_shrinkage_infill_wall_gap.value)) : 0;
+        const coord_t shrinkage_section_width = surface.hull_line_transition ?
+            scale_(localized_shrinkage_section_width(
+                shrinkage_strategy, this->config->localized_shrinkage_section_width.value)) : 0;
+        const coord_t shrinkage_section_spacing = surface.hull_line_transition ?
+            scale_(localized_shrinkage_section_spacing(
+                shrinkage_strategy, this->config->localized_shrinkage_section_spacing.value)) : 0;
+        const coord_t shrinkage_perforation_diameter = surface.hull_line_transition ?
+            scale_(localized_shrinkage_perforation_diameter(
+                shrinkage_strategy, this->config->localized_shrinkage_perforation_diameter.value)) : 0;
+        const coord_t shrinkage_perforation_spacing = surface.hull_line_transition ?
+            scale_(localized_shrinkage_perforation_spacing(
+                shrinkage_strategy, this->config->localized_shrinkage_perforation_spacing.value)) : 0;
+        const bool shrinkage_preview = surface.hull_line_transition &&
+            (shrinkage_expansion_mm > 0. || shrinkage_relief > 0 ||
+             shrinkage_section_width > 0 || shrinkage_perforation_diameter > 0 ||
+             (surface.extra_perimeters > 0 &&
+              shrinkage_strategy != LocalizedShrinkageStrategy::Disabled));
         coord_t bead_width_0 = ext_perimeter_spacing;
         // detect how many perimeters must be generated for this island
         int loop_number = this->config->wall_loops + surface.extra_perimeters - 1; // 0-indexed loops
@@ -2412,9 +2577,11 @@ void PerimeterGenerator::process_arachne()
         
         auto apply_precise_outer_wall = config->precise_outer_wall && wall_sequence == WallSequence::InnerOuter;
         // Orca: properly adjust offset for the outer wall if precise_outer_wall is enabled.
+        const double hull_line_expansion = scale_(shrinkage_expansion_mm);
         ExPolygons last = offset_ex(surface.expolygon.simplify_p(surface_simplify_resolution),
-                       apply_precise_outer_wall? -float(ext_perimeter_width - ext_perimeter_spacing )
-                                                 : -float(ext_perimeter_width / 2. - ext_perimeter_spacing / 2.));
+                       (apply_precise_outer_wall ? -float(ext_perimeter_width - ext_perimeter_spacing)
+                                                 : -float(ext_perimeter_width / 2. - ext_perimeter_spacing / 2.)) +
+                       hull_line_expansion);
         
         Arachne::WallToolPathsParams input_params = Arachne::make_paths_params(this->layer_id, *object_config, *print_config);
         // Set params is_top_or_bottom_layer for adjusting short-wall removal sensitivity.
@@ -2747,6 +2914,8 @@ void PerimeterGenerator::process_arachne()
                 reorient_perimeters(extrusion_coll, steep_overhang_contour, steep_overhang_hole,
                                     this->config->overhang_reverse_internal_only);
             }
+            if (shrinkage_preview)
+                mark_shrinkage_compensation(extrusion_coll);
             this->loops->append(extrusion_coll);
         }
 
@@ -2773,6 +2942,8 @@ void PerimeterGenerator::process_arachne()
             inset = coord_t(scale_(this->config->top_bottom_infill_wall_overlap.get_abs_value(unscale<double>(inset))));
         else
             inset = coord_t(scale_(this->config->infill_wall_overlap.get_abs_value(unscale<double>(inset))));
+        inset -= shrinkage_relief;
+        top_inset -= shrinkage_relief;
         
         // simplify infill contours according to resolution
         Polygons pp;
@@ -2786,6 +2957,11 @@ void PerimeterGenerator::process_arachne()
             not_filled_exp,
             float(-min_perimeter_infill_spacing / 2.),
             float(inset + min_perimeter_infill_spacing / 2.));
+        infill_exp = section_shrinkage_infill(
+            infill_exp, shrinkage_section_spacing, shrinkage_section_width);
+        infill_exp = perforate_shrinkage_interface(
+            infill_exp, shrinkage_perforation_spacing,
+            shrinkage_perforation_diameter);
         // append infill areas to fill_surfaces
         if (!top_expolygons.empty()) {
             infill_exp = union_ex(infill_exp, offset_ex(top_expolygons, double(top_inset)));

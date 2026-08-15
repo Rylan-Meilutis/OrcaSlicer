@@ -74,6 +74,14 @@ struct Settings
 		        true, // SupportTransition
 		        true, // Mixed
 		        true, // ArcOverhang
+		        true, // ArcBridge
+		        true, // NonplanarSurface
+		        true, // NonplanarSupport
+		        true, // StaggeredPerimeter
+		        true, // NonplanarInfill
+		        true, // SmoothOuterWall
+		        true, // NonplanarInterlockingWall
+		        true, // ShrinkageCompensation
 		};
 };
 

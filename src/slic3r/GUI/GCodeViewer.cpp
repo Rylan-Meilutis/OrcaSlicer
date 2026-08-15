@@ -636,6 +636,14 @@ static std::string to_string(libvgcode::EGCodeExtrusionRole role)
     case libvgcode::EGCodeExtrusionRole::SupportTransition:        { return _u8L("Support transition"); }
     case libvgcode::EGCodeExtrusionRole::Mixed:                    { return _u8L("Mixed"); }
     case libvgcode::EGCodeExtrusionRole::ArcOverhang:              { return _u8L("Arc overhang"); }
+    case libvgcode::EGCodeExtrusionRole::ArcBridge:                { return _u8L("Arc bridge"); }
+    case libvgcode::EGCodeExtrusionRole::NonplanarSurface:         { return _u8L("Non-planar top surface"); }
+    case libvgcode::EGCodeExtrusionRole::NonplanarSupport:         { return _u8L("Non-planar transition"); }
+    case libvgcode::EGCodeExtrusionRole::NonplanarInfill:          { return _u8L("Non-planar interlocking infill"); }
+    case libvgcode::EGCodeExtrusionRole::StaggeredPerimeter:       { return _u8L("Brick wall"); }
+    case libvgcode::EGCodeExtrusionRole::SmoothOuterWall:          { return _u8L("Smooth outer wall"); }
+    case libvgcode::EGCodeExtrusionRole::NonplanarInterlockingWall:{ return _u8L("Interlocking inner wall"); }
+    case libvgcode::EGCodeExtrusionRole::ShrinkageCompensation:   { return _u8L("Shrinkage compensation"); }
     default:                                                       { return _u8L("Unknown"); }
     }
 }
@@ -1673,7 +1681,15 @@ void GCodeViewer::load_as_gcode(const GCodeProcessorResult& gcode_result, const 
             // ORCA
             libvgcode::EGCodeExtrusionRole::BottomSurface, libvgcode::EGCodeExtrusionRole::InternalBridgeInfill, libvgcode::EGCodeExtrusionRole::Brim,
             libvgcode::EGCodeExtrusionRole::SupportTransition, libvgcode::EGCodeExtrusionRole::Mixed,
-            libvgcode::EGCodeExtrusionRole::ArcOverhang
+            libvgcode::EGCodeExtrusionRole::ArcOverhang,
+            libvgcode::EGCodeExtrusionRole::ArcBridge,
+            libvgcode::EGCodeExtrusionRole::NonplanarSurface,
+            libvgcode::EGCodeExtrusionRole::NonplanarSupport,
+            libvgcode::EGCodeExtrusionRole::NonplanarInfill,
+            libvgcode::EGCodeExtrusionRole::StaggeredPerimeter,
+            libvgcode::EGCodeExtrusionRole::SmoothOuterWall,
+            libvgcode::EGCodeExtrusionRole::NonplanarInterlockingWall,
+            libvgcode::EGCodeExtrusionRole::ShrinkageCompensation
             });
     m_paths_bounding_box = BoundingBoxf3(libvgcode::convert(bbox[0]).cast<double>(), libvgcode::convert(bbox[1]).cast<double>());
 

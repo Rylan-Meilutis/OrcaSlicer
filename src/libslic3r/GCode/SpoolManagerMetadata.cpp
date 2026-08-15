@@ -1,6 +1,7 @@
 #include "SpoolManagerMetadata.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <fstream>
 #include <functional>
 #include <regex>
@@ -19,6 +20,94 @@ namespace {
 constexpr size_t tail_line_count = 1000;
 constexpr size_t copy_buffer_size = 64 * 1024;
 
+std::string scalar_string(const nlohmann::json &value)
+{
+    if (value.is_string())
+        return value.get<std::string>();
+    if (value.is_number_integer())
+        return std::to_string(value.get<long long>());
+    if (value.is_number_unsigned())
+        return std::to_string(value.get<unsigned long long>());
+    return {};
+}
+
+std::string object_string(const nlohmann::json &object, std::initializer_list<const char *> keys)
+{
+    if (!object.is_object())
+        return {};
+    for (const char *key : keys) {
+        const auto value = object.find(key);
+        if (value != object.end()) {
+            const std::string result = scalar_string(*value);
+            if (!result.empty())
+                return result;
+        }
+    }
+    return {};
+}
+
+Filament filament_from_spool(const nlohmann::json &spool, const std::string &provider)
+{
+    if (!spool.is_object())
+        return {};
+
+    const auto nested_spool = spool.find("spool");
+    if (nested_spool != spool.end() && nested_spool->is_object())
+        return filament_from_spool(*nested_spool, provider);
+    const auto filament_it = spool.find("filament");
+    const auto profile_it = spool.find("profile");
+    const nlohmann::json &filament = filament_it != spool.end() && filament_it->is_object() ? *filament_it :
+                                     profile_it != spool.end() && profile_it->is_object() ? *profile_it : spool;
+    std::string vendor;
+    const auto vendor_it = filament.find("vendor");
+    if (vendor_it != filament.end()) {
+        vendor = vendor_it->is_object() ? object_string(*vendor_it, {"name", "displayName"})
+                                        : scalar_string(*vendor_it);
+    }
+    if (vendor.empty())
+        vendor = object_string(spool, {"vendor", "manufacturer"});
+
+    Filament result;
+    result.name       = object_string(spool, {"displayName", "display_name", "name"});
+    if (result.name.empty())
+        result.name   = object_string(filament, {"name", "displayName", "display_name"});
+    result.material   = object_string(filament, {"material", "type", "filament_type"});
+    result.color      = object_string(filament, {"color", "color_hex", "colour", "colour_hex"});
+    result.color_name = object_string(filament, {"colorName", "color_name", "colourName", "colour_name"});
+    result.vendor     = std::move(vendor);
+    result.spool_id   = object_string(spool, {"spoolId", "spool_id", "id"});
+    result.provider   = provider;
+    result.inventory_provider = object_string(spool, {"provider", "inventory_provider"});
+    if (result.name.empty() && (!result.vendor.empty() || !result.material.empty())) {
+        result.name = result.vendor;
+        if (!result.name.empty() && !result.material.empty())
+            result.name += ' ';
+        result.name += result.material;
+    }
+    return result;
+}
+
+const nlohmann::json *find_spool(const nlohmann::json &spools, const std::string &id)
+{
+    if (!spools.is_array() || id.empty())
+        return nullptr;
+    for (const nlohmann::json &spool : spools)
+        if (spool.is_object() && object_string(spool, {"spoolId", "spool_id", "id"}) == id)
+            return &spool;
+    return nullptr;
+}
+
+bool finish_slots(std::vector<Filament> &slots, std::string &error)
+{
+    if (!slots.empty() && std::any_of(slots.begin(), slots.end(), [](const Filament &filament) {
+            return !filament.name.empty() || !filament.spool_id.empty();
+        }))
+        return true;
+    slots.clear();
+    error = "The OctoPrint filament provider has no spools assigned to its tools or slots.";
+    return false;
+}
+
 std::string sanitize_metadata_value(std::string value)
 {
     std::replace_if(value.begin(), value.end(), [](char ch) {
@@ -27,8 +116,36 @@ std::string sanitize_metadata_value(std::string value)
     return value;
 }
 
+std::string normalized_identifier_component(std::string value)
+{
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    std::replace_if(value.begin(), value.end(), [](unsigned char ch) {
+        return std::isspace(ch) != 0;
+    }, '-');
+    return sanitize_metadata_value(std::move(value));
+}
+
+std::string validation_spool_name(const Filament &filament)
+{
+    if (filament.spool_id.empty())
+        return filament.name;
+
+    const std::string provider = normalized_identifier_component(filament.provider);
+    if (provider == "spoolman")
+        return "spoolman:" + sanitize_metadata_value(filament.spool_id);
+    if (provider.find("rme") != std::string::npos) {
+        std::string inventory_provider = normalized_identifier_component(filament.inventory_provider);
+        if (inventory_provider.empty() || inventory_provider.find("rme") != std::string::npos)
+            inventory_provider = "internal";
+        return "rme:" + inventory_provider + ':' + sanitize_metadata_value(filament.spool_id);
+    }
+    return filament.name;
+}
+
 std::string metadata_line(const char *key, const std::vector<Filament> &filaments,
-                          const std::function<const std::string &(const Filament &)> &value)
+                          const std::function<std::string(const Filament &)> &value)
 {
     std::string output = std::string("; ") + key + " = ";
     for (size_t index = 0; index < filaments.size(); ++index) {
@@ -80,52 +197,200 @@ std::pair<std::string, std::streamoff> read_tail(const fs::path &path)
 
 } // namespace
 
-bool parse_selected_spools(const std::string &response, std::vector<Filament> &slots, std::string &error)
+bool parse_selected_spools(const std::string &response, std::vector<Filament> &slots,
+                           std::string &error,
+                           const std::string &fallback_provider)
 {
     try {
         const nlohmann::json root = nlohmann::json::parse(response);
-        const auto selected = root.find("selectedSpools");
-        if (selected == root.end() || !selected->is_array()) {
-            error = "The OctoPrint SpoolManager response did not contain selectedSpools.";
-            return false;
-        }
-
         slots.clear();
-        slots.reserve(selected->size());
-        bool has_assigned_spool = false;
-        for (const nlohmann::json &entry : *selected) {
-            if (entry.is_null()) {
-                slots.emplace_back();
-                continue;
-            }
-            if (!entry.is_object()) {
-                error = "The OctoPrint SpoolManager selectedSpools list contained an invalid slot.";
-                slots.clear();
-                return false;
-            }
 
-            Filament spool{
-                entry.value("displayName", ""),
-                entry.value("material", ""),
-                entry.value("color", ""),
-                entry.value("colorName", ""),
-                entry.value("vendor", "")
+        const nlohmann::json *payload = &root;
+        const auto data = root.find("data");
+        if (data != root.end() && data->is_object())
+            payload = &*data;
+        const std::string reported_provider = object_string(root, {"provider"});
+        const bool rme_filament_report = object_string(root, {"schema"}) == "rme-filament-report-v1";
+        const auto provider_or = [&](const char *native_provider) {
+            // In the RME report, the top-level provider names the backing
+            // inventory (for example `spoolmanager`), not the HTTP backend.
+            if (rme_filament_report)
+                return fallback_provider.empty() ? std::string("RME compatibility") : fallback_provider;
+            if (!reported_provider.empty())
+                return reported_provider;
+            return fallback_provider.empty() ? std::string(native_provider) :
+                                               fallback_provider;
+        };
+
+        // Legacy OllisGit SpoolManager and the generic compatibility format
+        // may return the complete assigned spool objects directly.
+        auto selected = payload->find("selectedSpools");
+        if (selected == payload->end())
+            selected = payload->find("selected_spools");
+        if (selected != payload->end() && selected->is_array()) {
+            slots.reserve(selected->size());
+            for (const nlohmann::json &entry : *selected)
+                slots.emplace_back(entry.is_null() ? Filament{} :
+                    filament_from_spool(entry, provider_or("SpoolManager")));
+            return finish_slots(slots, error);
+        }
+
+        // OllisGit FilamentManager returns one selection per tool and nests
+        // its material data under spool.profile.
+        const auto selections = payload->find("selections");
+        if (selections != payload->end() && selections->is_array()) {
+            for (size_t position = 0; position < selections->size(); ++position) {
+                const nlohmann::json &selection = (*selections)[position];
+                size_t index = position;
+                if (selection.is_object()) {
+                    const std::string tool = object_string(selection, {"tool", "toolIdx", "tool_index"});
+                    if (!tool.empty()) {
+                        try { index = static_cast<size_t>(std::stoul(tool)); }
+                        catch (...) {}
+                    }
+                }
+                if (slots.size() <= index)
+                    slots.resize(index + 1);
+                slots[index] = filament_from_spool(
+                    selection, provider_or("FilamentManager"));
+            }
+            return finish_slots(slots, error);
+        }
+
+        const auto spools_it = payload->find("spools");
+        const nlohmann::json empty_spools = nlohmann::json::array();
+        const nlohmann::json &spools = spools_it != payload->end() ? *spools_it : empty_spools;
+
+        // The maintained OctoPrint Spoolman plugin stores tool assignments as
+        // selectedSpoolIds and reports the Spoolman inventory separately.
+        auto ids = payload->find("selectedSpoolIds");
+        if (ids == payload->end())
+            ids = payload->find("selected_spool_ids");
+        if (ids != payload->end() && ids->is_object()) {
+            size_t slot_count = 0;
+            for (const auto &[tool, assignment] : ids->items()) {
+                try { slot_count = std::max(slot_count, static_cast<size_t>(std::stoul(tool) + 1)); }
+                catch (...) { continue; }
+            }
+            slots.resize(slot_count);
+            for (const auto &[tool, assignment] : ids->items()) {
+                size_t index;
+                try { index = static_cast<size_t>(std::stoul(tool)); }
+                catch (...) { continue; }
+                const std::string id = assignment.is_object()
+                    ? object_string(assignment, {"spoolId", "spool_id", "id"}) : scalar_string(assignment);
+                if (const nlohmann::json *spool = find_spool(spools, id))
+                    slots[index] = filament_from_spool(
+                        *spool, provider_or("Spoolman"));
+                else {
+                    slots[index].spool_id = id;
+                    slots[index].provider = provider_or("Spoolman");
+                }
+            }
+            return finish_slots(slots, error);
+        }
+
+        // Provider-neutral response for RME compatibility and third-party
+        // plugins: tools may be an array or an object keyed by tool number.
+        const auto tools = payload->find("tools");
+        if (tools != payload->end() && (tools->is_array() || tools->is_object())) {
+            const auto append_tool = [&](size_t index, const nlohmann::json &tool) {
+                if (slots.size() <= index)
+                    slots.resize(index + 1);
+                const nlohmann::json *source = &tool;
+                if (tool.is_object()) {
+                    const auto nested = tool.find("spool");
+                    if (nested != tool.end() && nested->is_object())
+                        source = &*nested;
+                    else if (const nlohmann::json *spool = find_spool(
+                                 spools, object_string(tool, {"spoolId", "spool_id", "id"})))
+                        source = spool;
+                }
+                slots[index] = filament_from_spool(
+                    *source, provider_or("OctoPrint"));
+                if (tool.is_object()) {
+                    const std::string inventory_provider = object_string(
+                        tool, {"provider", "inventory_provider"});
+                    if (!inventory_provider.empty())
+                        slots[index].inventory_provider = inventory_provider;
+                    else if (rme_filament_report)
+                        slots[index].inventory_provider = reported_provider;
+                    if (slots[index].spool_id.empty())
+                        slots[index].spool_id = object_string(tool, {"spoolId", "spool_id", "id"});
+                }
             };
-            has_assigned_spool |= !spool.name.empty();
-            slots.emplace_back(std::move(spool));
+            if (tools->is_array()) {
+                for (size_t index = 0; index < tools->size(); ++index)
+                    append_tool(index, (*tools)[index]);
+            } else {
+                for (const auto &[tool, value] : tools->items()) {
+                    try { append_tool(static_cast<size_t>(std::stoul(tool)), value); }
+                    catch (...) { continue; }
+                }
+            }
+            return finish_slots(slots, error);
         }
 
-        if (slots.empty() || !has_assigned_spool) {
-            error = "OctoPrint SpoolManager has no spools assigned to its tools or slots.";
-            slots.clear();
-            return false;
-        }
+        error = "The OctoPrint filament provider response did not contain recognized tool assignments.";
+        return false;
     } catch (const std::exception &exception) {
         error = exception.what();
         slots.clear();
         return false;
     }
     return true;
+}
+
+std::string mapped_profile_name(const Filament &filament,
+                                const std::vector<std::string> &spool_mappings,
+                                const std::vector<std::string> &material_mappings,
+                                const std::string &default_profile)
+{
+    const auto normalized = [](std::string value) {
+        std::transform(value.begin(), value.end(), value.begin(),
+                       [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+        value.erase(std::remove_if(value.begin(), value.end(),
+                                   [](unsigned char ch) { return std::isspace(ch) != 0; }),
+                    value.end());
+        return value;
+    };
+    const auto lookup = [&normalized](const std::vector<std::string> &mappings,
+                                      const std::vector<std::string> &keys) {
+        for (const std::string &mapping : mappings) {
+            const size_t separator = mapping.find('=');
+            if (separator == std::string::npos)
+                continue;
+            const std::string key = normalized(mapping.substr(0, separator));
+            if (std::find(keys.begin(), keys.end(), key) == keys.end())
+                continue;
+            std::string profile = mapping.substr(separator + 1);
+            const size_t first = profile.find_first_not_of(" \t");
+            const size_t last = profile.find_last_not_of(" \t");
+            return first == std::string::npos ? std::string() : profile.substr(first, last - first + 1);
+        }
+        return std::string();
+    };
+
+    const std::string spool_id = normalized(filament.spool_id);
+    if (!spool_id.empty()) {
+        std::vector<std::string> keys{spool_id};
+        const std::string provider = normalized(filament.provider);
+        if (!provider.empty())
+            keys.insert(keys.begin(), provider + ':' + spool_id);
+        if (std::string profile = lookup(spool_mappings, keys); !profile.empty())
+            return profile;
+    }
+
+    const std::string material = normalized(filament.material);
+    if (!material.empty()) {
+        std::vector<std::string> keys{material};
+        const std::string vendor = normalized(filament.vendor);
+        if (!vendor.empty())
+            keys.insert(keys.begin(), vendor + '|' + material);
+        if (std::string profile = lookup(material_mappings, keys); !profile.empty())
+            return profile;
+    }
+    return default_profile;
 }
 
 std::string update_gcode_tail(const std::string &gcode_tail, const std::vector<Filament> &filaments)
@@ -137,7 +402,7 @@ std::string update_gcode_tail(const std::string &gcode_tail, const std::vector<F
 
     std::string output = gcode_tail;
     static const std::regex metadata_re(
-        R"((^|\n); spool_manager_filament_(names|materials|colors) = [^\r\n]*(\r?\n|$))");
+        R"((^|\n); spool_manager_filament_(names|materials|colors|spool_ids|providers|validation_ids) = [^\r\n]*)");
     output = std::regex_replace(output, metadata_re, "$1");
 
     size_t filament_count = 0;
@@ -162,18 +427,27 @@ std::string update_gcode_tail(const std::string &gcode_tail, const std::vector<F
     }
 
     std::smatch notes_match;
+    std::string generated_notes_metadata;
     if (std::regex_search(output, notes_match, filament_notes_re)) {
         std::vector<std::string> notes;
         std::stringstream notes_stream(notes_match[2].str());
         for (std::string note; std::getline(notes_stream, note, ';');)
             notes.emplace_back(std::move(note));
+        notes.resize(std::max(notes.size(), std::min(filament_count, filaments.size())));
 
         for (size_t index = 0; index < notes.size() && index < filaments.size(); ++index) {
-            if (filaments[index].name.empty() || !std::regex_search(notes[index], spool_name_re))
+            const std::string validation_name = validation_spool_name(filaments[index]);
+            if (validation_name.empty())
                 continue;
-            notes[index] = std::regex_replace(
-                notes[index], spool_name_re, "[sm_name = " + sanitize_metadata_value(filaments[index].name) + "]",
-                std::regex_constants::format_first_only);
+            const std::string marker = "[sm_name = " + sanitize_metadata_value(validation_name) + "]";
+            if (std::regex_search(notes[index], spool_name_re))
+                notes[index] = std::regex_replace(notes[index], spool_name_re, marker,
+                                                  std::regex_constants::format_first_only);
+            else {
+                if (!notes[index].empty() && !std::isspace(static_cast<unsigned char>(notes[index].back())))
+                    notes[index] += ' ';
+                notes[index] += marker;
+            }
         }
 
         std::string replacement = notes_match[1].str() + "; filament_notes = ";
@@ -183,15 +457,34 @@ std::string update_gcode_tail(const std::string &gcode_tail, const std::vector<F
             replacement += notes[index];
         }
         output.replace(static_cast<size_t>(notes_match.position()), static_cast<size_t>(notes_match.length()), replacement);
+    } else if (!filaments.empty()) {
+        generated_notes_metadata = "; filament_notes = ";
+        const size_t note_count = filament_count == 0 ? filaments.size() :
+                                  std::min(filament_count, filaments.size());
+        for (size_t index = 0; index < note_count; ++index) {
+            if (index > 0)
+                generated_notes_metadata += ';';
+            const std::string validation_name = validation_spool_name(filaments[index]);
+            if (!validation_name.empty())
+                generated_notes_metadata += "[sm_name = " + sanitize_metadata_value(validation_name) + "]";
+        }
+        generated_notes_metadata += '\n';
     }
 
     const std::string metadata =
+        generated_notes_metadata +
         metadata_line("spool_manager_filament_names", filaments,
-                      [](const Filament &filament) -> const std::string & { return filament.name; }) +
+                      [](const Filament &filament) { return filament.name; }) +
         metadata_line("spool_manager_filament_materials", filaments,
-                      [](const Filament &filament) -> const std::string & { return filament.material; }) +
+                      [](const Filament &filament) { return filament.material; }) +
         metadata_line("spool_manager_filament_colors", filaments,
-                      [](const Filament &filament) -> const std::string & { return filament.color; });
+                      [](const Filament &filament) { return filament.color; }) +
+        metadata_line("spool_manager_filament_spool_ids", filaments,
+                      [](const Filament &filament) { return filament.spool_id; }) +
+        metadata_line("spool_manager_filament_providers", filaments,
+                      [](const Filament &filament) { return filament.provider; }) +
+        metadata_line("spool_manager_filament_validation_ids", filaments,
+                      [](const Filament &filament) { return validation_spool_name(filament); });
 
     size_t insertion_position = output.size();
     if (std::regex_search(output, notes_match, filament_notes_re))

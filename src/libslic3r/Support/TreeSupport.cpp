@@ -1725,7 +1725,7 @@ void TreeSupport::generate()
 
     // Generate overhang areas
     profiler.stage_start(STAGE_DETECT_OVERHANGS);
-    m_object->print()->set_status(55, _u8L("Generating support"));
+    m_object->print()->set_status(55, _u8L("Detecting tree support overhangs"));
     detect_overhangs();
     profiler.stage_finish(STAGE_DETECT_OVERHANGS);
 
@@ -1746,22 +1746,23 @@ void TreeSupport::generate()
 
     //Drop nodes to lower layers.
     profiler.stage_start(STAGE_DROP_DOWN_NODES);
-    m_object->print()->set_status(60, _u8L("Generating support"));
+    m_object->print()->set_status(60, _u8L("Propagating tree support branches"));
     drop_nodes();
     profiler.stage_finish(STAGE_DROP_DOWN_NODES);
 
+    m_object->print()->set_status(62, _u8L("Smoothing tree support branches"));
     smooth_nodes();// , tree_support_3d_config);
 
     //Generate support areas.
     profiler.stage_start(STAGE_DRAW_CIRCLES);
-    m_object->print()->set_status(65, _u8L("Generating support"));
+    m_object->print()->set_status(65, _u8L("Building tree support branch regions"));
     draw_circles();
     profiler.stage_finish(STAGE_DRAW_CIRCLES);
 
 
 
     profiler.stage_start(STAGE_GENERATE_TOOLPATHS);
-    m_object->print()->set_status(70, _u8L("Generating support"));
+    m_object->print()->set_status(69, _u8L("Generating tree support toolpaths"));
     generate_toolpaths();
     profiler.stage_finish(STAGE_GENERATE_TOOLPATHS);
 

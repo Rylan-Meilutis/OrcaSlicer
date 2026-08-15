@@ -1024,6 +1024,15 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
                         params.fixed_angle = !region_config.solid_infill_rotate_template.value.empty();
                     }
                 }
+                if (params.extrusion_role == erTopSolidInfill &&
+                    nonplanar_perimeters_enabled(region_config)) {
+                    // Variable-Z top skins need one stable raster direction
+                    // across every nominal slice band. Rotating the ordinary
+                    // solid-fill angle between bands produces diagonal seams
+                    // and incomplete joins on a draped roof or deck.
+                    params.angle = 0.f;
+                    params.fixed_angle = true;
+                }
                 params.bridge_angle = float(surface.bridge_angle);
 
                 if (is_bridge && !surface.is_internal_bridge() && region_config.arc_overhang_enabled) {
@@ -1052,24 +1061,45 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
 
                     if (support_points > 0) {
                         support_center /= double(support_points);
-                        const Vec2d surface_center = surface_bbox.center().cast<double>();
-                        const Vec2d support_offset = surface_center - support_center;
-                        const double normal_offset = std::abs(support_offset.dot(overhang_axis));
-                        const double bridge_offset = std::abs(support_offset.dot(bridge_axis));
+                        double surface_min = std::numeric_limits<double>::max();
+                        double surface_max = std::numeric_limits<double>::lowest();
+                        double support_min = std::numeric_limits<double>::max();
+                        double support_max = std::numeric_limits<double>::lowest();
+                        const auto expand_projection = [&overhang_axis](
+                                const ExPolygons &polygons, double &minimum, double &maximum) {
+                            for (const ExPolygon &polygon : polygons)
+                                for (const Point &point : polygon.contour.points) {
+                                    const double projection = point.cast<double>().dot(overhang_axis);
+                                    minimum = std::min(minimum, projection);
+                                    maximum = std::max(maximum, projection);
+                                }
+                        };
+                        expand_projection(ExPolygons{surface.expolygon}, surface_min, surface_max);
+                        expand_projection(nearby_support, support_min, support_max);
+                        const double edge_tolerance = std::max<double>(
+                            scale_(0.25), 0.5 * layerm.flow(frPerimeter).scaled_width());
+                        const bool touches_low_edge  = support_min <= surface_min + edge_tolerance;
+                        const bool touches_high_edge = support_max >= surface_max - edge_tolerance;
 
-                        // A two-sided bridge has lower-layer anchors whose centroid
-                        // stays near the bridge surface center. A cantilever has a
-                        // clear centroid offset normal to its supported edge.
-                        one_sided_overhang =
-                            normal_offset > std::max<double>(scale_(0.25), 0.2 * overhang_span) &&
-                            normal_offset > bridge_offset;
+                        // A cantilever must have an anchor at exactly one edge
+                        // normal to its growth direction. Centroid displacement
+                        // misclassified asymmetric but two-sided Benchy bridge
+                        // surfaces as arc overhangs.
+                        one_sided_overhang = touches_low_edge != touches_high_edge;
                     }
 
                     // Measure only the unsupported remainder. Actual support toolpaths split a
                     // long span just like model geometry does, so a nearby support can keep a
                     // short section on traditional bridge/overhang infill or eliminate arcs.
                     if (!nearby_support.empty()) {
-                        const ExPolygons unsupported = diff_ex(surface.expolygon, nearby_support);
+                        // A centerline is supported by the deposited bead
+                        // footprint, not only by exact polygon overlap. Without
+                        // this allowance, tessellation-sized slivers on an
+                        // otherwise supported roof spuriously enabled arcs.
+                        const coord_t support_reach = coord_t(std::lround(
+                            0.5 * layerm.flow(frPerimeter).scaled_width()));
+                        const ExPolygons unsupported = diff_ex(
+                            surface.expolygon, offset_ex(nearby_support, float(support_reach)));
                         has_unsupported_area = !unsupported.empty();
                         bridge_span = 0.;
                         overhang_span = 0.;
@@ -1105,7 +1135,7 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
                             params.bridge_angle = float(std::atan2(growth_axis.y(), growth_axis.x()));
                         }
                         params.pattern = ipArcOverhang;
-                        params.extrusion_role = erArcOverhang;
+                        params.extrusion_role = one_sided_overhang ? erArcOverhang : erArcBridge;
                     }
                 }
 
@@ -1124,7 +1154,7 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
 					//Orca: enable thick bridge based on config
 					layerm.bridging_flow(extrusion_role, is_thick_bridge) :
 					layerm.flow(extrusion_role, (surface.thickness == -1) ? layer.height : surface.thickness);
-                if (params.extrusion_role == erArcOverhang) {
+                if (is_arc_fill(params.extrusion_role)) {
                     // Keep arc paths at the normal perimeter width. Representing
                     // reduced free-air volume by shrinking the path width may
                     // request a strand narrower than the nozzle and makes both
@@ -1138,7 +1168,7 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
 				params.role_speed = 0;
                 if (params.extrusion_role == erBridgeInfill)
                     params.role_speed = region_config.bridge_speed.get_at(layer.get_extruder_id(params.extruder));
-                else if (params.extrusion_role == erArcOverhang)
+                else if (is_arc_fill(params.extrusion_role))
                     params.role_speed = region_config.arc_overhang_speed.value;
                 else if (params.extrusion_role == erInternalBridgeInfill)
                     params.role_speed = region_config.get_abs_value_at("internal_bridge_speed", layer.get_extruder_id(params.extruder));
@@ -1248,7 +1278,7 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
     // from converting the entire bottom surface.
     std::vector<SurfaceFill> supported_bridge_fills;
     for (SurfaceFill &fill : surface_fills) {
-        if (fill.params.extrusion_role != erArcOverhang || fill.expolygons.empty())
+        if (!is_arc_fill(fill.params.extrusion_role) || fill.expolygons.empty())
             continue;
 
         const LayerRegion &layerm = *layer.regions()[fill.region_id];
@@ -1302,7 +1332,7 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
     // by another region on the same layer.
     std::vector<bool> arc_regions(layer.regions().size(), false);
     for (const SurfaceFill &fill : surface_fills) {
-        if (fill.params.extrusion_role != erArcOverhang || fill.expolygons.empty())
+        if (!is_arc_fill(fill.params.extrusion_role) || fill.expolygons.empty())
             continue;
         for (const size_t region_id : fill.region_id_group)
             if (region_id < arc_regions.size())
@@ -1357,7 +1387,7 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
                 union_ex(previous_layer_perimeter_coverage);
     }
     for (SurfaceFill &fill : surface_fills) {
-        if (fill.params.extrusion_role != erArcOverhang || fill.expolygons.empty())
+        if (!is_arc_fill(fill.params.extrusion_role) || fill.expolygons.empty())
             continue;
 
         const LayerRegion &layerm = *layer.regions()[fill.region_id];

@@ -386,6 +386,7 @@ void PrintObjectSupportMaterial::generate(PrintObject &object)
     BOOST_LOG_TRIVIAL(info) << "Support generator - Creating top contacts";
 
     // Per object layer projection of the object below the layer into print bed.
+    object.print()->set_status(51, L("Analyzing build plate support coverage"));
     std::vector<Polygons> buildplate_covered = this->buildplate_covered(object);
 
     // Determine the top contact surfaces of the support, defined as:
@@ -394,6 +395,7 @@ void PrintObjectSupportMaterial::generate(PrintObject &object)
     // should the support material expose to the object in order to guarantee
     // that it will be effective, regardless of how it's built below.
     // If raft is to be generated, the 1st top_contact layer will contain the 1st object layer silhouette without holes.
+    object.print()->set_status(52, L("Detecting support overhangs and top contacts"));
     SupportGeneratorLayersPtr top_contacts = this->top_contact_layers(object, buildplate_covered, layer_storage);
     if (top_contacts.empty())
         // Nothing is supported, no supports are generated.
@@ -417,6 +419,7 @@ void PrintObjectSupportMaterial::generate(PrintObject &object)
     // Depending on whether the support is soluble or not, the contact layer thickness is decided.
     // layer_support_areas contains the per object layer support areas. These per object layer support areas
     // may get merged and trimmed by this->generate_base_layers() if the support layers are not synchronized with object layers.
+    object.print()->set_status(54, L("Generating lower support contacts"));
     std::vector<Polygons> layer_support_areas;
     SupportGeneratorLayersPtr bottom_contacts = this->bottom_contact_layers_and_layer_support_areas(
         object, top_contacts, buildplate_covered,
@@ -439,9 +442,11 @@ void PrintObjectSupportMaterial::generate(PrintObject &object)
     // The layers may or may not be synchronized with the object layers, depending on the configuration.
     // For example, a single nozzle multi material printing will need to generate a waste tower, which in turn
     // wastes less material, if there are as little tool changes as possible.
+    object.print()->set_status(56, L("Planning support layer heights"));
     SupportGeneratorLayersPtr intermediate_layers = this->raft_and_intermediate_support_layers(
         object, bottom_contacts, top_contacts, layer_storage);
 
+    object.print()->set_status(58, L("Trimming support regions against the model"));
     this->trim_support_layers_by_object(object, top_contacts, m_slicing_params.gap_support_object, m_slicing_params.gap_object_support, m_support_params.gap_xy);
 
 #ifdef SLIC3R_DEBUG
@@ -454,6 +459,7 @@ void PrintObjectSupportMaterial::generate(PrintObject &object)
     BOOST_LOG_TRIVIAL(info) << "Support generator - Creating base layers";
 
     // Fill in intermediate layers between the top / bottom support contact layers, trim them by the object.
+    object.print()->set_status(60, L("Propagating support base regions"));
     this->generate_base_layers(object, bottom_contacts, top_contacts, intermediate_layers, layer_support_areas);
 
 #ifdef SLIC3R_DEBUG
@@ -469,6 +475,7 @@ void PrintObjectSupportMaterial::generate(PrintObject &object)
     // and unwanted strong bonds to the object.
     // Rather trim the top contacts by their overlapping bottom contacts to leave a gap instead of over extruding
     // top contacts over the bottom contacts.
+    object.print()->set_status(62, L("Resolving support contact overlaps"));
     this->trim_top_contacts_by_bottom_contacts(object, bottom_contacts, top_contacts);
 
 
@@ -476,6 +483,7 @@ void PrintObjectSupportMaterial::generate(PrintObject &object)
 
     // Propagate top / bottom contact layers to generate interface layers 
     // and base interface layers (for soluble interface / non souble base only)
+    object.print()->set_status(64, L("Generating support interface layers"));
 	SupportGeneratorLayersPtr empty_layers;
     auto [interface_layers, base_interface_layers] = generate_interface_layers(*m_object_config, m_support_params, bottom_contacts, top_contacts, empty_layers, empty_layers, intermediate_layers, layer_storage);
 
@@ -484,6 +492,7 @@ void PrintObjectSupportMaterial::generate(PrintObject &object)
     // If raft is to be generated, the 1st top_contact layer will contain the 1st object layer silhouette with holes filled.
     // There is also a 1st intermediate layer containing bases of support columns.
     // Inflate the bases of the support columns and create the raft base under the object.
+    object.print()->set_status(66, L("Generating support raft layers"));
     SupportGeneratorLayersPtr raft_layers = generate_raft_base(object, m_support_params, m_slicing_params, top_contacts, interface_layers, base_interface_layers, intermediate_layers, layer_storage);
 
     if (object.print()->canceled())
@@ -517,6 +526,7 @@ void PrintObjectSupportMaterial::generate(PrintObject &object)
 //    intermediate_layers.clear();
 //    interface_layers.clear();
 
+    object.print()->set_status(68, L("Assembling support layers"));
 #ifdef SLIC3R_DEBUG
     SupportGeneratorLayersPtr layers_sorted =
 #endif // SLIC3R_DEBUG
@@ -552,7 +562,29 @@ void PrintObjectSupportMaterial::generate(PrintObject &object)
 #endif /* SLIC3R_DEBUG */
 
     // Generate the actual toolpaths and save them into each layer.
-    generate_support_toolpaths(object.support_layers(), *m_object_config, m_support_params, m_slicing_params, raft_layers, bottom_contacts, top_contacts, intermediate_layers, interface_layers, base_interface_layers);
+    object.print()->set_status(69, L("Generating support toolpaths"));
+    generate_support_toolpaths(
+        object.support_layers(), *m_object_config, m_support_params,
+        m_slicing_params, raft_layers, bottom_contacts, top_contacts,
+        intermediate_layers, interface_layers, base_interface_layers,
+        [&object](const SupportToolpathProgress &event) {
+            std::string message;
+            switch (event.stage) {
+            case SupportToolpathProgressStage::Raft:
+                message = (boost::format(L("Generating support raft toolpaths: layer %1% of %2%")) %
+                           event.current % event.total).str();
+                break;
+            case SupportToolpathProgressStage::RegionPaths:
+                message = (boost::format(L("Generating support region paths: layer %1% of %2%")) %
+                           event.current % event.total).str();
+                break;
+            case SupportToolpathProgressStage::LayerAssembly:
+                message = (boost::format(L("Assembling support extrusion layers: layer %1% of %2%")) %
+                           event.current % event.total).str();
+                break;
+            }
+            object.print()->set_status(69, message);
+        });
 
 #ifdef SLIC3R_DEBUG
     {
@@ -1154,7 +1186,7 @@ namespace SupportMaterialInternal {
                 assert(! ee2->is_collection());
                 assert(! ee2->is_loop());
                 if (ee2->role() == erBridgeInfill || ee2->role() == erInternalBridgeInfill ||
-                    ee2->role() == erArcOverhang)
+                    is_arc_fill(ee2->role()))
                     return true;
             }
         }

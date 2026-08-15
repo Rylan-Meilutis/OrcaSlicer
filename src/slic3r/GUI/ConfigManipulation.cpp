@@ -687,6 +687,97 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, in
     }
 
     bool have_perimeters = config->opt_int("wall_loops") > 0;
+    const auto *perimeter_layering_option =
+        config->option<ConfigOptionEnum<PerimeterLayeringMode>>("perimeter_layering");
+    PerimeterLayeringMode perimeter_layering = perimeter_layering_option == nullptr ?
+        PerimeterLayeringMode::Standard : perimeter_layering_option->value;
+    if (config->opt_bool("spiral_mode") &&
+        perimeter_layering != PerimeterLayeringMode::Standard) {
+        perimeter_layering = PerimeterLayeringMode::Standard;
+        if (perimeter_layering_option != nullptr)
+            config->set_key_value("perimeter_layering",
+                new ConfigOptionEnum<PerimeterLayeringMode>(perimeter_layering));
+    }
+    const bool use_smooth_outer_walls = perimeter_layering == PerimeterLayeringMode::SmoothOuterWall;
+    const bool use_interlocking_walls = perimeter_layering == PerimeterLayeringMode::InterlockingWalls ||
+        perimeter_layering == PerimeterLayeringMode::Nonplanar;
+    const auto *staggered_perimeters =
+        config->option<ConfigOptionBool>("staggered_perimeters");
+    const auto *nonplanar_top_surface =
+        config->option<ConfigOptionBool>("nonplanar_top_surface");
+    const auto *zaa_layering = config->option<ConfigOptionBool>("zaa_enabled");
+    const auto *top_surface_z_option =
+        config->option<ConfigOptionEnum<TopSurfaceZMode>>("top_surface_z_mode");
+    TopSurfaceZMode top_surface_z_mode = top_surface_z_option == nullptr ?
+        ((nonplanar_top_surface != nullptr && nonplanar_top_surface->value) ?
+             TopSurfaceZMode::NonplanarTopSurface :
+         (zaa_layering != nullptr && zaa_layering->value) ?
+             TopSurfaceZMode::ZContouring : TopSurfaceZMode::Disabled) :
+        top_surface_z_option->value;
+    bool hybrid_top_surface = top_surface_z_mode ==
+        TopSurfaceZMode::NonplanarWithZContouringFallback;
+
+    if (nonplanar_top_surface != nullptr &&
+        nonplanar_top_surface->value !=
+            (top_surface_z_mode == TopSurfaceZMode::NonplanarTopSurface ||
+             hybrid_top_surface))
+        config->set_key_value("nonplanar_top_surface", new ConfigOptionBool(
+            top_surface_z_mode == TopSurfaceZMode::NonplanarTopSurface ||
+            hybrid_top_surface));
+    if (zaa_layering != nullptr &&
+        zaa_layering->value !=
+            (top_surface_z_mode == TopSurfaceZMode::ZContouring ||
+             hybrid_top_surface))
+        config->set_key_value("zaa_enabled", new ConfigOptionBool(
+            top_surface_z_mode == TopSurfaceZMode::ZContouring ||
+            hybrid_top_surface));
+
+    const bool use_brick_perimeters = perimeter_layering == PerimeterLayeringMode::Brick ||
+        (perimeter_layering == PerimeterLayeringMode::Standard &&
+         staggered_perimeters != nullptr && staggered_perimeters->value);
+    bool use_nonplanar_top_surfaces =
+        perimeter_layering != PerimeterLayeringMode::SmoothOuterWall &&
+        (top_surface_z_mode == TopSurfaceZMode::NonplanarTopSurface ||
+         hybrid_top_surface);
+
+    // Keep the two legacy booleans loadable, but only synchronize values that
+    // are implied or forbidden by the selected wall-course method. Brick and
+    // mesh-following top surfaces are intentionally independent.
+    if (staggered_perimeters != nullptr) {
+        if (perimeter_layering == PerimeterLayeringMode::Brick && !staggered_perimeters->value)
+            config->set_key_value("staggered_perimeters", new ConfigOptionBool(true));
+        else if ((use_smooth_outer_walls || use_interlocking_walls) && staggered_perimeters->value)
+            config->set_key_value("staggered_perimeters", new ConfigOptionBool(false));
+    }
+    if (use_smooth_outer_walls && use_nonplanar_top_surfaces) {
+        config->set_key_value("nonplanar_top_surface", new ConfigOptionBool(false));
+        config->set_key_value("top_surface_z_mode",
+            new ConfigOptionEnum<TopSurfaceZMode>(TopSurfaceZMode::Disabled));
+        top_surface_z_mode = TopSurfaceZMode::Disabled;
+        hybrid_top_surface = false;
+        use_nonplanar_top_surfaces = false;
+    }
+    if ((perimeter_layering != PerimeterLayeringMode::Standard || use_nonplanar_top_surfaces) &&
+        top_surface_z_mode == TopSurfaceZMode::ZContouring) {
+        config->set_key_value("zaa_enabled", new ConfigOptionBool(false));
+        config->set_key_value("top_surface_z_mode",
+            new ConfigOptionEnum<TopSurfaceZMode>(TopSurfaceZMode::Disabled));
+        top_surface_z_mode = TopSurfaceZMode::Disabled;
+    }
+
+    const bool have_staggered_perimeters = have_perimeters && use_brick_perimeters &&
+        !config->opt_bool("spiral_mode");
+    toggle_field("perimeter_layering", have_perimeters && !config->opt_bool("spiral_mode"));
+    toggle_field("top_surface_z_mode", have_perimeters && !config->opt_bool("spiral_mode") &&
+        !use_smooth_outer_walls);
+    toggle_line("smooth_outer_wall_layer_height", have_perimeters && use_smooth_outer_walls &&
+        !config->opt_bool("spiral_mode"));
+    for (const char *key : {"interlocking_wall_amplitude", "interlocking_wall_wavelength",
+                            "interlocking_wall_resolution"})
+        toggle_line(key, have_perimeters && use_interlocking_walls &&
+                         !config->opt_bool("spiral_mode"));
+    toggle_line("staggered_perimeters_inner_only", have_staggered_perimeters);
+    toggle_line("staggered_perimeter_offset", have_staggered_perimeters);
     const auto *inner_walls_flow = config->option<ConfigOptionPercent>("inner_walls_flow_ratio");
     const bool have_thicker_inner_walls =
         config->opt_int("wall_loops") >= 3 &&
@@ -926,8 +1017,16 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, in
     bool can_ironing_support = have_raft || (have_support_material && config->opt_int("support_interface_top_layers") > 0);
     toggle_field("support_ironing", can_ironing_support);
     bool has_support_ironing = can_ironing_support && config->opt_bool("support_ironing");
-    for (auto el : {"support_ironing_pattern", "support_ironing_flow", "support_ironing_spacing" })
-        toggle_line(el, has_support_ironing);
+    for (auto el : {"support_ironing_pattern", "support_ironing_flow", "support_ironing_spacing", "support_ironing_nonplanar" })
+        if (config->has(el))
+            toggle_line(el, has_support_ironing);
+    const auto *support_ironing_nonplanar =
+        config->option<ConfigOptionBool>("support_ironing_nonplanar");
+    const bool has_nonplanar_support_ironing = has_support_ironing &&
+        support_ironing_nonplanar != nullptr && support_ironing_nonplanar->value;
+    for (auto el : {"support_ironing_nonplanar_max_angle", "support_ironing_nonplanar_resolution"})
+        if (config->has(el))
+            toggle_line(el, has_nonplanar_support_ironing);
     // Orca: Force solid support interface when using support ironing
     toggle_field("support_interface_spacing", have_support_material && have_support_interface && !has_support_ironing);
 
@@ -965,9 +1064,19 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, in
     
     toggle_line("ironing_speed", has_ironing || has_support_ironing);
 
-    bool has_zaa = config->opt_bool("zaa_enabled");
+    const auto *zaa_enabled = config->option<ConfigOptionBool>("zaa_enabled");
+    const bool has_zaa =
+        (top_surface_z_mode == TopSurfaceZMode::ZContouring &&
+         perimeter_layering == PerimeterLayeringMode::Standard) ||
+        (hybrid_top_surface &&
+         (perimeter_layering == PerimeterLayeringMode::Standard ||
+          perimeter_layering == PerimeterLayeringMode::Brick));
     for (auto el : {"zaa_minimize_perimeter_height", "zaa_min_z", "zaa_dont_alternate_fill_direction", "ironing_expansion"})
         toggle_line(el, has_zaa);
+
+    for (auto el : {"nonplanar_top_surface_max_angle", "nonplanar_top_surface_layers",
+                    "nonplanar_top_surface_resolution", "nonplanar_top_surface_min_height"})
+        toggle_line(el, use_nonplanar_top_surfaces);
 
     bool have_sequential_printing = (config->opt_enum<PrintSequence>("print_sequence") == PrintSequence::ByObject);
     // for (auto el : { "extruder_clearance_radius", "extruder_clearance_height_to_rod", "extruder_clearance_height_to_lid" })
@@ -1045,8 +1154,20 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, in
     bool has_fuzzy_skin = config->opt_enum<FuzzySkinType>("fuzzy_skin") != FuzzySkinType::Disabled_fuzzy;
     
     // Show fuzzy skin options when fuzzy skin is not disabled
-    for (auto el : {"fuzzy_skin_mode", "fuzzy_skin_noise_type", "fuzzy_skin_point_distance", "fuzzy_skin_thickness", "fuzzy_skin_first_layer"})
-        toggle_line(el, has_fuzzy_skin);
+    for (auto el : {"fuzzy_skin_mode", "fuzzy_skin_noise_type", "fuzzy_skin_point_distance", "fuzzy_skin_thickness", "fuzzy_skin_first_layer", "fuzzy_skin_top_surface"})
+        if (config->has(el))
+            toggle_line(el, has_fuzzy_skin);
+
+    // Object/part settings use a deliberately sparse DynamicPrintConfig.  The
+    // non-planar infill switch is not present in every one of those views, so
+    // do not use opt_bool(), which assumes the key exists and dereferences a
+    // null option.  Missing means disabled for UI dependency purposes.
+    const auto *nonplanar_infill = config->option<ConfigOptionBool>("nonplanar_infill");
+    const bool have_nonplanar_infill =
+        nonplanar_infill != nullptr && nonplanar_infill->value;
+    for (auto el : {"nonplanar_infill_amplitude", "nonplanar_infill_wavelength", "nonplanar_infill_resolution"})
+        if (config->has(el))
+            toggle_line(el, have_nonplanar_infill);
     
     // Show noise type specific options with the same logic
     NoiseType fuzzy_skin_noise_type = config->opt_enum<NoiseType>("fuzzy_skin_noise_type");

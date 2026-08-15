@@ -255,6 +255,37 @@ static t_config_enum_values s_keys_map_TopSurfaceExpansionDirection {
 };
 CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(TopSurfaceExpansionDirection)
 
+static t_config_enum_values s_keys_map_LocalizedShrinkageStrategy {
+    { "custom",                   int(LocalizedShrinkageStrategy::Custom) },
+    { "disabled",                 int(LocalizedShrinkageStrategy::Disabled) },
+    { "dimensional_compensation", int(LocalizedShrinkageStrategy::DimensionalCompensation) },
+    { "reinforced_walls",         int(LocalizedShrinkageStrategy::ReinforcedWalls) },
+    { "reduced_wall_coupling",    int(LocalizedShrinkageStrategy::ReducedWallCoupling) },
+    { "balanced",                 int(LocalizedShrinkageStrategy::Balanced) },
+    { "full_wall_decoupling",     int(LocalizedShrinkageStrategy::FullWallDecoupling) },
+    { "sectioned_solid_infill",   int(LocalizedShrinkageStrategy::SectionedSolidInfill) },
+    { "perforated_wall_relief",   int(LocalizedShrinkageStrategy::PerforatedWallRelief) },
+};
+CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(LocalizedShrinkageStrategy)
+
+static t_config_enum_values s_keys_map_PerimeterLayeringMode {
+    { "standard",  int(PerimeterLayeringMode::Standard) },
+    { "brick",     int(PerimeterLayeringMode::Brick) },
+    { "nonplanar", int(PerimeterLayeringMode::Nonplanar) },
+    { "smooth_outer_wall", int(PerimeterLayeringMode::SmoothOuterWall) },
+    { "interlocking_walls", int(PerimeterLayeringMode::InterlockingWalls) },
+};
+CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(PerimeterLayeringMode)
+
+static t_config_enum_values s_keys_map_TopSurfaceZMode {
+    { "disabled",              int(TopSurfaceZMode::Disabled) },
+    { "z_contouring",          int(TopSurfaceZMode::ZContouring) },
+    { "nonplanar_top_surface", int(TopSurfaceZMode::NonplanarTopSurface) },
+    { "nonplanar_with_z_contouring_fallback",
+      int(TopSurfaceZMode::NonplanarWithZContouringFallback) },
+};
+CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(TopSurfaceZMode)
+
 static t_config_enum_values s_keys_map_InfillPattern {
     { "monotonic", ipMonotonic },
     { "monotonicline", ipMonotonicLine },
@@ -1023,14 +1054,28 @@ void PrintConfigDef::init_common_params()
     def->set_default_value(new ConfigOptionString());
 
     def = this->add("sync_spool_manager_filament_names", coBool);
-    def->label = L("Enable OctoPrint SpoolManager sync");
-    def->tooltip = L("Loads the current tool/slot spool names, materials, and colors from the SpoolManager plugin "
+    def->label = L("Enable OctoPrint filament spool sync");
+    def->tooltip = L("Loads the current tool/slot spool names, materials, and colors from SpoolManager, Spoolman, "
+                     "or a compatible filament reporting plugin "
                      "using this OctoPrint host and API key. Synchronization is read-only and never changes the "
-                     "OctoPrint machine configuration. Selected spool metadata is embedded in G-code for host-side "
-                     "material validation. Existing [sm_name=] note markers are also updated.");
+                     "OctoPrint machine configuration. The separate embed option controls whether selected spool "
+                     "metadata and existing [sm_name=] note markers are written into G-code.");
     def->mode = comAdvanced;
     def->cli = ConfigOptionDef::nocli;
     def->set_default_value(new ConfigOptionBool(false));
+
+    def = this->add("embed_spool_manager_filament_names", coBool);
+    def->label = L("Embed filament spool names in G-code");
+    def->tooltip = L("Embed the selected OctoPrint spool names in exported G-code. "
+                     "The output uses the legacy post-processing format: [sm_name = ...] markers "
+                     "in filament notes plus spool_manager_filament_names metadata. Disable this "
+                     "to synchronize colors and profiles without modifying G-code metadata.");
+    def->mode = comAdvanced;
+    def->cli = ConfigOptionDef::nocli;
+    // Embedding was previously unconditional whenever SpoolManager sync was
+    // enabled. Keep that behavior for existing physical-printer presets while
+    // allowing users to turn it off independently.
+    def->set_default_value(new ConfigOptionBool(true));
 
     def = this->add("spool_manager_sync_mode", coEnum);
     def->label = L("SpoolManager sync contents");
@@ -1042,6 +1087,39 @@ void PrintConfigDef::init_common_params()
     def->mode = comAdvanced;
     def->cli = ConfigOptionDef::nocli;
     def->set_default_value(new ConfigOptionEnum<SpoolManagerSyncMode>(smsmColorsAndProfiles));
+
+    def = this->add("octoprint_filament_plugin_endpoint", coString);
+    def->label = L("Filament plugin endpoint");
+    def->tooltip = L("Optional OctoPrint-relative endpoint for a third-party filament reporting plugin. "
+                     "The response may contain selectedSpools, or the provider-neutral data.tools and data.spools fields. "
+                     "Leave blank to automatically detect SpoolManager, Spoolman, and RME-compatible providers.");
+    def->mode = comAdvanced;
+    def->cli = ConfigOptionDef::nocli;
+    def->set_default_value(new ConfigOptionString());
+
+    def = this->add("octoprint_spool_profile_mappings", coStrings);
+    def->label = L("Spool profile mappings");
+    def->tooltip = L("Map an exact OctoPrint roll to an Orca filament preset. Use one entry per line as "
+                     "provider:spool-id=preset-name, or spool-id=preset-name. Exact roll mappings have highest priority.");
+    def->mode = comAdvanced;
+    def->cli = ConfigOptionDef::nocli;
+    def->set_default_value(new ConfigOptionStrings());
+
+    def = this->add("octoprint_material_profile_mappings", coStrings);
+    def->label = L("Material profile mappings");
+    def->tooltip = L("Map a manufacturer and material to an Orca filament preset. Use one entry per line as "
+                     "manufacturer|material=preset-name, or material=preset-name.");
+    def->mode = comAdvanced;
+    def->cli = ConfigOptionDef::nocli;
+    def->set_default_value(new ConfigOptionStrings());
+
+    def = this->add("octoprint_default_filament_profile", coString);
+    def->label = L("Default OctoPrint filament profile");
+    def->tooltip = L("Optional fallback filament preset used when an OctoPrint roll has no exact-roll or "
+                     "manufacturer/material mapping. Leave blank to use Orca's best match.");
+    def->mode = comAdvanced;
+    def->cli = ConfigOptionDef::nocli;
+    def->set_default_value(new ConfigOptionString());
 
     def = this->add("flashforge_serial_number", coString);
     def->label = L("Serial Number");
@@ -1474,6 +1552,104 @@ void PrintConfigDef::init_fff_params()
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionBool(false));
 
+    def = this->add("localized_shrinkage_strategy", coEnum);
+    def->label = L("Localized shrinkage strategy");
+    def->category = L("Quality");
+    def->tooltip = L("Selects how automatically detected broad solid-to-wall transitions are prevented from pulling the surrounding walls inward as they cool.\n"
+                     " - Manual tuning uses the individual values below and preserves older project behavior.\n"
+                     " - Dimensional compensation expands the affected contour.\n"
+                     " - Reinforced walls adds inner walls to carry contraction without moving the outside surface.\n"
+                     " - Reduced wall coupling leaves a small relief gap between the solid region and walls; this is effective but reduces local strength.\n"
+                     " - Balanced combines modest compensation, reinforcement, and relief.\n"
+                     " - Full wall decoupling creates a narrow continuous air break at the detected interface. It provides the strongest isolation, but substantially reduces local strength.\n"
+                     " - Sectioned solid infill divides only the buried solid region into shorter contracting spans while restoring top surfaces over the relief channels.\n"
+                     " - Perforated wall relief places small, spaced air pockets at the buried solid/wall interface. Material between pockets preserves periodic bonding while interrupting long stress-transfer paths.");
+    def->enum_keys_map = &ConfigOptionEnum<LocalizedShrinkageStrategy>::get_enum_values();
+    def->enum_values = {"custom", "disabled", "dimensional_compensation", "reinforced_walls",
+                        "reduced_wall_coupling", "balanced", "full_wall_decoupling",
+                        "sectioned_solid_infill", "perforated_wall_relief"};
+    def->enum_labels = {L("Manual tuning"), L("Disabled"), L("Dimensional compensation"),
+                        L("Reinforced walls"), L("Reduced wall coupling"), L("Balanced"),
+                        L("Full wall decoupling"), L("Sectioned solid infill"),
+                        L("Perforated wall relief")};
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionEnum<LocalizedShrinkageStrategy>(LocalizedShrinkageStrategy::Custom));
+
+    def = this->add("hull_line_extra_perimeters", coInt);
+    def->label = L("Shrinkage reinforcement walls");
+    def->category = L("Quality");
+    def->tooltip = L("Adds inner walls on automatically detected layers where a broad solid region changes into walls, a cavity, or a deck. "
+                     "This preserves local strength while reducing inward movement of the outside surface. Set to 0 to disable reinforcement in Custom mode.");
+    def->sidetext = L("walls");
+    def->min = 0;
+    def->max = 5;
+    def->mode = comExpert;
+    def->set_default_value(new ConfigOptionInt(0));
+
+    def = this->add("hull_line_perimeter_expansion", coFloat);
+    def->label = L("Shrinkage contour compensation");
+    def->category = L("Quality");
+    def->tooltip = L("Expands contours only on automatically detected solid-to-wall transition layers to compensate for local thermal contraction. "
+                     "Use small values and calibrate for the material; 0 disables expansion.");
+    def->sidetext = L("mm");
+    def->min = 0.;
+    def->max = 0.5;
+    def->mode = comExpert;
+    def->set_default_value(new ConfigOptionFloat(0.));
+
+    def = this->add("localized_shrinkage_section_width", coFloat);
+    def->label = L("Solid infill relief channel width");
+    def->category = L("Quality");
+    def->tooltip = L("Width of the internal stress-relief channels used to divide a broad buried solid region into shorter contracting spans. "
+                     "Top surfaces are restored over these channels so the exterior remains closed. Set to 0 to disable sectioning in Manual tuning mode.");
+    def->sidetext = L("mm");
+    def->min = 0.;
+    def->max = 1.;
+    def->mode = comExpert;
+    def->set_default_value(new ConfigOptionFloat(0.));
+
+    def = this->add("localized_shrinkage_section_spacing", coFloat);
+    def->label = L("Solid infill section length");
+    def->category = L("Quality");
+    def->tooltip = L("Maximum nominal span between internal stress-relief channels on automatically detected shrinkage-prone transition layers.");
+    def->sidetext = L("mm");
+    def->min = 2.;
+    def->max = 100.;
+    def->mode = comExpert;
+    def->set_default_value(new ConfigOptionFloat(10.));
+
+    def = this->add("localized_shrinkage_perforation_diameter", coFloat);
+    def->label = L("Wall relief pocket diameter");
+    def->category = L("Quality");
+    def->tooltip = L("Diameter of the periodic buried air pockets placed along the solid-infill/wall interface. "
+                     "The visible top surface is restored above the pockets. Set to 0 to disable perforation in Manual tuning mode.");
+    def->sidetext = L("mm");
+    def->min = 0.;
+    def->max = 2.;
+    def->mode = comExpert;
+    def->set_default_value(new ConfigOptionFloat(0.));
+
+    def = this->add("localized_shrinkage_perforation_spacing", coFloat);
+    def->label = L("Wall relief pocket spacing");
+    def->category = L("Quality");
+    def->tooltip = L("Distance between periodic wall-relief pockets. Material left between pockets remains bonded for greater strength than a continuous air break.");
+    def->sidetext = L("mm");
+    def->min = 1.;
+    def->max = 50.;
+    def->mode = comExpert;
+    def->set_default_value(new ConfigOptionFloat(3.));
+
+    def = this->add("localized_shrinkage_infill_wall_gap", coFloat);
+    def->label = L("Solid infill wall relief");
+    def->category = L("Quality");
+    def->tooltip = L("Reduces coupling between broad solid infill and the surrounding walls only on detected shrinkage-prone transition layers. "
+                     "A larger relief transmits less cooling contraction into the outside surface, but also reduces local wall-to-solid bonding and strength.");
+    def->sidetext = L("mm");
+    def->min = 0.;
+    def->max = 0.5;
+    def->mode = comExpert;
+    def->set_default_value(new ConfigOptionFloat(0.));
+
     def = this->add("bridge_density", coPercent);
     def->label = L("External bridge density");
     def->category = L("Strength");
@@ -1750,6 +1926,93 @@ void PrintConfigDef::init_fff_params()
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionPercent(100));
 
+    def = this->add("perimeter_layering", coEnum);
+    def->label = L("Perimeter layering");
+    def->category = L("Quality");
+    def->tooltip = L("Selects a perimeter wall-course method.\n"
+                     " - Standard uses ordinary planar perimeter layers.\n"
+                     " - Brick offsets eligible perimeter courses to interlock neighboring layers.\n"
+                     " - Smooth outer wall subdivides supported outer-wall courses into thinner passes while retaining normal inner walls and infill.\n"
+                     " - Non-planar interlocking walls undulate buried inner walls downward within their owning layer, with alternating phase between layers.\n\n"
+                     "Brick and non-planar interlocking wall courses can both be used below mesh-following non-planar top surfaces.");
+    def->enum_keys_map = &ConfigOptionEnum<PerimeterLayeringMode>::get_enum_values();
+    // "nonplanar" remains in enum_keys_map so old projects deserialize, but it
+    // is migrated and is intentionally not presented as a new UI choice.
+    def->enum_values = {"standard", "brick", "smooth_outer_wall", "interlocking_walls"};
+    def->enum_labels = {L("Standard"), L("Brick"), L("Smooth outer wall"), L("Non-planar interlocking walls")};
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionEnum<PerimeterLayeringMode>(PerimeterLayeringMode::Standard));
+
+    def = this->add("smooth_outer_wall_layer_height", coFloat);
+    def->label = L("Smooth outer wall layer height");
+    def->category = L("Quality");
+    def->tooltip = L("Target height for independently subdivided outer-wall courses. The actual height evenly divides the owning layer. "
+                     "Only complete, non-overhanging loops supported by the preceding layer are subdivided; other walls retain their normal layer height.");
+    def->sidetext = L("mm");
+    def->min = 0.02;
+    def->max = 1.;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(0.1));
+
+    def = this->add("interlocking_wall_amplitude", coFloat);
+    def->label = L("Interlocking wall depth");
+    def->category = L("Strength");
+    def->tooltip = L("Maximum downward displacement of eligible buried inner-wall paths. The value is limited to less than half of the owning layer height so paths remain supported and cannot cross adjacent layers.");
+    def->sidetext = L("mm");
+    def->min = 0.01;
+    def->max = 0.4;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(0.08));
+
+    def = this->add("interlocking_wall_wavelength", coFloat);
+    def->label = L("Interlocking wall wavelength");
+    def->category = L("Strength");
+    def->tooltip = L("Distance along a buried inner wall over which one interlocking wave repeats.");
+    def->sidetext = L("mm");
+    def->min = 1.;
+    def->max = 100.;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(6.));
+
+    def = this->add("interlocking_wall_resolution", coFloat);
+    def->label = L("Interlocking wall resolution");
+    def->category = L("Strength");
+    def->tooltip = L("Maximum distance between samples along a non-planar interlocking inner wall.");
+    def->sidetext = L("mm");
+    def->min = 0.05;
+    def->max = 2.;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(0.5));
+
+    def = this->add("staggered_perimeters", coBool);
+    def->label = L("Brick walls");
+    def->category = L("Strength");
+    def->tooltip = L("Offsets alternating wall courses upward to interlock adjacent layers. "
+                     "Only walls fully covered by the next layer are bricked, so exposed top, bottom, and sloped surface boundaries remain unchanged. "
+                     "Half-height entry and exit courses keep the transition filled and return subsequent walls to the normal layer grid.");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionBool(false));
+
+    def = this->add("staggered_perimeters_inner_only", coBool);
+    def->label = L("Brick inner walls only");
+    def->category = L("Strength");
+    def->tooltip = L("Limits bricking to alternating inner walls. Disable this to brick eligible outer walls too. "
+                     "Outer walls adjacent to top, bottom, or sloped exposed surfaces remain conventional to preserve the model envelope and surface finish.");
+    def->mode = comAdvanced;
+    // Preserve the behavior of projects and profiles created before outer-wall
+    // bricking was available.
+    def->set_default_value(new ConfigOptionBool(true));
+
+    def = this->add("staggered_perimeter_offset", coPercent);
+    def->label = L("Stagger height");
+    def->category = L("Strength");
+    def->tooltip = L("Vertical offset for staggered inner walls as a percentage of layer height.");
+    def->sidetext = "%";
+    def->min = 0;
+    def->max = 100;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionPercent(50));
+
     def = this->add("overhang_flow_ratio", coFloat);
     def->label = L("Overhang flow ratio");
     def->category = L("Advanced");
@@ -1890,6 +2153,16 @@ void PrintConfigDef::init_fff_params()
     def->enum_labels.emplace_back(L("Partially bridged"));
     def->enum_labels.emplace_back(L("Sacrificial layer"));
     def->set_default_value(new ConfigOptionEnum<CounterboreHoleBridgingOption>(chbNone));
+
+    def = this->add("bridge_overhang_before_walls", coBool);
+    def->label = L("Print bridges and overhangs before walls");
+    def->category = L("Quality");
+    def->tooltip = L(
+        "Print bridge infill, arc bridges, and arc overhangs before the walls on only the islands and layers that contain them. "
+        "This can support inner walls around counterbores and similar features that would otherwise be printed in mid-air. "
+        "Other islands and layers keep the configured wall and infill order.");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionBool(false));
 
     def = this->add("overhang_reverse_threshold", coFloatOrPercent);
     def->label = L("Reverse threshold");
@@ -2214,6 +2487,21 @@ void PrintConfigDef::init_fff_params()
     def->label = L("Slow printing down for better layer cooling");
     def->tooltip = L("Enable this option to slow printing speed down to ensure that the final layer time is not shorter than the layer time threshold in \"Max fan speed threshold\", so that the layer can be cooled for a longer time. This can improve the quality for small details.");
     def->set_default_value(new ConfigOptionBools { true });
+
+    def = this->add("hull_line_mitigation", coBools);
+    def->label = L("Thermal transition smoothing");
+    def->tooltip = L("Gradually reduces printing speed when adjacent layers would otherwise have a large drop in layer time. This limits abrupt thermal and localized shrinkage changes. Enable it only when needed because it may increase print time.");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionBools { false });
+
+    def = this->add("hull_line_max_layer_time_variation", coPercents);
+    def->label = L("Maximum adjacent layer time change");
+    def->tooltip = L("Maximum decrease in estimated printing time from one layer to the next when thermal transition smoothing is enabled. Smaller values create a more gradual thermal transition but may slow more layers.");
+    def->sidetext = L("%");
+    def->min = 1;
+    def->max = 100;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionPercents { 25.0 });
 
     def = this->add("default_acceleration", coFloats);
     def->label = L("Normal printing");
@@ -2743,6 +3031,15 @@ void PrintConfigDef::init_fff_params()
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionFloat(40));
 
+    def = this->add("nonplanar_toolhead_clearance_angle", coFloat);
+    def->label = L("Non-planar toolhead clearance angle");
+    def->tooltip = L("Outward angle from vertical of the rotationally symmetric clearance cone used for non-planar collision checks when no detailed gantry geometry is available. The cone begins at the nozzle tip.");
+    def->sidetext = u8"°";
+    def->min = 0;
+    def->max = 89;
+    def->mode = comExpert;
+    def->set_default_value(new ConfigOptionFloat(0));
+
     def = this->add("sequential_print_gantry_geometry", coString);
     def->label = L("Gantry collision geometry");
     def->tooltip = L("Optional JSON geometry used for model-aware collision checks and auto-arrange in by-object printing. "
@@ -2756,7 +3053,7 @@ void PrintConfigDef::init_fff_params()
 
     def = this->add("sequential_print_gantry_model", coString);
     def->label = L("Gantry model");
-    def->tooltip = L("Optional STL model of the printhead and gantry for sequential-print visualization.");
+    def->tooltip = L("Optional nozzle-centred STL model of the printhead and gantry. The lowest point is treated as the nozzle tip. When no JSON collision geometry is supplied, OrcaSlicer processes this model into conservative slices for sequential printing and non-planar collision checks.");
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionString());
 
@@ -3557,6 +3854,47 @@ void PrintConfigDef::init_fff_params()
     def->max = 100;
     def->set_default_value(new ConfigOptionPercent(20));
 
+    def = this->add("nonplanar_infill", coBool);
+    def->label = L("Non-planar interlocking infill");
+    def->category = L("Strength");
+    def->tooltip = L("Modulate sparse infill smoothly in Z so adjacent layers interlock. "
+                     "The path remains anchored at planar height where it meets walls, and "
+                     "the amplitude is limited to a safe fraction of the current layer height.");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionBool(false));
+
+    def = this->add("nonplanar_infill_amplitude", coFloat);
+    def->label = L("Non-planar infill amplitude");
+    def->category = L("Strength");
+    def->tooltip = L("Requested peak Z displacement of sparse infill. The generated displacement "
+                     "is clamped below half the local layer height to prevent adjacent courses from crossing.");
+    def->sidetext = L("mm");
+    def->min = 0.01;
+    def->max = 1.;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(0.08));
+
+    def = this->add("nonplanar_infill_wavelength", coFloat);
+    def->label = L("Non-planar infill wavelength");
+    def->category = L("Strength");
+    def->tooltip = L("Distance along an infill path occupied by one complete Z wave.");
+    def->sidetext = L("mm");
+    def->min = 1.;
+    def->max = 100.;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(6.));
+
+    def = this->add("nonplanar_infill_resolution", coFloat);
+    def->label = L("Non-planar infill resolution");
+    def->category = L("Strength");
+    def->tooltip = L("Maximum XY segment length used to sample the infill Z wave. Smaller values "
+                     "produce smoother motion but increase G-code size and slicing time.");
+    def->sidetext = L("mm");
+    def->min = 0.1;
+    def->max = 5.;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(1.));
+
     def           = this->add("align_infill_direction_to_model", coBool);
     def->label    = L("Align directions to model");
     def->category = L("Strength");
@@ -3858,6 +4196,17 @@ void PrintConfigDef::init_fff_params()
     def->min = 0;
     def->set_default_value(new ConfigOptionFloat(0.2));
 
+    def = this->add("nonplanar_top_surface_min_height", coFloat);
+    def->label    = L("Minimum non-planar layer height");
+    def->category = L("Quality");
+    def->tooltip  = L("Minimum vertical deposition height preserved between neighboring physical layers. "
+                      "This bounds both upward and downward non-planar displacement so later paths remain printable.");
+    def->sidetext = L("mm");
+    def->min      = 0.01;
+    def->max      = 1;
+    def->mode     = comExpert;
+    def->set_default_value(new ConfigOptionFloat(0.05));
+
     //def = this->add("adaptive_layer_height", coBool);
     //def->label = L("Adaptive layer height");
     //def->category = L("Quality");
@@ -4083,6 +4432,14 @@ void PrintConfigDef::init_fff_params()
     def->tooltip = L("Whether to apply fuzzy skin on the first layer.");
     def->mode = comSimple;
     def->set_default_value(new ConfigOptionBool(0));
+
+    def = this->add("fuzzy_skin_top_surface", coBool);
+    def->label = L("Apply fuzzy skin to top surfaces");
+    def->category = L("Others");
+    def->tooltip = L("Apply the selected fuzzy-skin noise to top solid infill while preserving "
+                     "the exact endpoints that anchor each line to its neighboring extrusion.");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionBool(false));
 
     def = this->add("fuzzy_skin_mode", coEnum);
     def->label = L("Fuzzy skin generator mode");
@@ -4773,7 +5130,7 @@ void PrintConfigDef::init_fff_params()
     def->gui_type = ConfigOptionDef::GUIType::i_enum_open;
     def->label = L("Infill");
     def->category = L("Extruders");
-    def->tooltip = L("Filament to print internal sparse infill.\n\"Default\" uses the active object/part filament.");
+    def->tooltip = L("Filament/tool to print internal sparse infill. Auto line width is calculated from that tool's nozzle diameter, allowing a larger nozzle for faster infill.\n\"Default\" uses the active object/part filament.");
     def->min = 0;
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionInt(0));
@@ -5016,10 +5373,25 @@ void PrintConfigDef::init_fff_params()
     def->mode     = comExpert;
     def->set_default_value(new ConfigOptionFloat(0));
 
+    def = this->add("top_surface_z_mode", coEnum);
+    def->label    = L("Top surface Z method");
+    def->category = L("Quality");
+    def->tooltip  = L("Select how top surfaces improve Z fidelity. Z contouring adjusts slicing planes. "
+                      "Non-planar top layers retain ordinary slicing planes and finish eligible shallow surfaces with continuous mesh-following Z motion. "
+                      "The hybrid method uses Z contouring only where collision or support validation rejects a non-planar surface.");
+    def->enum_keys_map = &ConfigOptionEnum<TopSurfaceZMode>::get_enum_values();
+    def->enum_values = {"disabled", "z_contouring", "nonplanar_top_surface",
+                        "nonplanar_with_z_contouring_fallback"};
+    def->enum_labels = {L("Disabled"), L("Z contouring"), L("Non-planar top layers"),
+                        L("Non-planar with Z-contouring fallback")};
+    def->enum_icons = false;
+    def->mode = comExpert;
+    def->set_default_value(new ConfigOptionEnum<TopSurfaceZMode>(TopSurfaceZMode::Disabled));
+
     def = this->add("zaa_enabled", coBool);
     def->label    = L("Z contouring enabled");
     def->category = L("Quality");
-    def->tooltip  = L("Enable Z-layer contouring (aka Z-layer anti-aliasing).");
+    def->tooltip  = L("Legacy compatibility flag controlled by Top surface Z method.");
     def->mode     = comExpert;
     def->set_default_value(new ConfigOptionBool(false));
 
@@ -5052,6 +5424,46 @@ void PrintConfigDef::init_fff_params()
     def->max      = 100;
     def->mode     = comExpert;
     def->set_default_value(new ConfigOptionFloat(0.05));
+
+    def = this->add("nonplanar_top_surface", coBool);
+    def->label    = L("Non-planar top surfaces");
+    def->category = L("Quality");
+    def->tooltip  = L("Legacy compatibility flag controlled by Top surface Z method.");
+    def->mode     = comExpert;
+    def->set_default_value(new ConfigOptionBool(false));
+
+    def = this->add("nonplanar_top_surface_max_angle", coFloat);
+    def->label    = L("Maximum non-planar surface angle");
+    def->category = L("Quality");
+    def->tooltip  = L("Only upward-facing surfaces this many degrees or less from horizontal are considered for "
+                      "non-planar top layers. Reachability is still validated against the printer's detailed "
+                      "toolhead geometry or fallback clearance cone.");
+    def->sidetext = u8"°";
+    def->min      = 0;
+    def->max      = 90;
+    def->mode     = comExpert;
+    def->set_default_value(new ConfigOptionFloat(45));
+
+    def = this->add("nonplanar_top_surface_layers", coInt);
+    def->label    = L("Non-planar top layers");
+    def->category = L("Quality");
+    def->tooltip  = L("Number of upper solid shell layers replaced by a gradual non-planar transition. "
+                      "Each transition skin follows the same surface below the final exposed skin, while ordinary solid infill is retained underneath for support.");
+    def->sidetext = L("layers");
+    def->min      = 1;
+    def->max      = 20;
+    def->mode     = comExpert;
+    def->set_default_value(new ConfigOptionInt(5));
+
+    def = this->add("nonplanar_top_surface_resolution", coFloat);
+    def->label    = L("Non-planar path resolution");
+    def->category = L("Quality");
+    def->tooltip  = L("Maximum distance between mesh-following samples along a non-planar top path.");
+    def->sidetext = L("mm");
+    def->min      = 0.05;
+    def->max      = 2;
+    def->mode     = comExpert;
+    def->set_default_value(new ConfigOptionFloat(0.2));
 
     def = this->add("layer_change_gcode", coString);
     def->label = L("Layer change G-code");
@@ -5682,7 +6094,7 @@ void PrintConfigDef::init_fff_params()
     def->gui_type = ConfigOptionDef::GUIType::i_enum_open;
     def->label = L("Outer walls");
     def->category = L("Extruders");
-    def->tooltip = L("Filament to print outer walls.\n\"Default\" uses the active object/part filament.");
+    def->tooltip = L("Filament/tool to print outer walls. Auto line width is calculated from that tool's nozzle diameter, allowing a smaller nozzle for dimensional and surface detail.\n\"Default\" uses the active object/part filament.");
     def->min = 0;
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionInt(0));
@@ -5691,7 +6103,7 @@ void PrintConfigDef::init_fff_params()
     def->gui_type = ConfigOptionDef::GUIType::i_enum_open;
     def->label = L("Inner walls");
     def->category = L("Extruders");
-    def->tooltip = L("Filament to print inner walls.\n\"Default\" uses the active object/part filament.");
+    def->tooltip = L("Filament/tool to print inner walls. Auto line width is calculated from that tool's nozzle diameter, allowing a different nozzle from the outer wall and infill.\n\"Default\" uses the active object/part filament.");
     def->min = 0;
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionInt(0));
@@ -7078,6 +7490,37 @@ void PrintConfigDef::init_fff_params()
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionInt(0));
 
+    def = this->add("slow_down_layer_above_dissimilar_support_interface", coBool);
+    def->label = L("Slow layer above dissimilar interface");
+    def->category = L("Support");
+    def->tooltip = L("Slows model extrusion directly above a top support interface when the interface and model use different material types. "
+                     "This can improve adhesion to the interface and is disabled for same-material interfaces.");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionBool(false));
+
+    def = this->add("dissimilar_support_interface_speed", coFloatOrPercent);
+    def->label = L("Layer above interface speed");
+    def->category = L("Support");
+    def->tooltip = L("Maximum speed for model extrusion directly above a dissimilar-material support interface. "
+                     "A percentage is calculated from each extrusion's normal speed.");
+    def->sidetext = L("mm/s or %");
+    def->min = 1;
+    def->max = 1000;
+    def->max_literal = 1000;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloatOrPercent(50., true));
+
+    def = this->add("dissimilar_support_interface_speed_layers", coInt);
+    def->label = L("Interface speed recovery layers");
+    def->category = L("Support");
+    def->tooltip = L("Number of model layers after the interface-contact layer used to blend the speed limit back to normal. "
+                     "Set to 0 to slow only the layer directly above the interface.");
+    def->sidetext = L("layers");
+    def->min = 0;
+    def->max = 100;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionInt(0));
+
     def = this->add("support_interface_spacing", coFloat);
     def->label = L("Top interface spacing");
     def->category = L("Support");
@@ -7418,6 +7861,35 @@ void PrintConfigDef::init_fff_params()
     def->max = 1;
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionFloat(0.1));
+
+    def = this->add("support_ironing_nonplanar", coBool);
+    def->label = L("Surface-following support ironing");
+    def->category = L("Support");
+    def->tooltip = L("Project eligible spans of the top support interface and its ironing pass onto the underside of the model while preserving the configured support gap. "
+                     "A span remains planar when its surface contact or toolhead clearance cannot be validated.");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionBool(false));
+
+    def = this->add("support_ironing_nonplanar_max_angle", coFloat);
+    def->label = L("Maximum support ironing slope");
+    def->category = L("Support");
+    def->tooltip = L("Maximum underside slope, measured from horizontal, considered for surface-following support ironing. "
+                     "The printer toolhead geometry may impose a lower reachable angle.");
+    def->sidetext = L("°");
+    def->min = 0;
+    def->max = 90;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(45.));
+
+    def = this->add("support_ironing_nonplanar_resolution", coFloat);
+    def->label = L("Support ironing surface resolution");
+    def->category = L("Support");
+    def->tooltip = L("Maximum distance between samples used to follow the model underside during support ironing.");
+    def->sidetext = L("mm");
+    def->min = 0.02;
+    def->max = 1.;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(0.2));
 
     def = this->add("activate_chamber_temp_control",coBools);
     def->label = L("Activate temperature control");
@@ -9123,7 +9595,7 @@ void PrintConfigDef::init_sla_params()
 void PrintConfigDef::handle_legacy(t_config_option_key &opt_key, std::string &value)
 {
     //BBS: handle legacy options
-    if (opt_key == "third_wall_flow_ratio")
+    if (opt_key == "third_wall_flow_ratio" || opt_key == "staggered_perimeter_flow_ratio")
         opt_key = "inner_walls_flow_ratio";
 
     if (opt_key == "curr_bed_type" && value == "SuperTack Plate") {
@@ -9394,6 +9866,63 @@ void PrintConfigDef::handle_legacy(t_config_option_key &opt_key, std::string &va
 // Don't convert single options here, implement such conversion in PrintConfigDef::handle_legacy() instead.
 void PrintConfigDef::handle_legacy_composite(DynamicPrintConfig &config)
 {
+    // Older projects stored the two top-surface techniques as independent
+    // booleans, and briefly exposed perimeter_layering=nonplanar as a shortcut
+    // for mesh-following top skins. Migrate that shortcut back to Standard
+    // walls. The perimeter selector's new non-planar choice is the existing
+    // interlocking_walls value, while top-surface treatment is selected here.
+    bool old_nonplanar = config.has("nonplanar_top_surface") &&
+                         config.opt_bool("nonplanar_top_surface");
+    bool old_zaa = config.has("zaa_enabled") && config.opt_bool("zaa_enabled");
+    const bool old_brick = config.has("staggered_perimeters") &&
+        config.opt_bool("staggered_perimeters");
+    if (config.has("perimeter_layering") &&
+        config.opt_enum<PerimeterLayeringMode>("perimeter_layering") ==
+            PerimeterLayeringMode::Nonplanar) {
+        config.set_key_value("perimeter_layering",
+            new ConfigOptionEnum<PerimeterLayeringMode>(PerimeterLayeringMode::Standard));
+        old_nonplanar = true;
+    }
+    const bool selector_is_default = config.has("perimeter_layering") &&
+        config.opt_enum<PerimeterLayeringMode>("perimeter_layering") ==
+            PerimeterLayeringMode::Standard;
+    if (!config.has("perimeter_layering") ||
+        (selector_is_default && (old_nonplanar || old_brick))) {
+        const PerimeterLayeringMode mode = old_brick ? PerimeterLayeringMode::Brick :
+            PerimeterLayeringMode::Standard;
+        config.set_key_value("perimeter_layering", new ConfigOptionEnum<PerimeterLayeringMode>(mode));
+    }
+
+    TopSurfaceZMode top_surface_z_mode = TopSurfaceZMode::Disabled;
+    if (config.has("top_surface_z_mode")) {
+        top_surface_z_mode = config.opt_enum<TopSurfaceZMode>("top_surface_z_mode");
+    } else {
+        // A malformed legacy profile with both flags enabled resolves to the
+        // mesh-following method, matching the former GUI conflict resolution.
+        top_surface_z_mode = old_nonplanar ? TopSurfaceZMode::NonplanarTopSurface :
+            old_zaa ? TopSurfaceZMode::ZContouring : TopSurfaceZMode::Disabled;
+        config.set_key_value("top_surface_z_mode",
+            new ConfigOptionEnum<TopSurfaceZMode>(top_surface_z_mode));
+    }
+    // Full legacy configs already contain defaults for keys introduced by a
+    // newer build. Preserve an enabled legacy mesh-following flag in that
+    // case; the GUI always synchronizes the flag when a user changes the new
+    // selector, so a newly saved explicit Disabled selection remains false.
+    if (old_nonplanar && top_surface_z_mode == TopSurfaceZMode::Disabled &&
+        config.has("perimeter_layering") &&
+        config.opt_enum<PerimeterLayeringMode>("perimeter_layering") ==
+            PerimeterLayeringMode::Standard)
+        top_surface_z_mode = TopSurfaceZMode::NonplanarTopSurface;
+
+    const bool hybrid = top_surface_z_mode ==
+        TopSurfaceZMode::NonplanarWithZContouringFallback;
+    config.set_key_value("zaa_enabled", new ConfigOptionBool(
+        top_surface_z_mode == TopSurfaceZMode::ZContouring || hybrid));
+    config.set_key_value("nonplanar_top_surface", new ConfigOptionBool(
+        top_surface_z_mode == TopSurfaceZMode::NonplanarTopSurface || hybrid));
+    config.set_key_value("top_surface_z_mode",
+        new ConfigOptionEnum<TopSurfaceZMode>(top_surface_z_mode));
+
     if (config.has("thumbnails")) {
         std::string extention;
         if (config.has("thumbnails_format")) {
@@ -12874,7 +13403,7 @@ CustomGcodeSpecificConfigDef::CustomGcodeSpecificConfigDef()
 
 // change_extrusion_role_gcode
     std::string extrusion_role_types = "Possible Values:\n[\"Perimeter\", \"ExternalPerimeter\", "
-                                                     "\"OverhangPerimeter\", \"InternalInfill\", \"SolidInfill\", \"TopSolidInfill\", \"BottomSurface\", \"BridgeInfill\", \"ArcOverhang\", \"GapFill\", \"Ironing\", "
+                                                     "\"OverhangPerimeter\", \"InternalInfill\", \"SolidInfill\", \"TopSolidInfill\", \"BottomSurface\", \"BridgeInfill\", \"ArcOverhang\", \"ArcBridge\", \"GapFill\", \"Ironing\", "
                                                      "\"Skirt\", \"Brim\", \"SupportMaterial\", \"SupportMaterialInterface\", \"SupportTransition\", \"WipeTower\", \"Mixed\"]";
 
     new_def("extrusion_role", coString, "Extrusion role", "The new extrusion role/type that is going to be used\n" + extrusion_role_types);

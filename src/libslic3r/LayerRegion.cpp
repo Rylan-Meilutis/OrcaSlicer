@@ -12,11 +12,612 @@
 
 #include <string>
 #include <map>
+#include <limits>
 
 #include <boost/log/trivial.hpp>
 #include <boost/algorithm/clamp.hpp>
 
 namespace Slic3r {
+
+namespace {
+
+bool path_is_fully_buried(const ExtrusionPath &path,
+                          const ExPolygons &upper_coverage)
+{
+    const Polygons footprint = path.polygons_covered_by_width(
+        float(SCALED_EPSILON));
+    return !footprint.empty() && !upper_coverage.empty() && diff_ex(
+        footprint, upper_coverage, ApplySafetyOffset::No).empty();
+}
+
+bool path_is_stagger_wall(const ExtrusionPath &path, int inset_idx,
+                          bool inner_only)
+{
+    const bool alternating_inner = inset_idx > 0 && inset_idx % 2 == 1 &&
+        path.role() == erPerimeter;
+    const bool outer = !inner_only && inset_idx == 0 &&
+        (path.role() == erExternalPerimeter || path.role() == erPerimeter);
+    return (alternating_inner || outer) && path.polyline.points.size() >= 2;
+}
+
+bool path_is_stagger_candidate(const ExtrusionPath &path, int inset_idx,
+                               bool inner_only)
+{
+    return path_is_stagger_wall(path, inset_idx, inner_only) &&
+           !path.z_contoured;
+}
+
+bool path_can_be_staggered(const ExtrusionPath &path, int inset_idx,
+                           bool inner_only,
+                           const ExPolygons &current_coverage,
+                           const ExPolygons &upper_coverage)
+{
+    if (!path_is_stagger_candidate(path, inset_idx, inner_only))
+        return false;
+
+    if (!inner_only && inset_idx == 0) {
+        // An external bead intentionally straddles the model contour, so the
+        // inner-wall "whole bead is inside the next slice" test can never
+        // accept it. Instead require the slice boundary to be unchanged in
+        // the complete bead corridor. This admits vertical structural walls
+        // while rejecting top edges and sloped walls where either slice gains
+        // or loses material beside the path.
+        const Polygons footprint = path.polygons_covered_by_width(
+            float(SCALED_EPSILON));
+        if (footprint.empty() || current_coverage.empty() ||
+            upper_coverage.empty())
+            return false;
+        const ExPolygons changed = xor_ex(
+            current_coverage, upper_coverage, ApplySafetyOffset::No);
+        return changed.empty() || intersection_ex(
+            footprint, changed, ApplySafetyOffset::No).empty();
+    }
+
+    // Raising an inner wall is safe only when its complete deposited bead is
+    // buried by the next model layer. Checking the centerline alone lets the
+    // outside half of a bead emerge on sloped walls and beside top surfaces,
+    // which makes the brick pattern visible and changes the model envelope.
+    return path_is_fully_buried(path, upper_coverage);
+}
+
+void stagger_path(ExtrusionPath &path, int inset_idx, coord_t z_offset)
+{
+    path.inset_idx = inset_idx;
+    for (Point3 &point : path.polyline.points)
+        point.z() += z_offset;
+    path.z_contoured = true;
+    path.staggered_perimeter = true;
+}
+
+void set_staggered_transition_height(ExtrusionPath &path, coord_t z_offset,
+                                     bool entering_course)
+{
+    const double original_height = std::max(0.01, double(path.height));
+    const double offset = unscale<double>(z_offset);
+    const double transition_height = entering_course ?
+        original_height + offset : std::max(0.01, original_height - offset);
+    path.mm3_per_mm *= transition_height / original_height;
+    path.height = float(transition_height);
+    // The short exit bead returns the course to the nominal layer grid. It is
+    // ordinary inner-wall geometry, not a raised brick bead; keeping the brick
+    // preview tag here made the final exposed perimeter look bricked even
+    // though this half-height course is the required realignment layer.
+    path.staggered_perimeter = entering_course;
+    path.staggered_transition = true;
+    path.z_contoured = true;
+}
+
+ExtrusionPaths add_staggered_course_transitions(
+    const ExtrusionPath &source, int inherited_inset_idx, coord_t z_offset,
+    bool inner_only, const ExPolygons &lower_staggered_coverage)
+{
+    const int inset_idx = source.inset_idx >= 0 ? source.inset_idx : inherited_inset_idx;
+    if (!path_is_stagger_wall(source, inset_idx, inner_only) ||
+        source.nonplanar_surface ||
+        lower_staggered_coverage.empty()) {
+        ExtrusionPath result = source;
+        result.inset_idx = inset_idx;
+        // With no lower brick course, every newly raised path is the entrance
+        // bead and must span the otherwise missing half layer below it.
+        if (result.staggered_perimeter)
+            set_staggered_transition_height(result, z_offset, true);
+        return {std::move(result)};
+    }
+
+    const Polyline source_polyline = source.polyline.to_polyline();
+    Polylines fragments = intersection_pl(
+        Polylines{source_polyline}, lower_staggered_coverage);
+    append(fragments, diff_pl(Polylines{source_polyline}, lower_staggered_coverage));
+    if (fragments.size() <= 1) {
+        ExtrusionPath result = source;
+        result.inset_idx = inset_idx;
+        const bool lower_course_present = !intersection_pl(
+            Polylines{source_polyline}, lower_staggered_coverage).empty();
+        if (result.staggered_perimeter && !lower_course_present)
+            set_staggered_transition_height(result, z_offset, true);
+        else if (!result.staggered_perimeter && lower_course_present)
+            set_staggered_transition_height(result, z_offset, false);
+        return {std::move(result)};
+    }
+    restore_source_path_order(source_polyline, fragments);
+
+    ExtrusionPaths result;
+    result.reserve(fragments.size());
+    for (const Polyline &fragment : fragments) {
+        if (fragment.points.size() < 2)
+            continue;
+        result.emplace_back(Polyline3(fragment), source);
+        ExtrusionPath &path = result.back();
+        path.inset_idx = inset_idx;
+        const Point &sample = fragment.points[fragment.points.size() / 2];
+        const bool lower_course_present = std::any_of(
+            lower_staggered_coverage.begin(), lower_staggered_coverage.end(),
+            [&sample](const ExPolygon &polygon) { return polygon.contains(sample); });
+        if (path.staggered_perimeter && !lower_course_present)
+            set_staggered_transition_height(path, z_offset, true);
+        else if (!path.staggered_perimeter && lower_course_present)
+            set_staggered_transition_height(path, z_offset, false);
+    }
+    return result.empty() ? ExtrusionPaths{source} : result;
+}
+
+void ramp_staggered_endpoint(ExtrusionPath &path, bool at_start,
+                             coord_t z_offset)
+{
+    Points3 &points = path.polyline.points;
+    if (!path.staggered_perimeter || points.size() < 2 || z_offset <= 0)
+        return;
+    if (std::none_of(points.begin(), points.end(), [z_offset](const Point3 &point) {
+            return point.z() >= z_offset;
+        }))
+        return;
+
+    // This path contains a deliberate Brick-course entry/exit ramp. Keep that
+    // provenance even if a later course-boundary pass classifies the bead as
+    // an ordinary (non-raised) wall for preview purposes. Otherwise G-code
+    // mistakes the variable Z for a non-planar finishing surface and enables
+    // toolhead-clearance lifts for every subsequent path on the layer.
+    path.staggered_transition = true;
+
+    if (!at_start)
+        path.polyline.reverse();
+    const Point3 start = points.front();
+    const Point3 next = points[1];
+    const double segment_length =
+        (next.to_point() - start.to_point()).cast<double>().norm();
+    if (segment_length > 1.) {
+        const double ramp_length = std::min(
+            segment_length * 0.9, double(scale_(std::max(0.1f, path.width))));
+        const auto interpolate = [&start, &next, segment_length](double distance,
+                                                                coord_t z) {
+            const double ratio = distance / segment_length;
+            return Point3(
+                coord_t(std::llround(double(start.x()) +
+                    (double(next.x()) - double(start.x())) * ratio)),
+                coord_t(std::llround(double(start.y()) +
+                    (double(next.y()) - double(start.y())) * ratio)), z);
+        };
+        const coord_t base_z = start.z() - z_offset;
+        points.front().z() = base_z;
+        // Explicit half-height point makes the transition visible to the
+        // motion planner and prevents an abrupt Z-only jump at the boundary
+        // between nominal and brick-offset fragments.
+        points.insert(points.begin() + 1,
+                      interpolate(0.5 * ramp_length, base_z + z_offset / 2));
+        if (ramp_length < segment_length * 0.9)
+            points.insert(points.begin() + 2,
+                          interpolate(ramp_length, base_z + z_offset));
+        path.polyline.fitting_result.clear();
+    }
+    if (!at_start)
+        path.polyline.reverse();
+}
+
+void smooth_staggered_transitions(ExtrusionPaths &paths, coord_t z_offset,
+                                  bool closed)
+{
+    if (paths.size() < 2)
+        return;
+    const size_t transition_count = closed ? paths.size() : paths.size() - 1;
+    for (size_t idx = 0; idx < transition_count; ++idx) {
+        ExtrusionPath &before = paths[idx];
+        ExtrusionPath &after = paths[(idx + 1) % paths.size()];
+        const auto is_raised = [](const ExtrusionPath &path) {
+            return path.staggered_perimeter && std::any_of(
+                path.polyline.points.begin(), path.polyline.points.end(),
+                [](const Point3 &point) { return point.z() > 0; });
+        };
+        const bool before_raised = is_raised(before);
+        const bool after_raised = is_raised(after);
+        if (before_raised == after_raised ||
+            before.last_point3().to_point() != after.first_point3().to_point())
+            continue;
+        if (before_raised)
+            ramp_staggered_endpoint(before, false, z_offset);
+        else
+            ramp_staggered_endpoint(after, true, z_offset);
+    }
+}
+
+ExtrusionPaths stagger_supported_fragments(const ExtrusionPath &source,
+                                           int inherited_inset_idx,
+                                           coord_t z_offset,
+                                           bool inner_only,
+                                           const ExPolygons &current_coverage,
+                                           const ExPolygons &upper_coverage)
+{
+    const int inset_idx = source.inset_idx >= 0 ? source.inset_idx : inherited_inset_idx;
+    if (!path_is_stagger_candidate(source, inset_idx, inner_only))
+        return {source};
+    if (path_can_be_staggered(
+            source, inset_idx, inner_only, current_coverage, upper_coverage)) {
+        ExtrusionPath result = source;
+        stagger_path(result, inset_idx, z_offset);
+        return {std::move(result)};
+    }
+
+    // Clip the centerline against coverage inset by the bead radius. This
+    // partitions a path that crosses a top-surface boundary without allowing
+    // any raised bead fragment to protrude beyond the next layer. Intersected
+    // and subtracted fragments are restored to source order before extrusion.
+    const coord_t clearance = scale_(0.5 * source.width) + coord_t(SCALED_EPSILON);
+    const ExPolygons safe_centerline_area = shrink_ex(upper_coverage, clearance);
+    if (safe_centerline_area.empty())
+        return {source};
+
+    const Polyline source_polyline = source.polyline.to_polyline();
+    Polylines fragments = intersection_pl(Polylines{source_polyline}, safe_centerline_area);
+    append(fragments, diff_pl(Polylines{source_polyline}, safe_centerline_area));
+    if (fragments.size() <= 1)
+        return {source};
+    restore_source_path_order(source_polyline, fragments);
+
+    ExtrusionPaths result;
+    result.reserve(fragments.size());
+    for (const Polyline &fragment : fragments) {
+        if (fragment.points.size() < 2)
+            continue;
+        result.emplace_back(Polyline3(fragment), source);
+        ExtrusionPath &path = result.back();
+        path.inset_idx = inset_idx;
+        if (path_can_be_staggered(
+                path, inset_idx, inner_only, current_coverage, upper_coverage))
+            stagger_path(path, inset_idx, z_offset);
+    }
+    return result.empty() ? ExtrusionPaths{source} : result;
+}
+
+coord_t entity_max_relative_z(const ExtrusionEntity &entity)
+{
+    const auto path_max_z = [](const ExtrusionPath &path) {
+        coord_t maximum = 0;
+        for (const Point3 &point : path.polyline.points)
+            maximum = std::max(maximum, point.z());
+        return maximum;
+    };
+    if (const auto *path = dynamic_cast<const ExtrusionPath *>(&entity))
+        return path_max_z(*path);
+    if (const auto *multipath = dynamic_cast<const ExtrusionMultiPath *>(&entity)) {
+        coord_t maximum = 0;
+        for (const ExtrusionPath &path : multipath->paths)
+            maximum = std::max(maximum, path_max_z(path));
+        return maximum;
+    }
+    if (const auto *loop = dynamic_cast<const ExtrusionLoop *>(&entity)) {
+        coord_t maximum = 0;
+        for (const ExtrusionPath &path : loop->paths)
+            maximum = std::max(maximum, path_max_z(path));
+        return maximum;
+    }
+    if (const auto *collection = dynamic_cast<const ExtrusionEntityCollection *>(&entity)) {
+        coord_t maximum = 0;
+        for (const ExtrusionEntity *child : collection->entities)
+            maximum = std::max(maximum, entity_max_relative_z(*child));
+        return maximum;
+    }
+    return 0;
+}
+
+void start_closed_course_at_lowest_path(ExtrusionPaths &paths)
+{
+    if (paths.size() < 2)
+        return;
+    const auto minimum_z = [](const ExtrusionPath &path) {
+        coord_t minimum = std::numeric_limits<coord_t>::max();
+        for (const Point3 &point : path.polyline.points)
+            minimum = std::min(minimum, point.z());
+        return minimum;
+    };
+    const auto first = std::min_element(paths.begin(), paths.end(),
+        [&minimum_z](const ExtrusionPath &left, const ExtrusionPath &right) {
+            const coord_t left_z = minimum_z(left);
+            const coord_t right_z = minimum_z(right);
+            if (left_z != right_z)
+                return left_z < right_z;
+            // At the same Z, start in the conventional wall. This keeps the
+            // seam and prime on supported geometry before entering a raised
+            // interlocking segment.
+            return !left.staggered_perimeter && right.staggered_perimeter;
+        });
+    std::rotate(paths.begin(), first, paths.end());
+}
+
+void interlock_inner_wall_path(ExtrusionPath &path, int inset_idx,
+                               double depth, double wavelength,
+                               double resolution, int layer_id)
+{
+    if (path.polyline.points.size() < 2 || depth <= EPSILON ||
+        wavelength <= EPSILON || resolution <= EPSILON)
+        return;
+
+    double total_length = 0.;
+    for (const Line3 &line : path.polyline.lines())
+        total_length += (line.b.to_point() - line.a.to_point()).cast<double>().norm() *
+                        SCALING_FACTOR;
+    if (total_length <= 2. * resolution)
+        return;
+
+    const double phase = (layer_id & 1) ? M_PI : 0.;
+    const double transition_length = std::min(0.5 * wavelength, 0.25 * total_length);
+    Points3 sampled;
+    sampled.reserve(size_t(std::ceil(total_length / resolution)) + 2);
+    sampled.emplace_back(path.polyline.points.front().x(),
+                         path.polyline.points.front().y(), coord_t(0));
+
+    double distance = 0.;
+    for (const Line3 &line : path.polyline.lines()) {
+        const Vec2d delta = (line.b.to_point() - line.a.to_point()).cast<double>();
+        const double length = delta.norm() * SCALING_FACTOR;
+        const size_t segments = std::max<size_t>(1, size_t(std::ceil(length / resolution)));
+        for (size_t segment = 1; segment <= segments; ++segment) {
+            const double t = double(segment) / double(segments);
+            const Vec2d xy = line.a.to_point().cast<double>() + t * delta;
+            const double along = distance + t * length;
+            const double edge_distance = std::min(along, total_length - along);
+            const double u = transition_length <= EPSILON ? 1. :
+                std::clamp(edge_distance / transition_length, 0., 1.);
+            const double envelope = u * u * (3. - 2. * u);
+            // Keep the entire course at or below its nominal plane. This
+            // creates alternating interlock without entering the next layer's
+            // motion envelope or requiring a cross-layer dependency reorder.
+            const double wave = 0.5 + 0.5 * std::sin(
+                2. * M_PI * along / wavelength + phase);
+            sampled.emplace_back(coord_t(std::llround(xy.x())),
+                                 coord_t(std::llround(xy.y())),
+                                 coord_t(-scale_(envelope * depth * wave)));
+        }
+        distance += length;
+    }
+    sampled.back().z() = 0;
+    path.polyline.points = std::move(sampled);
+    path.polyline.remove_duplicate_points();
+    path.polyline.fitting_result.clear();
+    path.inset_idx = inset_idx;
+    path.z_contoured = true;
+    path.nonplanar_interlocking_wall = true;
+}
+
+void apply_nonplanar_interlocking_walls(ExtrusionEntity &entity,
+                                        int inherited_inset_idx,
+                                        double depth, double wavelength,
+                                        double resolution, int layer_id,
+                                        const ExPolygons &current_coverage,
+                                        const ExPolygons &upper_coverage)
+{
+    const int inset_idx = entity.inset_idx >= 0 ? entity.inset_idx : inherited_inset_idx;
+    if (auto *path = dynamic_cast<ExtrusionPath *>(&entity)) {
+        if (path_can_be_staggered(*path, inset_idx, true,
+                                  current_coverage, upper_coverage))
+            interlock_inner_wall_path(*path, inset_idx, depth, wavelength,
+                                      resolution, layer_id);
+    } else if (auto *multipath = dynamic_cast<ExtrusionMultiPath *>(&entity)) {
+        for (ExtrusionPath &path : multipath->paths)
+            apply_nonplanar_interlocking_walls(path, inset_idx, depth, wavelength,
+                                               resolution, layer_id, current_coverage,
+                                               upper_coverage);
+    } else if (auto *loop = dynamic_cast<ExtrusionLoop *>(&entity)) {
+        for (ExtrusionPath &path : loop->paths)
+            apply_nonplanar_interlocking_walls(path, inset_idx, depth, wavelength,
+                                               resolution, layer_id, current_coverage,
+                                               upper_coverage);
+    } else if (auto *collection = dynamic_cast<ExtrusionEntityCollection *>(&entity)) {
+        for (ExtrusionEntity *child : collection->entities)
+            apply_nonplanar_interlocking_walls(*child, inset_idx, depth, wavelength,
+                                               resolution, layer_id, current_coverage,
+                                               upper_coverage);
+    }
+}
+
+void apply_staggered_perimeters(ExtrusionEntity &entity, int inherited_inset_idx,
+                                coord_t z_offset, bool inner_only,
+                                const ExPolygons &current_coverage,
+                                const ExPolygons &upper_coverage,
+                                const ExPolygons &lower_staggered_coverage)
+{
+    const int inset_idx = entity.inset_idx >= 0 ? entity.inset_idx : inherited_inset_idx;
+    if (auto *path = dynamic_cast<ExtrusionPath *>(&entity)) {
+        if (path_can_be_staggered(
+                *path, inset_idx, inner_only, current_coverage, upper_coverage)) {
+            stagger_path(*path, inset_idx, z_offset);
+            const bool continues_lower_course = !intersection_pl(
+                Polylines{path->polyline.to_polyline()}, lower_staggered_coverage).empty();
+            if (!continues_lower_course)
+                set_staggered_transition_height(*path, z_offset, true);
+        } else if (path_is_stagger_candidate(*path, inset_idx, inner_only) &&
+                   !intersection_pl(Polylines{path->polyline.to_polyline()},
+                                    lower_staggered_coverage).empty()) {
+            path->inset_idx = inset_idx;
+            set_staggered_transition_height(*path, z_offset, false);
+        }
+    } else if (auto *multipath = dynamic_cast<ExtrusionMultiPath *>(&entity)) {
+        // Arachne may split one wall into ordinary and overhang paths. Do not
+        // let one exposed segment disable brick staggering for every buried
+        // segment in the same multipath. G-code already supports a different
+        // Z on consecutive Polyline3 paths and emits the connecting Z move.
+        ExtrusionPaths paths;
+        for (const ExtrusionPath &path : multipath->paths) {
+            ExtrusionPaths supported = stagger_supported_fragments(
+                path, inset_idx, z_offset, inner_only, current_coverage,
+                upper_coverage);
+            for (const ExtrusionPath &fragment : supported)
+                append(paths, add_staggered_course_transitions(
+                    fragment, inset_idx, z_offset, inner_only,
+                    lower_staggered_coverage));
+        }
+        smooth_staggered_transitions(paths, z_offset, false);
+        multipath->paths = std::move(paths);
+    } else if (auto *loop = dynamic_cast<ExtrusionLoop *>(&entity)) {
+        // The same loop may contain independently classified overhang and
+        // perimeter sections. Raise only the buried ordinary sections; the
+        // exposed portions stay at nominal Z and retain the model envelope.
+        ExtrusionPaths paths;
+        for (const ExtrusionPath &path : loop->paths) {
+            ExtrusionPaths supported = stagger_supported_fragments(
+                path, inset_idx, z_offset, inner_only, current_coverage,
+                upper_coverage);
+            for (const ExtrusionPath &fragment : supported)
+                append(paths, add_staggered_course_transitions(
+                    fragment, inset_idx, z_offset, inner_only,
+                    lower_staggered_coverage));
+        }
+        // A closed course has no geometric beginning, so choose its lowest
+        // supported fragment as the emission start. This retains one
+        // continuous loop while preventing a seam prime at the raised height
+        // followed by a descent through an already deposited brick bead.
+        start_closed_course_at_lowest_path(paths);
+        smooth_staggered_transitions(paths, z_offset, true);
+        loop->paths = std::move(paths);
+    } else if (auto *collection = dynamic_cast<ExtrusionEntityCollection *>(&entity)) {
+        for (ExtrusionEntity *child : collection->entities)
+            apply_staggered_perimeters(
+                *child, inset_idx, z_offset, inner_only, current_coverage,
+                upper_coverage,
+                lower_staggered_coverage);
+        // Resolve the physical Z dependency before applying the configured
+        // wall order: lower courses must exist before a neighboring raised
+        // wall is deposited. Stable ordering preserves the user's inner /
+        // outer wall order among entities at the same relative height.
+        std::stable_sort(collection->entities.begin(), collection->entities.end(),
+            [](const ExtrusionEntity *left, const ExtrusionEntity *right) {
+                return entity_max_relative_z(*left) < entity_max_relative_z(*right);
+            });
+    }
+}
+
+coord_t entity_min_relative_z(const ExtrusionEntity &entity)
+{
+    const auto path_min_z = [](const ExtrusionPath &path) {
+        coord_t minimum = 0;
+        for (const Point3 &point : path.polyline.points)
+            minimum = std::min(minimum, point.z());
+        return minimum;
+    };
+    if (const auto *path = dynamic_cast<const ExtrusionPath *>(&entity))
+        return path_min_z(*path);
+    coord_t minimum = 0;
+    if (const auto *multipath = dynamic_cast<const ExtrusionMultiPath *>(&entity)) {
+        for (const ExtrusionPath &path : multipath->paths)
+            minimum = std::min(minimum, path_min_z(path));
+    } else if (const auto *loop = dynamic_cast<const ExtrusionLoop *>(&entity)) {
+        for (const ExtrusionPath &path : loop->paths)
+            minimum = std::min(minimum, path_min_z(path));
+    } else if (const auto *collection = dynamic_cast<const ExtrusionEntityCollection *>(&entity)) {
+        for (const ExtrusionEntity *child : collection->entities)
+            minimum = std::min(minimum, entity_min_relative_z(*child));
+    }
+    return minimum;
+}
+
+bool smooth_outer_loop_is_eligible(const ExtrusionLoop &loop,
+                                   const ExPolygons &changed_footprint)
+{
+    if (loop.paths.empty())
+        return false;
+    Polylines centerlines;
+    for (const ExtrusionPath &path : loop.paths) {
+        if (path.role() != erExternalPerimeter || path.z_contoured ||
+            path.polyline.points.size() < 2)
+            return false;
+        centerlines.emplace_back(path.polyline.to_polyline());
+    }
+    if (changed_footprint.empty())
+        return true;
+    const coord_t clearance = scale_(0.5 * loop.paths.front().width) +
+        coord_t(SCALED_EPSILON);
+    return intersection_pl(centerlines, offset_ex(changed_footprint, clearance)).empty();
+}
+
+ExtrusionEntitiesPtr smooth_outer_wall_courses(
+    const ExtrusionLoop &source, double layer_height, double target_height)
+{
+    // Choose the evenly dividing course height closest to the request. Merely
+    // rounding layer_height / target_height selects one pass for e.g.
+    // 0.20 / 0.14, even though two 0.10 mm courses are the closer result.
+    const double ratio = layer_height / target_height;
+    const int lower_passes = std::max(1, int(std::floor(ratio)));
+    const int upper_passes = std::max(1, int(std::ceil(ratio)));
+    const int passes =
+        std::abs(layer_height / lower_passes - target_height) <=
+                std::abs(layer_height / upper_passes - target_height) ?
+            lower_passes : upper_passes;
+    if (passes < 2)
+        return {};
+    const double course_height = layer_height / double(passes);
+    ExtrusionEntitiesPtr courses;
+    courses.reserve(size_t(passes));
+    for (int pass = 0; pass < passes; ++pass) {
+        auto *loop = static_cast<ExtrusionLoop *>(source.clone());
+        const coord_t relative_z = scale_(
+            -layer_height + (double(pass) + 1.) * course_height);
+        for (ExtrusionPath &path : loop->paths) {
+            for (Point3 &point : path.polyline.points)
+                point.z() += relative_z;
+            path.height = float(course_height);
+            path.mm3_per_mm /= double(passes);
+            path.z_contoured = true;
+            path.nonplanar_clearance_validated = true;
+            path.smooth_outer_wall = true;
+            path.set_reverse();
+        }
+        courses.emplace_back(loop);
+    }
+    return courses;
+}
+
+void apply_smooth_outer_wall_courses(ExtrusionEntityCollection &collection,
+                                     double layer_height, double target_height,
+                                     const ExPolygons &changed_footprint)
+{
+    for (size_t idx = 0; idx < collection.entities.size(); ++idx) {
+        ExtrusionEntity *entity = collection.entities[idx];
+        if (auto *nested = dynamic_cast<ExtrusionEntityCollection *>(entity)) {
+            apply_smooth_outer_wall_courses(
+                *nested, layer_height, target_height, changed_footprint);
+        } else if (const auto *loop = dynamic_cast<const ExtrusionLoop *>(entity);
+                   loop != nullptr &&
+                   smooth_outer_loop_is_eligible(*loop, changed_footprint)) {
+            ExtrusionEntitiesPtr courses = smooth_outer_wall_courses(
+                *loop, layer_height, target_height);
+            if (!courses.empty()) {
+                delete entity;
+                collection.entities.erase(collection.entities.begin() + idx);
+                collection.entities.insert(collection.entities.begin() + idx,
+                    courses.begin(), courses.end());
+                idx += courses.size() - 1;
+            }
+        }
+    }
+    // Independent sub-courses must be deposited before any neighboring path
+    // at the owning layer's nominal Z. This dependency takes precedence over
+    // the selected wall sequence; stable ordering preserves that sequence for
+    // entities sharing the same minimum Z.
+    std::stable_sort(collection.entities.begin(), collection.entities.end(),
+        [](const ExtrusionEntity *left, const ExtrusionEntity *right) {
+            return entity_min_relative_z(*left) < entity_min_relative_z(*right);
+        });
+}
+
+} // namespace
 
 Flow LayerRegion::flow(FlowRole role) const
 {
@@ -145,6 +746,71 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
         g.process_arachne();
     else
         g.process_classic();
+
+    if (brick_perimeters_enabled(region_config) && this->layer()->lower_layer != nullptr &&
+        !spiral_mode) {
+        const double offset_ratio = region_config.staggered_perimeter_offset.get_abs_value(1.);
+        const coord_t z_offset = scale_(this->layer()->height * offset_ratio);
+        if (z_offset > 0) {
+            // Aggregate object coverage is intentional: a wall is buried even
+            // when the next layer covering it belongs to another print region.
+            const ExPolygons upper_coverage = this->layer()->upper_layer == nullptr ?
+                ExPolygons{} : this->layer()->upper_layer->lslices;
+            ExPolygons lower_staggered_coverage;
+            // Perimeters are generated in parallel across layers, so course
+            // continuity must be derived from slice geometry rather than from
+            // whether the lower layer's path entities happen to be ready. A
+            // previous brick course can exist only where the same buried wall
+            // corridor exists in both the current and lower slices. Layer zero
+            // is deliberately conventional, making layer one an entry course.
+            if (this->layer()->lower_layer->lower_layer != nullptr) {
+                const coord_t clearance = scale_(0.5 * this->flow(frPerimeter).width()) +
+                    coord_t(SCALED_EPSILON);
+                lower_staggered_coverage = intersection_ex(
+                    shrink_ex(this->layer()->lslices, clearance),
+                    shrink_ex(this->layer()->lower_layer->lslices, clearance));
+            }
+            apply_staggered_perimeters(
+                this->perimeters, -1, z_offset,
+                region_config.staggered_perimeters_inner_only.value,
+                this->layer()->lslices,
+                upper_coverage,
+                lower_staggered_coverage);
+        }
+    }
+    if (region_config.perimeter_layering.value ==
+            PerimeterLayeringMode::SmoothOuterWall &&
+        this->layer()->lower_layer != nullptr && !spiral_mode) {
+        const double target_height = region_config.smooth_outer_wall_layer_height.value;
+        if (target_height > EPSILON && this->layer()->height > target_height + EPSILON) {
+            const ExPolygons changed_footprint = union_ex(
+                diff_ex(this->layer()->lslices,
+                        this->layer()->lower_layer->lslices,
+                        ApplySafetyOffset::No),
+                diff_ex(this->layer()->lower_layer->lslices,
+                        this->layer()->lslices,
+                        ApplySafetyOffset::No));
+            apply_smooth_outer_wall_courses(
+                this->perimeters, this->layer()->height, target_height,
+                changed_footprint);
+        }
+    }
+    if ((region_config.perimeter_layering.value ==
+             PerimeterLayeringMode::InterlockingWalls ||
+         region_config.perimeter_layering.value ==
+             PerimeterLayeringMode::Nonplanar) &&
+        this->layer()->lower_layer != nullptr &&
+        this->layer()->upper_layer != nullptr && !spiral_mode) {
+        const double depth = std::min(
+            region_config.interlocking_wall_amplitude.value,
+            0.45 * this->layer()->height);
+        apply_nonplanar_interlocking_walls(
+            this->perimeters, -1, depth,
+            region_config.interlocking_wall_wavelength.value,
+            region_config.interlocking_wall_resolution.value,
+            int(this->layer()->id()), this->layer()->lslices,
+            this->layer()->upper_layer->lslices);
+    }
 }
 
 #if 1
@@ -1085,7 +1751,7 @@ void LayerRegion::simplify_path(ExtrusionPath* path)
     // paths. Preserve fitting data approved by the generator, but never fit or
     // simplify one here: doing so without the generator's obstacle context may
     // bow a segment outside its validated corridor.
-    if (path->role() == erArcOverhang) {
+    if (is_arc_fill(path->role())) {
         return;
     }
 
@@ -1108,7 +1774,7 @@ void LayerRegion::simplify_multi_path(ExtrusionMultiPath* multipath)
     const auto scaled_resolution = scaled<double>(print_config.resolution.value);
 
     for (size_t i = 0; i < multipath->paths.size(); ++i) {
-        if (multipath->paths[i].role() == erArcOverhang) {
+        if (is_arc_fill(multipath->paths[i].role())) {
             continue;
         }
         if (enable_arc_fitting &&
@@ -1131,7 +1797,7 @@ void LayerRegion::simplify_loop(ExtrusionLoop* loop)
     const auto scaled_resolution = scaled<double>(print_config.resolution.value);
 
     for (size_t i = 0; i < loop->paths.size(); ++i) {
-        if (loop->paths[i].role() == erArcOverhang) {
+        if (is_arc_fill(loop->paths[i].role())) {
             continue;
         }
         if (enable_arc_fitting &&

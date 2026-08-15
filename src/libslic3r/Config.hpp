@@ -2553,6 +2553,10 @@ public:
     // Mostly used for enums (when type == coEnum), but may be used for ints resp. floats, if gui_type is set to "i_enum_open" resp. "f_enum_open".
     std::vector<std::string>            enum_values;
     std::vector<std::string>            enum_labels;
+    // Add matching param_<enum value>.svg images to the combo box when they
+    // exist. Disable this for selectors whose value names happen to share an
+    // icon with a settings section but whose choices should remain text-only.
+    bool                                enum_icons = true;
     // For enums (when type == coEnum). Maps enum_values to enums.
     // Initialized by ConfigOptionEnum<xxx>::get_enum_values()
     const t_config_enum_values         *enum_keys_map   = nullptr;

@@ -1,6 +1,7 @@
 #include <catch2/catch_all.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <fstream>
 #include <limits>
@@ -9,16 +10,21 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "libslic3r/ClipperUtils.hpp"
 #include "libslic3r/Fill/Fill.hpp"
 #include "libslic3r/Flow.hpp"
 #include "libslic3r/GCode/GCodeProcessor.hpp"
+#include "libslic3r/GCodeReader.hpp"
 #include "libslic3r/Geometry.hpp"
+#include "libslic3r/Geometry/ConvexHull.hpp"
 #include "libslic3r/Layer.hpp"
+#include "libslic3r/MeshBoolean.hpp"
 #include "libslic3r/Print.hpp"
 #include "libslic3r/SVG.hpp"
+#include "libslic3r/Tesselate.hpp"
 #include "libslic3r/libslic3r.h"
 
 #include "test_helpers.hpp"
@@ -34,7 +40,7 @@ static bool print_has_arc_overhang(const Print &print)
         for (const Layer *layer : object->layers())
             for (const LayerRegion *region : layer->regions())
                 for (const ExtrusionEntity *entity : region->fills.flatten().entities)
-                    if (entity->role() == erArcOverhang)
+                    if (is_arc_fill(entity->role()))
                         return true;
     return false;
 }
@@ -46,9 +52,398 @@ static std::optional<ExtrusionPath> first_arc_overhang_path(const Print &print)
             for (const LayerRegion *region : layer->regions())
                 for (const ExtrusionEntity *entity : region->fills.flatten().entities)
                     if (const auto *path = dynamic_cast<const ExtrusionPath *>(entity);
-                        path != nullptr && path->role() == erArcOverhang && path->mm3_per_mm > 0.)
+                        path != nullptr && is_arc_fill(path->role()) && path->mm3_per_mm > 0.)
                         return *path;
     return std::nullopt;
+}
+
+static std::vector<ExtrusionPath> nonplanar_top_paths(const Print &print)
+{
+    std::vector<ExtrusionPath> paths;
+    for (const PrintObject *object : print.objects())
+        for (const Layer *layer : object->layers())
+            for (const LayerRegion *region : layer->regions())
+                for (const ExtrusionEntity *entity : region->fills.flatten().entities)
+                    if (const auto *path = dynamic_cast<const ExtrusionPath *>(entity);
+                        path != nullptr && path->nonplanar_surface && path->role() == erTopSolidInfill)
+                        paths.push_back(*path);
+    return paths;
+}
+
+static std::vector<ExtrusionPath> nonplanar_perimeter_paths(const Print &print)
+{
+    std::vector<ExtrusionPath> paths;
+    const auto collect = [&paths](const ExtrusionEntityCollection &collection) {
+        for (const ExtrusionEntity *entity : collection.flatten().entities)
+            if (const auto *path = dynamic_cast<const ExtrusionPath *>(entity)) {
+                if (path->nonplanar_surface && is_perimeter(path->role()))
+                    paths.push_back(*path);
+            } else if (const auto *loop = dynamic_cast<const ExtrusionLoop *>(entity)) {
+                for (const ExtrusionPath &path : loop->paths)
+                    if (path.nonplanar_surface && is_perimeter(path.role()))
+                        paths.push_back(path);
+            } else if (const auto *multipath = dynamic_cast<const ExtrusionMultiPath *>(entity)) {
+                for (const ExtrusionPath &path : multipath->paths)
+                    if (path.nonplanar_surface && is_perimeter(path.role()))
+                        paths.push_back(path);
+            }
+    };
+    for (const PrintObject *object : print.objects())
+        for (const Layer *layer : object->layers())
+            for (const LayerRegion *region : layer->regions()) {
+                collect(region->perimeters);
+                collect(region->fills);
+            }
+    return paths;
+}
+
+static bool has_connected_nonplanar_wall_loop(const Print &print)
+{
+    const auto connected = [](const ExtrusionPaths &paths) {
+        if (paths.empty() || paths.front().first_point3() != paths.back().last_point3())
+            return false;
+        bool has_nonplanar = false;
+        for (size_t idx = 0; idx < paths.size(); ++idx) {
+            if (!is_perimeter(paths[idx].role()))
+                return false;
+            has_nonplanar |= paths[idx].nonplanar_surface;
+            if (idx > 0 && paths[idx - 1].last_point3() != paths[idx].first_point3())
+                return false;
+        }
+        return has_nonplanar;
+    };
+    const auto inspect = [&](auto &&self, const ExtrusionEntity &entity) -> bool {
+        if (const auto *loop = dynamic_cast<const ExtrusionLoop *>(&entity))
+            return connected(loop->paths);
+        if (const auto *multipath = dynamic_cast<const ExtrusionMultiPath *>(&entity))
+            return connected(multipath->paths);
+        if (const auto *collection =
+                dynamic_cast<const ExtrusionEntityCollection *>(&entity))
+            return std::any_of(collection->entities.begin(), collection->entities.end(),
+                [&](const ExtrusionEntity *child) { return self(self, *child); });
+        return false;
+    };
+    for (const PrintObject *object : print.objects())
+        for (const Layer *layer : object->layers())
+            for (const LayerRegion *region : layer->regions())
+                if (std::any_of(region->perimeters.entities.begin(),
+                        region->perimeters.entities.end(),
+                        [&](const ExtrusionEntity *entity) {
+                            return inspect(inspect, *entity);
+                        }))
+                    return true;
+    return false;
+}
+
+static void append_nonplanar_wall_insets_in_order(
+    const ExtrusionEntity &entity, std::vector<unsigned int> &insets)
+{
+    const auto contains_nonplanar = [](auto &&self,
+                                       const ExtrusionEntity &candidate) -> bool {
+        if (const auto *path = dynamic_cast<const ExtrusionPath *>(&candidate))
+            return path->nonplanar_surface && is_perimeter(path->role());
+        if (const auto *loop = dynamic_cast<const ExtrusionLoop *>(&candidate))
+            return std::any_of(loop->paths.begin(), loop->paths.end(),
+                [](const ExtrusionPath &path) {
+                    return path.nonplanar_surface && is_perimeter(path.role());
+                });
+        if (const auto *multipath = dynamic_cast<const ExtrusionMultiPath *>(&candidate))
+            return std::any_of(multipath->paths.begin(), multipath->paths.end(),
+                [](const ExtrusionPath &path) {
+                    return path.nonplanar_surface && is_perimeter(path.role());
+                });
+        if (const auto *collection =
+                dynamic_cast<const ExtrusionEntityCollection *>(&candidate))
+            return std::any_of(collection->entities.begin(), collection->entities.end(),
+                [&](const ExtrusionEntity *child) { return self(self, *child); });
+        return false;
+    };
+    if (!contains_nonplanar(contains_nonplanar, entity))
+        return;
+    if (const auto *collection =
+                   dynamic_cast<const ExtrusionEntityCollection *>(&entity)) {
+        for (const ExtrusionEntity *child : collection->entities) {
+            if (child->inset_idx >= 0 && is_perimeter(child->role()))
+                insets.emplace_back(child->inset_idx);
+            else
+                append_nonplanar_wall_insets_in_order(*child, insets);
+        }
+    } else if (entity.inset_idx >= 0 && is_perimeter(entity.role()))
+        insets.emplace_back(entity.inset_idx);
+}
+
+static std::vector<unsigned int> nonplanar_wall_inset_order(const Print &print)
+{
+    std::vector<unsigned int> insets;
+    for (const PrintObject *object : print.objects())
+        for (const Layer *layer : object->layers())
+            for (const LayerRegion *region : layer->regions()) {
+                for (const ExtrusionEntity *entity : region->perimeters.entities)
+                    append_nonplanar_wall_insets_in_order(*entity, insets);
+                for (const ExtrusionEntity *entity : region->fills.entities)
+                    append_nonplanar_wall_insets_in_order(*entity, insets);
+            }
+    insets.erase(std::remove_if(insets.begin(), insets.end(),
+        [](unsigned int inset) { return inset > 2; }), insets.end());
+    // Clipping a wall at the replacement boundary may split one inset into
+    // several consecutive path fragments. They are still one scheduled wall,
+    // so compare changes in inset rather than mistaking those fragments for
+    // three separately ordered walls.
+    insets.erase(std::unique(insets.begin(), insets.end()), insets.end());
+    // The first complete three-wall course is sufficient to verify the
+    // configured order; subsequent courses repeat that sequence.
+    if (insets.size() > 3)
+        insets.resize(3);
+    return insets;
+}
+
+static size_t perimeter_path_count(const Print &print, ExtrusionRole role)
+{
+    size_t count = 0;
+    auto count_paths = [role, &count](const ExtrusionEntity &entity) {
+        if (const auto *path = dynamic_cast<const ExtrusionPath *>(&entity)) {
+            count += path->role() == role;
+        } else if (const auto *loop = dynamic_cast<const ExtrusionLoop *>(&entity)) {
+            count += std::count_if(loop->paths.begin(), loop->paths.end(),
+                [role](const ExtrusionPath &path) { return path.role() == role; });
+        } else if (const auto *multipath = dynamic_cast<const ExtrusionMultiPath *>(&entity)) {
+            count += std::count_if(multipath->paths.begin(), multipath->paths.end(),
+                [role](const ExtrusionPath &path) { return path.role() == role; });
+        }
+    };
+    for (const PrintObject *object : print.objects())
+        for (const Layer *layer : object->layers())
+            for (const LayerRegion *region : layer->regions())
+                for (const ExtrusionEntity *entity : region->perimeters.flatten().entities)
+                    count_paths(*entity);
+    return count;
+}
+
+static size_t staggered_perimeter_path_count(const Print &print)
+{
+    size_t count = 0;
+    auto count_paths = [&count](const ExtrusionEntity &entity) {
+        if (const auto *path = dynamic_cast<const ExtrusionPath *>(&entity)) {
+            count += path->staggered_perimeter;
+        } else if (const auto *loop = dynamic_cast<const ExtrusionLoop *>(&entity)) {
+            count += std::count_if(loop->paths.begin(), loop->paths.end(),
+                [](const ExtrusionPath &path) { return path.staggered_perimeter; });
+        } else if (const auto *multipath = dynamic_cast<const ExtrusionMultiPath *>(&entity)) {
+            count += std::count_if(multipath->paths.begin(), multipath->paths.end(),
+                [](const ExtrusionPath &path) { return path.staggered_perimeter; });
+        }
+    };
+    for (const PrintObject *object : print.objects())
+        for (const Layer *layer : object->layers())
+            for (const LayerRegion *region : layer->regions())
+                for (const ExtrusionEntity *entity : region->perimeters.flatten().entities)
+                    count_paths(*entity);
+    return count;
+}
+
+static size_t interlocking_perimeter_path_count(const Print &print)
+{
+    size_t count = 0;
+    const auto count_paths = [&count](auto &&self,
+                                      const ExtrusionEntity &entity) -> void {
+        if (const auto *path = dynamic_cast<const ExtrusionPath *>(&entity)) {
+            count += path->nonplanar_interlocking_wall;
+        } else if (const auto *loop = dynamic_cast<const ExtrusionLoop *>(&entity)) {
+            for (const ExtrusionPath &path : loop->paths)
+                count += path.nonplanar_interlocking_wall;
+        } else if (const auto *multipath =
+                       dynamic_cast<const ExtrusionMultiPath *>(&entity)) {
+            for (const ExtrusionPath &path : multipath->paths)
+                count += path.nonplanar_interlocking_wall;
+        } else if (const auto *collection =
+                       dynamic_cast<const ExtrusionEntityCollection *>(&entity)) {
+            for (const ExtrusionEntity *child : collection->entities)
+                self(self, *child);
+        }
+    };
+    for (const PrintObject *object : print.objects())
+        for (const Layer *layer : object->layers())
+            for (const LayerRegion *region : layer->regions())
+                for (const ExtrusionEntity *entity : region->perimeters.entities)
+                    count_paths(count_paths, *entity);
+    return count;
+}
+
+static bool has_nonplanar_path_with_role(const Print &print, ExtrusionRole role)
+{
+    for (const PrintObject *object : print.objects())
+        for (const Layer *layer : object->layers())
+            for (const LayerRegion *region : layer->regions())
+                for (const ExtrusionEntity *entity : region->fills.flatten().entities)
+                    if (const auto *path = dynamic_cast<const ExtrusionPath *>(entity);
+                        path != nullptr && path->nonplanar_surface && path->role() == role)
+                        return true;
+    return false;
+}
+
+static bool has_planar_path_inside_nonplanar_top_coverage(const Print &print)
+{
+    for (const PrintObject *object : print.objects()) {
+        for (const Layer *layer : object->layers()) {
+            Polygons coverage;
+            for (const LayerRegion *region : layer->regions()) {
+                for (const ExtrusionEntity *entity : region->fills.flatten().entities) {
+                    if (const auto *path = dynamic_cast<const ExtrusionPath *>(entity);
+                        path != nullptr && path->nonplanar_surface && path->role() == erTopSolidInfill)
+                        path->polygons_covered_by_spacing(coverage, float(scale_(0.02)));
+                }
+            }
+            if (coverage.empty())
+                continue;
+            const ExPolygons interior = offset_ex(union_ex(coverage), -scale_(0.01));
+            const auto overlaps = [&interior](const ExtrusionPath &path) {
+                if (path.nonplanar_surface || path.role() != erPerimeter ||
+                    path.inset_idx == 0 || path.polyline.points.empty())
+                    return false;
+                coord_t min_x = path.polyline.points.front().x();
+                coord_t max_x = min_x;
+                coord_t min_y = path.polyline.points.front().y();
+                coord_t max_y = min_y;
+                for (const Point3 &point : path.polyline.points) {
+                    min_x = std::min(min_x, point.x());
+                    max_x = std::max(max_x, point.x());
+                    min_y = std::min(min_y, point.y());
+                    max_y = std::max(max_y, point.y());
+                }
+                // Ignore legitimate compact features (for example the
+                // chimney bore). The regression is the large inner-wall box
+                // spanning the accepted roof patch.
+                if (unscale_(max_x - min_x) < 12. ||
+                    unscale_(max_y - min_y) < 8.)
+                    return false;
+                return !intersection_pl(
+                    Polylines{path.polyline.to_polyline()}, interior).empty();
+            };
+            for (const LayerRegion *region : layer->regions()) {
+                for (const ExtrusionEntityCollection *collection : {&region->fills, &region->perimeters}) {
+                    for (const ExtrusionEntity *entity : collection->flatten().entities) {
+                        if (const auto *path = dynamic_cast<const ExtrusionPath *>(entity)) {
+                            if (overlaps(*path))
+                                return true;
+                        } else if (const auto *loop = dynamic_cast<const ExtrusionLoop *>(entity)) {
+                            if (std::any_of(loop->paths.begin(), loop->paths.end(), overlaps))
+                                return true;
+                        } else if (const auto *multipath = dynamic_cast<const ExtrusionMultiPath *>(entity)) {
+                            if (std::any_of(multipath->paths.begin(), multipath->paths.end(), overlaps))
+                                return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return false;
+}
+
+static TriangleMesh shallow_top_wedge(double angle_degrees)
+{
+    TriangleMesh cube = Slic3r::Test::cube(20.);
+    std::vector<Vec3f> vertices = cube.its.vertices;
+    const std::vector<Vec3i32> faces = cube.its.indices;
+    const float top_z = std::max_element(vertices.begin(), vertices.end(),
+        [](const Vec3f &lhs, const Vec3f &rhs) { return lhs.z() < rhs.z(); })->z();
+    const float slope = float(std::tan(angle_degrees * M_PI / 180.));
+    for (Vec3f &vertex : vertices)
+        if (std::abs(vertex.z() - top_z) < float(EPSILON))
+            vertex.z() += slope * vertex.x();
+    return TriangleMesh(std::move(vertices), std::move(faces));
+}
+
+template<class BottomZ, class TopZ>
+static TriangleMesh extrude_sloped_footprint(const ExPolygon &footprint,
+                                              BottomZ bottom_z, TopZ top_z)
+{
+    std::vector<Vec3f> vertices;
+    std::vector<Vec3i32> faces;
+    const auto append_triangle_soup = [&](const std::vector<Vec2f> &triangles,
+                                          const auto &z_at) {
+        REQUIRE(triangles.size() % 3 == 0);
+        for (size_t idx = 0; idx < triangles.size(); idx += 3) {
+            const int32_t first = int32_t(vertices.size());
+            for (size_t point_idx = 0; point_idx < 3; ++point_idx) {
+                const Vec2f &point = triangles[idx + point_idx];
+                vertices.emplace_back(point.x(), point.y(), float(z_at(point.x())));
+            }
+            faces.emplace_back(first, first + 1, first + 2);
+        }
+    };
+    append_triangle_soup(triangulate_expolygon_2f(footprint, NORMALS_DOWN), bottom_z);
+    append_triangle_soup(triangulate_expolygon_2f(footprint, NORMALS_UP), top_z);
+
+    const auto append_sides = [&](const Polygon &polygon) {
+        for (size_t idx = 0; idx < polygon.points.size(); ++idx) {
+            const Point &a_scaled = polygon.points[idx];
+            const Point &b_scaled = polygon.points[(idx + 1) % polygon.points.size()];
+            const Vec2f a(float(unscale_(a_scaled.x())), float(unscale_(a_scaled.y())));
+            const Vec2f b(float(unscale_(b_scaled.x())), float(unscale_(b_scaled.y())));
+            const int32_t first = int32_t(vertices.size());
+            vertices.emplace_back(a.x(), a.y(), float(bottom_z(a.x())));
+            vertices.emplace_back(b.x(), b.y(), float(bottom_z(b.x())));
+            vertices.emplace_back(b.x(), b.y(), float(top_z(b.x())));
+            vertices.emplace_back(a.x(), a.y(), float(top_z(a.x())));
+            faces.emplace_back(first, first + 1, first + 2);
+            faces.emplace_back(first, first + 2, first + 3);
+        }
+    };
+    append_sides(footprint.contour);
+    for (const Polygon &hole : footprint.holes)
+        append_sides(hole);
+    TriangleMesh mesh(std::move(vertices), std::move(faces));
+    its_merge_vertices(mesh.its);
+    return mesh;
+}
+
+// A compact version of the Benchy cabin/roof topology: a shallow sloped roof
+// interrupted by an open, hollow chimney. It catches regressions where the
+// non-planar patch closes itself with a new inner-wall box, or consumes either
+// side of the chimney wall while replacing the roof's planar top courses.
+static TriangleMesh benchy_roof_with_chimney(double angle_degrees)
+{
+    constexpr double width = 24.;
+    constexpr double depth = 20.;
+    constexpr double roof_height = 12.;
+    constexpr double chimney_x = 7.;
+    constexpr double chimney_y = 10.;
+    // Deliberately thick enough for three requested walls on both sides of the
+    // annulus. A thinner cosmetic tube would legitimately collapse inner
+    // insets under Arachne and could not detect a missing-wall regression.
+    constexpr double chimney_outer_radius = 5.0;
+    constexpr double chimney_inner_radius = 1.5;
+    constexpr double chimney_top = 22.;
+    const double slope = std::tan(angle_degrees * M_PI / 180.);
+
+    Polygon rectangle({Point::new_scale(0., 0.), Point::new_scale(width, 0.),
+                       Point::new_scale(width, depth), Point::new_scale(0., depth)});
+    ExPolygon roof_footprint(rectangle);
+    TriangleMesh model = extrude_sloped_footprint(
+        roof_footprint, [](double) { return 0.; },
+        [slope](double x) { return roof_height + slope * x; });
+
+    Polygon chimney_outer = make_circle_num_segments(scale_(chimney_outer_radius), 64);
+    chimney_outer.translate(Point::new_scale(chimney_x, chimney_y));
+    ExPolygon chimney_footprint(chimney_outer);
+    TriangleMesh chimney = extrude_sloped_footprint(
+        chimney_footprint,
+        [slope](double x) { return roof_height - 0.6 + slope * x; },
+        [](double) { return chimney_top; });
+    MeshBoolean::cgal::plus(model, chimney);
+
+    // Build a single watertight volume. Merely merging overlapping triangle
+    // soups makes the roof/chimney intersection non-manifold and can itself
+    // make upper chimney contours disappear, masking the slicing regression
+    // this fixture is intended to detect.
+    Polygon chimney_bore = make_circle_num_segments(scale_(chimney_inner_radius), 48);
+    chimney_bore.translate(Point::new_scale(chimney_x, chimney_y));
+    TriangleMesh bore = extrude_sloped_footprint(
+        ExPolygon(chimney_bore), [](double) { return -1.; },
+        [](double) { return chimney_top + 1.; });
+    MeshBoolean::cgal::minus(model, bore);
+    return model;
 }
 
 static bool arc_paths_have_proper_crossing(const Polylines &paths,
@@ -1482,6 +1877,8 @@ TEST_CASE("Arc overhang keeps a distinct G-code feature role", "[Fill][ArcOverha
 {
     CHECK(ExtrusionEntity::role_to_string(erArcOverhang) == "Arc overhang");
     CHECK(ExtrusionEntity::string_to_role("Arc overhang") == erArcOverhang);
+    CHECK(ExtrusionEntity::role_to_string(erArcBridge) == "Arc bridge");
+    CHECK(ExtrusionEntity::string_to_role("Arc bridge") == erArcBridge);
 }
 
 TEST_CASE("Wide unsupported roofs reach the preview as arc overhangs", "[Fill][ArcOverhang][GCode]")
@@ -1554,6 +1951,48 @@ TEST_CASE("Wide unsupported roofs reach the preview as arc overhangs", "[Fill][A
     CHECK(minimum_bead_clearance <= 0.);
 }
 
+TEST_CASE("Bridge and overhang ordering can precede walls on only the affected layer", "[Fill][ArcOverhang][GCode][Ordering]")
+{
+    const bool use_arc_overhangs = GENERATE(false, true);
+    CAPTURE(use_arc_overhangs);
+    TriangleMesh model = make_cube(10., 20., 5.);
+    TriangleMesh roof  = make_cube(30., 20., 2.);
+    roof.translate(-10., 0., 5.);
+    model.merge(roof);
+
+    Print print;
+    Slic3r::Test::init_and_process_print({model}, print, {
+        {"arc_overhang_enabled", use_arc_overhangs ? "1" : "0"},
+        {"arc_overhang_bridge_distance", "0"},
+        {"arc_overhang_min_overhang_distance", "0"},
+        {"bridge_overhang_before_walls", "1"},
+        {"enable_support", "0"}
+    });
+
+    ScopedTemporaryFile gcode_file(".gcode");
+    GCodeProcessorResult preview;
+    print.export_gcode(gcode_file.string(), &preview, nullptr);
+    const auto first_supporting_fill = std::find_if(preview.moves.begin(), preview.moves.end(), [](const auto &move) {
+        return move.type == EMoveType::Extrude && is_bridge_or_arc_fill(move.extrusion_role);
+    });
+    REQUIRE(first_supporting_fill != preview.moves.end());
+    if (use_arc_overhangs)
+        CHECK(is_arc_fill(first_supporting_fill->extrusion_role));
+    else
+        CHECK((first_supporting_fill->extrusion_role == erBridgeInfill ||
+               first_supporting_fill->extrusion_role == erInternalBridgeInfill));
+    const float affected_z = first_supporting_fill->position.z();
+
+    CHECK(std::none_of(preview.moves.begin(), first_supporting_fill, [affected_z](const auto &move) {
+        return move.type == EMoveType::Extrude && is_perimeter(move.extrusion_role) &&
+               std::abs(move.position.z() - affected_z) < 0.001f;
+    }));
+    CHECK(std::any_of(std::next(first_supporting_fill), preview.moves.end(), [affected_z](const auto &move) {
+        return move.type == EMoveType::Extrude && is_perimeter(move.extrusion_role) &&
+               std::abs(move.position.z() - affected_z) < 0.001f;
+    }));
+}
+
 TEST_CASE("Narrow bridge G-code keeps every arc path anchored and curved",
           "[Fill][ArcOverhang][GCode][Narrow]")
 {
@@ -1584,7 +2023,7 @@ TEST_CASE("Narrow bridge G-code keeps every arc path anchored and curved",
                         if (const auto *path =
                                 dynamic_cast<const ExtrusionPath *>(entity);
                             path != nullptr &&
-                            path->role() == erArcOverhang) {
+                            is_arc_fill(path->role())) {
                             raw_arc_paths.emplace_back();
                             for (const Point3 &point :
                                  path->polyline.points)
@@ -1614,7 +2053,8 @@ TEST_CASE("Narrow bridge G-code keeps every arc path anchored and curved",
         const std::string gcode(
             (std::istreambuf_iterator<char>(stream)),
             std::istreambuf_iterator<char>());
-        CHECK(gcode.find(";TYPE:Arc overhang") != std::string::npos);
+        CHECK(gcode.find(";TYPE:Arc bridge") != std::string::npos);
+        CHECK(gcode.find(";TYPE:Arc overhang") == std::string::npos);
 
         struct PrintedSegment {
             Vec2d a;
@@ -1635,10 +2075,10 @@ TEST_CASE("Narrow bridge G-code keeps every arc path anchored and curved",
             const auto &move = preview.moves[move_idx];
             const bool is_arc =
                 move.type == EMoveType::Extrude &&
-                move.extrusion_role == erArcOverhang;
+                is_arc_fill(move.extrusion_role);
             const bool previous_is_arc =
                 previous.type == EMoveType::Extrude &&
-                previous.extrusion_role == erArcOverhang &&
+                is_arc_fill(previous.extrusion_role) &&
                 previous.layer_id == move.layer_id;
             const bool is_wall =
                 move.type == EMoveType::Extrude &&
@@ -1684,7 +2124,7 @@ TEST_CASE("Narrow bridge G-code keeps every arc path anchored and curved",
                         const bool same_layer_anchor =
                             std::abs(anchor.print_z - current_z) <= 0.001 &&
                             (is_perimeter(anchor.role) ||
-                             anchor.role == erArcOverhang);
+                             is_arc_fill(anchor.role));
                         const bool lower_layer_anchor =
                             std::abs(anchor.print_z - previous_layer_z) <= 0.001;
                         if (!same_layer_anchor && !lower_layer_anchor)
@@ -1764,7 +2204,7 @@ TEST_CASE("Narrow bridge G-code keeps every arc path anchored and curved",
                 }));
         }
 
-        bool arc_overhang_role = false;
+        bool arc_fill_role = false;
         double x = 0.;
         double y = 0.;
         size_t arc_command_count = 0;
@@ -1772,8 +2212,7 @@ TEST_CASE("Narrow bridge G-code keeps every arc path anchored and curved",
         std::string line;
         while (std::getline(lines, line)) {
             if (line.rfind(";TYPE:", 0) == 0) {
-                arc_overhang_role =
-                    line.find("Arc overhang") != std::string::npos;
+                arc_fill_role = line == ";TYPE:Arc bridge";
                 continue;
             }
             std::istringstream words(line);
@@ -1810,7 +2249,7 @@ TEST_CASE("Narrow bridge G-code keeps every arc path anchored and curved",
                 }
             }
 
-            if (arc_overhang_role &&
+            if (arc_fill_role &&
                 (command == "G2" || command == "G3") &&
                 (has_i || has_j)) {
                 ++arc_command_count;
@@ -1856,14 +2295,14 @@ TEST_CASE("Arc overhang fitting follows the global arc fitting setting",
 
         std::ifstream stream(gcode_file.string());
         REQUIRE(stream.good());
-        bool arc_overhang_role = false;
+        bool arc_fill_role = false;
         size_t arc_command_count = 0;
         for (std::string line; std::getline(stream, line);) {
             if (line.rfind(";TYPE:", 0) == 0) {
-                arc_overhang_role = line == ";TYPE:Arc overhang";
+                arc_fill_role = line == ";TYPE:Arc bridge";
                 continue;
             }
-            if (!arc_overhang_role)
+            if (!arc_fill_role)
                 continue;
             std::istringstream words(line);
             std::string command;
@@ -2565,6 +3004,81 @@ TEST_CASE("Sparse infill rotation template turns the infill layer by layer", "[F
     CHECK(angles == expected);
 }
 
+TEST_CASE("Non-planar infill is a bounded wall-anchored Z wave", "[Fill][NonplanarInfill]")
+{
+    Print print;
+    Slic3r::Test::init_and_process_print(
+        {Slic3r::Test::cube(10)}, print,
+        {{"nonplanar_infill", 1},
+         {"nonplanar_infill_amplitude", 0.08},
+         {"nonplanar_infill_wavelength", 6.0},
+         {"nonplanar_infill_resolution", 0.5},
+         {"sparse_infill_density", "40%"},
+         {"sparse_infill_pattern", "rectilinear"},
+         {"top_shell_layers", 0},
+         {"bottom_shell_layers", 0},
+         {"layer_height", 0.2}});
+
+    size_t waved_paths = 0;
+    bool has_nonzero_z = false;
+    for (const Layer *layer : print.objects().front()->layers())
+        for (const LayerRegion *region : layer->regions())
+            for (const ExtrusionEntity *entity : region->fills.flatten().entities)
+                if (const auto *path = dynamic_cast<const ExtrusionPath *>(entity);
+                    path != nullptr && path->nonplanar_infill) {
+                    ++waved_paths;
+                    REQUIRE(path->z_contoured);
+                    REQUIRE(path->polyline.points.size() >= 3);
+                    CHECK(path->polyline.points.front().z() == 0);
+                    CHECK(path->polyline.points.back().z() == 0);
+                    for (const Point3 &point : path->polyline.points) {
+                        CHECK(std::abs(unscale_(point.z())) <= 0.08 + EPSILON);
+                        has_nonzero_z |= point.z() != 0;
+                    }
+                }
+    CHECK(waved_paths > 0);
+    CHECK(has_nonzero_z);
+    ScopedTemporaryFile gcode_file(".gcode");
+    GCodeProcessorResult preview;
+    REQUIRE_NOTHROW(print.export_gcode(gcode_file.string(), &preview, nullptr));
+    std::ifstream stream(gcode_file.string());
+    REQUIRE(stream.good());
+    const std::string gcode((std::istreambuf_iterator<char>(stream)),
+                            std::istreambuf_iterator<char>());
+    CHECK(gcode.find(";TYPE:Non-planar interlocking infill") != std::string::npos);
+    CHECK(std::any_of(preview.moves.begin(), preview.moves.end(),
+        [](const GCodeProcessorResult::MoveVertex &move) {
+            return move.type == EMoveType::Extrude &&
+                   move.extrusion_role == erNonplanarInfill;
+        }));
+}
+
+TEST_CASE("Fuzzy skin can texture top fill without losing line anchors", "[Fill][FuzzySkin]")
+{
+    Print print;
+    Slic3r::Test::init_and_process_print(
+        {Slic3r::Test::cube(10)}, print,
+        {{"fuzzy_skin", "all"},
+         {"fuzzy_skin_top_surface", 1},
+         {"fuzzy_skin_thickness", 0.1},
+         {"fuzzy_skin_point_distance", 0.3},
+         {"top_surface_pattern", "rectilinear"},
+         {"layer_height", 0.2}});
+
+    size_t textured_paths = 0;
+    for (const Layer *layer : print.objects().front()->layers())
+        for (const LayerRegion *region : layer->regions())
+            for (const ExtrusionEntity *entity : region->fills.flatten().entities)
+                if (const auto *path = dynamic_cast<const ExtrusionPath *>(entity);
+                    path != nullptr && path->role() == erTopSolidInfill &&
+                    path->polyline.points.size() > 3) {
+                    ++textured_paths;
+                    CHECK(path->polyline.points.front().z() == 0);
+                    CHECK(path->polyline.points.back().z() == 0);
+                }
+    CHECK(textured_paths > 0);
+}
+
 TEST_CASE("Infill rotation template layer count modifier holds each angle for N layers", "[Fill]")
 {
     Print print;
@@ -2620,6 +3134,1621 @@ TEST_CASE("Z anti-aliasing keeps the infill rotation template's step", "[Fill]")
         steps += delta == 45;
     }
     CHECK(steps > 0);
+}
+
+TEST_CASE("True non-planar top surfaces work without Z contouring", "[Fill][NonplanarSurface]")
+{
+    Print print;
+    Slic3r::Test::init_and_process_print(
+        {shallow_top_wedge(8.)}, print,
+        {{"nonplanar_top_surface", 1},
+         {"nonplanar_top_surface_max_angle", 45},
+         {"nonplanar_top_surface_resolution", 0.2},
+         {"nonplanar_top_surface_min_height", 0.08},
+         {"zaa_enabled", 0},
+         {"layer_height", 0.2}});
+
+    const std::vector<ExtrusionPath> paths = nonplanar_top_paths(print);
+    REQUIRE_FALSE(paths.empty());
+    const std::vector<ExtrusionPath> boundary_paths = nonplanar_perimeter_paths(print);
+    // The complete configured wall stack is draped with the skin. Leaving a
+    // nominal-Z inner wall at this boundary reintroduces stair steps and can
+    // collide with the top raster. The outer wall retains dimensional
+    // accuracy while Arachne closes variable-width wall-to-fill gaps.
+    CHECK_FALSE(boundary_paths.empty());
+    CHECK(has_connected_nonplanar_wall_loop(print));
+    // A completely selected wall has no in-layer planar/non-planar boundary.
+    // It therefore remains one closed, continuously contoured loop; forcing
+    // its seam down to the nominal owner Z would introduce a notch on every
+    // transition course. Attachment is supplied by the aligned flat
+    // foundation and the preceding wall course, which are validated below.
+    CHECK(std::any_of(boundary_paths.begin(), boundary_paths.end(),
+        [](const ExtrusionPath &path) {
+            if (path.polyline.points.size() < 3 ||
+                path.polyline.points.front().head<2>() !=
+                    path.polyline.points.back().head<2>() ||
+                path.polyline.points.front().z() !=
+                    path.polyline.points.back().z())
+                return false;
+            const auto [minimum, maximum] = std::minmax_element(
+                path.polyline.points.begin(), path.polyline.points.end(),
+                [](const Point3 &left, const Point3 &right) {
+                    return left.z() < right.z();
+                });
+            return maximum->z() > minimum->z();
+        }));
+
+    // The fill domain is already inset from the generated wall stack. Row
+    // phase must not add another half-spacing at either edge, otherwise the
+    // skin leaves a visible wedge beside an otherwise valid draped wall.
+    // Inspect the interior of the outer non-planar wall and require the
+    // deposited wall/skin envelopes to form one closed surface. A 0.05 mm
+    // opening removes only polygon rounding noise, not a printable gap.
+    Points outer_wall_points;
+    Polygons deposited_surface;
+    for (const ExtrusionPath &path : boundary_paths) {
+        if (path.inset_idx == 0)
+            for (const Point3 &point : path.polyline.points)
+                outer_wall_points.emplace_back(point.to_point());
+        path.polygons_covered_by_width(deposited_surface, 0.f);
+    }
+    for (const ExtrusionPath &path : paths)
+        path.polygons_covered_by_width(deposited_surface, 0.f);
+    REQUIRE(outer_wall_points.size() >= 3);
+    ExPolygons expected_surface{ExPolygon(
+        Geometry::convex_hull(std::move(outer_wall_points)))};
+    expected_surface = offset_ex(expected_surface, -scale_(0.05));
+    ExPolygons uncovered_surface = diff_ex(
+        expected_surface, union_ex(deposited_surface), ApplySafetyOffset::No);
+    uncovered_surface = opening_ex(uncovered_surface, scale_(0.05));
+    const double uncovered_surface_area = std::accumulate(
+        uncovered_surface.begin(), uncovered_surface.end(), 0.,
+        [](double total, const ExPolygon &polygon) {
+            return total + std::abs(polygon.area()) *
+                SCALING_FACTOR * SCALING_FACTOR;
+        });
+    CAPTURE(uncovered_surface_area);
+    CHECK(uncovered_surface_area < 0.05);
+    CHECK_FALSE(has_nonplanar_path_with_role(print, erSolidInfill));
+    bool has_continuous_z_change = false;
+    coord_t maximum_path_z_span = 0;
+    size_t x_aligned_segments = 0;
+    size_t boundary_anchor_segments = 0;
+    size_t short_serpentine_connectors = 0;
+    const float maximum_path_width = std::max_element(
+        paths.begin(), paths.end(), [](const ExtrusionPath &left,
+                                       const ExtrusionPath &right) {
+            return left.width < right.width;
+        })->width;
+    for (const ExtrusionPath &path : paths) {
+        REQUIRE(path.role() == erTopSolidInfill);
+        REQUIRE(path.z_contoured);
+        for (size_t point_idx = 1; point_idx < path.polyline.points.size(); ++point_idx) {
+            has_continuous_z_change |= path.polyline.points[point_idx - 1].z() !=
+                                       path.polyline.points[point_idx].z();
+            const Vec3crd delta = path.polyline.points[point_idx] -
+                                  path.polyline.points[point_idx - 1];
+            if (std::abs(delta.x()) + std::abs(delta.y()) > scale_(0.05)) {
+                if (std::abs(delta.y()) <= scale_(0.001)) {
+                    ++x_aligned_segments;
+                } else if (std::abs(delta.x()) <= scale_(0.001)) {
+                    // Arachne may add a long variable-width anchor along the
+                    // rectangular wall band.  It closes the bead-envelope
+                    // sliver at the wall rather than connecting unrelated
+                    // scanlines, so its length is not bounded by raster
+                    // spacing.
+                    ++boundary_anchor_segments;
+                } else {
+                    CHECK(delta.head<2>().cast<double>().norm() <= scale_(0.6));
+                    ++short_serpentine_connectors;
+                }
+            }
+        }
+        const auto [minimum_z, maximum_z] = std::minmax_element(
+            path.polyline.points.begin(), path.polyline.points.end(),
+            [](const Point3 &lhs, const Point3 &rhs) { return lhs.z() < rhs.z(); });
+        maximum_path_z_span = std::max(maximum_path_z_span, maximum_z->z() - minimum_z->z());
+    }
+    CHECK(has_continuous_z_change);
+    CHECK(x_aligned_segments > 0);
+    CHECK(boundary_anchor_segments > 0);
+    CHECK(boundary_anchor_segments + short_serpentine_connectors > 0);
+    // Every point of the finishing course lies on the source plane. Sampling
+    // an interior XY by first projecting it to the patch boundary produces a
+    // visibly flat plateau even though the emitted XY remains in the
+    // interior. The unknown object translation affects only the intercept,
+    // so z - slope*x must remain constant across the complete finishing skin.
+    const double expected_slope = std::tan(8. * M_PI / 180.);
+    double minimum_plane_intercept = std::numeric_limits<double>::max();
+    double maximum_plane_intercept = std::numeric_limits<double>::lowest();
+    size_t finishing_surface_points = 0;
+    for (const PrintObject *object : print.objects())
+        for (const Layer *layer : object->layers())
+            for (const LayerRegion *region : layer->regions())
+                for (const ExtrusionEntity *entity : region->fills.flatten().entities)
+                    if (const auto *path = dynamic_cast<const ExtrusionPath *>(entity);
+                        path != nullptr && path->nonplanar_surface &&
+                        !path->nonplanar_transition &&
+                        path->role() == erTopSolidInfill)
+                        for (const Point3 &point : path->polyline.points) {
+                            const double intercept = layer->print_z +
+                                unscale_(point.z()) -
+                                expected_slope * unscale_(point.x());
+                            minimum_plane_intercept = std::min(
+                                minimum_plane_intercept, intercept);
+                            maximum_plane_intercept = std::max(
+                                maximum_plane_intercept, intercept);
+                            ++finishing_surface_points;
+                        }
+    REQUIRE(finishing_surface_points > 0);
+    CHECK(maximum_plane_intercept - minimum_plane_intercept < 0.01);
+    // The boundary is the original slicer-owned wall loop, not a second
+    // Arachne outline generated from the finishing patch. This keeps its
+    // dimensional contour, configured inset count and seam topology.
+    CHECK(std::any_of(boundary_paths.begin(), boundary_paths.end(),
+        [](const ExtrusionPath &path) {
+            return path.nonplanar_clearance_validated;
+        }));
+    // The final curved skin is generated from one projected surface rather
+    // than nominal-layer fragments, so a raster may cross several ordinary
+    // layer heights continuously. The stepped planar shell below supports it.
+    CHECK(unscale<double>(maximum_path_z_span) > 0.2 + EPSILON);
+
+    ScopedTemporaryFile gcode_file(".gcode");
+    GCodeProcessorResult preview;
+    REQUIRE_NOTHROW(print.export_gcode(gcode_file.string(), &preview, nullptr));
+    std::ifstream stream(gcode_file.string());
+    REQUIRE(stream.good());
+    const std::string gcode((std::istreambuf_iterator<char>(stream)),
+                            std::istreambuf_iterator<char>());
+    CHECK_FALSE(gcode.empty());
+    CHECK(gcode.find(";TYPE:Non-planar top surface") != std::string::npos);
+    CHECK(gcode.find(";TYPE:Non-planar transition") != std::string::npos);
+    // Adjacent variable-width pieces are one wall even when Arachne represents
+    // them as separate ExtrusionPaths. Their intentional bead contact must not
+    // be mistaken for a travel collision. Genuine moves between disconnected
+    // rasters may still need clearance, so reject only a raise whose eventual
+    // XYZ target was already within the normal geometry join tolerance.
+    Vec3d gcode_position = Vec3d::Zero();
+    bool have_gcode_position = false;
+    std::optional<Vec3d> position_before_clearance_raise;
+    size_t spurious_clearance_raises = 0;
+    std::istringstream clearance_lines(gcode);
+    for (std::string line; std::getline(clearance_lines, line);) {
+        if (line.rfind("G0 ", 0) != 0 && line.rfind("G1 ", 0) != 0)
+            continue;
+        Vec3d next_position = gcode_position;
+        bool has_coordinate = false;
+        std::istringstream words(line);
+        for (std::string word; words >> word;) {
+            if (word.size() < 2)
+                continue;
+            const int axis = word.front() == 'X' ? 0 :
+                             word.front() == 'Y' ? 1 :
+                             word.front() == 'Z' ? 2 : -1;
+            if (axis >= 0) {
+                next_position[axis] = std::stod(word.substr(1));
+                has_coordinate = true;
+            }
+        }
+        if (line.find("raise for non-planar toolhead clearance") !=
+                std::string::npos && have_gcode_position)
+            position_before_clearance_raise = gcode_position;
+        if (line.find("set Z for variable-Z surface") != std::string::npos &&
+            position_before_clearance_raise) {
+            const Vec3d delta = next_position - *position_before_clearance_raise;
+            spurious_clearance_raises +=
+                delta.head<2>().norm() <= 0.05 && std::abs(delta.z()) <= 0.05;
+            position_before_clearance_raise.reset();
+        }
+        if (has_coordinate) {
+            gcode_position = next_position;
+            have_gcode_position = true;
+        }
+    }
+    CHECK(spurious_clearance_raises == 0);
+    // A mixed wall must be written as one extrusion entity. Splitting it at
+    // the planar/non-planar metadata boundary produces the characteristic
+    // retract, clearance travel and isolated raised contour that this feature
+    // is intended to replace.
+    bool wall_started = false;
+    bool retracted_after_wall = false;
+    bool continuous_wall_transition = false;
+    bool nonplanar_started = false;
+    std::istringstream gcode_lines(gcode);
+    for (std::string line; std::getline(gcode_lines, line);) {
+        if (line == ";LAYER_CHANGE") {
+            nonplanar_started = false;
+            wall_started = false;
+            retracted_after_wall = false;
+        } else if (line == ";TYPE:Outer wall" || line == ";TYPE:Inner wall" ||
+                   line == ";TYPE:Brick wall") {
+            wall_started = true;
+            retracted_after_wall = false;
+        } else if (wall_started && line.find("; retract") != std::string::npos) {
+            retracted_after_wall = true;
+        } else if (line.rfind(";TYPE:Non-planar", 0) == 0) {
+            continuous_wall_transition |= !retracted_after_wall;
+            nonplanar_started = true;
+        } else if (line.rfind(";TYPE:", 0) == 0 && line != ";TYPE:Custom") {
+            CAPTURE(line);
+            CHECK_FALSE(nonplanar_started);
+        }
+    }
+    CHECK(continuous_wall_transition);
+
+    std::map<unsigned int, std::pair<float, float>> preview_z_ranges;
+    for (const GCodeProcessorResult::MoveVertex &move : preview.moves) {
+        if (move.type != EMoveType::Extrude || move.extrusion_role != erNonplanarSurface)
+            continue;
+        auto range = preview_z_ranges.try_emplace(
+            move.layer_id, std::numeric_limits<float>::max(), std::numeric_limits<float>::lowest()).first;
+        range->second.first  = std::min(range->second.first, move.position.z());
+        range->second.second = std::max(range->second.second, move.position.z());
+    }
+    REQUIRE_FALSE(preview_z_ranges.empty());
+    CHECK(std::any_of(preview_z_ranges.begin(), preview_z_ranges.end(), [](const auto &entry) {
+        return entry.second.second - entry.second.first > 0.001f;
+    }));
+}
+
+TEST_CASE("A connected non-planar top surface transitions across upper layer operations", "[Fill][NonplanarSurface]")
+{
+    Print print;
+    Slic3r::Test::init_and_process_print(
+        {shallow_top_wedge(8.)}, print,
+        {{"nonplanar_top_surface", 1},
+         {"nonplanar_top_surface_max_angle", 45},
+         {"nonplanar_top_surface_layers", 5},
+         {"zaa_enabled", 0},
+         {"layer_height", 0.2}});
+
+    size_t owning_layers = 0;
+    coord_t deepest_relative_z = 0;
+    size_t planar_anchored_paths = 0;
+    size_t unsupported_anchor_points = 0;
+    size_t planar_wall_anchor_paths = 0;
+    size_t unsupported_wall_anchor_points = 0;
+    std::map<std::pair<coord_t, coord_t>, std::vector<double>> shell_z_by_xy;
+    std::set<const Layer *> nonplanar_top_owner_layers;
+    std::set<const Layer *> nonplanar_wall_owner_layers;
+    for (const PrintObject *object : print.objects()) {
+        for (const Layer *layer : object->layers()) {
+            bool owns_nonplanar_top = false;
+            for (const LayerRegion *region : layer->regions()) {
+                const auto inspect = [&](const ExtrusionEntityCollection &collection) {
+                    for (const ExtrusionEntity *entity : collection.flatten().entities) {
+                        const auto *path = dynamic_cast<const ExtrusionPath *>(entity);
+                        if (path == nullptr || !path->nonplanar_surface)
+                            continue;
+                        if (path->role() != erTopSolidInfill)
+                            continue;
+                        owns_nonplanar_top = true;
+                        nonplanar_top_owner_layers.insert(layer);
+                        for (const Point3 &point : path->polyline.points) {
+                            deepest_relative_z = std::min(deepest_relative_z, point.z());
+                            shell_z_by_xy[{point.x(), point.y()}].push_back(
+                                layer->print_z + unscale_(point.z()));
+                        }
+
+                        if (!path->nonplanar_transition ||
+                            path->nonplanar_feature_transition)
+                            continue;
+                        std::vector<const Layer *> support_layers;
+                        support_layers.reserve(path->polyline.points.size());
+                        bool lies_on_planar_courses = true;
+                        for (const Point3 &point : path->polyline.points) {
+                            const double absolute_z = layer->print_z + unscale_(point.z());
+                            const auto nearest = std::min_element(
+                                object->layers().begin(), object->layers().end(),
+                                [absolute_z](const Layer *left, const Layer *right) {
+                                    return std::abs(left->print_z - absolute_z) <
+                                           std::abs(right->print_z - absolute_z);
+                                });
+                            if (nearest == object->layers().end() ||
+                                std::abs((*nearest)->print_z - absolute_z) > 1e-4) {
+                                lies_on_planar_courses = false;
+                                break;
+                            }
+                            support_layers.emplace_back(*nearest);
+                        }
+                        if (!lies_on_planar_courses)
+                            continue;
+                        ++planar_anchored_paths;
+                        for (size_t point_idx = 0;
+                             point_idx < path->polyline.points.size(); ++point_idx)
+                            unsupported_anchor_points += !Geometry::contains(
+                                support_layers[point_idx]->lslices,
+                                path->polyline.points[point_idx].to_point());
+                    }
+                };
+                inspect(region->perimeters);
+                inspect(region->fills);
+
+                const auto inspect_wall_anchors = [&](auto &&self,
+                                                      const ExtrusionEntity &entity) -> void {
+                    if (const auto *path = dynamic_cast<const ExtrusionPath *>(&entity)) {
+                        if (!path->nonplanar_surface ||
+                            !is_perimeter(path->role()) || path->polyline.points.empty())
+                            return;
+                        nonplanar_wall_owner_layers.insert(layer);
+                        std::vector<const Layer *> support_layers;
+                        support_layers.reserve(path->polyline.points.size());
+                        bool lies_on_planar_courses = true;
+                        for (const Point3 &point : path->polyline.points) {
+                                const double absolute_z =
+                                    layer->print_z + unscale_(point.z());
+                                const auto support = std::min_element(
+                                    object->layers().begin(), object->layers().end(),
+                                    [absolute_z](const Layer *left, const Layer *right) {
+                                        return std::abs(left->print_z - absolute_z) <
+                                               std::abs(right->print_z - absolute_z);
+                                    });
+                                if (support == object->layers().end() ||
+                                    std::abs((*support)->print_z - absolute_z) > 1e-4) {
+                                    lies_on_planar_courses = false;
+                                    break;
+                                }
+                                support_layers.emplace_back(*support);
+                        }
+                        if (!lies_on_planar_courses)
+                            return;
+                        ++planar_wall_anchor_paths;
+                        for (size_t point_idx = 0;
+                             point_idx < path->polyline.points.size(); ++point_idx) {
+                            const ExPolygons support_area = offset_ex(
+                                support_layers[point_idx]->lslices,
+                                scale_(0.5 * double(path->width) + 0.02));
+                            unsupported_wall_anchor_points += !Geometry::contains(
+                                support_area,
+                                path->polyline.points[point_idx].to_point());
+                        }
+                    } else if (const auto *loop = dynamic_cast<const ExtrusionLoop *>(&entity)) {
+                        for (const ExtrusionPath &path : loop->paths)
+                            self(self, path);
+                    } else if (const auto *multipath =
+                                   dynamic_cast<const ExtrusionMultiPath *>(&entity)) {
+                        for (const ExtrusionPath &path : multipath->paths)
+                            self(self, path);
+                    } else if (const auto *collection =
+                                   dynamic_cast<const ExtrusionEntityCollection *>(&entity)) {
+                        for (const ExtrusionEntity *child : collection->entities)
+                            self(self, *child);
+                    }
+                };
+                inspect_wall_anchors(inspect_wall_anchors, region->perimeters);
+                inspect_wall_anchors(inspect_wall_anchors, region->fills);
+            }
+            owning_layers += owns_nonplanar_top;
+        }
+    }
+
+    // The configured count is the minimum transition depth. A broad slope may
+    // require additional intermediate courses so its high edge still remains
+    // within one nominal layer of the preceding extrusion.
+    REQUIRE(owning_layers >= 5);
+    // The boundary-reaching wedge retains a complete multi-course perimeter
+    // transition, and that transition begins no later than the generated top
+    // stack. Perimeters keep their original slicer owner when one connected
+    // wall spans multiple absolute Z courses, so owner IDs need not match the
+    // raster owners one-for-one.
+    REQUIRE_FALSE(nonplanar_top_owner_layers.empty());
+    REQUIRE(nonplanar_wall_owner_layers.size() >= 5);
+    const auto earlier_layer = [](const Layer *left, const Layer *right) {
+        return left->print_z < right->print_z;
+    };
+    const Layer *first_top_owner = *std::min_element(
+        nonplanar_top_owner_layers.begin(), nonplanar_top_owner_layers.end(),
+        earlier_layer);
+    const Layer *first_wall_owner = *std::min_element(
+        nonplanar_wall_owner_layers.begin(), nonplanar_wall_owner_layers.end(),
+        earlier_layer);
+    CAPTURE(first_top_owner->id(), first_wall_owner->id());
+    CHECK(first_wall_owner->print_z <= first_top_owner->print_z + 1e-4);
+    // Generated skin courses remain anchored to their actual XY footprint.
+    // Retained walls are checked separately below because their original XY
+    // contour is intentionally preserved for dimensional accuracy.
+    // The ordinary planar foundation is no longer emitted a second time as a
+    // generated blend=0 path. Exact-course generated anchors must therefore
+    // be absent; support for the first generated course is checked against
+    // the preceding retained layer below.
+    CHECK(planar_anchored_paths == 0);
+    CHECK(unsupported_anchor_points == 0);
+    // The retained perimeter graph starts on the same real flat course as the
+    // dense foundation.  This is intentional: it gives the first rising wall
+    // an attached planar endpoint instead of beginning on the already stepped
+    // contour.  Every such anchor still has to lie inside the supporting bead
+    // envelope.
+    CHECK(planar_wall_anchor_paths > 0);
+    CHECK(unsupported_wall_anchor_points == 0);
+    // Corresponding points in the blended stack may be owned by different
+    // nominal layers, but no adjacent deposited course may be farther apart
+    // than the configured layer height. Selecting the support course below
+    // the requested transition depth adds a rounding remainder to the stack
+    // and makes the visible finishing shell float above its predecessor.
+    size_t aligned_stack_points = 0;
+    size_t foundation_points = 0;
+    size_t unsupported_foundation_points = 0;
+    double maximum_shell_gap = 0.;
+    double maximum_foundation_gap = 0.;
+    double minimum_inferred_anchor = std::numeric_limits<double>::max();
+    double maximum_inferred_anchor = std::numeric_limits<double>::lowest();
+    REQUIRE(print.objects().size() == 1);
+    const auto object_layers = print.objects().front()->layers();
+    for (auto &[xy, z_values] : shell_z_by_xy) {
+        std::sort(z_values.begin(), z_values.end());
+        z_values.erase(std::unique(z_values.begin(), z_values.end(),
+            [](double left, double right) {
+                return std::abs(left - right) < 1e-4;
+            }), z_values.end());
+        if (z_values.size() < 5)
+            continue;
+        ++aligned_stack_points;
+        const double shell_step =
+            (z_values.back() - z_values.front()) /
+            double(z_values.size() - 1);
+        const double inferred_anchor = z_values.front() - shell_step;
+        minimum_inferred_anchor = std::min(
+            minimum_inferred_anchor, inferred_anchor);
+        maximum_inferred_anchor = std::max(
+            maximum_inferred_anchor, inferred_anchor);
+        const double first_generated_z = z_values.front();
+        auto foundation = std::lower_bound(
+            object_layers.begin(), object_layers.end(),
+            first_generated_z - 1e-4,
+            [](const Layer *layer, double z) { return layer->print_z < z; });
+        if (foundation != object_layers.begin()) {
+            --foundation;
+            ++foundation_points;
+            const double gap = first_generated_z - (*foundation)->print_z;
+            maximum_foundation_gap = std::max(maximum_foundation_gap, gap);
+            const ExPolygons support_area = offset_ex(
+                (*foundation)->lslices, scale_(0.25));
+            unsupported_foundation_points +=
+                gap > 0.2 + 1e-4 ||
+                !Geometry::contains(support_area, Point(xy.first, xy.second));
+        }
+        for (size_t idx = 1; idx < z_values.size(); ++idx)
+            maximum_shell_gap = std::max(
+                maximum_shell_gap, z_values[idx] - z_values[idx - 1]);
+    }
+    CHECK(aligned_stack_points > 0);
+    CHECK(foundation_points > 0);
+    CHECK(unsupported_foundation_points == 0);
+    CHECK(maximum_foundation_gap <= 0.2 + 1e-4);
+    CHECK(maximum_shell_gap <= 0.2 + 1e-4);
+    // Every XY column must extrapolate to the same horizontal foundation.
+    // Anchoring each point to surface_z - shell_depth reproduces a hidden
+    // staircase and yields different inferred anchors across the roof.
+    CHECK(maximum_inferred_anchor - minimum_inferred_anchor <= 0.02);
+    // Walls remain in the original perimeter graph rather than being cloned
+    // from a finishing-patch outline. A vertical-sided wedge legitimately has
+    // the same XY wall footprint on every course, so connectivity—not forced
+    // lateral motion—is the invariant here.
+    CHECK_FALSE(nonplanar_perimeter_paths(print).empty());
+    // At least one owner contains a path originating more than one nominal
+    // layer below it, preserving continuous multi-layer Z motion.
+    CHECK(deepest_relative_z < -scale_(0.2));
+
+    // An open perimeter may be surface-following only when a loop or
+    // multipath owns its connection to the neighboring planar wall pieces.
+    // A bare path child would be scheduled as a separate operation and leave
+    // the characteristic retract/travel-isolated raised Arachne fragment.
+    size_t isolated_open_nonplanar_walls = 0;
+    const auto inspect_collection = [&](auto &&self,
+                                        const ExtrusionEntityCollection &collection) -> void {
+        for (const ExtrusionEntity *entity : collection.entities) {
+            if (const auto *path = dynamic_cast<const ExtrusionPath *>(entity)) {
+                isolated_open_nonplanar_walls +=
+                    path->nonplanar_surface && is_perimeter(path->role()) &&
+                    path->first_point() != path->last_point();
+            } else if (const auto *nested =
+                           dynamic_cast<const ExtrusionEntityCollection *>(entity)) {
+                self(self, *nested);
+            }
+            // ExtrusionLoop and ExtrusionMultiPath intentionally own open
+            // component paths, so their children are connected by contract.
+        }
+    };
+    for (const PrintObject *object : print.objects())
+        for (const Layer *layer : object->layers())
+            for (const LayerRegion *region : layer->regions()) {
+                inspect_collection(inspect_collection, region->perimeters);
+                inspect_collection(inspect_collection, region->fills);
+            }
+    CHECK(isolated_open_nonplanar_walls == 0);
+}
+
+TEST_CASE("Non-planar walls respect the configured wall sequence", "[Fill][NonplanarSurface][WallSequence]")
+{
+    const auto generate_order = [](const char *wall_sequence) {
+        Print print;
+        Slic3r::Test::init_and_process_print(
+            {shallow_top_wedge(8.)}, print,
+            {{"nonplanar_top_surface", 1},
+             {"nonplanar_top_surface_max_angle", 45},
+             {"wall_loops", 3},
+             {"wall_sequence", wall_sequence},
+             {"zaa_enabled", 0},
+             {"layer_height", 0.2}});
+        return nonplanar_wall_inset_order(print);
+    };
+
+    CHECK(generate_order("inner wall/outer wall") ==
+          std::vector<unsigned int>{2, 1, 0});
+    CHECK(generate_order("outer wall/inner wall") ==
+          std::vector<unsigned int>{0, 1, 2});
+    CHECK(generate_order("inner-outer-inner wall") ==
+          std::vector<unsigned int>{2, 0, 1});
+}
+
+TEST_CASE("True non-planar top surfaces leave paths planar when disabled", "[Fill][NonplanarSurface]")
+{
+    Print print;
+    Slic3r::Test::init_and_process_print(
+        {shallow_top_wedge(8.)}, print,
+        {{"nonplanar_top_surface", 0}, {"zaa_enabled", 0}, {"layer_height", 0.2}});
+
+    CHECK(nonplanar_top_paths(print).empty());
+}
+
+TEST_CASE("Horizontal top surfaces are not classified as non-planar", "[Fill][NonplanarSurface]")
+{
+    Print print;
+    Slic3r::Test::init_and_process_print(
+        {Slic3r::Test::cube(10.)}, print,
+        {{"nonplanar_top_surface", 1},
+         {"nonplanar_top_surface_max_angle", 45},
+         {"zaa_enabled", 0},
+         {"layer_height", 0.2}});
+
+    CHECK(nonplanar_top_paths(print).empty());
+    CHECK(nonplanar_perimeter_paths(print).empty());
+}
+
+TEST_CASE("True non-planar top surfaces respect the configured surface angle", "[Fill][NonplanarSurface]")
+{
+    Print accepted;
+    Slic3r::Test::init_and_process_print(
+        {shallow_top_wedge(8.)}, accepted,
+        {{"nonplanar_top_surface", 1},
+         {"nonplanar_top_surface_max_angle", 10},
+         {"zaa_enabled", 0},
+         {"layer_height", 0.2}});
+    CHECK_FALSE(nonplanar_top_paths(accepted).empty());
+
+    Print rejected;
+    Slic3r::Test::init_and_process_print(
+        {shallow_top_wedge(8.)}, rejected,
+        {{"nonplanar_top_surface", 1},
+         {"nonplanar_top_surface_max_angle", 5},
+         {"zaa_enabled", 0},
+         {"layer_height", 0.2}});
+    CHECK(nonplanar_top_paths(rejected).empty());
+}
+
+TEST_CASE("Doubly curved top surfaces use closed non-planar tracks", "[Fill][NonplanarSurface]")
+{
+    TriangleMesh dome = make_sphere(10., PI / 24.);
+    dome.translate(Vec3f(0.f, 0.f, 10.f));
+
+    Print print;
+    Slic3r::Test::init_and_process_print(
+        {dome}, print,
+        {{"nonplanar_top_surface", 1},
+         {"nonplanar_top_surface_max_angle", 20},
+         {"nonplanar_top_surface_resolution", 0.2},
+         {"nonplanar_top_surface_min_height", 0.05},
+         {"top_surface_pattern", "rectilinear"},
+         {"zaa_enabled", 0},
+         {"layer_height", 0.2}});
+
+    const std::vector<ExtrusionPath> paths = nonplanar_top_paths(print);
+    REQUIRE_FALSE(paths.empty());
+    // The configured rectilinear pattern remains appropriate for a plane,
+    // even one sloped in both X and Y. A sphere's gradient changes across
+    // both XY directions, so the adaptive non-planar generator must instead
+    // follow it with closed concentric courses.
+    CHECK(std::any_of(paths.begin(), paths.end(), [](const ExtrusionPath &path) {
+        return path.polyline.points.size() > 3 &&
+               path.polyline.points.front() == path.polyline.points.back();
+    }));
+}
+
+TEST_CASE("Compact wall-only slopes without a solid source course stay planar",
+          "[Fill][NonplanarSurface][PerimeterOnly]")
+{
+    Polygon footprint = make_circle_num_segments(scale_(1.7), 48);
+    const double slope = std::tan(8. * M_PI / 180.);
+    TriangleMesh model = extrude_sloped_footprint(
+        ExPolygon(footprint), [](double) { return 0.; },
+        [slope](double x) { return 8. + slope * x; });
+
+    Print print;
+    Slic3r::Test::init_and_process_print(
+        {std::move(model)}, print,
+        {{"nonplanar_top_surface", 1},
+         {"nonplanar_top_surface_max_angle", 45},
+         {"wall_loops", 3}, {"zaa_enabled", 0}, {"layer_height", 0.2}});
+
+    // A wall-only component has no dense course from which to build a bonded
+    // transition. Warping its rings alone creates an isolated recess (the
+    // Benchy flag-hole regression), so preserve the conventional slice until
+    // a coherent skin and support course exist.
+    CHECK(nonplanar_top_paths(print).empty());
+    const std::vector<ExtrusionPath> walls = nonplanar_perimeter_paths(print);
+    CHECK(walls.empty());
+}
+
+TEST_CASE("Non-planar skins exclude normal paths from their top footprint", "[Fill][NonplanarSurface]")
+{
+    Print nonplanar;
+    Slic3r::Test::init_and_process_print(
+        {shallow_top_wedge(8.)}, nonplanar,
+        {{"nonplanar_top_surface", 1}, {"wall_loops", 3},
+         {"staggered_perimeters", 1},
+         {"top_surface_expansion", 0.}, {"zaa_enabled", 0}, {"layer_height", 0.2}});
+
+    // Clipping closed loops may split one wall into several path entities, so
+    // raw entity counts do not measure replacement. Verify the actual overlap
+    // below instead.
+    CHECK(perimeter_path_count(nonplanar, erExternalPerimeter) > 0);
+    // Brick courses remain active in buried wall regions, while wall sections
+    // accepted into the non-planar replacement use only the mesh-following Z
+    // schedule. This permits both features in one print without combining two
+    // independent offsets on the same physical extrusion.
+    CHECK(staggered_perimeter_path_count(nonplanar) > 0);
+    const std::vector<ExtrusionPath> nonplanar_walls =
+        nonplanar_perimeter_paths(nonplanar);
+    CHECK_FALSE(std::any_of(nonplanar_walls.begin(), nonplanar_walls.end(),
+        [](const ExtrusionPath &path) { return path.staggered_perimeter; }));
+    CHECK(std::any_of(nonplanar_walls.begin(), nonplanar_walls.end(),
+        [](const ExtrusionPath &path) { return path.inset_idx == 0; }));
+    CHECK(std::any_of(nonplanar_walls.begin(), nonplanar_walls.end(),
+        [](const ExtrusionPath &path) { return path.inset_idx == 1; }));
+    CHECK(std::any_of(nonplanar_walls.begin(), nonplanar_walls.end(),
+        [](const ExtrusionPath &path) { return path.inset_idx == 2; }));
+    CHECK_FALSE(has_planar_path_inside_nonplanar_top_coverage(nonplanar));
+}
+
+TEST_CASE("Non-planar top skins smooth exposed interlocking wall courses",
+          "[Fill][NonplanarSurface][InterlockingWalls]")
+{
+    TriangleMesh interlocking_control = Slic3r::Test::cube(8.);
+    interlocking_control.translate(Vec3f(20.f, 0.f, 0.f));
+    Print print;
+    Slic3r::Test::init_and_process_print(
+        {shallow_top_wedge(8.), std::move(interlocking_control)}, print,
+        {{"nonplanar_top_surface", 1},
+         {"perimeter_layering", "interlocking_walls"},
+         {"interlocking_wall_amplitude", 0.08},
+         {"interlocking_wall_wavelength", 6.0},
+         {"interlocking_wall_resolution", 0.4},
+         {"wall_loops", 3}, {"zaa_enabled", 0}, {"layer_height", 0.2}});
+
+    // Interlocking courses remain available on ordinary geometry in the same
+    // print. A wall section whose entire staircase is replaced by the angled
+    // transition has one authoritative Z schedule and is intentionally not
+    // interlocked a second time.
+    CHECK(interlocking_perimeter_path_count(print) > 0);
+    const std::vector<ExtrusionPath> exposed = nonplanar_perimeter_paths(print);
+    REQUIRE_FALSE(exposed.empty());
+    // Once accepted into the exposed skin, the mesh-following schedule is the
+    // only Z schedule and preview role on that physical wall section.
+    CHECK_FALSE(std::any_of(exposed.begin(), exposed.end(),
+        [](const ExtrusionPath &path) { return path.nonplanar_interlocking_wall; }));
+    // Covered by the emitted wall/top intersection audit below; keeping the
+    // older all-layer polygon scan here makes this focused regression
+    // needlessly quadratic for a complete coplanar roof.
+}
+
+TEST_CASE("Non-planar Benchy roof output preserves chimney walls and connected blends",
+          "[Fill][NonplanarSurface][GCode][Regression]")
+{
+    const std::string perimeter_mode = GENERATE(
+        std::string("standard"), std::string("brick"),
+        std::string("interlocking_walls"));
+    CAPTURE(perimeter_mode);
+
+    DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+    config.set_deserialize_strict({
+        {"top_surface_z_mode", "nonplanar_top_surface"},
+        {"nonplanar_top_surface", true},
+        {"nonplanar_top_surface_max_angle", 45.},
+        {"nonplanar_top_surface_layers", 5},
+        {"nonplanar_top_surface_resolution", 0.3},
+        {"nonplanar_top_surface_min_height", 0.05},
+        {"perimeter_layering", perimeter_mode},
+        {"staggered_perimeter_offset", 1},
+        {"interlocking_wall_amplitude", 0.08},
+        {"interlocking_wall_wavelength", 6.0},
+        {"interlocking_wall_resolution", 0.4},
+        {"wall_generator", "arachne"},
+        {"wall_loops", 3},
+        {"top_shell_layers", 4},
+        {"sparse_infill_density", "15%"},
+        {"layer_height", 0.25},
+        {"initial_layer_print_height", 0.25},
+        {"skirt_loops", 0},
+        {"brim_type", "no_brim"},
+        {"zaa_enabled", false}
+    });
+
+    Print print;
+    Model model;
+    std::vector<TriangleMesh> meshes;
+    meshes.emplace_back(benchy_roof_with_chimney(8.));
+    Slic3r::Test::init_print(std::move(meshes), print, model, config, nullptr,
+                             false);
+    REQUIRE_NOTHROW(print.process());
+
+    const std::vector<ExtrusionPath> top_paths = nonplanar_top_paths(print);
+    const std::vector<ExtrusionPath> wall_paths = nonplanar_perimeter_paths(print);
+    REQUIRE_FALSE(top_paths.empty());
+    REQUIRE_FALSE(wall_paths.empty());
+    // The finishing skin owns the requested wall stack. Feature-transition
+    // rings around the chimney are a separate dependency and must not hide a
+    // missing roof inset in this assertion: omitting an inner roof wall while
+    // still insetting the raster for it leaves an unextruded eave band.
+    std::set<unsigned int> roof_wall_insets;
+    for (const ExtrusionPath &path : wall_paths)
+        if (!path.nonplanar_feature_transition &&
+            !path.nonplanar_transition && path.inset_idx <= 2)
+            roof_wall_insets.insert(path.inset_idx);
+    CAPTURE(roof_wall_insets);
+    CHECK(roof_wall_insets.count(0) == 1);
+    CHECK(roof_wall_insets.count(1) == 1);
+    CHECK(roof_wall_insets.count(2) == 1);
+    // A nominal inner wall crossing the accepted roof patch is the spurious
+    // rectangular "box" seen in the Benchy preview. The top patch must replace
+    // that section instead of adding a second closed wall around itself.
+    CHECK_FALSE(has_planar_path_inside_nonplanar_top_coverage(print));
+
+    const std::string generated_gcode = Slic3r::Test::gcode(print);
+    std::ofstream("/tmp/nonplanar-benchy-focused.gcode") << generated_gcode;
+    REQUIRE_FALSE(generated_gcode.empty());
+    CHECK(generated_gcode.find(";TYPE:Non-planar top surface") != std::string::npos);
+    CHECK(generated_gcode.find(";TYPE:Non-planar transition") != std::string::npos);
+    // Feature deferral changes the wall schedule only. Source-layer infill is
+    // the physical foundation for both the draped roof and those walls; moving
+    // it down into a later dependency course creates unsupported paths and may
+    // cross a bridge that has already been emitted.
+    CHECK(generated_gcode.find("surface-following feature fill") ==
+          std::string::npos);
+
+    // Validate support in actual print order. Geometry-only containment can
+    // pass while the commit step clips away the wall course immediately below
+    // the first draped perimeter. That produced a 0.4--0.6 mm vertical gap on
+    // the real Benchy even though every generated point remained inside the
+    // model slice. A non-planar wall bead must overlap material deposited
+    // earlier and no more than one nominal course below it.
+    struct DepositedSegment {
+        Vec3d start;
+        Vec3d end;
+    };
+    std::vector<DepositedSegment> deposited_segments;
+    size_t unsupported_nonplanar_segments = 0;
+    std::map<std::string, size_t> unsupported_nonplanar_by_comment;
+    std::vector<std::string> unsupported_nonplanar_samples;
+    std::string support_type;
+    GCodeReader support_reader;
+    support_reader.parse_buffer(generated_gcode,
+        [&](GCodeReader &self, const GCodeReader::GCodeLine &line) {
+            const std::string comment(line.comment());
+            if (comment.rfind("TYPE:", 0) == 0)
+                support_type = comment.substr(5);
+            if (!line.extruding(self) || line.dist_XY(self) <= 0.01)
+                return;
+            const Vec3d start(self.x(), self.y(), self.z());
+            const Vec3d end(line.new_X(self), line.new_Y(self), line.new_Z(self));
+            if (support_type == "Non-planar transition" ||
+                support_type == "Non-planar top surface" ||
+                comment == "non-planar perimeter" ||
+                comment == "surface-following feature perimeter" ||
+                comment == "non-planar top surface") {
+                // A deliberately classified overhang perimeter is printable
+                // by cantilever/bridge policy and need not have a bead directly
+                // below every midpoint. The regression targets ordinary
+                // surface courses that incorrectly float while claiming to be
+                // supported; bridge paths are validated by bridge tests.
+                if (comment.find("(bridge)") != std::string::npos) {
+                    deposited_segments.push_back({
+                        Vec3d(self.x(), self.y(), self.z()),
+                        Vec3d(line.new_X(self), line.new_Y(self), line.new_Z(self))});
+                    return;
+                }
+                const Vec3d midpoint = 0.5 * (start + end);
+                bool supported = false;
+                double nearest_support_xy = std::numeric_limits<double>::max();
+                double nearest_support_gap = std::numeric_limits<double>::max();
+                for (auto candidate = deposited_segments.rbegin();
+                     candidate != deposited_segments.rend(); ++candidate) {
+                    const Vec2d delta =
+                        candidate->end.head<2>() - candidate->start.head<2>();
+                    const double denominator = delta.squaredNorm();
+                    const double t = denominator <= EPSILON ? 0. : std::clamp(
+                        (midpoint.head<2>() - candidate->start.head<2>()).dot(delta) /
+                            denominator,
+                        0., 1.);
+                    const Vec2d projected = candidate->start.head<2>() + t * delta;
+                    const double xy_distance =
+                        (projected - midpoint.head<2>()).norm();
+                    const double support_z = candidate->start.z() +
+                        t * (candidate->end.z() - candidate->start.z());
+                    const double gap = midpoint.z() - support_z;
+                    if (xy_distance < nearest_support_xy) {
+                        nearest_support_xy = xy_distance;
+                        nearest_support_gap = gap;
+                    }
+                    if (xy_distance > 0.4)
+                        continue;
+                    if (gap >= 0.04 && gap <=
+                            config.opt_float("layer_height") + 0.06) {
+                        supported = true;
+                        break;
+                    }
+                }
+                if (!supported) {
+                    ++unsupported_nonplanar_segments;
+                    ++unsupported_nonplanar_by_comment[
+                        comment.empty() ? support_type : comment];
+                    if (unsupported_nonplanar_samples.size() < 8)
+                        unsupported_nonplanar_samples.emplace_back(
+                            "(" + std::to_string(midpoint.x()) + "," +
+                            std::to_string(midpoint.y()) + "," +
+                            std::to_string(midpoint.z()) + ") " +
+                            (comment.empty() ? support_type : comment) +
+                            " nearest_xy=" + std::to_string(nearest_support_xy) +
+                            " gap=" + std::to_string(nearest_support_gap));
+                }
+            }
+            deposited_segments.push_back({start, end});
+        });
+    std::string unsupported_summary;
+    for (const auto &[comment, count] : unsupported_nonplanar_by_comment)
+        unsupported_summary += comment + '=' + std::to_string(count) + ' ';
+    CAPTURE(unsupported_summary);
+    CAPTURE(unsupported_nonplanar_samples);
+    CHECK(unsupported_nonplanar_segments == 0);
+
+    struct EmittedSegment {
+        Vec3d start;
+        Vec3d end;
+        double middle_z;
+        size_t chain;
+        std::string type;
+        std::string comment;
+    };
+    std::vector<EmittedSegment> emitted_wall_segments;
+    std::vector<EmittedSegment> emitted_top_segments;
+    std::vector<EmittedSegment> emitted_conventional_segments;
+    size_t transition_segments = 0;
+    size_t transition_z_moves = 0;
+    double maximum_transition_gradient = 0.;
+    std::string emitted_type;
+    size_t emitted_chain = 0;
+    std::optional<Vec3d> previous_extrusion_end;
+    GCodeReader geometry_reader;
+    geometry_reader.parse_buffer(generated_gcode,
+        [&](GCodeReader &self, const GCodeReader::GCodeLine &line) {
+            const std::string comment(line.comment());
+            if (comment.rfind("TYPE:", 0) == 0)
+                emitted_type = comment.substr(5);
+            if (!line.extruding(self) || line.dist_XY(self) <= 0.01)
+                return;
+            const Vec3d start(self.x(), self.y(), self.z());
+            const Vec3d end(line.new_X(self), line.new_Y(self), line.new_Z(self));
+            if (!previous_extrusion_end ||
+                (start - *previous_extrusion_end).norm() > 0.01)
+                ++emitted_chain;
+            previous_extrusion_end = end;
+            if (emitted_type == "Non-planar transition") {
+                const double dz = std::abs(end.z() - start.z());
+                ++transition_segments;
+                transition_z_moves += dz > 0.001;
+                maximum_transition_gradient = std::max(
+                    maximum_transition_gradient, dz / line.dist_XY(self));
+            }
+            // GCodeReader preserves optional whitespace/tool annotations in
+            // inline comments. Classify by the semantic tag so a top-surface
+            // move emitted under the shared transition TYPE is not also
+            // counted as a wall by the collision audit below.
+            const bool inline_nonplanar_top =
+                comment.find("non-planar top surface") != std::string::npos;
+            const bool inline_nonplanar_wall =
+                comment.find("non-planar perimeter") != std::string::npos ||
+                comment.find("surface-following feature perimeter") !=
+                    std::string::npos;
+            const bool wall = inline_nonplanar_wall ||
+                              (!inline_nonplanar_top &&
+                              (emitted_type == "Outer wall" ||
+                              emitted_type == "Inner wall" ||
+                              emitted_type == "Overhang wall" ||
+                              emitted_type == "Brick wall" ||
+                              emitted_type == "Interlocking inner wall" ||
+                              emitted_type == "Non-planar transition"));
+            const double middle_z = 0.5 * (start.z() + end.z());
+            if (wall)
+                emitted_wall_segments.push_back(
+                    {start, end, middle_z, emitted_chain, emitted_type, comment});
+            if (inline_nonplanar_top ||
+                emitted_type == "Non-planar top surface")
+                emitted_top_segments.push_back(
+                    {start, end, middle_z, emitted_chain, emitted_type, comment});
+            if (!inline_nonplanar_top && !inline_nonplanar_wall &&
+                emitted_type != "Non-planar transition" &&
+                emitted_type != "Non-planar top surface")
+                emitted_conventional_segments.push_back(
+                    {start, end, middle_z, emitted_chain, emitted_type, comment});
+        });
+    REQUIRE(transition_segments > 0);
+    CHECK(transition_z_moves > 0);
+    // A transition may traverse a long sloped roof in one move, so validate
+    // gradient rather than absolute dZ. It must remain below the configured
+    // 45-degree surface limit.
+    CHECK(maximum_transition_gradient < 1.);
+
+    // Select a stable band below the highest emitted wall rather than assuming
+    // an absolute G-code Z origin. Only the hollow chimney exists there.
+    REQUIRE_FALSE(emitted_wall_segments.empty());
+    const double highest_wall_z = std::max_element(
+        emitted_wall_segments.begin(), emitted_wall_segments.end(),
+        [](const EmittedSegment &lhs, const EmittedSegment &rhs) {
+            return lhs.middle_z < rhs.middle_z;
+        })->middle_z;
+    std::vector<EmittedSegment> chimney_wall_segments;
+    std::copy_if(emitted_wall_segments.begin(), emitted_wall_segments.end(),
+        std::back_inserter(chimney_wall_segments),
+        [highest_wall_z](const EmittedSegment &segment) {
+            return segment.middle_z > highest_wall_z - 5. &&
+                   segment.middle_z < highest_wall_z - 2.5;
+        });
+    CAPTURE(highest_wall_z);
+    REQUIRE_FALSE(chimney_wall_segments.empty());
+    Vec2d minimum_xy = chimney_wall_segments.front().start.head<2>();
+    Vec2d maximum_xy = minimum_xy;
+    for (const EmittedSegment &segment : chimney_wall_segments) {
+        minimum_xy = minimum_xy.cwiseMin(segment.start.head<2>());
+        minimum_xy = minimum_xy.cwiseMin(segment.end.head<2>());
+        maximum_xy = maximum_xy.cwiseMax(segment.start.head<2>());
+        maximum_xy = maximum_xy.cwiseMax(segment.end.head<2>());
+    }
+    const Vec2d chimney_center = 0.5 * (minimum_xy + maximum_xy);
+    double bore_wall_length = 0.;
+    double outside_wall_length = 0.;
+    for (const EmittedSegment &segment : chimney_wall_segments) {
+        const Vec2d midpoint =
+            0.5 * (segment.start.head<2>() + segment.end.head<2>());
+        const double length =
+            (segment.end.head<2>() - segment.start.head<2>()).norm();
+        if ((midpoint - chimney_center).norm() < 3.2)
+            bore_wall_length += length;
+        else
+            outside_wall_length += length;
+    }
+    CAPTURE(minimum_xy, maximum_xy, bore_wall_length, outside_wall_length);
+    CHECK((maximum_xy.x() - minimum_xy.x()) > 8.);
+    CHECK((maximum_xy.y() - minimum_xy.y()) > 8.);
+    CHECK(bore_wall_length > 10.);
+    CHECK(outside_wall_length > 30.);
+
+    // A top raster may end on the innermost perimeter, but it must never pass
+    // through a retained wall and continue on the other side at the same Z.
+    // The real Benchy failure presented exactly this way: long roof rows
+    // crossed a rectangular retained inner wall, creating duplicate material
+    // and a nozzle collision in the preview.
+    size_t wall_top_crossings = 0;
+    std::vector<std::string> wall_top_crossing_samples;
+    std::map<int, std::vector<size_t>> top_segments_by_x;
+    for (size_t index = 0; index < emitted_top_segments.size(); ++index) {
+        const EmittedSegment &top = emitted_top_segments[index];
+        const double minimum_x = std::min(top.start.x(), top.end.x());
+        const double maximum_x = std::max(top.start.x(), top.end.x());
+        for (int bucket = int(std::floor(minimum_x / 2.));
+             bucket <= int(std::floor(maximum_x / 2.)); ++bucket)
+            top_segments_by_x[bucket].push_back(index);
+    }
+    for (const EmittedSegment &wall : emitted_wall_segments) {
+        const Vec2d wall_start = wall.start.head<2>();
+        const Vec2d wall_delta = wall.end.head<2>() - wall_start;
+        std::set<size_t> candidate_indices;
+        const double wall_minimum_x = std::min(wall.start.x(), wall.end.x());
+        const double wall_maximum_x = std::max(wall.start.x(), wall.end.x());
+        for (int bucket = int(std::floor(wall_minimum_x / 2.));
+             bucket <= int(std::floor(wall_maximum_x / 2.)); ++bucket) {
+            const auto found = top_segments_by_x.find(bucket);
+            if (found != top_segments_by_x.end())
+                candidate_indices.insert(found->second.begin(),
+                                         found->second.end());
+        }
+        for (const size_t top_index : candidate_indices) {
+            const EmittedSegment &top = emitted_top_segments[top_index];
+            const Vec2d top_start = top.start.head<2>();
+            const Vec2d top_delta = top.end.head<2>() - top_start;
+            const Vec2d wall_min =
+                wall.start.head<2>().cwiseMin(wall.end.head<2>());
+            const Vec2d wall_max =
+                wall.start.head<2>().cwiseMax(wall.end.head<2>());
+            const Vec2d top_min =
+                top.start.head<2>().cwiseMin(top.end.head<2>());
+            const Vec2d top_max =
+                top.start.head<2>().cwiseMax(top.end.head<2>());
+            if (wall_max.x() < top_min.x() || top_max.x() < wall_min.x() ||
+                wall_max.y() < top_min.y() || top_max.y() < wall_min.y() ||
+                std::max(wall.start.z(), wall.end.z()) <
+                    std::min(top.start.z(), top.end.z()) - 0.05 ||
+                std::max(top.start.z(), top.end.z()) <
+                    std::min(wall.start.z(), wall.end.z()) - 0.05)
+                continue;
+            const double denominator =
+                wall_delta.x() * top_delta.y() -
+                wall_delta.y() * top_delta.x();
+            if (std::abs(denominator) <= EPSILON)
+                continue;
+            const Vec2d offset = top_start - wall_start;
+            const double wall_t =
+                (offset.x() * top_delta.y() -
+                 offset.y() * top_delta.x()) / denominator;
+            const double top_t =
+                (offset.x() * wall_delta.y() -
+                 offset.y() * wall_delta.x()) / denominator;
+            // Endpoint contact is the intended wall-to-skin bond. Only a
+            // proper interior crossing is an overlap.
+            if (wall_t <= 0.01 || wall_t >= 0.99 ||
+                top_t <= 0.01 || top_t >= 0.99)
+                continue;
+            const double wall_z = wall.start.z() +
+                wall_t * (wall.end.z() - wall.start.z());
+            const double top_z = top.start.z() +
+                top_t * (top.end.z() - top.start.z());
+            if (std::abs(wall_z - top_z) < 0.05) {
+                ++wall_top_crossings;
+                if (wall_top_crossing_samples.size() < 8)
+                    wall_top_crossing_samples.emplace_back(
+                        "wall=(" + std::to_string(wall.start.x()) + "," +
+                        std::to_string(wall.start.y()) + " -> " +
+                        std::to_string(wall.end.x()) + "," +
+                        std::to_string(wall.end.y()) + ",z=" +
+                        std::to_string(wall_z) + ",chain=" +
+                        std::to_string(wall.chain) + "," + wall.type + "," +
+                        wall.comment +
+                        ") top=(" + std::to_string(top.start.x()) + "," +
+                        std::to_string(top.start.y()) + " -> " +
+                        std::to_string(top.end.x()) + "," +
+                        std::to_string(top.end.y()) + ",z=" +
+                        std::to_string(top_z) + ")");
+            }
+        }
+    }
+    CAPTURE(wall_top_crossing_samples);
+    CHECK(wall_top_crossings == 0);
+
+    // Successive roof/cabin wall courses may have slightly different XY
+    // outlines. They may cross geometrically only when their physical Z is
+    // separated; emitting both centerlines at the same Z deposits duplicate
+    // material and makes the nozzle traverse the preceding course. This
+    // catches intersections inside sparse Arachne segments, not just at the
+    // source vertices used by the transition constraint.
+    size_t wall_wall_same_z_crossings = 0;
+    std::vector<std::string> wall_wall_crossing_samples;
+    struct EmittedSegmentBounds {
+        size_t index;
+        Vec2d minimum;
+        Vec2d maximum;
+        double minimum_z;
+        double maximum_z;
+    };
+    std::vector<EmittedSegmentBounds> wall_segment_bounds;
+    wall_segment_bounds.reserve(emitted_wall_segments.size());
+    for (size_t index = 0; index < emitted_wall_segments.size(); ++index) {
+        const EmittedSegment &segment = emitted_wall_segments[index];
+        wall_segment_bounds.push_back({
+            index,
+            segment.start.head<2>().cwiseMin(segment.end.head<2>()),
+            segment.start.head<2>().cwiseMax(segment.end.head<2>()),
+            std::min(segment.start.z(), segment.end.z()),
+            std::max(segment.start.z(), segment.end.z())});
+    }
+    std::sort(wall_segment_bounds.begin(), wall_segment_bounds.end(),
+        [](const EmittedSegmentBounds &left,
+           const EmittedSegmentBounds &right) {
+            return left.minimum.x() < right.minimum.x();
+        });
+    for (size_t left = 0; left < wall_segment_bounds.size(); ++left) {
+        const EmittedSegmentBounds &first_bounds = wall_segment_bounds[left];
+        const EmittedSegment &first =
+            emitted_wall_segments[first_bounds.index];
+        const Vec2d first_start = first.start.head<2>();
+        const Vec2d first_delta = first.end.head<2>() - first_start;
+        for (size_t right = left + 1;
+             right < wall_segment_bounds.size(); ++right) {
+            const EmittedSegmentBounds &second_bounds =
+                wall_segment_bounds[right];
+            if (second_bounds.minimum.x() > first_bounds.maximum.x())
+                break;
+            if (second_bounds.maximum.y() < first_bounds.minimum.y() ||
+                second_bounds.minimum.y() > first_bounds.maximum.y() ||
+                first_bounds.minimum_z > second_bounds.maximum_z + 0.05 ||
+                second_bounds.minimum_z > first_bounds.maximum_z + 0.05)
+                continue;
+            const EmittedSegment &second =
+                emitted_wall_segments[second_bounds.index];
+            const Vec2d second_start = second.start.head<2>();
+            const Vec2d second_delta = second.end.head<2>() - second_start;
+            const double denominator =
+                first_delta.x() * second_delta.y() -
+                first_delta.y() * second_delta.x();
+            const double first_length = first_delta.norm();
+            const double second_length = second_delta.norm();
+            if (first_length <= EPSILON || second_length <= EPSILON)
+                continue;
+            double first_z = 0.;
+            double second_z = 0.;
+            bool collision = false;
+            if (std::abs(denominator) <=
+                    1e-4 * first_length * second_length) {
+                const Vec2d offset = second_start - first_start;
+                const double offset_cross =
+                    first_delta.x() * offset.y() -
+                    first_delta.y() * offset.x();
+                if (std::abs(offset_cross) > 0.02 * first_length)
+                    continue;
+                const double second_start_on_first =
+                    offset.dot(first_delta) / first_delta.squaredNorm();
+                const double second_end_on_first =
+                    (second.end.head<2>() - first_start).dot(first_delta) /
+                    first_delta.squaredNorm();
+                const double overlap_start = std::max(
+                    0.01, std::min(second_start_on_first, second_end_on_first));
+                const double overlap_end = std::min(
+                    0.99, std::max(second_start_on_first, second_end_on_first));
+                if ((overlap_end - overlap_start) * first_length <= 0.05)
+                    continue;
+                const double first_t = 0.5 * (overlap_start + overlap_end);
+                const Vec2d overlap_middle = first_start + first_t * first_delta;
+                const double second_t =
+                    (overlap_middle - second_start).dot(second_delta) /
+                    second_delta.squaredNorm();
+                if (second_t <= 0.01 || second_t >= 0.99)
+                    continue;
+                first_z = first.start.z() +
+                    first_t * (first.end.z() - first.start.z());
+                second_z = second.start.z() +
+                    second_t * (second.end.z() - second.start.z());
+                collision = std::abs(first_z - second_z) < 0.05;
+            } else {
+                const Vec2d offset = second_start - first_start;
+                const double first_t =
+                    (offset.x() * second_delta.y() -
+                     offset.y() * second_delta.x()) / denominator;
+                const double second_t =
+                    (offset.x() * first_delta.y() -
+                     offset.y() * first_delta.x()) / denominator;
+                if (first_t <= 0.01 || first_t >= 0.99 ||
+                    second_t <= 0.01 || second_t >= 0.99)
+                    continue;
+                first_z = first.start.z() +
+                    first_t * (first.end.z() - first.start.z());
+                second_z = second.start.z() +
+                    second_t * (second.end.z() - second.start.z());
+                collision = std::abs(first_z - second_z) < 0.05;
+            }
+            wall_wall_same_z_crossings += collision;
+            if (collision &&
+                wall_wall_crossing_samples.size() < 8)
+                wall_wall_crossing_samples.emplace_back(
+                    "(" + std::to_string(first.start.x()) + "," +
+                    std::to_string(first.start.y()) + "," +
+                    std::to_string(first.end.x()) + "," +
+                    std::to_string(first.end.y()) + "," +
+                    std::to_string(first_z) + ",chain=" +
+                    std::to_string(first.chain) + "," + first.type + "," +
+                    first.comment + ") x (" +
+                    std::to_string(second.start.x()) + "," +
+                    std::to_string(second.start.y()) + "," +
+                    std::to_string(second.end.x()) + "," +
+                    std::to_string(second.end.y()) + "," +
+                    std::to_string(second_z) + ",chain=" +
+                    std::to_string(second.chain) + "," + second.type + "," +
+                    second.comment + ")");
+        }
+    }
+    CAPTURE(wall_wall_crossing_samples);
+    const auto gcode_context = [&generated_gcode](const std::string &needle) {
+        const size_t position = generated_gcode.find(needle);
+        if (position == std::string::npos)
+            return std::string{};
+        const size_t begin = position > 500 ? position - 500 : 0;
+        return generated_gcode.substr(begin, 1000);
+    };
+    CHECK(wall_wall_same_z_crossings == 0);
+
+    // Conventional bridge/infill centerlines must also be removed where the
+    // draped skin replaces them. A retained bridge crossing the first roof
+    // raster at the same physical Z is a real nozzle collision even though it
+    // is not classified as a wall in preview.
+    size_t conventional_top_crossings = 0;
+    for (const EmittedSegment &conventional : emitted_conventional_segments) {
+        const Vec2d conventional_start = conventional.start.head<2>();
+        const Vec2d conventional_delta =
+            conventional.end.head<2>() - conventional_start;
+        for (const EmittedSegment &top : emitted_top_segments) {
+            const Vec2d top_start = top.start.head<2>();
+            const Vec2d top_delta = top.end.head<2>() - top_start;
+            const double denominator =
+                conventional_delta.x() * top_delta.y() -
+                conventional_delta.y() * top_delta.x();
+            if (std::abs(denominator) <= EPSILON)
+                continue;
+            const Vec2d offset = top_start - conventional_start;
+            const double conventional_t =
+                (offset.x() * top_delta.y() -
+                 offset.y() * top_delta.x()) / denominator;
+            const double top_t =
+                (offset.x() * conventional_delta.y() -
+                 offset.y() * conventional_delta.x()) / denominator;
+            if (conventional_t <= 0.01 || conventional_t >= 0.99 ||
+                top_t <= 0.01 || top_t >= 0.99)
+                continue;
+            const double conventional_z = conventional.start.z() +
+                conventional_t *
+                    (conventional.end.z() - conventional.start.z());
+            const double top_z = top.start.z() +
+                top_t * (top.end.z() - top.start.z());
+            conventional_top_crossings +=
+                std::abs(conventional_z - top_z) < 0.05;
+        }
+    }
+    CHECK(conventional_top_crossings == 0);
+
+    // Boundary repair may create tiny variable-width tips beside a compact
+    // feature. Distinct top-surface chains must not cross at the same Z; that
+    // would deposit the same roof volume twice on every transition course.
+    size_t top_top_crossings = 0;
+    for (size_t left = 0; left < emitted_top_segments.size(); ++left) {
+        const EmittedSegment &first = emitted_top_segments[left];
+        const Vec2d first_start = first.start.head<2>();
+        const Vec2d first_delta = first.end.head<2>() - first_start;
+        for (size_t right = left + 1; right < emitted_top_segments.size(); ++right) {
+            const EmittedSegment &second = emitted_top_segments[right];
+            const Vec2d second_start = second.start.head<2>();
+            const Vec2d second_delta = second.end.head<2>() - second_start;
+            const double denominator = first_delta.x() * second_delta.y() -
+                                       first_delta.y() * second_delta.x();
+            if (std::abs(denominator) <= EPSILON)
+                continue;
+            const Vec2d offset = second_start - first_start;
+            const double first_t =
+                (offset.x() * second_delta.y() -
+                 offset.y() * second_delta.x()) / denominator;
+            const double second_t =
+                (offset.x() * first_delta.y() -
+                 offset.y() * first_delta.x()) / denominator;
+            if (first_t <= 0.01 || first_t >= 0.99 ||
+                second_t <= 0.01 || second_t >= 0.99)
+                continue;
+            const double first_z = first.start.z() +
+                first_t * (first.end.z() - first.start.z());
+            const double second_z = second.start.z() +
+                second_t * (second.end.z() - second.start.z());
+            top_top_crossings += std::abs(first_z - second_z) < 0.05;
+        }
+    }
+    CHECK(top_top_crossings == 0);
+
+    // Dependency-aware feature deferral is atomic at the wall-course level.
+    // Each transformed chimney course must retain the configured three-wall
+    // topology, including inset zero. Accepting a course after projecting only
+    // one child path is what made the outer wall disappear at the roof base.
+    struct FeatureCourseWalls {
+        std::set<unsigned int> insets;
+        bool has_external {false};
+    };
+    std::map<size_t, FeatureCourseWalls> feature_course_walls;
+    const auto collect_feature_courses =
+        [&feature_course_walls](auto &&self,
+                                const ExtrusionEntity &entity) -> void {
+            const auto collect_path = [&feature_course_walls](
+                                          const ExtrusionPath &path) {
+                if (!path.nonplanar_feature_transition ||
+                    !is_perimeter(path.role()))
+                    return;
+                FeatureCourseWalls &course =
+                    feature_course_walls[path.nonplanar_feature_course];
+                course.insets.insert(path.inset_idx);
+                course.has_external |= path.role() == erExternalPerimeter;
+            };
+            if (const auto *path = dynamic_cast<const ExtrusionPath *>(&entity))
+                collect_path(*path);
+            else if (const auto *loop = dynamic_cast<const ExtrusionLoop *>(&entity))
+                for (const ExtrusionPath &path : loop->paths)
+                    collect_path(path);
+            else if (const auto *multipath =
+                         dynamic_cast<const ExtrusionMultiPath *>(&entity))
+                for (const ExtrusionPath &path : multipath->paths)
+                    collect_path(path);
+            else if (const auto *collection =
+                         dynamic_cast<const ExtrusionEntityCollection *>(&entity))
+                for (const ExtrusionEntity *child : collection->entities)
+                    self(self, *child);
+        };
+    for (const PrintObject *object : print.objects())
+        for (const Layer *layer : object->layers())
+            for (const LayerRegion *region : layer->regions())
+                for (const ExtrusionEntityCollection *collection :
+                     {&region->perimeters, &region->fills})
+                    for (const ExtrusionEntity *entity : collection->entities)
+                        collect_feature_courses(collect_feature_courses, *entity);
+    REQUIRE_FALSE(feature_course_walls.empty());
+    for (const auto &[course_index, walls] : feature_course_walls) {
+        CAPTURE(course_index, walls.insets);
+        CHECK(walls.has_external);
+        CHECK(walls.insets.count(0) == 1);
+        CHECK(walls.insets.count(1) == 1);
+        CHECK(walls.insets.count(2) == 1);
+    }
+
+    // Successive deferred feature courses must retain a printable physical
+    // separation everywhere around the wall. Blending every chimney ring
+    // independently toward the same roof surface collapsed the low side to
+    // roughly 0.03 mm while retaining nominal 0.25 mm wall flow. In preview
+    // those rings crossed one another; on a printer the nozzle would drag
+    // through the preceding course. Compare corresponding external-wall
+    // centerlines in XY and require at least half a nominal layer of Z
+    // separation (the transition may intentionally vary local thickness).
+    struct FeatureWallSegment {
+        Vec3d start;
+        Vec3d end;
+    };
+    std::map<size_t, std::vector<FeatureWallSegment>> feature_outer_courses;
+    for (const PrintObject *object : print.objects())
+        for (const Layer *layer : object->layers())
+            for (const LayerRegion *region : layer->regions()) {
+                const auto collect = [&](auto &&self,
+                                         const ExtrusionEntity &entity) -> void {
+                    const auto path = [&](const ExtrusionPath &value) {
+                        if (!value.nonplanar_feature_transition ||
+                            value.role() != erExternalPerimeter)
+                            return;
+                        const Points3 &points = value.polyline.points;
+                        for (size_t point_idx = 1; point_idx < points.size(); ++point_idx) {
+                            const auto absolute = [layer](const Point3 &point) {
+                                return Vec3d(unscale_(point.x()), unscale_(point.y()),
+                                    layer->print_z + unscale_(point.z()));
+                            };
+                            feature_outer_courses[value.nonplanar_feature_course].push_back(
+                                {absolute(points[point_idx - 1]),
+                                 absolute(points[point_idx])});
+                        }
+                    };
+                    if (const auto *value = dynamic_cast<const ExtrusionPath *>(&entity))
+                        path(*value);
+                    else if (const auto *loop = dynamic_cast<const ExtrusionLoop *>(&entity))
+                        for (const ExtrusionPath &value : loop->paths)
+                            path(value);
+                    else if (const auto *multipath =
+                                 dynamic_cast<const ExtrusionMultiPath *>(&entity))
+                        for (const ExtrusionPath &value : multipath->paths)
+                            path(value);
+                    else if (const auto *collection =
+                                 dynamic_cast<const ExtrusionEntityCollection *>(&entity))
+                        for (const ExtrusionEntity *child : collection->entities)
+                            self(self, *child);
+                };
+                for (const ExtrusionEntityCollection *collection :
+                     {&region->perimeters, &region->fills})
+                    for (const ExtrusionEntity *entity : collection->entities)
+                        collect(collect, *entity);
+            }
+    REQUIRE(feature_outer_courses.size() > 1);
+    double minimum_feature_course_separation =
+        std::numeric_limits<double>::max();
+    for (auto current = std::next(feature_outer_courses.begin());
+         current != feature_outer_courses.end(); ++current) {
+        const auto previous = std::prev(current);
+        for (const FeatureWallSegment &segment : current->second) {
+            const Vec3d midpoint = 0.5 * (segment.start + segment.end);
+            for (const FeatureWallSegment &support : previous->second) {
+                const Vec2d delta = support.end.head<2>() - support.start.head<2>();
+                const double denominator = delta.squaredNorm();
+                const double t = denominator <= EPSILON ? 0. : std::clamp(
+                    (midpoint.head<2>() - support.start.head<2>()).dot(delta) /
+                        denominator,
+                    0., 1.);
+                const Vec2d projected = support.start.head<2>() + t * delta;
+                if ((projected - midpoint.head<2>()).norm() > 0.05)
+                    continue;
+                const double support_z = support.start.z() +
+                    t * (support.end.z() - support.start.z());
+                minimum_feature_course_separation = std::min(
+                    minimum_feature_course_separation, midpoint.z() - support_z);
+            }
+        }
+    }
+    CAPTURE(minimum_feature_course_separation);
+    CHECK(minimum_feature_course_separation >=
+          0.5 * config.opt_float("layer_height"));
+
+    // Once the feature has levelled back to normal layers, every complete
+    // chimney layer must still contain all three walls. Brick mode changes an
+    // inner wall's Z/order metadata; it may not punch intermittent holes in
+    // the annulus or suppress its dimensional outer wall.
+    size_t complete_chimney_layers = 0;
+    for (const PrintObject *object : print.objects())
+        for (const Layer *layer : object->layers()) {
+            if (layer->print_z < 18. || layer->print_z > 20.)
+                continue;
+            std::set<unsigned int> insets;
+            bool has_external = false;
+            bool has_brick = false;
+            const auto collect = [&](auto &&self,
+                                     const ExtrusionEntity &entity) -> void {
+                const auto path = [&](const ExtrusionPath &value) {
+                    if (!is_perimeter(value.role()))
+                        return;
+                    insets.insert(value.inset_idx);
+                    has_external |= value.role() == erExternalPerimeter;
+                    has_brick |= value.staggered_perimeter;
+                };
+                if (const auto *value =
+                        dynamic_cast<const ExtrusionPath *>(&entity))
+                    path(*value);
+                else if (const auto *loop =
+                             dynamic_cast<const ExtrusionLoop *>(&entity))
+                    for (const ExtrusionPath &value : loop->paths)
+                        path(value);
+                else if (const auto *multipath =
+                             dynamic_cast<const ExtrusionMultiPath *>(&entity))
+                    for (const ExtrusionPath &value : multipath->paths)
+                        path(value);
+                else if (const auto *collection =
+                             dynamic_cast<const ExtrusionEntityCollection *>(&entity))
+                    for (const ExtrusionEntity *child : collection->entities)
+                        self(self, *child);
+            };
+            for (const LayerRegion *region : layer->regions())
+                for (const ExtrusionEntity *entity : region->perimeters.entities)
+                    collect(collect, *entity);
+            CAPTURE(layer->print_z, insets);
+            CHECK(has_external);
+            CHECK(insets.count(0) == 1);
+            CHECK(insets.count(1) == 1);
+            CHECK(insets.count(2) == 1);
+            if (perimeter_mode == "brick")
+                CHECK(has_brick);
+            ++complete_chimney_layers;
+        }
+    CHECK(complete_chimney_layers >= 6);
+
+    // Compare emitted 3D extrusion segments, not only the in-memory entities.
+    // Re-emitting a retained roof wall underneath its non-planar replacement
+    // produces an identical segment (possibly reversed) and is unprintable.
+    std::map<std::array<long long, 6>, std::string> emitted_segments;
+    size_t duplicate_roof_wall_segments = 0;
+    std::string feature_type;
+    GCodeReader reader;
+    reader.parse_buffer(generated_gcode,
+        [&](GCodeReader &self, const GCodeReader::GCodeLine &line) {
+            const std::string comment(line.comment());
+            if (comment.rfind("TYPE:", 0) == 0)
+                feature_type = comment.substr(5);
+            if (!line.extruding(self) || line.dist_XY(self) <= 0.01)
+                return;
+            const bool is_wall = feature_type == "Outer wall" ||
+                                 feature_type == "Inner wall" ||
+                                 feature_type == "Overhang wall" ||
+                                 feature_type == "Brick wall" ||
+                                 feature_type == "Interlocking inner wall" ||
+                                 feature_type == "Non-planar transition" ||
+                                 feature_type == "Non-planar top surface";
+            if (!is_wall)
+                return;
+            const Vec3d start(self.x(), self.y(), self.z());
+            const Vec3d end(line.new_X(self), line.new_Y(self), line.new_Z(self));
+            if (std::max(start.z(), end.z()) < 10.5)
+                return;
+            const auto quantize = [](double value) {
+                return std::llround(value * 1000.);
+            };
+            std::array<long long, 3> a{quantize(start.x()), quantize(start.y()),
+                                       quantize(start.z())};
+            std::array<long long, 3> b{quantize(end.x()), quantize(end.y()),
+                                       quantize(end.z())};
+            if (b < a)
+                std::swap(a, b);
+            const std::array<long long, 6> key{
+                a[0], a[1], a[2], b[0], b[1], b[2]};
+            const auto [found, inserted] = emitted_segments.try_emplace(key, feature_type);
+            if (!inserted && found->second != feature_type) {
+                const bool previous_nonplanar =
+                    found->second.rfind("Non-planar", 0) == 0;
+                const bool current_nonplanar =
+                    feature_type.rfind("Non-planar", 0) == 0;
+                duplicate_roof_wall_segments += previous_nonplanar || current_nonplanar;
+            }
+        });
+    CHECK(duplicate_roof_wall_segments == 0);
+}
+
+TEST_CASE("Detailed toolhead geometry limits non-planar surface angle", "[Fill][NonplanarSurface]")
+{
+    Print print;
+    Slic3r::Test::init_and_process_print(
+        {shallow_top_wedge(8.)}, print,
+        {{"nonplanar_top_surface", 1},
+         {"nonplanar_top_surface_max_angle", 45},
+         {"sequential_print_gantry_geometry",
+          R"({"slices":[{"height":"1","type":"convex","polygons":["-10,-10;10,-10;10,10;-10,10"]}]})"},
+         {"zaa_enabled", 0},
+         {"layer_height", 0.2}});
+
+    // atan(1 / sqrt(10^2 + 10^2)) is about four degrees, so the requested
+    // eight-degree skin cannot clear this physical toolhead definition.
+    CHECK(nonplanar_top_paths(print).empty());
+    // Rejection is a fallback to the original supported top skin, not a
+    // destructive removal of its candidate paths. Otherwise internal solid
+    // infill becomes the visible surface wherever a gantry vetoes a patch.
+    bool has_planar_top_solid = false;
+    for (const PrintObject *object : print.objects())
+        for (const Layer *layer : object->layers())
+            for (const LayerRegion *region : layer->regions())
+                for (const ExtrusionEntity *entity : region->fills.flatten().entities)
+                    if (const auto *path = dynamic_cast<const ExtrusionPath *>(entity);
+                        path != nullptr && !path->nonplanar_surface &&
+                        path->role() == erTopSolidInfill)
+                        has_planar_top_solid = true;
+    CHECK(has_planar_top_solid);
+}
+
+TEST_CASE("Hybrid top surfaces Z contour only paths rejected by non-planar clearance",
+          "[Fill][NonplanarSurface][ContourZ][Regression]")
+{
+    Print rejected;
+    Slic3r::Test::init_and_process_print(
+        {shallow_top_wedge(8.)}, rejected,
+        {{"top_surface_z_mode", "nonplanar_with_z_contouring_fallback"},
+         {"nonplanar_top_surface", true}, {"zaa_enabled", true},
+         {"nonplanar_top_surface_max_angle", 45},
+         {"sequential_print_gantry_geometry",
+          R"({"slices":[{"height":"1","type":"convex","polygons":["-10,-10;10,-10;10,10;-10,10"]}]})"},
+         {"layer_height", 0.2}});
+
+    CHECK(nonplanar_top_paths(rejected).empty());
+    size_t fallback_paths = 0;
+    for (const PrintObject *object : rejected.objects())
+        for (const Layer *layer : object->layers())
+            for (const LayerRegion *region : layer->regions())
+                for (const ExtrusionEntity *entity : region->fills.flatten().entities)
+                    if (const auto *path = dynamic_cast<const ExtrusionPath *>(entity);
+                        path != nullptr && !path->nonplanar_surface &&
+                        path->role() == erTopSolidInfill && path->z_contoured)
+                        ++fallback_paths;
+    CHECK(fallback_paths > 0);
+
+    Print accepted;
+    Slic3r::Test::init_and_process_print(
+        {shallow_top_wedge(8.)}, accepted,
+        {{"top_surface_z_mode", "nonplanar_with_z_contouring_fallback"},
+         {"nonplanar_top_surface", true}, {"zaa_enabled", true},
+         {"nonplanar_top_surface_max_angle", 45},
+         {"wall_loops", 3}, {"layer_height", 0.2}});
+    CHECK_FALSE(nonplanar_top_paths(accepted).empty());
+    CHECK_FALSE(has_planar_path_inside_nonplanar_top_coverage(accepted));
+}
+
+TEST_CASE("Ironing follows eligible non-planar top surfaces", "[Fill][NonplanarSurface]")
+{
+    Print print;
+    Slic3r::Test::init_and_process_print(
+        {shallow_top_wedge(8.)}, print,
+        {{"nonplanar_top_surface", 1},
+         {"nonplanar_top_surface_max_angle", 45},
+         {"nonplanar_top_surface_layers", 5},
+         {"ironing_type", "top"},
+         {"top_surface_pattern", "rectilinear"},
+         {"layer_height", 0.2}});
+
+    CHECK(has_nonplanar_path_with_role(print, erIroning));
 }
 
 TEST_CASE("Ironing follows the solid infill rotation template", "[Fill]")

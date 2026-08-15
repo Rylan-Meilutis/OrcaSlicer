@@ -93,6 +93,14 @@ Slic3r::ExtrusionRole convert(EGCodeExtrusionRole role)
     case EGCodeExtrusionRole::SupportTransition:        { return Slic3r::ExtrusionRole::erSupportTransition; }
     case EGCodeExtrusionRole::Mixed:                    { return Slic3r::ExtrusionRole::erMixed; }
     case EGCodeExtrusionRole::ArcOverhang:              { return Slic3r::ExtrusionRole::erArcOverhang; }
+    case EGCodeExtrusionRole::ArcBridge:                { return Slic3r::ExtrusionRole::erArcBridge; }
+    case EGCodeExtrusionRole::NonplanarSurface:         { return Slic3r::ExtrusionRole::erNonplanarSurface; }
+    case EGCodeExtrusionRole::NonplanarSupport:         { return Slic3r::ExtrusionRole::erNonplanarSupport; }
+    case EGCodeExtrusionRole::NonplanarInfill:          { return Slic3r::ExtrusionRole::erNonplanarInfill; }
+    case EGCodeExtrusionRole::StaggeredPerimeter:       { return Slic3r::ExtrusionRole::erStaggeredPerimeter; }
+    case EGCodeExtrusionRole::SmoothOuterWall:          { return Slic3r::ExtrusionRole::erSmoothOuterWall; }
+    case EGCodeExtrusionRole::NonplanarInterlockingWall:{ return Slic3r::ExtrusionRole::erNonplanarInterlockingWall; }
+    case EGCodeExtrusionRole::ShrinkageCompensation:    { return Slic3r::ExtrusionRole::erShrinkageCompensation; }
     default:                                            { return Slic3r::ExtrusionRole::erNone; }
     }
 }
@@ -123,6 +131,14 @@ EGCodeExtrusionRole convert(Slic3r::ExtrusionRole role)
     case Slic3r::ExtrusionRole::erSupportTransition:           { return EGCodeExtrusionRole::SupportTransition; }
     case Slic3r::ExtrusionRole::erMixed:                       { return EGCodeExtrusionRole::Mixed; }
     case Slic3r::ExtrusionRole::erArcOverhang:                 { return EGCodeExtrusionRole::ArcOverhang; }
+    case Slic3r::ExtrusionRole::erArcBridge:                   { return EGCodeExtrusionRole::ArcBridge; }
+    case Slic3r::ExtrusionRole::erNonplanarSurface:            { return EGCodeExtrusionRole::NonplanarSurface; }
+    case Slic3r::ExtrusionRole::erNonplanarSupport:            { return EGCodeExtrusionRole::NonplanarSupport; }
+    case Slic3r::ExtrusionRole::erNonplanarInfill:             { return EGCodeExtrusionRole::NonplanarInfill; }
+    case Slic3r::ExtrusionRole::erStaggeredPerimeter:          { return EGCodeExtrusionRole::StaggeredPerimeter; }
+    case Slic3r::ExtrusionRole::erSmoothOuterWall:             { return EGCodeExtrusionRole::SmoothOuterWall; }
+    case Slic3r::ExtrusionRole::erNonplanarInterlockingWall:   { return EGCodeExtrusionRole::NonplanarInterlockingWall; }
+    case Slic3r::ExtrusionRole::erShrinkageCompensation:       { return EGCodeExtrusionRole::ShrinkageCompensation; }
     default:                                                   { return EGCodeExtrusionRole::None; }
     }
 }
@@ -314,9 +330,45 @@ static void convert_lines_to_vertices(const Slic3r::Lines& lines, const std::vec
     }
 }
 
+static void convert_contoured_path_to_vertices(const Slic3r::ExtrusionPath& extrusion_path, float print_z, size_t layer_id,
+    size_t extruder_id, size_t color_id, EGCodeExtrusionRole extrusion_role, const Slic3r::Point& shift,
+    std::vector<PathVertex>& vertices)
+{
+    if (extrusion_path.polyline.points.size() < 2)
+        return;
+
+    const auto position = [print_z, &shift](const Slic3r::Point3 &point) {
+        return convert(Slic3r::Vec3f(
+            float(unscale_(point.x() + shift.x())),
+            float(unscale_(point.y() + shift.y())),
+            float(print_z + unscale_(point.z()))));
+    };
+#if VGCODE_ENABLE_COG_AND_TOOL_MARKERS
+    libvgcode::PathVertex vertex = { position(extrusion_path.polyline.points.front()), extrusion_path.height,
+        extrusion_path.width, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, extrusion_role, EMoveType::Noop, 0,
+        static_cast<uint32_t>(layer_id), static_cast<uint8_t>(extruder_id), static_cast<uint8_t>(color_id), { 0.0f, 0.0f } };
+#else
+    libvgcode::PathVertex vertex = { position(extrusion_path.polyline.points.front()), extrusion_path.height,
+        extrusion_path.width, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, extrusion_role, EMoveType::Noop, 0,
+        static_cast<uint32_t>(layer_id), static_cast<uint8_t>(extruder_id), static_cast<uint8_t>(color_id), { 0.0f, 0.0f } };
+#endif // VGCODE_ENABLE_COG_AND_TOOL_MARKERS
+    vertices.emplace_back(vertex);
+    vertex.type = EMoveType::Extrude;
+    vertices.emplace_back(vertex);
+    for (size_t point_idx = 1; point_idx < extrusion_path.polyline.points.size(); ++point_idx) {
+        vertex.position = position(extrusion_path.polyline.points[point_idx]);
+        vertices.emplace_back(vertex);
+    }
+}
+
 static void convert_to_vertices(const Slic3r::ExtrusionPath& extrusion_path, float print_z, size_t layer_id, size_t extruder_id, size_t color_id,
     EGCodeExtrusionRole extrusion_role, const Slic3r::Point& shift, std::vector<PathVertex>& vertices)
 {
+    if (extrusion_path.z_contoured) {
+        convert_contoured_path_to_vertices(extrusion_path, print_z, layer_id, extruder_id, color_id,
+                                           extrusion_role, shift, vertices);
+        return;
+    }
     Slic3r::Polyline polyline = extrusion_path.polyline.to_polyline();
     polyline.remove_duplicate_points();
     polyline.translate(shift);
@@ -329,6 +381,12 @@ static void convert_to_vertices(const Slic3r::ExtrusionPath& extrusion_path, flo
 static void convert_to_vertices(const Slic3r::ExtrusionMultiPath& extrusion_multi_path, float print_z, size_t layer_id, size_t extruder_id,
     size_t color_id, EGCodeExtrusionRole extrusion_role, const Slic3r::Point& shift, std::vector<PathVertex>& vertices)
 {
+    if (std::any_of(extrusion_multi_path.paths.begin(), extrusion_multi_path.paths.end(),
+                    [](const Slic3r::ExtrusionPath &path) { return path.z_contoured; })) {
+        for (const Slic3r::ExtrusionPath &path : extrusion_multi_path.paths)
+            convert_to_vertices(path, print_z, layer_id, extruder_id, color_id, extrusion_role, shift, vertices);
+        return;
+    }
     Slic3r::Lines lines;
     std::vector<float> widths;
     std::vector<float> heights;
@@ -347,6 +405,12 @@ static void convert_to_vertices(const Slic3r::ExtrusionMultiPath& extrusion_mult
 static void convert_to_vertices(const Slic3r::ExtrusionLoop& extrusion_loop, float print_z, size_t layer_id, size_t extruder_id, size_t color_id,
     EGCodeExtrusionRole extrusion_role, const Slic3r::Point& shift, std::vector<PathVertex>& vertices)
 {
+    if (std::any_of(extrusion_loop.paths.begin(), extrusion_loop.paths.end(),
+                    [](const Slic3r::ExtrusionPath &path) { return path.z_contoured; })) {
+        for (const Slic3r::ExtrusionPath &path : extrusion_loop.paths)
+            convert_to_vertices(path, print_z, layer_id, extruder_id, color_id, extrusion_role, shift, vertices);
+        return;
+    }
     Slic3r::Lines lines;
     std::vector<float> widths;
     std::vector<float> heights;

@@ -102,6 +102,8 @@ set(lisbslic3r_sources
     Config.cpp
     Config.hpp
     ContourZ.cpp
+    NonplanarSurface.cpp
+    NonplanarSurface.hpp
     CustomGCode.cpp
     CustomGCode.hpp
     CutUtils.cpp

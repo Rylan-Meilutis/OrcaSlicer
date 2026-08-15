@@ -35,7 +35,9 @@ public:
     std::string get_host() const override { return m_host; }
     const std::string& get_apikey() const { return m_apikey; }
     const std::string& get_cafile() const { return m_cafile; }
-    bool get_spool_manager_selected_spools(std::vector<SpoolManagerMetadata::Filament> &slots, wxString &error) const;
+    bool get_selected_filament_spools(std::vector<SpoolManagerMetadata::Filament> &slots, wxString &error) const;
+    bool get_spool_manager_selected_spools(std::vector<SpoolManagerMetadata::Filament> &slots, wxString &error) const
+    { return get_selected_filament_spools(slots, error); }
 
 protected:
 #ifdef WIN32
@@ -48,6 +50,7 @@ protected:
     std::string m_apikey;
     std::string m_cafile;
     bool        m_ssl_revoke_best_effort;
+    std::string m_filament_plugin_endpoint;
 
     virtual void set_auth(Http &http) const;
     std::string make_url(const std::string &path) const;

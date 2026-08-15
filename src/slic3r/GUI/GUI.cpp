@@ -114,6 +114,20 @@ void change_opt_value(DynamicPrintConfig& config, const t_config_option_key& opt
 {
 	try{
 
+        const auto numeric_value = [&value]() -> double {
+            if (value.type() == typeid(double))
+                return boost::any_cast<double>(value);
+            if (value.type() == typeid(float))
+                return boost::any_cast<float>(value);
+            if (value.type() == typeid(int))
+                return boost::any_cast<int>(value);
+            if (value.type() == typeid(long))
+                return boost::any_cast<long>(value);
+            if (value.type() == typeid(std::string))
+                return std::stod(boost::any_cast<const std::string &>(value));
+            throw boost::bad_any_cast();
+        };
+
         if (config.def()->get(opt_key)->type == coBools && config.def()->get(opt_key)->nullable) {
             const auto v = boost::any_cast<unsigned char>(value);
             auto vec_new = std::make_unique<ConfigOptionBoolsNullable>(1, v);
@@ -149,20 +163,19 @@ void change_opt_value(DynamicPrintConfig& config, const t_config_option_key& opt
             config.option<ConfigOptionFloatsOrPercents>(opt_key)->set_at(vec_new.get(), opt_index, opt_index);
 			break;}
 		case coPercent:
-			config.set_key_value(opt_key, new ConfigOptionPercent(boost::any_cast<double>(value)));
+			config.set_key_value(opt_key, new ConfigOptionPercent(numeric_value()));
 			break;
 		case coFloat:{
-			double& val = config.opt_float(opt_key);
-			val = boost::any_cast<double>(value);
+			config.set_key_value(opt_key, new ConfigOptionFloat(numeric_value()));
 			break;
 		}
 		case coPercents:{
-            auto vec_new = std::make_unique <ConfigOptionPercent>(boost::any_cast<double>(value));
+            auto vec_new = std::make_unique <ConfigOptionPercent>(numeric_value());
 			config.option<ConfigOptionPercents>(opt_key)->set_at(vec_new.get(), opt_index, opt_index);
 			break;
 		}
 		case coFloats:{
-            auto vec_new = std::make_unique<ConfigOptionFloat>(boost::any_cast<double>(value));
+            auto vec_new = std::make_unique<ConfigOptionFloat>(numeric_value());
 			config.option<ConfigOptionFloats>(opt_key)->set_at(vec_new.get(), opt_index, opt_index);
  			break;
 		}

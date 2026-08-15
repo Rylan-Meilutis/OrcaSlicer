@@ -32,6 +32,12 @@ static double slope_from_normal(const Eigen::Vector3d& normal)
 
 static bool contour_extrusion_path(LayerRegion *region, const sla::IndexedMesh &mesh, ExtrusionPath &path)
 {
+    // In hybrid mode this pass runs after non-planar consolidation. Accepted
+    // paths already contain the validated mesh-following XYZ geometry and
+    // must never be contoured a second time. Conventional paths that remain
+    // are precisely the safe fallback ownership left by rejected patches.
+    if (path.nonplanar_surface || path.z_contoured)
+        return false;
     if (path.role() != erTopSolidInfill && path.role() != erIroning && path.role() != erExternalPerimeter && path.role() != erPerimeter) {
 		return false;
 	}
@@ -115,7 +121,11 @@ static bool contour_extrusion_path(LayerRegion *region, const sla::IndexedMesh &
             }
 
             if (is_perimeter(path.role()) && d > 0) {
-                // do not increase height of perimeters as this may create an appearance of a seam
+                // Keep dimensional walls on the nominal layer plane; raising a
+                // perimeter produces a visible seam and may conflict with a
+                // neighboring wall. Top skin and ironing are allowed to follow
+                // the local surface upward, which is the useful Z-contouring
+                // fallback for a non-planar patch rejected by the toolhead.
                 d = 0;
             }
 
@@ -232,10 +242,20 @@ static void handle_extrusion_collection(LayerRegion *region, const sla::IndexedM
     }
 }
 
-void Layer::make_contour_z(const sla::IndexedMesh &mesh)
+void Layer::make_contour_z(const sla::IndexedMesh &mesh,
+                           bool rejected_nonplanar_fallback)
 {
 	for (LayerRegion *region : this->regions()) {
-        if (!region->region().config().zaa_enabled)
+        const PrintRegionConfig &config = region->region().config();
+        const bool hybrid = config.top_surface_z_mode.value ==
+            TopSurfaceZMode::NonplanarWithZContouringFallback;
+        const bool compatible_walls =
+            config.perimeter_layering.value == PerimeterLayeringMode::Standard ||
+            (rejected_nonplanar_fallback &&
+             config.perimeter_layering.value == PerimeterLayeringMode::Brick);
+        if (!config.zaa_enabled || !compatible_walls ||
+            (rejected_nonplanar_fallback ? !hybrid :
+             (hybrid || nonplanar_perimeters_enabled(config))))
             continue;
 
         handle_extrusion_collection(region, mesh, region->fills, {erTopSolidInfill, erIroning, erPerimeter, erExternalPerimeter, erMixed});

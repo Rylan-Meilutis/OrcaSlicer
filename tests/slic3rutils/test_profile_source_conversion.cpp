@@ -264,5 +264,6 @@ TEST_CASE("Profile source prompts are limited to new remote revisions", "[Profil
     CHECK(Slic3r::ProfileSourceManager::has_update(source, R"("revision-b")"));
 
     source.last_sync = 0;
-    CHECK(Slic3r::ProfileSourceManager::has_update(source, R"("revision-a")"));
+    CHECK_FALSE(Slic3r::ProfileSourceManager::has_update(source, R"("revision-a")"));
+    CHECK(Slic3r::ProfileSourceManager::has_update(source, R"("revision-b")"));
 }

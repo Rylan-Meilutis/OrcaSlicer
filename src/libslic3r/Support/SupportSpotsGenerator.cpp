@@ -88,7 +88,7 @@ using LD = AABBTreeLines::LinesDistancer<ExtrusionLine>;
 
 float get_flow_width(const LayerRegion *region, ExtrusionRole role)
 {
-    if (role == ExtrusionRole::erBridgeInfill || role == ExtrusionRole::erArcOverhang)
+    if (role == ExtrusionRole::erBridgeInfill || is_arc_fill(role))
         return region->flow(FlowRole::frExternalPerimeter).width();
     if (role == ExtrusionRole::erExternalPerimeter) return region->flow(FlowRole::frExternalPerimeter).width();
     if (role == ExtrusionRole::erGapFill) return region->flow(FlowRole::frInfill).width();

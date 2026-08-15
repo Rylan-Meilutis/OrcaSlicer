@@ -154,6 +154,15 @@ enum class EGCodeExtrusionRole : uint8_t
       SupportTransition,
       Mixed,
       ArcOverhang,
+      ArcBridge,
+      NonplanarSurface,
+      NonplanarSupport,
+      StaggeredPerimeter,
+      NonplanarInfill,
+      // Append roles to preserve existing serialized numeric values.
+      SmoothOuterWall,
+      NonplanarInterlockingWall,
+      ShrinkageCompensation,
     COUNT
 };
 

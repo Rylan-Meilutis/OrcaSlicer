@@ -12,6 +12,8 @@
 #include "../Surface.hpp"
 #include "../libslic3r.h"
 #include "../VariableWidth.hpp"
+#include "../Feature/FuzzySkin/FuzzySkin.hpp"
+#include "../PerimeterGenerator.hpp"
 
 #include "FillBase.hpp"
 #include "FillConcentric.hpp"
@@ -32,6 +34,136 @@
 // #define INFILL_DEBUG_OUTPUT
 
 namespace Slic3r {
+
+namespace {
+
+void apply_top_surface_fuzz(ExtrusionPath &path, coordf_t slice_z,
+                            const PrintRegionConfig &config, int layer_id)
+{
+    if (path.role() != erTopSolidInfill || !config.fuzzy_skin_top_surface.value ||
+        config.fuzzy_skin.value == FuzzySkinType::Disabled_fuzzy ||
+        path.polyline.points.size() < 2)
+        return;
+
+    const Point start = path.first_point();
+    const Point end   = path.last_point();
+    Points points;
+    points.reserve(path.polyline.points.size());
+    for (const Point3 &point : path.polyline.points)
+        points.emplace_back(point.to_point());
+
+    const FuzzySkinConfig fuzzy_config{
+        config.fuzzy_skin,
+        scaled<coord_t>(config.fuzzy_skin_thickness.value),
+        scaled<coord_t>(config.fuzzy_skin_point_distance.value),
+        config.fuzzy_skin_first_layer,
+        config.fuzzy_skin_noise_type,
+        config.fuzzy_skin_scale,
+        config.fuzzy_skin_octaves,
+        config.fuzzy_skin_persistence,
+        config.fuzzy_skin_mode,
+        config.fuzzy_skin_ripples_per_layer,
+        config.fuzzy_skin_ripple_offset,
+        config.fuzzy_skin_layers_between_ripple_offset,
+        layer_id};
+    Feature::FuzzySkin::fuzzy_polyline(points, false, slice_z, fuzzy_config);
+    if (points.empty())
+        return;
+
+    // Top infill is an open path. Its endpoints provide the deliberate overlap
+    // with the perimeter or adjacent fill, so never let fuzz shorten them.
+    if (points.front() != start)
+        points.insert(points.begin(), start);
+    if (points.back() != end)
+        points.emplace_back(end);
+
+    path.polyline.points.clear();
+    path.polyline.points.reserve(points.size());
+    for (const Point &point : points)
+        path.polyline.points.emplace_back(Point3(point, 0));
+    path.polyline.remove_duplicate_points();
+    path.polyline.fitting_result.clear();
+}
+
+void apply_nonplanar_infill_wave(ExtrusionPath &path,
+                                 const PrintRegionConfig &config,
+                                 int layer_id)
+{
+    if (path.role() != erInternalInfill || !config.nonplanar_infill.value ||
+        path.polyline.points.size() < 2)
+        return;
+
+    const double amplitude = std::min(
+        config.nonplanar_infill_amplitude.value,
+        0.45 * double(path.height));
+    const double wavelength = config.nonplanar_infill_wavelength.value;
+    const double resolution = config.nonplanar_infill_resolution.value;
+    if (amplitude <= EPSILON || wavelength <= EPSILON || resolution <= EPSILON)
+        return;
+
+    double total_length = 0.;
+    for (const Line3 &line : path.polyline.lines())
+        total_length += (line.b.to_point() - line.a.to_point()).cast<double>().norm() *
+                        SCALING_FACTOR;
+    if (total_length <= 2. * resolution)
+        return;
+
+    const double phase = (layer_id & 1) ? M_PI : 0.;
+    const double transition_length = std::min(0.5 * wavelength, 0.5 * total_length);
+    Points3 sampled;
+    sampled.reserve(size_t(std::ceil(total_length / resolution)) + 2);
+    sampled.emplace_back(Point3(path.polyline.points.front().x(),
+                                path.polyline.points.front().y(), coord_t(0)));
+
+    double distance = 0.;
+    for (const Line3 &line : path.polyline.lines()) {
+        const Vec2d delta = (line.b.to_point() - line.a.to_point()).cast<double>();
+        const double length = delta.norm() * SCALING_FACTOR;
+        const size_t segments = std::max<size_t>(1, size_t(std::ceil(length / resolution)));
+        for (size_t segment = 1; segment <= segments; ++segment) {
+            const double t = double(segment) / double(segments);
+            const Vec2d xy = line.a.to_point().cast<double>() + t * delta;
+            const double along = distance + t * length;
+            const double edge_distance = std::min(along, total_length - along);
+            const double u = transition_length <= EPSILON ? 1. :
+                std::clamp(edge_distance / transition_length, 0., 1.);
+            const double envelope = u * u * (3. - 2. * u);
+            const double z = envelope * amplitude *
+                std::sin(2. * M_PI * along / wavelength + phase);
+            sampled.emplace_back(Point3(coord_t(std::llround(xy.x())),
+                                        coord_t(std::llround(xy.y())),
+                                        coord_t(scale_(z))));
+        }
+        distance += length;
+    }
+    sampled.back().z() = 0;
+    path.polyline.points = std::move(sampled);
+    path.polyline.remove_duplicate_points();
+    path.polyline.fitting_result.clear();
+    path.z_contoured = true;
+    path.nonplanar_infill = true;
+}
+
+void apply_fill_surface_effects(ExtrusionEntity &entity,
+                                const PrintRegionConfig &config,
+                                coordf_t slice_z, int layer_id)
+{
+    if (auto *path = dynamic_cast<ExtrusionPath *>(&entity)) {
+        apply_top_surface_fuzz(*path, slice_z, config, layer_id);
+        apply_nonplanar_infill_wave(*path, config, layer_id);
+    } else if (auto *loop = dynamic_cast<ExtrusionLoop *>(&entity)) {
+        for (ExtrusionPath &path : loop->paths)
+            apply_fill_surface_effects(path, config, slice_z, layer_id);
+    } else if (auto *multipath = dynamic_cast<ExtrusionMultiPath *>(&entity)) {
+        for (ExtrusionPath &path : multipath->paths)
+            apply_fill_surface_effects(path, config, slice_z, layer_id);
+    } else if (auto *collection = dynamic_cast<ExtrusionEntityCollection *>(&entity)) {
+        for (ExtrusionEntity *child : collection->entities)
+            apply_fill_surface_effects(*child, config, slice_z, layer_id);
+    }
+}
+
+} // namespace
 
 //BBS: 0% of sparse_infill_line_width, no anchor at the start of sparse infill
 float Fill::infill_anchor = 400;
@@ -159,7 +291,7 @@ void Fill::fill_surface_extrusion(const Surface* surface, const FillParams& para
             flow_mm3_per_mm = new_flow.mm3_per_mm();
             flow_width = new_flow.width();
         }
-        if (params.extrusion_role == erArcOverhang && params.config != nullptr) {
+        if (is_arc_fill(params.extrusion_role) && params.config != nullptr) {
             // Arc width and pitch remain tied to the printable perimeter width.
             // The user-facing percentage controls only deposited volume.
             flow_mm3_per_mm *=
@@ -182,7 +314,7 @@ void Fill::fill_surface_extrusion(const Surface* surface, const FillParams& para
         // rate calibration's special toolpath order.
         const bool keep_fill_order =
             params.fill_order != SurfaceFillOrder::Default ||
-            params.extrusion_role == erArcOverhang;
+            is_arc_fill(params.extrusion_role);
         if (is_flow_calib || keep_fill_order) {
             eec->no_sort = true;
         }
@@ -198,6 +330,10 @@ void Fill::fill_surface_extrusion(const Surface* surface, const FillParams& para
                 params.extrusion_role,
                 flow_mm3_per_mm, float(flow_width), params.flow.height());
         }
+        if (params.config != nullptr)
+            for (size_t i = idx; i < eec->entities.size(); ++i)
+                apply_fill_surface_effects(
+                    *eec->entities[i], *params.config, this->z, this->layer_id);
         if (!params.can_reverse || is_flow_calib || keep_fill_order) {
             for (size_t i = idx; i < eec->entities.size(); i++)
                 eec->entities[i]->set_reverse();

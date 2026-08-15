@@ -303,6 +303,14 @@ static const std::array<Color, size_t(EGCodeExtrusionRole::COUNT)> DEFAULT_EXTRU
     {   0,  64,   0 }, // SupportTransition
     { 128, 128, 128 }, // Mixed
     {   0, 196, 255 }, // ArcOverhang
+    {  79, 120, 255 }, // ArcBridge
+    {   0, 190, 190 }, // NonplanarSurface
+    { 238, 158,   0 }, // NonplanarSupport
+    { 150, 110, 255 }, // StaggeredPerimeter
+    {  55, 145, 230 }, // NonplanarInfill
+    {  40, 175, 225 }, // SmoothOuterWall
+    {  55, 205, 125 }, // NonplanarInterlockingWall
+    { 235, 135,  45 }, // ShrinkageCompensation
 } };
 
 static const std::array<Color, size_t(EOptionType::COUNT)> DEFAULT_OPTIONS_COLORS{ {
@@ -1499,7 +1507,28 @@ bool ViewerImpl::is_extrusion_role_visible(EGCodeExtrusionRole role) const
 void ViewerImpl::toggle_extrusion_role_visibility(EGCodeExtrusionRole role)
 {
     m_settings.extrusion_roles_visibility[size_t(role)] = ! m_settings.extrusion_roles_visibility[size_t(role)];
+    const Interval old_enabled_range = m_view_range.get_enabled();
+    const Interval old_visible_range = m_view_range.get_visible();
     update_view_full_range();
+    const Interval& new_enabled_range = m_view_range.get_enabled();
+    if (old_enabled_range != new_enabled_range) {
+        // Hiding a feature may clamp the visible move range to the last
+        // remaining segment. When that feature is shown again, expand a range
+        // that previously represented the complete view as well. Leaving it
+        // truncated makes update_colors_texture() mistake the whole model for
+        // historical layers and render it with the neutral gray material.
+        if (old_visible_range[1] == old_enabled_range[1]) {
+            const Interval::value_type minimum =
+                old_visible_range[0] == old_enabled_range[0] ?
+                    new_enabled_range[0] :
+                    std::clamp(old_visible_range[0], new_enabled_range[0],
+                               new_enabled_range[1]);
+            m_view_range.set_visible(minimum, new_enabled_range[1]);
+        }
+        else if (m_settings.top_layer_only_view_range &&
+                 new_enabled_range[0] < old_visible_range[0])
+            m_view_range.set_visible(new_enabled_range[0], old_visible_range[1]);
+    }
     m_settings.update_enabled_entities = true;
     m_settings.update_colors = true;
 }

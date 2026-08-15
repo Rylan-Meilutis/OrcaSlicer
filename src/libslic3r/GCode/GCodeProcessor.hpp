@@ -487,6 +487,10 @@ class Print;
         static const std::string Nozzle_Change_Start_Tag;
         static const std::string Nozzle_Change_End_Tag;
         static const std::string Toolchange_Wipe_Tag;
+        // Preview-only boundary between physical non-planar leveling courses.
+        // Firmware ignores the comment; the processor advances its visual
+        // layer index so variable-Z transitions are inspectable separately.
+        static const std::string Nonplanar_Transition_Layer_Tag;
     public:
         enum class ETags : unsigned char
         {
@@ -1526,5 +1530,4 @@ class Print;
 } /* namespace Slic3r */
 
 #endif /* slic3r_GCodeProcessor_hpp_ */
-
 

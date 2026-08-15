@@ -14,6 +14,9 @@
 #include <boost/log/trivial.hpp>
 
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <mutex>
 #include <tbb/parallel_for.h>
 
 #include "SupportCommon.hpp"
@@ -1429,8 +1432,28 @@ void generate_support_toolpaths(
     const SupportGeneratorLayersPtr     &top_contacts,
     const SupportGeneratorLayersPtr     &intermediate_layers,
     const SupportGeneratorLayersPtr     &interface_layers,
-    const SupportGeneratorLayersPtr     &base_interface_layers)
+    const SupportGeneratorLayersPtr     &base_interface_layers,
+    const std::function<void(const SupportToolpathProgress &)> &progress)
 {
+    std::mutex progress_mutex;
+    std::array<size_t, 3> reported_percent{
+        std::numeric_limits<size_t>::max(),
+        std::numeric_limits<size_t>::max(),
+        std::numeric_limits<size_t>::max()};
+    const auto report_progress = [&](SupportToolpathProgressStage stage,
+                                     size_t current, size_t total) {
+        if (!progress)
+            return;
+        const size_t stage_idx = size_t(stage);
+        const size_t percent = total == 0 ? 100 :
+            std::min<size_t>(100, 100 * current / total);
+        std::scoped_lock lock(progress_mutex);
+        if (reported_percent[stage_idx] == percent)
+            return;
+        reported_percent[stage_idx] = percent;
+        progress({stage, current, total});
+    };
+
     // loop_interface_processor with a given circle radius.
     LoopInterfaceProcessor loop_interface_processor(1.5 * support_params.support_material_interface_flow.scaled_width());
     loop_interface_processor.n_contact_loops = config.support_interface_loop_pattern.value ? 1 : 0;
@@ -1531,6 +1554,8 @@ void generate_support_toolpaths(
                 support_params, support_layer_id == 0, support_layer_id == 0);
         }
     });
+    report_progress(SupportToolpathProgressStage::Raft,
+                    n_raft_layers, n_raft_layers);
 
     struct LayerCacheItem {
         LayerCacheItem(SupportGeneratorLayerExtruded *layer_extruded = nullptr) : layer_extruded(layer_extruded) {}
@@ -1558,9 +1583,11 @@ void generate_support_toolpaths(
     };
     std::vector<LayerCache>             layer_caches(support_layers.size());
 
+    std::atomic_size_t region_layers_completed {0};
     tbb::parallel_for(tbb::blocked_range<size_t>(n_raft_layers, support_layers.size()),
         [&config, &slicing_params, &support_params, &support_layers, &bottom_contacts, &top_contacts, &intermediate_layers, &interface_layers, &base_interface_layers, &layer_caches, &loop_interface_processor,
-            &bbox_object, &angles, n_raft_layers, link_max_length_factor]
+            &bbox_object, &angles, &region_layers_completed, &report_progress,
+            n_raft_layers, link_max_length_factor]
             (const tbb::blocked_range<size_t>& range) {
         // Indices of the 1st layer in their respective container at the support layer height.
         size_t idx_layer_bottom_contact   = size_t(-1);
@@ -1883,12 +1910,16 @@ void generate_support_toolpaths(
                 // for (const ExPolygon &expoly : support_layer.support_islands)
                 //     support_layer.support_islands_bboxes.emplace_back(get_extents(expoly).inflated(SCALED_EPSILON));
             }
+            report_progress(SupportToolpathProgressStage::RegionPaths,
+                ++region_layers_completed, support_layers.size() - n_raft_layers);
         } // for each support_layer_id
     });
 
     // Now modulate the support layer height in parallel.
+    std::atomic_size_t assembled_layers {0};
     tbb::parallel_for(tbb::blocked_range<size_t>(n_raft_layers, support_layers.size()),
-        [&support_layers, &layer_caches, &support_params, &bbox_object]
+        [&support_layers, &layer_caches, &support_params, &bbox_object,
+         &assembled_layers, &report_progress, n_raft_layers]
             (const tbb::blocked_range<size_t>& range) {
         for (size_t support_layer_id = range.begin(); support_layer_id < range.end(); ++ support_layer_id) {
             SupportLayer &support_layer = *support_layers[support_layer_id];
@@ -1932,6 +1963,8 @@ void generate_support_toolpaths(
                     // Extrusion parameters
                     ExtrusionRole::erIroning, support_params.ironing_flow);
             }
+            report_progress(SupportToolpathProgressStage::LayerAssembly,
+                ++assembled_layers, support_layers.size() - n_raft_layers);
         }
     });
 

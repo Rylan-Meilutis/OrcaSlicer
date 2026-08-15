@@ -77,6 +77,99 @@ enum class TopSurfaceExpansionDirection {
     Outward,
 };
 
+// Localized compensation for solid regions whose cooling contraction would
+// otherwise pull the surrounding walls inward. Custom preserves the behavior
+// of projects created before the strategy selector was introduced.
+enum class LocalizedShrinkageStrategy {
+    Custom,
+    Disabled,
+    DimensionalCompensation,
+    ReinforcedWalls,
+    ReducedWallCoupling,
+    Balanced,
+    FullWallDecoupling,
+    SectionedSolidInfill,
+    PerforatedWallRelief,
+};
+
+inline int localized_shrinkage_reinforcement_walls(LocalizedShrinkageStrategy strategy,
+                                                    int configured)
+{
+    switch (strategy) {
+    case LocalizedShrinkageStrategy::Custom:          return configured;
+    case LocalizedShrinkageStrategy::ReinforcedWalls:
+    case LocalizedShrinkageStrategy::Balanced:        return std::max(1, configured);
+    default:                                           return 0;
+    }
+}
+
+inline double localized_shrinkage_contour_compensation(LocalizedShrinkageStrategy strategy,
+                                                        double configured)
+{
+    switch (strategy) {
+    case LocalizedShrinkageStrategy::Custom:                  return configured;
+    case LocalizedShrinkageStrategy::DimensionalCompensation: return std::max(0.1, configured);
+    case LocalizedShrinkageStrategy::Balanced:                return std::max(0.1, configured);
+    default:                                                   return 0.;
+    }
+}
+
+inline double localized_shrinkage_wall_relief(LocalizedShrinkageStrategy strategy,
+                                               double configured)
+{
+    switch (strategy) {
+    case LocalizedShrinkageStrategy::Custom:              return configured;
+    case LocalizedShrinkageStrategy::ReducedWallCoupling: return std::max(0.1, configured);
+    case LocalizedShrinkageStrategy::Balanced:            return std::max(0.05, 0.5 * configured);
+    // A positive air break must exceed normal infill/wall overlap. Keep this
+    // preset independent of a stale manual value so selecting it has an
+    // immediate, predictable effect. This is the strongest stress isolation
+    // mode and intentionally sacrifices bonding at the detected interface.
+    case LocalizedShrinkageStrategy::FullWallDecoupling:  return std::max(0.35, configured);
+    default:                                               return 0.;
+    }
+}
+
+inline double localized_shrinkage_section_width(LocalizedShrinkageStrategy strategy,
+                                                 double configured)
+{
+    switch (strategy) {
+    case LocalizedShrinkageStrategy::Custom:                return configured;
+    case LocalizedShrinkageStrategy::SectionedSolidInfill:  return std::max(0.25, configured);
+    default:                                                 return 0.;
+    }
+}
+
+inline double localized_shrinkage_section_spacing(LocalizedShrinkageStrategy strategy,
+                                                   double configured)
+{
+    switch (strategy) {
+    case LocalizedShrinkageStrategy::Custom:                return configured;
+    case LocalizedShrinkageStrategy::SectionedSolidInfill:  return std::max(10., configured);
+    default:                                                 return 0.;
+    }
+}
+
+inline double localized_shrinkage_perforation_diameter(LocalizedShrinkageStrategy strategy,
+                                                        double configured)
+{
+    switch (strategy) {
+    case LocalizedShrinkageStrategy::Custom:                return configured;
+    case LocalizedShrinkageStrategy::PerforatedWallRelief:  return std::max(0.3, configured);
+    default:                                                 return 0.;
+    }
+}
+
+inline double localized_shrinkage_perforation_spacing(LocalizedShrinkageStrategy strategy,
+                                                       double configured)
+{
+    switch (strategy) {
+    case LocalizedShrinkageStrategy::Custom:                return configured;
+    case LocalizedShrinkageStrategy::PerforatedWallRelief:  return std::max(2., configured);
+    default:                                                 return 0.;
+    }
+}
+
 enum class CenterOfSurfacePattern {
     Each_Surface,
     Each_Model,
@@ -201,6 +294,36 @@ enum class SurfaceFillOrder {
     Outward,
     Inward,
     Count,
+};
+
+// Selects the structural wall-course geometry. Nonplanar is retained only as a
+// serialized legacy value. New non-planar perimeter profiles use
+// InterlockingWalls; mesh-following top layers are selected independently by
+// TopSurfaceZMode. Brick and interlocking courses may remain below a smooth
+// non-planar top skin.
+enum class PerimeterLayeringMode {
+    Standard,
+    Brick,
+    // Legacy serialized value. New profiles use InterlockingWalls for
+    // non-planar interlocking perimeter courses; old projects are migrated to
+    // Standard plus nonplanar_top_surface when loaded.
+    Nonplanar,
+    SmoothOuterWall,
+    InterlockingWalls,
+};
+
+// Selects the technique used to improve top-surface Z fidelity. The hybrid
+// value has strict ownership ordering (non-planar first, Z contouring only on
+// rejected conventional paths), rather than applying both methods to the same
+// extrusion. The legacy booleans remain serialized for profile and 3MF
+// compatibility and are synchronized with this selector.
+enum class TopSurfaceZMode {
+    Disabled,
+    ZContouring,
+    NonplanarTopSurface,
+    // Generate collision-safe non-planar surfaces first, then apply Z
+    // contouring only to conventional paths left behind by rejected patches.
+    NonplanarWithZContouringFallback,
 };
 
 //BBS
@@ -649,6 +772,7 @@ CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(GCodeFlavor)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(FuzzySkinType)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(FuzzySkinMode)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(TopSurfaceExpansionDirection)
+CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(LocalizedShrinkageStrategy)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(WipeTowerType)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(NoiseType)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(InfillPattern)
@@ -679,6 +803,8 @@ CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(PerimeterGeneratorType)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(ToolChangeOrderingType)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(PowerLossRecoveryMode)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(SurfaceFillOrder)
+CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(PerimeterLayeringMode)
+CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(TopSurfaceZMode)
 
 #undef CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS
 
@@ -1130,6 +1256,9 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionInt,                 support_interface_top_layers))
     ((ConfigOptionInt,                 support_interface_bottom_layers))
     ((ConfigOptionInt,                 support_interface_top_temperature))
+    ((ConfigOptionBool,                slow_down_layer_above_dissimilar_support_interface))
+    ((ConfigOptionFloatOrPercent,      dissimilar_support_interface_speed))
+    ((ConfigOptionInt,                 dissimilar_support_interface_speed_layers))
     // Spacing between interface lines (the hatching distance). Set zero to get a solid interface.
     ((ConfigOptionFloat,               support_interface_spacing))
     ((ConfigOptionFloatsNullable,      support_interface_speed))
@@ -1165,6 +1294,9 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionEnum<InfillPattern>, support_ironing_pattern))
     ((ConfigOptionPercent,             support_ironing_flow))
     ((ConfigOptionFloat,               support_ironing_spacing))
+    ((ConfigOptionBool,                support_ironing_nonplanar))
+    ((ConfigOptionFloat,               support_ironing_nonplanar_max_angle))
+    ((ConfigOptionFloat,               support_ironing_nonplanar_resolution))
     ((ConfigOptionFloat,               xy_hole_compensation))
     ((ConfigOptionFloat,               xy_contour_compensation))
     ((ConfigOptionBool,                flush_into_objects))
@@ -1274,6 +1406,10 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionPercent,              sparse_infill_density))
     ((ConfigOptionEnum<InfillPattern>,  sparse_infill_pattern))
     ((ConfigOptionPercent,              sparse_infill_smooth_factor))
+    ((ConfigOptionBool,                 nonplanar_infill))
+    ((ConfigOptionFloat,                nonplanar_infill_amplitude))
+    ((ConfigOptionFloat,                nonplanar_infill_wavelength))
+    ((ConfigOptionFloat,                nonplanar_infill_resolution))
     ((ConfigOptionFloat,                lateral_lattice_angle_1))
     ((ConfigOptionFloat,                lateral_lattice_angle_2))
     ((ConfigOptionFloat,                infill_overhang_angle))
@@ -1288,6 +1424,7 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionFloat,                fuzzy_skin_thickness))
     ((ConfigOptionFloat,                fuzzy_skin_point_distance))
     ((ConfigOptionBool,                 fuzzy_skin_first_layer))
+    ((ConfigOptionBool,                 fuzzy_skin_top_surface))
     ((ConfigOptionEnum<NoiseType>,      fuzzy_skin_noise_type))
     ((ConfigOptionEnum<FuzzySkinMode>,  fuzzy_skin_mode))
     ((ConfigOptionFloat,                fuzzy_skin_scale))
@@ -1337,6 +1474,14 @@ PRINT_CONFIG_CLASS_DEFINE(
     // Total number of perimeters.
     ((ConfigOptionInt, wall_loops))
     ((ConfigOptionBool, alternate_extra_wall))
+    ((ConfigOptionInt, hull_line_extra_perimeters))
+    ((ConfigOptionFloat, hull_line_perimeter_expansion))
+    ((ConfigOptionEnum<LocalizedShrinkageStrategy>, localized_shrinkage_strategy))
+    ((ConfigOptionFloat, localized_shrinkage_infill_wall_gap))
+    ((ConfigOptionFloat, localized_shrinkage_section_width))
+    ((ConfigOptionFloat, localized_shrinkage_section_spacing))
+    ((ConfigOptionFloat, localized_shrinkage_perforation_diameter))
+    ((ConfigOptionFloat, localized_shrinkage_perforation_spacing))
     ((ConfigOptionFloat, minimum_sparse_infill_area))
     ((ConfigOptionInt, internal_solid_filament_id))
     ((ConfigOptionInt, top_surface_filament_id))
@@ -1396,6 +1541,7 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionBool,                 overhang_reverse_internal_only))
     ((ConfigOptionFloatOrPercent,       overhang_reverse_threshold))
     ((ConfigOptionEnum<CounterboreHoleBridgingOption>, counterbore_hole_bridging))
+    ((ConfigOptionBool,                 bridge_overhang_before_walls))
     ((ConfigOptionEnum<WallSequence>,  wall_sequence))
     ((ConfigOptionBool,                is_infill_first))
     ((ConfigOptionBool,                small_area_infill_flow_compensation))
@@ -1406,6 +1552,14 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionFloat,                outer_wall_flow_ratio))
     ((ConfigOptionFloat,                inner_wall_flow_ratio))
     ((ConfigOptionPercent,              inner_walls_flow_ratio))
+    ((ConfigOptionEnum<PerimeterLayeringMode>, perimeter_layering))
+    ((ConfigOptionFloat, smooth_outer_wall_layer_height))
+    ((ConfigOptionFloat, interlocking_wall_amplitude))
+    ((ConfigOptionFloat, interlocking_wall_wavelength))
+    ((ConfigOptionFloat, interlocking_wall_resolution))
+    ((ConfigOptionBool,                 staggered_perimeters))
+    ((ConfigOptionBool,                 staggered_perimeters_inner_only))
+    ((ConfigOptionPercent,              staggered_perimeter_offset))
     ((ConfigOptionFloat,                overhang_flow_ratio))
     ((ConfigOptionFloat,                sparse_infill_flow_ratio))
     ((ConfigOptionFloat,                internal_solid_infill_flow_ratio))
@@ -1438,11 +1592,42 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionPercent,              scarf_overhang_threshold))
     
     // Orca: Z Anti-Aliasing (aka Z Contouring)
+    ((ConfigOptionEnum<TopSurfaceZMode>, top_surface_z_mode))
     ((ConfigOptionBool, zaa_enabled))
     ((ConfigOptionBool, zaa_dont_alternate_fill_direction))
     ((ConfigOptionFloat, zaa_min_z))
     ((ConfigOptionFloat, zaa_minimize_perimeter_height))
+
+    // True non-planar top surfaces. This is intentionally independent of
+    // Z contouring: it does not alter the object's slicing planes.
+    ((ConfigOptionBool,  nonplanar_top_surface))
+    ((ConfigOptionFloat, nonplanar_top_surface_max_angle))
+    ((ConfigOptionInt,   nonplanar_top_surface_layers))
+    ((ConfigOptionFloat, nonplanar_top_surface_resolution))
+    ((ConfigOptionFloat, nonplanar_top_surface_min_height))
     )
+
+// Mesh-following top surfaces are independent of the underlying structural wall
+// course. Standard, brick, and buried sine-wave interlocking walls may all be
+// smoothed into the exposed non-planar skin. SmoothOuterWall owns a competing
+// exposed-wall height schedule and remains incompatible.
+inline bool nonplanar_perimeters_enabled(const PrintRegionConfig &config)
+{
+    const PerimeterLayeringMode mode = config.perimeter_layering.value;
+    return (mode == PerimeterLayeringMode::Standard ||
+            mode == PerimeterLayeringMode::Brick ||
+            mode == PerimeterLayeringMode::InterlockingWalls ||
+            mode == PerimeterLayeringMode::Nonplanar) &&
+           config.nonplanar_top_surface.value;
+}
+
+inline bool brick_perimeters_enabled(const PrintRegionConfig &config)
+{
+    const PerimeterLayeringMode mode = config.perimeter_layering.value;
+    return mode == PerimeterLayeringMode::Brick ||
+           (mode == PerimeterLayeringMode::Standard &&
+            config.staggered_perimeters.value);
+}
 
 PRINT_CONFIG_CLASS_DEFINE(
     MachineEnvelopeConfig,
@@ -1769,11 +1954,14 @@ PRINT_CONFIG_CLASS_DERIVED_DEFINE(
     ((ConfigOptionInts,               other_layers_print_sequence))
     ((ConfigOptionInt,                other_layers_print_sequence_nums))
     ((ConfigOptionBools,              slow_down_for_layer_cooling))
+    ((ConfigOptionBools,              hull_line_mitigation))
+    ((ConfigOptionPercents,           hull_line_max_layer_time_variation))
     ((ConfigOptionInts,               close_fan_the_first_x_layers))
     ((ConfigOptionEnum<DraftShield>,  draft_shield))
     ((ConfigOptionFloat,              extruder_clearance_height_to_rod))//BBs
     ((ConfigOptionFloat,              extruder_clearance_height_to_lid))//BBS
     ((ConfigOptionFloat,              extruder_clearance_radius))
+    ((ConfigOptionFloat,              nonplanar_toolhead_clearance_angle))
     ((ConfigOptionString,             sequential_print_gantry_geometry))
     ((ConfigOptionString,             sequential_print_gantry_model))
     ((ConfigOptionFloat,              nozzle_height))

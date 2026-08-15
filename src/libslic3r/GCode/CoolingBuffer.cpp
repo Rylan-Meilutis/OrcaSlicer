@@ -41,6 +41,7 @@ void CoolingBuffer::reset(const Vec3d &position)
     m_fan_speed = -1;
     m_additional_fan_speed = -1;
     m_current_fan_speed = -1;
+    m_previous_layer_time = 0.f;
 }
 
 struct CoolingLine
@@ -181,6 +182,13 @@ struct PerExtruderAdjustments
         return time_total;
     }
 
+    float elapsed_time_after_slowdown(float factor, bool slowdown_external_perimeters) const {
+        float time_total = 0.f;
+        for (const CoolingLine &line : lines)
+            time_total += line.adjustable(slowdown_external_perimeters) ? std::min(line.time_max, line.time * factor) : line.time;
+        return time_total;
+    }
+
     // Sort the lines, adjustable first, higher feedrate first.
     // Used by non-proportional slow down.
     void sort_lines_by_decreasing_feedrate() {
@@ -239,6 +247,8 @@ struct PerExtruderAdjustments
     float                       slow_down_min_speed     = 0.f;
     
     bool                        dont_slow_down_outer_wall = false;
+    bool                        hull_line_mitigation = false;
+    float                       hull_line_max_layer_time_variation = 25.f;
 
 
     // Parsed lines.
@@ -329,6 +339,7 @@ std::string CoolingBuffer::process_layer(std::string &&gcode, size_t layer_id, b
         // and one object layer.
         std::vector<PerExtruderAdjustments> per_extruder_adjustments = this->parse_layer_gcode(m_gcode, m_current_pos);
         float layer_time_stretched = this->calculate_layer_slowdown(per_extruder_adjustments);
+        layer_time_stretched = this->apply_hull_line_slowdown(per_extruder_adjustments, layer_time_stretched);
         out = this->apply_layer_cooldown(m_gcode, layer_id, layer_time_stretched, per_extruder_adjustments);
         m_gcode.clear();
     }
@@ -350,6 +361,8 @@ std::vector<PerExtruderAdjustments> CoolingBuffer::parse_layer_gcode(const std::
         adj.slow_down_min_speed           = float(m_config.slow_down_min_speed.get_at(extruder_id));
         // ORCA: To enable dont slow down external perimeters feature per filament (extruder)
         adj.dont_slow_down_outer_wall   = m_config.dont_slow_down_outer_wall.get_at(extruder_id);
+        adj.hull_line_mitigation = m_config.hull_line_mitigation.get_at(extruder_id);
+        adj.hull_line_max_layer_time_variation = float(m_config.hull_line_max_layer_time_variation.get_at(extruder_id));
         map_extruder_to_per_extruder_adjustment[extruder_id] = i;
     }
 
@@ -696,6 +709,60 @@ float CoolingBuffer::calculate_layer_slowdown(std::vector<PerExtruderAdjustments
     }
 
     return elapsed_time_total0;
+}
+
+float CoolingBuffer::hull_line_target_time(float previous_layer_time, float current_layer_time, float max_variation_percent)
+{
+    if (previous_layer_time <= 0.f || current_layer_time <= 0.f || max_variation_percent <= 0.f)
+        return current_layer_time;
+    return std::max(current_layer_time, previous_layer_time / (1.f + max_variation_percent * 0.01f));
+}
+
+float CoolingBuffer::apply_hull_line_slowdown(
+    std::vector<PerExtruderAdjustments> &per_extruder_adjustments, float layer_time)
+{
+    std::vector<PerExtruderAdjustments *> enabled;
+    float max_variation = 100.f;
+    for (PerExtruderAdjustments &adjustment : per_extruder_adjustments) {
+        if (adjustment.hull_line_mitigation && !adjustment.lines.empty()) {
+            enabled.emplace_back(&adjustment);
+            max_variation = std::min(max_variation, adjustment.hull_line_max_layer_time_variation);
+        }
+    }
+
+    const float target = hull_line_target_time(m_previous_layer_time, layer_time, max_variation);
+    if (!enabled.empty() && target > layer_time + EPSILON) {
+        auto time_at_factor = [&per_extruder_adjustments, &enabled](float factor) {
+            float total = 0.f;
+            for (const PerExtruderAdjustments &adjustment : per_extruder_adjustments) {
+                const bool smooth = std::find(enabled.begin(), enabled.end(), &adjustment) != enabled.end();
+                total += smooth ? adjustment.elapsed_time_after_slowdown(factor, true) : adjustment.elapsed_time_total();
+            }
+            return total;
+        };
+
+        float low = 1.f;
+        float high = 2.f;
+        while (high < 65536.f && time_at_factor(high) < target)
+            high *= 2.f;
+        if (time_at_factor(high) >= target) {
+            for (size_t iteration = 0; iteration < 24; ++iteration) {
+                const float middle = 0.5f * (low + high);
+                if (time_at_factor(middle) < target)
+                    low = middle;
+                else
+                    high = middle;
+            }
+            for (PerExtruderAdjustments *adjustment : enabled)
+                adjustment->slow_down_proportional(high, true);
+            layer_time = 0.f;
+            for (const PerExtruderAdjustments &adjustment : per_extruder_adjustments)
+                layer_time += adjustment.elapsed_time_total();
+        }
+    }
+
+    m_previous_layer_time = layer_time;
+    return layer_time;
 }
 
 // Apply slow down over G-code lines stored in per_extruder_adjustments, enable fan if needed.

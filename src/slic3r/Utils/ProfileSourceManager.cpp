@@ -128,6 +128,47 @@ std::string remote_revision(const std::string &url, std::string &error,
     return revision;
 }
 
+std::string archive_url(std::string url);
+
+std::string github_repository(const std::string &url)
+{
+    constexpr const char *prefix = "https://github.com/";
+    if (!boost::starts_with(url, prefix) || boost::ends_with(boost::to_lower_copy(url), ".zip"))
+        return {};
+    std::string repository = url.substr(std::char_traits<char>::length(prefix));
+    boost::trim_right_if(repository, boost::is_any_of("/"));
+    if (boost::ends_with(repository, ".git"))
+        repository.resize(repository.size() - 4);
+    return std::count(repository.begin(), repository.end(), '/') == 1 ? repository : std::string{};
+}
+
+std::string source_revision(const ProfileSource &source, std::string &error,
+                            const ProfileSourceManager::CancelFn &cancel)
+{
+    // Native slicer repositories contain far more than profiles. Comparing
+    // their archive ETag reports every code/documentation commit as a profile
+    // update. GitHub's path-filtered commit endpoint changes only when the
+    // canonical profile tree changes.
+    const std::string repository = source.format == ProfileSource::Format::Orca ?
+        github_repository(source.url) : std::string{};
+    if (!repository.empty()) {
+        const std::string body = download(
+            "https://api.github.com/repos/" + repository +
+                "/commits?path=resources/profiles&per_page=1",
+            error, nullptr, cancel);
+        if (!error.empty())
+            return {};
+        const json commits = json::parse(body, nullptr, false);
+        if (!commits.is_array() || commits.empty() ||
+            !commits.front().contains("sha") || !commits.front()["sha"].is_string()) {
+            error = "The profile source did not provide a profile revision.";
+            return {};
+        }
+        return commits.front()["sha"].get<std::string>();
+    }
+    return remote_revision(archive_url(source.url), error, cancel);
+}
+
 bool safe_archive_name(const std::string &name)
 {
     const fs::path path(name);
@@ -1221,13 +1262,21 @@ ProfileSourceUpdateResult ProfileSourceManager::check_for_update(const ProfileSo
                                                                   const CancelFn &cancel) const
 {
     ProfileSourceUpdateResult result;
-    result.revision = remote_revision(archive_url(source.url), result.error, cancel);
+    result.revision = source_revision(source, result.error, cancel);
     if (!result.error.empty())
         return result;
-    // A never-synchronized source represents newly available profiles. For
-    // migrated configurations, establish the current revision as a baseline
-    // without claiming an update when the installed source has no old ETag.
-    result.update_available = has_update(source, result.revision);
+    if (source.revision.empty()) {
+        // Migrated configurations may already have an installed source but no
+        // revision. Establish a silent baseline for those; a newly enabled,
+        // never-installed source contains genuinely new profiles and prompts.
+        const std::string user = m_config.get("preset_folder").empty() ?
+            DEFAULT_USER_FOLDER_NAME : m_config.get("preset_folder");
+        const fs::path installed = fs::path(data_dir()) / PRESET_USER_DIR / user /
+            PRESET_LOCAL_DIR / ("profile_source_" + sanitize(source.id));
+        result.update_available = !fs::exists(installed);
+    } else {
+        result.update_available = has_update(source, result.revision);
+    }
     return result;
 }
 
@@ -1235,6 +1284,12 @@ ProfileSourceSyncResult ProfileSourceManager::sync(const ProfileSource &source, 
                                                     const CancelFn &cancel) try
 {
     ProfileSourceSyncResult result;
+    std::string revision_error;
+    const std::string profile_revision = source_revision(source, revision_error, cancel);
+    if (!revision_error.empty()) {
+        result.error = revision_error;
+        return result;
+    }
     const std::string user = m_config.get("preset_folder").empty() ? DEFAULT_USER_FOLDER_NAME : m_config.get("preset_folder");
     const fs::path target = fs::path(data_dir()) / PRESET_USER_DIR / user / PRESET_LOCAL_DIR / ("profile_source_" + sanitize(source.id));
     // Keep transient trees outside _local. Preset loading enumerates that
@@ -1268,14 +1323,13 @@ ProfileSourceSyncResult ProfileSourceManager::sync(const ProfileSource &source, 
     }
 
     std::string error;
-    std::string downloaded_revision;
-    std::string body = download(archive_url(source.url), error, &downloaded_revision, cancel);
+    std::string body = download(archive_url(source.url), error, nullptr, cancel);
     if (!error.empty() && boost::starts_with(source.url, "https://github.com/") &&
         !boost::ends_with(source.url, ".zip")) {
         error.clear();
         std::string head_url = source.url;
         boost::trim_right_if(head_url, boost::is_any_of("/"));
-        body = download(head_url + "/archive/HEAD.zip", error, &downloaded_revision, cancel);
+        body = download(head_url + "/archive/HEAD.zip", error, nullptr, cancel);
     }
     if (!error.empty()) {
         result.error = error;
@@ -1300,7 +1354,7 @@ ProfileSourceSyncResult ProfileSourceManager::sync(const ProfileSource &source, 
         if (!result.success())
             return result;
     }
-    result.revision = std::move(downloaded_revision);
+    result.revision = profile_revision;
     fs::remove_all(extracted, ec);
 
     if (result.printers + result.filaments + result.processes == 0) {
@@ -1407,8 +1461,7 @@ std::string ProfileSourceManager::make_id(const std::string &name, const std::st
 
 bool ProfileSourceManager::has_update(const ProfileSource &source, const std::string &remote_revision)
 {
-    return source.last_sync == 0 ||
-        (!source.revision.empty() && source.revision != remote_revision);
+    return !source.revision.empty() && source.revision != remote_revision;
 }
 
 } // namespace Slic3r

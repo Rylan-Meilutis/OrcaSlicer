@@ -1136,12 +1136,12 @@ bool GLGizmoBrimEars::paint_point_at(const Vec2d &mouse_position)
 
     // Adjacent circular stamps overlap, producing a continuous brim region
     // while retaining the existing backwards-compatible brim-point format.
-    const float spacing = std::max(0.25f, m_new_point_head_diameter * 0.2f);
+    const float spacing = std::max(0.25f, m_new_point_head_radius * 0.4f);
     if (!m_last_painted_position.isZero() &&
         (object_pos.head<2>() - m_last_painted_position.head<2>()).norm() < spacing)
         return true;
 
-    if (add_point_to_cache(object_pos, m_new_point_head_diameter / 2.f, false,
+    if (add_point_to_cache(object_pos, m_new_point_head_radius, false,
                            (inverse_trsf * m_world_normal).cast<float>())) {
         m_last_painted_position = object_pos;
         find_single();

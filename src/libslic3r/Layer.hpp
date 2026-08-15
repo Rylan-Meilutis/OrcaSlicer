@@ -203,7 +203,11 @@ public:
                                                                            FillAdaptive::Octree *support_fill_octree,
                                                                            FillLightning::Generator* lightning_generator) const;
     void 					make_ironing();
-    void                    make_contour_z(const sla::IndexedMesh &mesh);
+    void                    make_contour_z(const sla::IndexedMesh &mesh,
+                                           bool rejected_nonplanar_fallback = false);
+    void                    make_nonplanar_top_surfaces(const sla::IndexedMesh &mesh,
+                                                        const std::vector<std::vector<uint8_t>> &selected_facets,
+                                                        const std::vector<std::vector<ExPolygons>> &selected_projections);
 
     void                    export_region_slices_to_svg(const char *path) const;
     void                    export_region_fill_surfaces_to_svg(const char *path) const;

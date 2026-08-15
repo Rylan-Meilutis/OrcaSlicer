@@ -28,6 +28,7 @@ TEST_CASE("New strength and overhang options preserve existing print defaults", 
 
     CHECK_FALSE(config.opt_bool("seam_start_on_inner_wall"));
     CHECK_FALSE(config.opt_bool("arc_overhang_enabled"));
+    CHECK_FALSE(config.opt_bool("bridge_overhang_before_walls"));
     CHECK(config.opt_bool("arc_overhang_bridges"));
     CHECK(config.opt_bool("arc_overhang_overhangs"));
     CHECK(config.opt_bool("arc_overhang_recursive_fill"));
@@ -75,18 +76,89 @@ TEST_CASE("New strength and overhang options preserve existing print defaults", 
         percent_inner_walls_config.option<ConfigOptionPercent>("inner_walls_flow_ratio");
     REQUIRE(percent_inner_walls_flow != nullptr);
     CHECK_THAT(percent_inner_walls_flow->value, Catch::Matchers::WithinAbs(125.0, EPSILON));
+    DynamicPrintConfig legacy_stagger_flow_config = config;
+    REQUIRE_NOTHROW(legacy_stagger_flow_config.set_deserialize_strict(
+        "staggered_perimeter_flow_ratio", "105%"));
+    const auto *legacy_stagger_flow =
+        legacy_stagger_flow_config.option<ConfigOptionPercent>("inner_walls_flow_ratio");
+    REQUIRE(legacy_stagger_flow != nullptr);
+    CHECK_THAT(legacy_stagger_flow->value, Catch::Matchers::WithinAbs(105.0, EPSILON));
+    CHECK_FALSE(config.opt_bool("staggered_perimeters"));
+    CHECK(config.opt_enum<PerimeterLayeringMode>("perimeter_layering") ==
+          PerimeterLayeringMode::Standard);
+    CHECK(config.opt_enum<TopSurfaceZMode>("top_surface_z_mode") ==
+          TopSurfaceZMode::Disabled);
+    CHECK_THAT(config.opt_float("smooth_outer_wall_layer_height"),
+               Catch::Matchers::WithinAbs(0.1, EPSILON));
+    CHECK_THAT(config.opt_float("interlocking_wall_amplitude"),
+               Catch::Matchers::WithinAbs(0.08, EPSILON));
+    CHECK_THAT(config.opt_float("interlocking_wall_wavelength"),
+               Catch::Matchers::WithinAbs(6., EPSILON));
+    CHECK_THAT(config.opt_float("interlocking_wall_resolution"),
+               Catch::Matchers::WithinAbs(0.5, EPSILON));
+    CHECK(config.opt_bool("staggered_perimeters_inner_only"));
+    const auto *stagger_offset = config.option<ConfigOptionPercent>("staggered_perimeter_offset");
+    REQUIRE(stagger_offset != nullptr);
+    CHECK_THAT(stagger_offset->value, Catch::Matchers::WithinAbs(50.0, EPSILON));
+    CHECK_FALSE(config.opt_bool("nonplanar_infill"));
+    CHECK_THAT(config.opt_float("nonplanar_infill_amplitude"),
+               Catch::Matchers::WithinAbs(0.08, EPSILON));
+    CHECK_THAT(config.opt_float("nonplanar_infill_wavelength"),
+               Catch::Matchers::WithinAbs(6., EPSILON));
+    CHECK_THAT(config.opt_float("nonplanar_infill_resolution"),
+               Catch::Matchers::WithinAbs(1., EPSILON));
+    CHECK_FALSE(config.opt_bool("fuzzy_skin_top_surface"));
     CHECK(config.opt_int("support_interface_top_temperature") == 0);
+    CHECK_FALSE(config.opt_bool("slow_down_layer_above_dissimilar_support_interface"));
+    CHECK(config.opt_int("hull_line_extra_perimeters") == 0);
+    CHECK_THAT(config.opt_float("hull_line_perimeter_expansion"),
+               Catch::Matchers::WithinAbs(0., EPSILON));
+    CHECK(config.opt_enum<LocalizedShrinkageStrategy>("localized_shrinkage_strategy") ==
+          LocalizedShrinkageStrategy::Custom);
+    CHECK_THAT(config.opt_float("localized_shrinkage_infill_wall_gap"),
+               Catch::Matchers::WithinAbs(0., EPSILON));
+    CHECK_THAT(config.opt_float("localized_shrinkage_section_width"),
+               Catch::Matchers::WithinAbs(0., EPSILON));
+    CHECK_THAT(config.opt_float("localized_shrinkage_section_spacing"),
+               Catch::Matchers::WithinAbs(10., EPSILON));
+    CHECK_THAT(config.opt_float("localized_shrinkage_perforation_diameter"),
+               Catch::Matchers::WithinAbs(0., EPSILON));
+    CHECK_THAT(config.opt_float("localized_shrinkage_perforation_spacing"),
+               Catch::Matchers::WithinAbs(3., EPSILON));
+    const auto *interface_speed =
+        config.option<ConfigOptionFloatOrPercent>("dissimilar_support_interface_speed");
+    REQUIRE(interface_speed != nullptr);
+    CHECK(interface_speed->percent);
+    CHECK_THAT(interface_speed->value, Catch::Matchers::WithinAbs(50., EPSILON));
+    CHECK(config.opt_int("dissimilar_support_interface_speed_layers") == 0);
     const ConfigOptionDef *spool_sync = print_config_def.get("sync_spool_manager_filament_names");
     REQUIRE(spool_sync != nullptr);
     const auto *spool_sync_default = dynamic_cast<const ConfigOptionBool *>(spool_sync->default_value.get());
     REQUIRE(spool_sync_default != nullptr);
     CHECK_FALSE(spool_sync_default->value);
+    const ConfigOptionDef *embed_spool_names =
+        print_config_def.get("embed_spool_manager_filament_names");
+    REQUIRE(embed_spool_names != nullptr);
+    const auto *embed_spool_names_default =
+        dynamic_cast<const ConfigOptionBool *>(embed_spool_names->default_value.get());
+    REQUIRE(embed_spool_names_default != nullptr);
+    CHECK(embed_spool_names_default->value);
     const ConfigOptionDef *spool_sync_mode = print_config_def.get("spool_manager_sync_mode");
     REQUIRE(spool_sync_mode != nullptr);
     const auto *spool_sync_mode_default =
         dynamic_cast<const ConfigOptionEnum<SpoolManagerSyncMode> *>(spool_sync_mode->default_value.get());
     REQUIRE(spool_sync_mode_default != nullptr);
     CHECK(spool_sync_mode_default->value == smsmColorsAndProfiles);
+    const ConfigOptionDef *filament_plugin_endpoint =
+        print_config_def.get("octoprint_filament_plugin_endpoint");
+    REQUIRE(filament_plugin_endpoint != nullptr);
+    const auto *filament_plugin_endpoint_default =
+        dynamic_cast<const ConfigOptionString *>(filament_plugin_endpoint->default_value.get());
+    REQUIRE(filament_plugin_endpoint_default != nullptr);
+    CHECK(filament_plugin_endpoint_default->value.empty());
+    REQUIRE(print_config_def.get("octoprint_spool_profile_mappings") != nullptr);
+    REQUIRE(print_config_def.get("octoprint_material_profile_mappings") != nullptr);
+    REQUIRE(print_config_def.get("octoprint_default_filament_profile") != nullptr);
     CHECK(config.opt_int("max_filament_colors") == 0);
     const std::vector<std::string> &printer_options = Preset::printer_options();
     CHECK(std::find(printer_options.begin(), printer_options.end(), "max_filament_colors") !=
@@ -97,9 +169,159 @@ TEST_CASE("New strength and overhang options preserve existing print defaults", 
     CHECK(std::find(physical_printer_options.begin(), physical_printer_options.end(),
                     "sync_spool_manager_filament_names") != physical_printer_options.end());
     CHECK(std::find(physical_printer_options.begin(), physical_printer_options.end(),
+                    "embed_spool_manager_filament_names") != physical_printer_options.end());
+    CHECK(std::find(physical_printer_options.begin(), physical_printer_options.end(),
                     "spool_manager_sync_mode") != physical_printer_options.end());
+    CHECK(std::find(physical_printer_options.begin(), physical_printer_options.end(),
+                    "octoprint_filament_plugin_endpoint") != physical_printer_options.end());
+    CHECK(std::find(physical_printer_options.begin(), physical_printer_options.end(),
+                    "octoprint_spool_profile_mappings") != physical_printer_options.end());
+    CHECK(std::find(physical_printer_options.begin(), physical_printer_options.end(),
+                    "octoprint_material_profile_mappings") != physical_printer_options.end());
+    CHECK(std::find(physical_printer_options.begin(), physical_printer_options.end(),
+                    "octoprint_default_filament_profile") != physical_printer_options.end());
     CHECK(config.opt_string("sequential_print_gantry_geometry").empty());
     CHECK(config.opt_string("sequential_print_gantry_model").empty());
+    CHECK_THAT(config.opt_float("nonplanar_toolhead_clearance_angle"),
+               Catch::Matchers::WithinAbs(0., EPSILON));
+    CHECK_FALSE(config.opt_bool("nonplanar_top_surface"));
+    CHECK_THAT(config.opt_float("nonplanar_top_surface_max_angle"),
+               Catch::Matchers::WithinAbs(45., EPSILON));
+    CHECK(config.opt_int("nonplanar_top_surface_layers") == 5);
+    CHECK_THAT(config.opt_float("nonplanar_top_surface_resolution"),
+               Catch::Matchers::WithinAbs(0.2, EPSILON));
+    CHECK_THAT(config.opt_float("nonplanar_top_surface_min_height"),
+               Catch::Matchers::WithinAbs(0.05, EPSILON));
+    CHECK_FALSE(config.opt_bool("support_ironing_nonplanar"));
+    CHECK_THAT(config.opt_float("support_ironing_nonplanar_max_angle"),
+               Catch::Matchers::WithinAbs(45., EPSILON));
+    CHECK_THAT(config.opt_float("support_ironing_nonplanar_resolution"),
+               Catch::Matchers::WithinAbs(0.2, EPSILON));
+    const std::vector<std::string> &print_options = Preset::print_options();
+    for (const char *key : {"perimeter_layering", "top_surface_z_mode", "smooth_outer_wall_layer_height",
+                            "interlocking_wall_amplitude", "interlocking_wall_wavelength",
+                            "interlocking_wall_resolution", "nonplanar_top_surface", "nonplanar_top_surface_max_angle",
+                            "nonplanar_top_surface_layers", "nonplanar_top_surface_resolution",
+                            "nonplanar_top_surface_min_height",
+                            "nonplanar_infill", "nonplanar_infill_amplitude",
+                            "nonplanar_infill_wavelength", "nonplanar_infill_resolution",
+                            "support_ironing_nonplanar",
+                            "support_ironing_nonplanar_max_angle",
+                            "support_ironing_nonplanar_resolution",
+                            "localized_shrinkage_strategy",
+                            "localized_shrinkage_infill_wall_gap",
+                            "localized_shrinkage_section_width",
+                            "localized_shrinkage_section_spacing",
+                            "localized_shrinkage_perforation_diameter",
+                            "localized_shrinkage_perforation_spacing",
+                            "slow_down_layer_above_dissimilar_support_interface",
+                            "dissimilar_support_interface_speed",
+                            "dissimilar_support_interface_speed_layers"}) {
+        CHECK(std::find(print_options.begin(), print_options.end(), key) != print_options.end());
+    }
+    CHECK(std::find(printer_options.begin(), printer_options.end(), "nonplanar_toolhead_clearance_angle") !=
+          printer_options.end());
+    const std::vector<std::string> &filament_options = Preset::filament_options();
+    CHECK(std::find(filament_options.begin(), filament_options.end(), "hull_line_mitigation") !=
+          filament_options.end());
+    CHECK(std::find(filament_options.begin(), filament_options.end(), "hull_line_max_layer_time_variation") !=
+          filament_options.end());
+    const auto *hull_line_mitigation =
+        config.option<ConfigOptionBools>("hull_line_mitigation");
+    const auto *hull_line_variation =
+        config.option<ConfigOptionPercents>("hull_line_max_layer_time_variation");
+    REQUIRE(hull_line_mitigation != nullptr);
+    REQUIRE(hull_line_variation != nullptr);
+    REQUIRE_FALSE(hull_line_mitigation->values.empty());
+    REQUIRE_FALSE(hull_line_variation->values.empty());
+    CHECK_FALSE(hull_line_mitigation->values.front());
+    CHECK_THAT(hull_line_variation->values.front(),
+               Catch::Matchers::WithinAbs(25., EPSILON));
+}
+
+TEST_CASE("Legacy perimeter layering options preserve compatible brick and nonplanar features", "[Config][PerimeterLayering]")
+{
+    DynamicPrintConfig legacy_brick;
+    legacy_brick.set_key_value("staggered_perimeters", new ConfigOptionBool(true));
+    legacy_brick.handle_legacy_composite();
+    CHECK(legacy_brick.opt_enum<PerimeterLayeringMode>("perimeter_layering") ==
+          PerimeterLayeringMode::Brick);
+
+    DynamicPrintConfig full_legacy_brick = DynamicPrintConfig::full_print_config();
+    full_legacy_brick.set_key_value("staggered_perimeters", new ConfigOptionBool(true));
+    full_legacy_brick.handle_legacy_composite();
+    CHECK(full_legacy_brick.opt_enum<PerimeterLayeringMode>("perimeter_layering") ==
+          PerimeterLayeringMode::Brick);
+
+    DynamicPrintConfig legacy_nonplanar;
+    legacy_nonplanar.set_key_value("nonplanar_top_surface", new ConfigOptionBool(true));
+    legacy_nonplanar.handle_legacy_composite();
+    CHECK(legacy_nonplanar.opt_enum<PerimeterLayeringMode>("perimeter_layering") ==
+          PerimeterLayeringMode::Standard);
+    CHECK(legacy_nonplanar.opt_enum<TopSurfaceZMode>("top_surface_z_mode") ==
+          TopSurfaceZMode::NonplanarTopSurface);
+
+    DynamicPrintConfig legacy_nonplanar_selector;
+    legacy_nonplanar_selector.set_key_value("perimeter_layering",
+        new ConfigOptionEnum<PerimeterLayeringMode>(PerimeterLayeringMode::Nonplanar));
+    legacy_nonplanar_selector.handle_legacy_composite();
+    CHECK(legacy_nonplanar_selector.opt_enum<PerimeterLayeringMode>("perimeter_layering") ==
+          PerimeterLayeringMode::Standard);
+    CHECK(legacy_nonplanar_selector.opt_enum<TopSurfaceZMode>("top_surface_z_mode") ==
+          TopSurfaceZMode::NonplanarTopSurface);
+    CHECK(legacy_nonplanar_selector.opt_bool("nonplanar_top_surface"));
+
+    DynamicPrintConfig selected_nonplanar = DynamicPrintConfig::full_print_config();
+    selected_nonplanar.set_key_value("top_surface_z_mode",
+        new ConfigOptionEnum<TopSurfaceZMode>(TopSurfaceZMode::NonplanarTopSurface));
+    selected_nonplanar.handle_legacy_composite();
+    CHECK(selected_nonplanar.opt_enum<TopSurfaceZMode>("top_surface_z_mode") ==
+          TopSurfaceZMode::NonplanarTopSurface);
+    CHECK(selected_nonplanar.opt_bool("nonplanar_top_surface"));
+    CHECK_FALSE(selected_nonplanar.opt_bool("zaa_enabled"));
+
+    DynamicPrintConfig selected_contouring = DynamicPrintConfig::full_print_config();
+    selected_contouring.set_key_value("top_surface_z_mode",
+        new ConfigOptionEnum<TopSurfaceZMode>(TopSurfaceZMode::ZContouring));
+    selected_contouring.handle_legacy_composite();
+    CHECK(selected_contouring.opt_enum<TopSurfaceZMode>("top_surface_z_mode") ==
+          TopSurfaceZMode::ZContouring);
+    CHECK(selected_contouring.opt_bool("zaa_enabled"));
+    CHECK_FALSE(selected_contouring.opt_bool("nonplanar_top_surface"));
+
+    DynamicPrintConfig selected_hybrid = DynamicPrintConfig::full_print_config();
+    selected_hybrid.set_key_value("top_surface_z_mode",
+        new ConfigOptionEnum<TopSurfaceZMode>(
+            TopSurfaceZMode::NonplanarWithZContouringFallback));
+    selected_hybrid.handle_legacy_composite();
+    CHECK(selected_hybrid.opt_enum<TopSurfaceZMode>("top_surface_z_mode") ==
+          TopSurfaceZMode::NonplanarWithZContouringFallback);
+    CHECK(selected_hybrid.opt_bool("zaa_enabled"));
+    CHECK(selected_hybrid.opt_bool("nonplanar_top_surface"));
+
+    DynamicPrintConfig serialized_hybrid = DynamicPrintConfig::full_print_config();
+    REQUIRE_NOTHROW(serialized_hybrid.set_deserialize_strict(
+        "top_surface_z_mode", "nonplanar_with_z_contouring_fallback"));
+    CHECK(serialized_hybrid.opt_enum<TopSurfaceZMode>("top_surface_z_mode") ==
+          TopSurfaceZMode::NonplanarWithZContouringFallback);
+
+    DynamicPrintConfig conflicting;
+    conflicting.set_key_value("staggered_perimeters", new ConfigOptionBool(true));
+    conflicting.set_key_value("nonplanar_top_surface", new ConfigOptionBool(true));
+    conflicting.handle_legacy_composite();
+    CHECK(conflicting.opt_enum<PerimeterLayeringMode>("perimeter_layering") ==
+          PerimeterLayeringMode::Brick);
+
+    PrintRegionConfig compatible;
+    compatible.perimeter_layering.value = PerimeterLayeringMode::Brick;
+    compatible.staggered_perimeters.value = true;
+    compatible.nonplanar_top_surface.value = true;
+    CHECK(brick_perimeters_enabled(compatible));
+    CHECK(nonplanar_perimeters_enabled(compatible));
+
+    compatible.perimeter_layering.value = PerimeterLayeringMode::InterlockingWalls;
+    CHECK_FALSE(brick_perimeters_enabled(compatible));
+    CHECK(nonplanar_perimeters_enabled(compatible));
 }
 
 TEST_CASE("Bundled Prusa sequential gantry models match their printer notes", "[Config][Arrange]")
@@ -571,6 +793,124 @@ TEST_CASE("save_to_json round-trips plugin capability references as strings", "[
     REQUIRE(reloaded.load_from_json(tmp.string(), substitutions, true, key_values, reason) == 0);
     CHECK(reason.empty());
     CHECK(reloaded.option<ConfigOptionStrings>("slicing_pipeline_plugin")->values == refs);
+}
+
+TEST_CASE("nonplanar and perimeter layering settings survive process preset JSON", "[Config][Preset][Nonplanar]")
+{
+    ScopedTemporaryFile tmp(".json");
+    const std::vector<std::string> keys = {
+        "perimeter_layering", "top_surface_z_mode", "staggered_perimeters",
+        "staggered_perimeters_inner_only", "staggered_perimeter_offset",
+        "smooth_outer_wall_layer_height", "interlocking_wall_amplitude",
+        "interlocking_wall_wavelength", "interlocking_wall_resolution",
+        "nonplanar_top_surface", "nonplanar_top_surface_max_angle",
+        "nonplanar_top_surface_layers", "nonplanar_top_surface_resolution",
+        "nonplanar_top_surface_min_height", "nonplanar_infill",
+        "nonplanar_infill_amplitude", "nonplanar_infill_wavelength",
+        "nonplanar_infill_resolution", "support_ironing_nonplanar",
+        "support_ironing_nonplanar_max_angle",
+        "support_ironing_nonplanar_resolution", "localized_shrinkage_strategy",
+        "localized_shrinkage_infill_wall_gap",
+        "localized_shrinkage_section_width",
+        "localized_shrinkage_section_spacing",
+        "localized_shrinkage_perforation_diameter",
+        "localized_shrinkage_perforation_spacing", "zaa_enabled",
+        "zaa_minimize_perimeter_height", "zaa_dont_alternate_fill_direction",
+        "zaa_min_z", "bridge_overhang_before_walls"
+    };
+    for (const std::string &key : keys)
+        CHECK(std::find(Preset::print_options().begin(), Preset::print_options().end(), key) !=
+              Preset::print_options().end());
+
+    std::unique_ptr<DynamicPrintConfig> config_ptr(
+        DynamicPrintConfig::new_from_defaults_keys(keys));
+    DynamicPrintConfig config = std::move(*config_ptr);
+    config.set_key_value("perimeter_layering",
+        new ConfigOptionEnum<PerimeterLayeringMode>(PerimeterLayeringMode::Brick));
+    config.set_key_value("top_surface_z_mode",
+        new ConfigOptionEnum<TopSurfaceZMode>(
+            TopSurfaceZMode::NonplanarWithZContouringFallback));
+    config.set_key_value("staggered_perimeters", new ConfigOptionBool(true));
+    config.set_key_value("staggered_perimeters_inner_only", new ConfigOptionBool(false));
+    config.set_key_value("staggered_perimeter_offset", new ConfigOptionPercent(42.));
+    config.set_key_value("nonplanar_top_surface", new ConfigOptionBool(true));
+    config.set_key_value("zaa_enabled", new ConfigOptionBool(true));
+    config.set_key_value("nonplanar_top_surface_max_angle", new ConfigOptionFloat(37.));
+    config.set_key_value("nonplanar_top_surface_layers", new ConfigOptionInt(4));
+    config.set_key_value("nonplanar_top_surface_resolution", new ConfigOptionFloat(0.15));
+    config.set_key_value("nonplanar_top_surface_min_height", new ConfigOptionFloat(0.04));
+    config.set_key_value("nonplanar_infill", new ConfigOptionBool(true));
+    config.set_key_value("nonplanar_infill_amplitude", new ConfigOptionFloat(0.07));
+    config.set_key_value("nonplanar_infill_wavelength", new ConfigOptionFloat(5.));
+    config.set_key_value("nonplanar_infill_resolution", new ConfigOptionFloat(0.75));
+    config.save_to_json(tmp.string(), "nonplanar_process", "User", "1.0.0.0");
+
+    nlohmann::json json;
+    {
+        boost::nowide::ifstream ifs(tmp.string());
+        ifs >> json;
+    }
+    for (const std::string &key : keys)
+        CHECK(json.contains(key));
+
+    DynamicPrintConfig reloaded = DynamicPrintConfig::full_print_config();
+    ConfigSubstitutionContext substitutions(ForwardCompatibilitySubstitutionRule::Disable);
+    std::map<std::string, std::string> key_values;
+    std::string reason;
+    REQUIRE(reloaded.load_from_json(tmp.string(), substitutions, true, key_values, reason) == 0);
+    CHECK(reason.empty());
+    CHECK(reloaded.opt_enum<PerimeterLayeringMode>("perimeter_layering") ==
+          PerimeterLayeringMode::Brick);
+    CHECK(reloaded.opt_enum<TopSurfaceZMode>("top_surface_z_mode") ==
+          TopSurfaceZMode::NonplanarWithZContouringFallback);
+    CHECK(reloaded.opt_bool("staggered_perimeters"));
+    CHECK_FALSE(reloaded.opt_bool("staggered_perimeters_inner_only"));
+    CHECK_THAT(reloaded.option<ConfigOptionPercent>("staggered_perimeter_offset")->value,
+               Catch::Matchers::WithinAbs(42., EPSILON));
+    CHECK(reloaded.opt_bool("nonplanar_top_surface"));
+    CHECK(reloaded.opt_bool("zaa_enabled"));
+    CHECK(reloaded.opt_bool("nonplanar_infill"));
+    CHECK_THAT(reloaded.opt_float("nonplanar_infill_amplitude"),
+               Catch::Matchers::WithinAbs(0.07, EPSILON));
+}
+
+TEST_CASE("nonplanar clearance settings survive printer preset JSON", "[Config][Preset][Nonplanar]")
+{
+    ScopedTemporaryFile tmp(".json");
+    const std::vector<std::string> keys = {
+        "nonplanar_toolhead_clearance_angle", "sequential_print_gantry_geometry",
+        "sequential_print_gantry_model"
+    };
+    for (const std::string &key : keys)
+        CHECK(std::find(Preset::printer_options().begin(),
+                        Preset::printer_options().end(), key) !=
+              Preset::printer_options().end());
+
+    std::unique_ptr<DynamicPrintConfig> config_ptr(
+        DynamicPrintConfig::new_from_defaults_keys(keys));
+    DynamicPrintConfig config = std::move(*config_ptr);
+    config.set_key_value("nonplanar_toolhead_clearance_angle",
+                         new ConfigOptionFloat(42.));
+    config.save_to_json(tmp.string(), "nonplanar_printer", "User", "1.0.0.0");
+
+    nlohmann::json json;
+    {
+        boost::nowide::ifstream ifs(tmp.string());
+        ifs >> json;
+    }
+    for (const std::string &key : keys)
+        CHECK(json.contains(key));
+
+    DynamicPrintConfig reloaded = DynamicPrintConfig::full_print_config();
+    ConfigSubstitutionContext substitutions(
+        ForwardCompatibilitySubstitutionRule::Disable);
+    std::map<std::string, std::string> key_values;
+    std::string reason;
+    REQUIRE(reloaded.load_from_json(tmp.string(), substitutions, true,
+                                    key_values, reason) == 0);
+    CHECK(reason.empty());
+    CHECK_THAT(reloaded.opt_float("nonplanar_toolhead_clearance_angle"),
+               Catch::Matchers::WithinAbs(42., EPSILON));
 }
 
 TEST_CASE("plugin capability references survive string-map serialization", "[Config][plugins]") {

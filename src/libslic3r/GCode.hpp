@@ -21,6 +21,7 @@
 #include "GCode/ThumbnailData.hpp"
 #include "libslic3r/ObjectID.hpp"
 #include "GCode/ExtrusionProcessor.hpp"
+#include "SequentialGantryGeometry.hpp"
 
 #include "GCode/PressureEqualizer.hpp"
 #include "GCode/SmallAreaInfillFlowCompensator.hpp"
@@ -30,10 +31,13 @@
 #include "GCode/TimelapsePosPicker.hpp"
 
 #include <memory>
+#include <cstdint>
+#include <limits>
 #include <map>
 #include <optional>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <cfloat>
 
 namespace Slic3r {
@@ -522,7 +526,20 @@ private:
 
     std::string     extrude_perimeters(const Print& print, const std::vector<ObjectByExtruder::Island::Region>& by_region, bool is_first_layer, bool is_infill_first);
     std::string     extrude_infill(const Print& print, const std::vector<ObjectByExtruder::Island::Region>& by_region, bool ironing,
-                                   ExtrusionRole role_filter = erMixed);
+                                   ExtrusionRole role_filter = erMixed, bool exclude_bridge_or_arc_fill = false,
+                                   bool enabled_bridge_order_regions_only = false);
+    std::string     extrude_nonplanar_surface(const Print& print, const std::vector<ObjectByExtruder::Island::Region>& by_region,
+                                              bool before_current_layer,
+                                              std::optional<size_t> feature_course = std::nullopt);
+    size_t          maximum_nonplanar_feature_course(const std::vector<ObjectByExtruder::Island::Region>& by_region,
+                                                     bool before_current_layer) const;
+    bool            is_nonplanar_leveling_course(const std::vector<ObjectByExtruder::Island::Region>& by_region,
+                                                 bool before_current_layer, size_t feature_course) const;
+    std::string     extrude_entity_nonplanar_filtered(const ExtrusionEntity& entity, const std::string& description,
+                                                      bool nonplanar, const ExtrusionEntitiesPtr& region_perimeters = {},
+                                                      std::optional<bool> before_current_layer = std::nullopt,
+                                                      std::optional<bool> feature_transition = std::nullopt,
+                                                      std::optional<size_t> feature_course = std::nullopt);
     std::string     extrude_support(const ExtrusionEntityCollection& support_fills, const ExtrusionRole support_extrusion_role);
 
     // Farthest-point timelapse: find the extrusion point farthest from camera (0,0)
@@ -543,6 +560,23 @@ private:
     std::set<ObjectInstanceID>      m_objsWithBrim; // indicates the object instances with brim
     // Cache for custom seam enforcers/blockers for each layer.
     SeamPlacer                          m_seam_placer;
+    // Exact nozzle-length tails omitted from already emitted adjacent inner
+    // walls. The external seam may consume one as its pressure-prime path;
+    // regenerating the tail from an unplaced source loop can select a
+    // different seam and over-extrude an already printed inner-wall segment.
+    std::vector<ExtrusionPaths>         m_inner_seam_prime_gaps;
+    // Prime paths emitted before their inner wall (outer-first ordering). The
+    // later inner wall adopts and clips this exact path as its seam gap. Only
+    // one pending prime may target a given loop.
+    std::vector<ExtrusionPaths>         m_pending_inner_seam_primes;
+    // Adjacent inner loops already emitted in the current perimeter
+    // collection. Once their saved gap has been consumed, another external
+    // contour must not reconstruct a second prime from the same loop.
+    std::set<const ExtrusionLoop *>      m_emitted_inner_seam_loops;
+    // External seams emitted before their adjacent inner wall. Such an inner
+    // wall must retain its normal seam gap because no later outer-wall prime
+    // can safely fill a specially enlarged gap.
+    std::vector<Point>                  m_unprimed_outer_seams;
 
     // One stop of the island-level tour: consecutive islands of a single instance. An instance
     // can have several visits per layer when its islands are toured non-consecutively.
@@ -691,6 +725,10 @@ private:
     // Arc bridges and one-sided arc overhangs have independent speed recovery ramps.
     std::map<const PrintObject*, int>    m_arc_overhang_overhang_start;
     std::map<const PrintObject*, int>    m_arc_overhang_bridge_start;
+    // Per object and model filament, the latest layer printed directly above a
+    // top support interface made from a different material type.
+    std::map<std::pair<const PrintObject*, unsigned int>, int>
+                                        m_dissimilar_support_interface_start;
     // Support for G-Code Processor
     float                               m_last_height{ 0.0f };
     float                               m_last_layer_z{ 0.0f };
@@ -744,6 +782,25 @@ private:
 
     std::vector<const PrintObject*> m_printed_objects;
 
+    // Ordered occupancy for collision-checking variable-Z paths. It is reset
+    // at each physical layer and populated as extrusion is actually emitted,
+    // so same-layer walls, supports, and earlier contoured paths are included.
+    SequentialGantryGeometry               m_toolhead_clearance_geometry;
+    ToolheadClearanceFallback              m_toolhead_clearance_fallback;
+    std::vector<PrintedToolpathObstacle>    m_toolhead_clearance_previous_obstacles;
+    std::vector<PrintedToolpathObstacle>    m_toolhead_clearance_obstacles;
+    using ToolheadClearanceGrid = std::unordered_map<uint64_t, std::vector<size_t>>;
+    ToolheadClearanceGrid                   m_toolhead_clearance_previous_grid;
+    ToolheadClearanceGrid                   m_toolhead_clearance_grid;
+    double                                  m_toolhead_clearance_previous_top_z{-std::numeric_limits<double>::max()};
+    double                                  m_toolhead_clearance_top_z{-std::numeric_limits<double>::max()};
+    std::set<coord_t>                       m_toolhead_clearance_record_layers;
+    std::vector<uint32_t>                   m_toolhead_clearance_candidate_marks;
+    uint32_t                                m_toolhead_clearance_candidate_generation{0};
+    bool                                    m_toolhead_clearance_enabled{false};
+    bool                                    m_toolhead_clearance_record_this_layer{false};
+    bool                                    m_nonplanar_clearance_active_this_layer{false};
+
     // Processor
     GCodeProcessor m_processor;
 
@@ -771,7 +828,14 @@ private:
     void update_layer_related_config(int layer_id);
 
     double      calc_max_volumetric_speed(const double layer_height, const double line_width, const std::string co_str);
-    std::string _extrude(const ExtrusionPath &path, std::string description = "", double speed = -1);
+    std::string _extrude(const ExtrusionPath &path, std::string description = "", double speed = -1,
+                         bool validate_nonplanar_clearance = true);
+    void        record_toolhead_clearance_obstacle(PrintedToolpathObstacle obstacle);
+    std::vector<const PrintedToolpathObstacle *> toolhead_clearance_candidates(
+        const std::vector<Vec3d> &points,
+        const std::vector<PrintedToolpathObstacle> &obstacles,
+        const ToolheadClearanceGrid &grid,
+        double maximum_obstacle_top_z);
     bool _needSAFC(const ExtrusionPath &path);
     void print_machine_envelope(GCodeOutputStream& file, Print& print);
     void _print_first_layer_bed_temperature(GCodeOutputStream &file, Print &print, const std::string &gcode, unsigned int first_printing_extruder_id, bool wait);

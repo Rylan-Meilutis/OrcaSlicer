@@ -1497,7 +1497,8 @@ void Choice::BUILD()
             image_path /= "images";
             for (auto el : m_opt.enum_labels) {
                 auto icon_name = "param_" + m_opt.enum_values[i];
-                if (boost::filesystem::exists(image_path / (icon_name + ".svg"))) {
+                if (m_opt.enum_icons &&
+                    boost::filesystem::exists(image_path / (icon_name + ".svg"))) {
                     ScalableBitmap bm(temp, icon_name, 24);
 				    temp->Append(_(el), bm.bmp());
                 } else {
@@ -1957,7 +1958,8 @@ void Choice::msw_rescale()
         auto temp = dynamic_cast<choice_ctrl *>(window);
         for (auto el : m_opt.enum_values) {
             auto icon_name = "param_" + m_opt.enum_values[i];
-            if (boost::filesystem::exists(image_path / (icon_name + ".svg"))) {
+            if (m_opt.enum_icons &&
+                boost::filesystem::exists(image_path / (icon_name + ".svg"))) {
                 ScalableBitmap bm(window, icon_name, 24);
                 temp->SetItemBitmap(i, bm.bmp());
             }

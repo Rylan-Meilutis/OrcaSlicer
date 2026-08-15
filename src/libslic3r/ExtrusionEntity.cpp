@@ -15,14 +15,78 @@ namespace Slic3r {
     
 static const double slope_inner_outer_wall_gap = 0.4;
 
+// Clipper operates on XY polylines. Rebuilding a clipped variable-Z path from
+// those 2D results used to set every relative Z to zero while retaining the
+// non-planar metadata. The resulting path was then emitted at its nominal
+// owner height, creating unsupported flat rows in an otherwise draped shell.
+// Recover each clipped vertex from the nearest segment of the source 3D
+// centerline. Clipping only retains source segments and inserts points on
+// them, so linear interpolation is exact apart from integer rounding.
+static Polyline3 restore_clipped_polyline_z(const Polyline &clipped,
+                                            const Polyline3 &source)
+{
+    if (source.points.empty() || clipped.points.empty())
+        return Polyline3(clipped);
+
+    Points3 points;
+    points.reserve(clipped.points.size());
+    for (const Point &point : clipped.points) {
+        double nearest_distance_squared =
+            std::numeric_limits<double>::infinity();
+        coord_t interpolated_z = source.points.front().z();
+        for (size_t segment_idx = 1;
+             segment_idx < source.points.size(); ++segment_idx) {
+            const Point3 &first = source.points[segment_idx - 1];
+            const Point3 &last = source.points[segment_idx];
+            const Vec2d a = first.to_point().cast<double>();
+            const Vec2d delta =
+                (last.to_point() - first.to_point()).cast<double>();
+            const double squared = delta.squaredNorm();
+            const double ratio = squared <= 0. ? 0. : std::clamp(
+                (point.cast<double>() - a).dot(delta) / squared, 0., 1.);
+            const double distance_squared =
+                (point.cast<double>() - (a + ratio * delta)).squaredNorm();
+            if (distance_squared >= nearest_distance_squared)
+                continue;
+            nearest_distance_squared = distance_squared;
+            interpolated_z = coord_t(std::llround(
+                double(first.z()) + ratio * double(last.z() - first.z())));
+        }
+        points.emplace_back(point.x(), point.y(), interpolated_z);
+    }
+    return Polyline3(std::move(points));
+}
+
 void ExtrusionPath::intersect_expolygons(const ExPolygons &collection, ExtrusionEntityCollection* retval) const
 {
-    this->_inflate_collection(intersection_pl(Polylines{ polyline.to_polyline() }, collection), retval);
+    const Polylines clipped =
+        intersection_pl(Polylines{polyline.to_polyline()}, collection);
+    if (!this->z_contoured) {
+        this->_inflate_collection(clipped, retval);
+        return;
+    }
+    for (const Polyline &fragment : clipped) {
+        auto *path = new ExtrusionPath(*this);
+        path->polyline = restore_clipped_polyline_z(fragment, this->polyline);
+        path->polyline.fitting_result.clear();
+        retval->entities.emplace_back(path);
+    }
 }
 
 void ExtrusionPath::subtract_expolygons(const ExPolygons &collection, ExtrusionEntityCollection* retval) const
 {
-    this->_inflate_collection(diff_pl(Polylines{ this->polyline.to_polyline() }, collection), retval);
+    const Polylines clipped =
+        diff_pl(Polylines{this->polyline.to_polyline()}, collection);
+    if (!this->z_contoured) {
+        this->_inflate_collection(clipped, retval);
+        return;
+    }
+    for (const Polyline &fragment : clipped) {
+        auto *path = new ExtrusionPath(*this);
+        path->polyline = restore_clipped_polyline_z(fragment, this->polyline);
+        path->polyline.fitting_result.clear();
+        retval->entities.emplace_back(path);
+    }
 }
 
 void ExtrusionPath::clip_end(double distance)
@@ -287,6 +351,13 @@ void ExtrusionLoop::split_at(const Point &point, bool prefer_non_overhang, const
     ExtrusionPath p1(path.role(), path.mm3_per_mm, path.width, path.height);
     ExtrusionPath p2(path.role(), path.mm3_per_mm, path.width, path.height);
     p1.z_contoured = p2.z_contoured = path.z_contoured;
+    p1.nonplanar_surface = p2.nonplanar_surface = path.nonplanar_surface;
+    p1.nonplanar_transition = p2.nonplanar_transition = path.nonplanar_transition;
+    p1.nonplanar_clearance_validated = p2.nonplanar_clearance_validated = path.nonplanar_clearance_validated;
+    p1.nonplanar_before_current_layer = p2.nonplanar_before_current_layer = path.nonplanar_before_current_layer;
+    p1.nonplanar_feature_transition = p2.nonplanar_feature_transition = path.nonplanar_feature_transition;
+    p1.nonplanar_feature_course = p2.nonplanar_feature_course = path.nonplanar_feature_course;
+    p1.nonplanar_leveling_transition = p2.nonplanar_leveling_transition = path.nonplanar_leveling_transition;
     path.polyline.split_at(p, &p1.polyline, &p2.polyline);
 
     if (this->paths.size() == 1) {
@@ -595,6 +666,14 @@ std::string ExtrusionEntity::role_to_string(ExtrusionRole role)
         case erBridgeInfill                 : return L("Bridge");
         case erInternalBridgeInfill         : return L("Internal Bridge");
         case erArcOverhang                  : return L("Arc overhang");
+        case erArcBridge                    : return L("Arc bridge");
+        case erNonplanarSurface             : return L("Non-planar top surface");
+        case erNonplanarSupport             : return L("Non-planar transition");
+        case erNonplanarInfill              : return L("Non-planar interlocking infill");
+        case erStaggeredPerimeter           : return L("Brick wall");
+        case erSmoothOuterWall              : return L("Smooth outer wall");
+        case erNonplanarInterlockingWall    : return L("Interlocking inner wall");
+        case erShrinkageCompensation        : return L("Shrinkage compensation");
         case erGapFill                      : return L("Gap infill");
         case erSkirt                        : return L("Skirt");
         case erBrim                         : return L("Brim");
@@ -633,6 +712,22 @@ ExtrusionRole ExtrusionEntity::string_to_role(const std::string_view role)
         return erInternalBridgeInfill;
     else if (role == L("Arc overhang"))
         return erArcOverhang;
+    else if (role == L("Arc bridge"))
+        return erArcBridge;
+    else if (role == L("Non-planar top surface"))
+        return erNonplanarSurface;
+    else if (role == L("Non-planar transition"))
+        return erNonplanarSupport;
+    else if (role == L("Non-planar interlocking infill"))
+        return erNonplanarInfill;
+    else if (role == L("Brick wall") || role == L("Brick inner wall"))
+        return erStaggeredPerimeter;
+    else if (role == L("Smooth outer wall"))
+        return erSmoothOuterWall;
+    else if (role == L("Interlocking inner wall"))
+        return erNonplanarInterlockingWall;
+    else if (role == L("Shrinkage compensation"))
+        return erShrinkageCompensation;
     else if (role == L("Gap infill"))
         return erGapFill;
     else if (role == ("Skirt"))

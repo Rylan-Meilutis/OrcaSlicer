@@ -3280,7 +3280,7 @@ void Sidebar::update_all_preset_comboboxes()
         p->m_bpButton_ams_filament->Show(
             is_octoprint || (agent && agent->get_filament_sync_mode() != FilamentSyncMode::none));
         p->m_bpButton_ams_filament->SetToolTip(
-            is_octoprint ? _L("Synchronize filament list from OctoPrint SpoolManager")
+            is_octoprint ? _L("Synchronize filament list from OctoPrint")
                          : _L("Synchronize filament list from AMS"));
 
         // Orca: with "Support 3MF as gcode" (use_3mf) the local export is a .gcode.3mf bundle, so when no
@@ -4661,13 +4661,13 @@ void Sidebar::sync_spool_manager_filaments(DynamicPrintConfig *host_config)
         host_config != nullptr ? *host_config : bundle.printers.get_edited_preset().config;
     const auto *host_type = printer_config.option<ConfigOptionEnum<PrintHostType>>("host_type");
     if (host_type == nullptr || host_type->value != htOctoPrint) {
-        show_error(this, _L("Select OctoPrint as the print host before synchronizing SpoolManager filaments."), false);
+        show_error(this, _L("Select OctoPrint as the print host before synchronizing filament spools."), false);
         return;
     }
 
     const auto *enabled = printer_config.option<ConfigOptionBool>("sync_spool_manager_filament_names");
     if (enabled == nullptr || !enabled->value) {
-        show_error(this, _L("Enable OctoPrint SpoolManager sync in the physical printer connection settings first."), false);
+        show_error(this, _L("Enable OctoPrint filament spool sync in the physical printer connection settings first."), false);
         return;
     }
 
@@ -4683,7 +4683,7 @@ void Sidebar::sync_spool_manager_filaments(DynamicPrintConfig *host_config)
     wxString error;
     {
         wxBusyCursor wait;
-        if (!host.get_spool_manager_selected_spools(slots, error)) {
+        if (!host.get_selected_filament_spools(slots, error)) {
             show_error(this, error, false);
             return;
         }
@@ -4732,6 +4732,13 @@ void Sidebar::sync_spool_manager_filaments(DynamicPrintConfig *host_config)
     };
 
     const std::string most_recent_preset = bundle.filaments.get_selected_preset_name();
+    const auto *spool_profile_mappings =
+        printer_config.option<ConfigOptionStrings>("octoprint_spool_profile_mappings");
+    const auto *material_profile_mappings =
+        printer_config.option<ConfigOptionStrings>("octoprint_material_profile_mappings");
+    const auto *default_filament_profile =
+        printer_config.option<ConfigOptionString>("octoprint_default_filament_profile");
+    const std::vector<std::string> no_mappings;
     size_t assigned_count = 0;
     const size_t synchronized_slots = std::min(filament_presets.size(), slots.size());
     for (size_t index = 0; index < synchronized_slots; ++index) {
@@ -4748,6 +4755,21 @@ void Sidebar::sync_spool_manager_filaments(DynamicPrintConfig *host_config)
 
         if (!sync_profiles)
             continue;
+
+        const std::string mapped_profile = SpoolManagerMetadata::mapped_profile_name(
+            spool,
+            spool_profile_mappings != nullptr ? spool_profile_mappings->values : no_mappings,
+            material_profile_mappings != nullptr ? material_profile_mappings->values : no_mappings,
+            default_filament_profile != nullptr ? default_filament_profile->value : std::string());
+        if (!mapped_profile.empty()) {
+            const Preset *mapped = bundle.filaments.find_preset(mapped_profile);
+            if (mapped != nullptr && mapped->is_visible && mapped->is_compatible) {
+                filament_presets[index] = mapped->name;
+                continue;
+            }
+            BOOST_LOG_TRIVIAL(warning) << "Configured OctoPrint spool mapping references unavailable filament preset: "
+                                       << mapped_profile;
+        }
 
         const Preset *current = bundle.filaments.find_preset(filament_presets[index]);
         const std::string wanted_material = normalize_material(spool.material);
@@ -4840,11 +4862,11 @@ void Sidebar::sync_spool_manager_filaments(DynamicPrintConfig *host_config)
     MessageDialog(
         this,
         format_wxstr(
-            _L("%1% OctoPrint SpoolManager tool/slot assignments were synchronized (%2%). "
+            _L("%1% OctoPrint filament tool/slot assignments were synchronized (%2%). "
                "The assignments are read-only in Orca Slicer and their spool names, materials, "
                "and colors will be embedded in G-code sent to this OctoPrint host."),
             assigned_count, synchronized_content),
-        _L("OctoPrint SpoolManager"), wxOK | wxICON_INFORMATION).ShowModal();
+        _L("OctoPrint filament spools"), wxOK | wxICON_INFORMATION).ShowModal();
 }
 
 
@@ -17610,10 +17632,14 @@ void Plater::send_gcode_legacy(int plate_idx, Export3mfProgressFn proFn)
 
         const auto *sync_spools_opt =
             physical_printer_config->option<ConfigOptionBool>("sync_spool_manager_filament_names");
-        if (host_type == htOctoPrint && sync_spools_opt != nullptr && sync_spools_opt->value) {
+        const auto *embed_spool_names_opt =
+            physical_printer_config->option<ConfigOptionBool>("embed_spool_manager_filament_names");
+        const bool embed_spool_names = embed_spool_names_opt == nullptr || embed_spool_names_opt->value;
+        if (host_type == htOctoPrint && sync_spools_opt != nullptr && sync_spools_opt->value &&
+            embed_spool_names) {
             auto *octoprint = dynamic_cast<OctoPrint *>(upload_job.printhost.get());
             if (octoprint == nullptr) {
-                show_error(this, _L("OctoPrint SpoolManager synchronization is not available for this print host."), false);
+                show_error(this, _L("OctoPrint filament spool synchronization is not available for this print host."), false);
                 return;
             }
 
@@ -17621,7 +17647,7 @@ void Plater::send_gcode_legacy(int plate_idx, Export3mfProgressFn proFn)
             wxString error;
             {
                 wxBusyCursor wait;
-                if (!octoprint->get_spool_manager_selected_spools(selected_slots, error)) {
+                if (!octoprint->get_selected_filament_spools(selected_slots, error)) {
                     show_error(this, error, false);
                     return;
                 }

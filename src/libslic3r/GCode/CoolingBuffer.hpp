@@ -28,11 +28,13 @@ public:
     void        reset(const Vec3d &position);
     void        set_current_extruder(unsigned int extruder_id, unsigned int nozzle_id) { m_current_extruder = extruder_id; m_current_nozzle = nozzle_id; }
     std::string process_layer(std::string &&gcode, size_t layer_id, bool flush);
+    static float hull_line_target_time(float previous_layer_time, float current_layer_time, float max_variation_percent);
 
 private:
 	CoolingBuffer& operator=(const CoolingBuffer&) = delete;
     std::vector<PerExtruderAdjustments> parse_layer_gcode(const std::string &gcode, std::vector<float> &current_pos) const;
     float       calculate_layer_slowdown(std::vector<PerExtruderAdjustments> &per_extruder_adjustments);
+    float       apply_hull_line_slowdown(std::vector<PerExtruderAdjustments> &per_extruder_adjustments, float layer_time);
     // Apply slow down over G-code lines stored in per_extruder_adjustments, enable fan if needed.
     // Returns the adjusted G-code.
     std::string apply_layer_cooldown(const std::string &gcode, size_t layer_id, float layer_time, std::vector<PerExtruderAdjustments> &per_extruder_adjustments);
@@ -60,6 +62,7 @@ private:
     unsigned int                m_current_nozzle;
     //BBS: current fan speed
     int                         m_current_fan_speed;
+    float                       m_previous_layer_time { 0.f };
 };
 
 }

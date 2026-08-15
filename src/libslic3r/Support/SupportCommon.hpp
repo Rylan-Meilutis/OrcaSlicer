@@ -7,10 +7,25 @@
 #include "SupportLayer.hpp"
 #include "SupportParameters.hpp"
 
+#include <cstdint>
+#include <functional>
+
 namespace Slic3r {
 
 class PrintObject;
 class SupportLayer;
+
+enum class SupportToolpathProgressStage : uint8_t {
+    Raft,
+    RegionPaths,
+    LayerAssembly
+};
+
+struct SupportToolpathProgress {
+    SupportToolpathProgressStage stage {SupportToolpathProgressStage::Raft};
+    size_t current {0};
+    size_t total {0};
+};
 
 // Turn some of the base layers into base interface layers.
 // For soluble interfaces with non-soluble bases, print maximum two first interface layers with the base
@@ -68,7 +83,8 @@ void generate_support_toolpaths(
     const SupportGeneratorLayersPtr   	&top_contacts,
     const SupportGeneratorLayersPtr   	&intermediate_layers,
 	const SupportGeneratorLayersPtr   	&interface_layers,
-    const SupportGeneratorLayersPtr   	&base_interface_layers);
+    const SupportGeneratorLayersPtr   	&base_interface_layers,
+    const std::function<void(const SupportToolpathProgress &)> &progress = {});
 
 // FN_HIGHER_EQUAL: the provided object pointer has a Z value >= of an internal threshold.
 // Find the first item with Z value >= of an internal threshold of fn_higher_equal.

@@ -395,7 +395,14 @@ public:
         EGCodeExtrusionRole::WipeTower, EGCodeExtrusionRole::Custom,
         // ORCA
         EGCodeExtrusionRole::BottomSurface, EGCodeExtrusionRole::InternalBridgeInfill, EGCodeExtrusionRole::Brim,
-        EGCodeExtrusionRole::SupportTransition, EGCodeExtrusionRole::Mixed, EGCodeExtrusionRole::ArcOverhang
+        EGCodeExtrusionRole::SupportTransition, EGCodeExtrusionRole::Mixed, EGCodeExtrusionRole::ArcOverhang,
+        EGCodeExtrusionRole::ArcBridge,
+        EGCodeExtrusionRole::NonplanarSurface, EGCodeExtrusionRole::NonplanarSupport,
+        EGCodeExtrusionRole::NonplanarInfill,
+        EGCodeExtrusionRole::StaggeredPerimeter,
+        EGCodeExtrusionRole::SmoothOuterWall,
+        EGCodeExtrusionRole::NonplanarInterlockingWall,
+        EGCodeExtrusionRole::ShrinkageCompensation
     }) const;
     //
     // Return the size of the used cpu memory, in bytes

@@ -3453,6 +3453,7 @@ static void generate_support_areas(Print &print, TreeSupport* tree_support, cons
 
 #if 1
         // use smart overhang detection
+        print.set_status(52, _L("Detecting organic support overhangs"));
         std::vector<Polygons>        overhangs;
         tree_support->detect_overhangs();
         const int       num_raft_layers = int(config.raft_layers.size());
@@ -3486,6 +3487,7 @@ static void generate_support_areas(Print &print, TreeSupport* tree_support, cons
         std::vector<Polygons>        overhangs = generate_overhangs(config, *print.get_object(processing.second.front()), throw_on_cancel);
 #endif
         // ### Precalculate avoidances, collision etc.
+        print.set_status(54, _L("Analyzing organic support collisions and avoidance"));
         size_t num_support_layers = precalculate(print, overhangs, processing.first, processing.second, volumes, throw_on_cancel);
         bool   has_support = num_support_layers > 0;
         bool   has_raft    = config.raft_layers.size() > 0;
@@ -3539,6 +3541,7 @@ static void generate_support_areas(Print &print, TreeSupport* tree_support, cons
             std::vector<SupportElements> move_bounds(num_support_layers);
 
             // ### Place tips of the support tree
+            print.set_status(57, _L("Placing organic support tips"));
             for (size_t mesh_idx : processing.second)
                 generate_initial_areas(*print.get_object(mesh_idx), volumes, config, overhangs, 
                     move_bounds, interface_placer, throw_on_cancel);
@@ -3546,16 +3549,18 @@ static void generate_support_areas(Print &print, TreeSupport* tree_support, cons
 
 
             // ### Propagate the influence areas downwards. This is an inherently serial operation.
-            print.set_status(60, _L("Generating support"));
+            print.set_status(60, _L("Propagating organic support influence regions"));
             create_layer_pathing(volumes, config, move_bounds, throw_on_cancel);
             auto t_path = std::chrono::high_resolution_clock::now();
 
             // ### Set a point in each influence area
+            print.set_status(63, _L("Placing organic support branch nodes"));
             create_nodes_from_area(volumes, config, move_bounds, throw_on_cancel);
             auto t_place = std::chrono::high_resolution_clock::now();
 
             // ### draw these points as circles
             // this new function give correct result when raft is also enabled
+            print.set_status(65, _L("Constructing organic support branches"));
             organic_draw_branches(
                 *print.get_object(processing.second.front()), volumes, config, move_bounds,
                 bottom_contacts, top_contacts, interface_placer, intermediate_layers, layer_storage,
@@ -3565,6 +3570,7 @@ static void generate_support_areas(Print &print, TreeSupport* tree_support, cons
 
             remove_undefined_layers();
 
+            print.set_status(67, _L("Generating organic support interface layers"));
             std::tie(interface_layers, base_interface_layers) = generate_interface_layers(print_object.config(), support_params,
                 bottom_contacts, top_contacts, interface_layers, base_interface_layers, intermediate_layers, layer_storage);
 
@@ -3593,6 +3599,7 @@ static void generate_support_areas(Print &print, TreeSupport* tree_support, cons
             continue;
 
         // Produce the support G-code.
+        print.set_status(68, _L("Assembling organic support layers"));
         SupportGeneratorLayersPtr raft_layers = generate_raft_base(print_object, support_params, print_object.slicing_parameters(), top_contacts, interface_layers, base_interface_layers, intermediate_layers, layer_storage);
         SupportGeneratorLayersPtr layers_sorted = generate_support_layers(print_object, raft_layers, bottom_contacts, top_contacts, intermediate_layers, interface_layers, base_interface_layers);
 
@@ -3601,9 +3608,30 @@ static void generate_support_areas(Print &print, TreeSupport* tree_support, cons
             if (layer) layer->polygons = intersection(layer->polygons, volumes.m_bed_area);
         });
 
-        print.set_status(69, _L("Generating support"));
-        generate_support_toolpaths(print_object.support_layers(), print_object.config(), support_params, print_object.slicing_parameters(),
-            raft_layers, bottom_contacts, top_contacts, intermediate_layers, interface_layers, base_interface_layers);
+        print.set_status(69, _L("Generating organic support toolpaths"));
+        generate_support_toolpaths(
+            print_object.support_layers(), print_object.config(), support_params,
+            print_object.slicing_parameters(), raft_layers, bottom_contacts,
+            top_contacts, intermediate_layers, interface_layers,
+            base_interface_layers,
+            [&print](const SupportToolpathProgress &event) {
+                std::string message;
+                switch (event.stage) {
+                case SupportToolpathProgressStage::Raft:
+                    message = (boost::format(_L("Generating organic support raft toolpaths: layer %1% of %2%")) %
+                               event.current % event.total).str();
+                    break;
+                case SupportToolpathProgressStage::RegionPaths:
+                    message = (boost::format(_L("Generating organic support region paths: layer %1% of %2%")) %
+                               event.current % event.total).str();
+                    break;
+                case SupportToolpathProgressStage::LayerAssembly:
+                    message = (boost::format(_L("Assembling organic support extrusion layers: layer %1% of %2%")) %
+                               event.current % event.total).str();
+                    break;
+                }
+                print.set_status(69, message);
+            });
 
         auto t_end = std::chrono::high_resolution_clock::now();
         BOOST_LOG_TRIVIAL(info) << "Total time of organic tree support: " << 0.001 * std::chrono::duration_cast<std::chrono::microseconds>(t_end - t_start).count() << " ms";
