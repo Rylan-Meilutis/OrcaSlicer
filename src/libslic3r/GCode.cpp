@@ -7176,8 +7176,14 @@ std::string GCode::extrude_loop(const ExtrusionLoop&        loop_ref,
     double seam_scarf_distance_mm = 0.0;
     double clip_length = m_enable_loop_clipping && !enable_seam_slope &&
         !preserve_nonplanar_loop ? seam_gap : 0;
+    // The inner-seam primer deliberately removes a short tail from an
+    // ordinary planar inner wall and deposits it while entering the outer
+    // wall. A preserved non-planar loop already owns a continuous 3D seam;
+    // clipping that tail opens its middle wall and the planar primer cannot
+    // reproduce the missing surface-following segment.
     const bool adjacent_inner_seam =
-        m_config.seam_start_on_inner_wall && loop.role() == erPerimeter && loop.inset_idx == 1;
+        !preserve_nonplanar_loop && m_config.seam_start_on_inner_wall &&
+        loop.role() == erPerimeter && loop.inset_idx == 1;
     if (adjacent_inner_seam) {
         const double maximum_outer_distance2 =
             scaled<double>(2.0 * nozzle_diameter) * scaled<double>(2.0 * nozzle_diameter);
@@ -8964,7 +8970,13 @@ std::string GCode::_extrude(const ExtrusionPath &input_path, std::string descrip
     const bool need_overhang_detection = NOZZLE_CONFIG(enable_overhang_speed) ||
         (FILAMENT_CONFIG(enable_overhang_bridge_fan) && m_enable_cooling_markers);
 
-    if (need_overhang_detection && !this->on_first_layer() && !object_layer_over_raft() &&
+    // The extrusion-quality estimator rebuilds a path from planar overlap
+    // samples.  Feeding it a surface-following wall may omit the coincident
+    // closing sample of a 3D loop, opening an otherwise validated perimeter.
+    // Variable-Z paths have already passed their support and toolhead checks;
+    // emit their original 3D point sequence without planar resampling.
+    if (need_overhang_detection && !path.z_contoured &&
+        !this->on_first_layer() && !object_layer_over_raft() &&
         (is_bridge(path.role()) || is_perimeter(path.role()))) {
             bool is_external = is_external_perimeter(path.role());
             double ref_speed   = is_external ? NOZZLE_CONFIG(outer_wall_speed) : NOZZLE_CONFIG(inner_wall_speed);
@@ -9107,10 +9119,13 @@ std::string GCode::_extrude(const ExtrusionPath &input_path, std::string descrip
     // transition material.
     const bool surface_following_support = path.nonplanar_surface &&
         (path.role() == erSupportMaterialInterface || path.role() == erIroning);
+    const bool planar_nonplanar_foundation =
+        path.nonplanar_surface && !path.z_contoured &&
+        !path.nonplanar_transition;
     const ExtrusionRole processor_role =
         (path.nonplanar_feature_transition || surface_following_support) ? path.role() :
         (path.nonplanar_transition ? erNonplanarSupport :
-        (path.nonplanar_surface ? erNonplanarSurface :
+        (path.nonplanar_surface && !planar_nonplanar_foundation ? erNonplanarSurface :
         (path.nonplanar_infill ? erNonplanarInfill :
         (path.shrinkage_compensation ? erShrinkageCompensation :
         (path.staggered_perimeter ? erStaggeredPerimeter :

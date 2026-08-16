@@ -3780,6 +3780,34 @@ TEST_CASE("Compact wall-only slopes without a solid source course stay planar",
     CHECK(walls.empty());
 }
 
+TEST_CASE("Narrow supported top caps remain eligible for non-planar finishing",
+          "[Fill][NonplanarSurface][Regression]")
+{
+    // This has the proportions of Benchy's narrow sloped bow cap: its area is
+    // below the broad-patch threshold and its short dimension is below 10 mm,
+    // but it still contains a real solid source course. Size alone must not
+    // force the hybrid mode to Z-contour geometry that passed support and
+    // toolhead-clearance validation.
+    Polygon footprint({Point::new_scale(0., 0.), Point::new_scale(6., 0.),
+                       Point::new_scale(6., 14.), Point::new_scale(0., 14.)});
+    const double slope = std::tan(8. * M_PI / 180.);
+    TriangleMesh model = extrude_sloped_footprint(
+        ExPolygon(footprint), [](double) { return 0.; },
+        [slope](double x) { return 8. + slope * x; });
+
+    Print print;
+    Slic3r::Test::init_and_process_print(
+        {std::move(model)}, print,
+        {{"top_surface_z_mode", "nonplanar_with_z_contouring_fallback"},
+         {"nonplanar_top_surface", true}, {"zaa_enabled", true},
+         {"nonplanar_top_surface_max_angle", 45},
+         {"wall_loops", 3}, {"layer_height", 0.2}});
+
+    CHECK_FALSE(nonplanar_top_paths(print).empty());
+    CHECK_FALSE(nonplanar_perimeter_paths(print).empty());
+    CHECK_FALSE(has_planar_path_inside_nonplanar_top_coverage(print));
+}
+
 TEST_CASE("Non-planar skins exclude normal paths from their top footprint", "[Fill][NonplanarSurface]")
 {
     Print nonplanar;
@@ -4024,8 +4052,16 @@ TEST_CASE("Non-planar Benchy roof output preserves chimney walls and connected b
     std::vector<EmittedSegment> emitted_conventional_segments;
     size_t transition_segments = 0;
     size_t transition_z_moves = 0;
+    std::map<std::string, std::pair<size_t, size_t>> transition_moves_by_layer;
+    struct EmittedFeatureChain {
+        Vec3d start;
+        Vec3d end;
+        size_t segments {0};
+    };
+    std::map<size_t, EmittedFeatureChain> emitted_feature_chains;
     double maximum_transition_gradient = 0.;
     std::string emitted_type;
+    std::string emitted_layer;
     size_t emitted_chain = 0;
     std::optional<Vec3d> previous_extrusion_end;
     GCodeReader geometry_reader;
@@ -4034,6 +4070,8 @@ TEST_CASE("Non-planar Benchy roof output preserves chimney walls and connected b
             const std::string comment(line.comment());
             if (comment.rfind("TYPE:", 0) == 0)
                 emitted_type = comment.substr(5);
+            else if (comment.rfind("Z:", 0) == 0)
+                emitted_layer = comment.substr(2);
             if (!line.extruding(self) || line.dist_XY(self) <= 0.01)
                 return;
             const Vec3d start(self.x(), self.y(), self.z());
@@ -4042,10 +4080,22 @@ TEST_CASE("Non-planar Benchy roof output preserves chimney walls and connected b
                 (start - *previous_extrusion_end).norm() > 0.01)
                 ++emitted_chain;
             previous_extrusion_end = end;
+            if (comment.find("surface-following feature perimeter") !=
+                    std::string::npos) {
+                EmittedFeatureChain &chain =
+                    emitted_feature_chains[emitted_chain];
+                if (chain.segments == 0)
+                    chain.start = start;
+                chain.end = end;
+                ++chain.segments;
+            }
             if (emitted_type == "Non-planar transition") {
                 const double dz = std::abs(end.z() - start.z());
                 ++transition_segments;
                 transition_z_moves += dz > 0.001;
+                auto &layer_moves = transition_moves_by_layer[emitted_layer];
+                ++layer_moves.first;
+                layer_moves.second += dz > 0.001;
                 maximum_transition_gradient = std::max(
                     maximum_transition_gradient, dz / line.dist_XY(self));
             }
@@ -4083,6 +4133,21 @@ TEST_CASE("Non-planar Benchy roof output preserves chimney walls and connected b
         });
     REQUIRE(transition_segments > 0);
     CHECK(transition_z_moves > 0);
+    // A horizontal foundation is an ordinary planar wall/top course.  Do not
+    // relabel a newly generated fixed-Z closed loop as a transition: that was
+    // the first tell-tale sign that the non-planar stack had been appended as
+    // a post-process shell instead of deforming the slicer's wall graph. Every
+    // layer advertised as a transition must contain an extrusion that truly
+    // changes Z; otherwise the original planar course must remain authoritative.
+    for (const auto &[layer, moves] : transition_moves_by_layer) {
+        CAPTURE(layer, moves.first, moves.second);
+        CHECK(moves.second > 0);
+    }
+    REQUIRE_FALSE(emitted_feature_chains.empty());
+    for (const auto &[chain_index, chain] : emitted_feature_chains) {
+        CAPTURE(chain_index, chain.segments, chain.start, chain.end);
+        CHECK((chain.end - chain.start).norm() <= 0.05);
+    }
     // A transition may traverse a long sloped roof in one move, so validate
     // gradient rather than absolute dZ. It must remain below the configured
     // 45-degree surface limit.
@@ -4375,6 +4440,19 @@ TEST_CASE("Non-planar Benchy roof output preserves chimney walls and connected b
         for (const EmittedSegment &top : emitted_top_segments) {
             const Vec2d top_start = top.start.head<2>();
             const Vec2d top_delta = top.end.head<2>() - top_start;
+            // The exact intersection test below is intentionally strict, but
+            // almost every Benchy segment pair is spatially disjoint. Reject
+            // those pairs before doing the line solve so this regression test
+            // remains practical as non-planar rasters gain resolution.
+            if (std::max(conventional.start.x(), conventional.end.x()) <=
+                    std::min(top.start.x(), top.end.x()) ||
+                std::max(top.start.x(), top.end.x()) <=
+                    std::min(conventional.start.x(), conventional.end.x()) ||
+                std::max(conventional.start.y(), conventional.end.y()) <=
+                    std::min(top.start.y(), top.end.y()) ||
+                std::max(top.start.y(), top.end.y()) <=
+                    std::min(conventional.start.y(), conventional.end.y()))
+                continue;
             const double denominator =
                 conventional_delta.x() * top_delta.y() -
                 conventional_delta.y() * top_delta.x();
@@ -4443,13 +4521,16 @@ TEST_CASE("Non-planar Benchy roof output preserves chimney walls and connected b
     struct FeatureCourseWalls {
         std::set<unsigned int> insets;
         bool has_external {false};
+        bool has_detached_open_fragment {false};
     };
     std::map<size_t, FeatureCourseWalls> feature_course_walls;
     const auto collect_feature_courses =
         [&feature_course_walls](auto &&self,
-                                const ExtrusionEntity &entity) -> void {
+                                const ExtrusionEntity &entity,
+                                bool connected_parent) -> void {
             const auto collect_path = [&feature_course_walls](
-                                          const ExtrusionPath &path) {
+                                          const ExtrusionPath &path,
+                                          bool path_has_connected_parent) {
                 if (!path.nonplanar_feature_transition ||
                     !is_perimeter(path.role()))
                     return;
@@ -4457,28 +4538,52 @@ TEST_CASE("Non-planar Benchy roof output preserves chimney walls and connected b
                     feature_course_walls[path.nonplanar_feature_course];
                 course.insets.insert(path.inset_idx);
                 course.has_external |= path.role() == erExternalPerimeter;
+                // Variable-width Arachne rings contain several path
+                // fragments. Feature deferral must retain their parent loop
+                // or multipath; appending the open children independently
+                // lets the sorter insert travels/retracts through the middle
+                // of one configured chimney wall.
+                course.has_detached_open_fragment |=
+                    !path_has_connected_parent &&
+                    path.polyline.points.size() >= 2 &&
+                    path.polyline.points.front().to_point().distance_to(
+                        path.polyline.points.back().to_point()) > scale_(0.05);
             };
             if (const auto *path = dynamic_cast<const ExtrusionPath *>(&entity))
-                collect_path(*path);
+                collect_path(*path, connected_parent);
             else if (const auto *loop = dynamic_cast<const ExtrusionLoop *>(&entity))
                 for (const ExtrusionPath &path : loop->paths)
-                    collect_path(path);
+                    collect_path(path, true);
             else if (const auto *multipath =
-                         dynamic_cast<const ExtrusionMultiPath *>(&entity))
+                         dynamic_cast<const ExtrusionMultiPath *>(&entity)) {
                 for (const ExtrusionPath &path : multipath->paths)
-                    collect_path(path);
+                    collect_path(path, true);
+                const auto feature = std::find_if(
+                    multipath->paths.begin(), multipath->paths.end(),
+                    [](const ExtrusionPath &path) {
+                        return path.nonplanar_feature_transition &&
+                               is_perimeter(path.role());
+                    });
+                if (feature != multipath->paths.end() &&
+                    !multipath->paths.empty() &&
+                    multipath->paths.front().first_point().distance_to(
+                        multipath->paths.back().last_point()) > scale_(0.05))
+                    feature_course_walls[feature->nonplanar_feature_course]
+                        .has_detached_open_fragment = true;
+            }
             else if (const auto *collection =
                          dynamic_cast<const ExtrusionEntityCollection *>(&entity))
                 for (const ExtrusionEntity *child : collection->entities)
-                    self(self, *child);
+                    self(self, *child, connected_parent);
         };
     for (const PrintObject *object : print.objects())
         for (const Layer *layer : object->layers())
             for (const LayerRegion *region : layer->regions())
                 for (const ExtrusionEntityCollection *collection :
-                     {&region->perimeters, &region->fills})
+                    {&region->perimeters, &region->fills})
                     for (const ExtrusionEntity *entity : collection->entities)
-                        collect_feature_courses(collect_feature_courses, *entity);
+                        collect_feature_courses(
+                            collect_feature_courses, *entity, false);
     REQUIRE_FALSE(feature_course_walls.empty());
     for (const auto &[course_index, walls] : feature_course_walls) {
         CAPTURE(course_index, walls.insets);
@@ -4486,6 +4591,7 @@ TEST_CASE("Non-planar Benchy roof output preserves chimney walls and connected b
         CHECK(walls.insets.count(0) == 1);
         CHECK(walls.insets.count(1) == 1);
         CHECK(walls.insets.count(2) == 1);
+        CHECK_FALSE(walls.has_detached_open_fragment);
     }
 
     // Successive deferred feature courses must retain a printable physical
