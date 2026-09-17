@@ -208,7 +208,7 @@ bool GLGizmoFdmSupports::on_init()
         {ctrl + _L("Mouse wheel"), _L("Gap area")}
     };
 
-    m_print_instance = {};
+    m_print_instance = PrintInstance();
     return true;
 }
 

@@ -16,6 +16,7 @@ using LayerPtrs = std::vector<Layer*>;
 class LayerRegion;
 using LayerRegionPtrs = std::vector<LayerRegion*>;
 class PrintRegion;
+class PrintRegionConfig;
 class PrintObject;
 class Print;
 
@@ -208,6 +209,11 @@ public:
     void                    make_nonplanar_top_surfaces(const sla::IndexedMesh &mesh,
                                                         const std::vector<std::vector<uint8_t>> &selected_facets,
                                                         const std::vector<std::vector<ExPolygons>> &selected_projections);
+    // Returns the filament id (1-based) the region is ironed with, or -1 when the
+    // region is not ironed.
+    static int              choose_ironing_extruder(const PrintRegionConfig &cfg,
+                                                    bool spiral_mode,
+                                                    bool is_topmost_layer);
 
     void                    export_region_slices_to_svg(const char *path) const;
     void                    export_region_fill_surfaces_to_svg(const char *path) const;

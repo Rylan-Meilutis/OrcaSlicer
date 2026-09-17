@@ -73,7 +73,6 @@ public:
             float m_model_z_offset{ 0.5f };
             bool m_visible{ true };
             bool m_is_dark = false;
-            bool m_fixed_screen_size{ false };
             float m_scale_factor{ 1.0f };
             bool m_is_gantry_model{ false };
             bool m_has_fixed_x_axis{ false };
