@@ -2,12 +2,15 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
+#include <cstdlib>
 #include <fstream>
 #include <limits>
 #include <map>
 #include <numeric>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <string>
 #include <tuple>
@@ -20,19 +23,301 @@
 #include "libslic3r/GCode/GCodeProcessor.hpp"
 #include "libslic3r/GCodeReader.hpp"
 #include "libslic3r/Geometry.hpp"
+#include "libslic3r/Geometry/Circle.hpp"
 #include "libslic3r/Geometry/ConvexHull.hpp"
 #include "libslic3r/Layer.hpp"
 #include "libslic3r/MeshBoolean.hpp"
+#include "libslic3r/NonplanarSurface.hpp"
+#include "libslic3r/SLA/IndexedMesh.hpp"
 #include "libslic3r/Print.hpp"
 #include "libslic3r/PrintConfig.hpp"
 #include "libslic3r/SVG.hpp"
 #include "libslic3r/Tesselate.hpp"
+#include "libslic3r/Utils.hpp"
 #include "libslic3r/libslic3r.h"
 
 #include "test_helpers.hpp"
 #include "test_utils.hpp"
 
 using namespace Slic3r;
+
+TEST_CASE("Non-planar candidate marking preserves wall direction and rejected brick geometry",
+          "[Fill][NonplanarSurface][CandidateWallGraph][Regression]")
+{
+    const std::string container = GENERATE(std::string("path"),
+        std::string("multipath"), std::string("loop"));
+    Print print;
+    Test::init_and_process_print({make_cube(2., 2., 1.)}, print, {
+        {"layer_height", 0.2}, {"initial_layer_print_height", 0.2},
+        {"top_surface_z_mode", "nonplanar_top_surface"},
+        {"nonplanar_top_surface", true}, {"nonplanar_top_surface_min_height", 0.001},
+        {"nonplanar_top_surface_resolution", 0.1}
+    });
+    Layer &layer = const_cast<Layer &>(*print.objects().front()->layers().front());
+    LayerRegion &region = *layer.regions().front();
+    region.fills.clear();
+    region.perimeters.clear();
+    const Flow flow(0.45f, 0.2f, 0.4f);
+    ExtrusionPath first(erPerimeter, flow.mm3_per_mm(), flow.width(), flow.height());
+    first.inset_idx = 1;
+    first.staggered_perimeter = true;
+    first.z_contoured = true;
+    first.polyline.points = {
+        Point3(scale_(0.2), scale_(0.2), scale_(0.1)),
+        Point3(scale_(1.8), scale_(0.2), scale_(0.1)),
+        Point3(scale_(1.8), scale_(1.8), scale_(0.1))};
+    ExtrusionPath second(first);
+    second.polyline.points = {first.last_point3(),
+        Point3(scale_(0.2), scale_(1.8), scale_(0.1))};
+    if (container == "loop")
+        second.polyline.points.push_back(first.first_point3());
+    if (container == "path")
+        region.perimeters.entities.push_back(first.clone());
+    else if (container == "multipath") {
+        auto *chain = new ExtrusionMultiPath(ExtrusionPaths{first, second});
+        chain->inset_idx = 1;
+        region.perimeters.entities.push_back(chain);
+    } else {
+        auto *loop = new ExtrusionLoop(ExtrusionPaths{first, second});
+        loop->inset_idx = 1;
+        region.perimeters.entities.push_back(loop);
+    }
+    indexed_triangle_set triangles;
+    triangles.vertices = {Vec3f(0, 0, 0.24f), Vec3f(2, 0, 0.28f),
+                          Vec3f(2, 2, 0.28f), Vec3f(0, 2, 0.24f)};
+    triangles.indices = {Vec3i32(0, 1, 2), Vec3i32(0, 2, 3)};
+    const TriangleMesh surface_mesh(triangles);
+    sla::IndexedMesh surface(surface_mesh);
+    surface.ground_level_offset(-surface.ground_level());
+    layer.make_nonplanar_top_surfaces(surface, {{1, 1}}, {});
+    REQUIRE(region.perimeters.entities.size() == 1);
+    if (container == "loop") {
+        const auto *loop = dynamic_cast<const ExtrusionLoop *>(region.perimeters.entities.front());
+        REQUIRE(loop != nullptr);
+        REQUIRE(loop->paths.size() == 2);
+        CHECK(loop->paths[0].nonplanar_surface);
+        CHECK(loop->paths[1].nonplanar_surface);
+        CHECK(loop->paths[0].last_point3() == loop->paths[1].first_point3());
+        CHECK(loop->paths[1].last_point3() == loop->paths[0].first_point3());
+    } else {
+        const ExtrusionPath *restored = nullptr;
+        if (container == "path")
+            restored = dynamic_cast<const ExtrusionPath *>(region.perimeters.entities.front());
+        else {
+            const auto *chain = dynamic_cast<const ExtrusionMultiPath *>(region.perimeters.entities.front());
+            REQUIRE(chain != nullptr);
+            REQUIRE(chain->paths.size() == 2);
+            CHECK(chain->paths[1].polyline.points == second.polyline.points);
+            restored = &chain->paths.front();
+        }
+        REQUIRE(restored != nullptr);
+        CHECK(restored->polyline.points == first.polyline.points);
+        CHECK(restored->staggered_perimeter);
+        CHECK(restored->z_contoured);
+        CHECK_FALSE(restored->nonplanar_surface);
+        CHECK_THAT(restored->mm3_per_mm, Catch::Matchers::WithinAbs(first.mm3_per_mm, 1e-9));
+        CHECK_THAT(restored->height, Catch::Matchers::WithinAbs(first.height, 1e-6));
+    }
+}
+
+TEST_CASE("Source-course projection uses print-space heights for translated meshes",
+          "[Fill][NonplanarSurface][SourceCourseProjection][Regression]")
+{
+    const double mesh_shift = GENERATE(-24., 0., 100.);
+    Print print;
+    Test::init_and_process_print({make_cube(2., 2., 1.)}, print, {
+        {"layer_height", 0.2}, {"initial_layer_print_height", 0.2},
+        {"top_surface_z_mode", "disabled"}, {"nonplanar_top_surface_resolution", 0.2}
+    });
+    Layer &layer = const_cast<Layer &>(*print.objects().front()->layers().front());
+    LayerRegion &region = *layer.regions().front();
+    region.fills.clear();
+    const Flow flow(0.45f, 0.2f, 0.4f);
+    ExtrusionPath source(erSolidInfill, flow.mm3_per_mm(), flow.width(), flow.height());
+    source.polyline = Polyline3(Points3{
+        Point3(scale_(1.), scale_(1.), scale_(0.)),
+        Point3(scale_(9.), scale_(1.), scale_(0.))});
+    region.fills.entities.push_back(source.clone());
+
+    indexed_triangle_set triangles;
+    triangles.vertices = {Vec3f(0, 0, mesh_shift + 2.), Vec3f(10, 0, mesh_shift + 3.),
+                          Vec3f(10, 10, mesh_shift + 3.), Vec3f(0, 10, mesh_shift + 2.)};
+    triangles.indices = {Vec3i32(0, 1, 2), Vec3i32(0, 2, 3)};
+    TriangleMesh surface(triangles);
+    sla::IndexedMesh indexed(surface);
+    indexed.ground_level_offset(mesh_shift - indexed.ground_level());
+    const ExPolygons domain{ExPolygon(Polygon(Points{
+        Point(scale_(0.), scale_(0.)), Point(scale_(10.), scale_(0.)),
+        Point(scale_(10.), scale_(10.)), Point(scale_(0.), scale_(10.))}))};
+    const double destination_z = 3.;
+    ExtrusionEntityCollection projected;
+    projected.entities = project_nonplanar_source_course(
+        region, indexed, domain, {1, 1}, domain, destination_z, 4.);
+    REQUIRE(projected.entities.size() == 1);
+    const auto *path = dynamic_cast<const ExtrusionPath *>(projected.entities.front());
+    REQUIRE(path != nullptr);
+    REQUIRE(path->polyline.points.size() >= 2);
+    CHECK(path->role() == erTopSolidInfill);
+    CHECK_THAT(path->width, Catch::Matchers::WithinAbs(source.width, 1e-6));
+    CHECK_THAT(path->mm3_per_mm, Catch::Matchers::WithinAbs(source.mm3_per_mm, 1e-9));
+    CHECK_THAT(unscale<double>(path->polyline.to_polyline().length()),
+               Catch::Matchers::WithinAbs(8., 1e-5));
+    for (const Point3 &point : path->polyline.points) {
+        CHECK_THAT(destination_z + unscale_(point.z()),
+                   Catch::Matchers::WithinAbs(2. + 0.1 * unscale_(point.x()), 1e-5));
+        CHECK_THAT(unscale_(point.y()), Catch::Matchers::WithinAbs(1., 1e-5));
+    }
+    // Converting coordinate spaces must not relax the physical reach limit.
+    ExtrusionEntityCollection out_of_reach;
+    out_of_reach.entities = project_nonplanar_source_course(
+        region, indexed, domain, {1, 1}, domain, destination_z, 0.1);
+    CHECK(out_of_reach.empty());
+}
+
+TEST_CASE("Native non-planar foundations reject raised neighboring brick paths",
+          "[Fill][NonplanarSurface][NativeFoundation][Regression]")
+{
+    Print print;
+    Test::init_and_process_print({make_cube(2., 2., 1.)}, print, {
+        {"layer_height", 0.2}, {"initial_layer_print_height", 0.2},
+        {"top_surface_z_mode", "disabled"}, {"perimeter_layering", "standard"}
+    });
+    const Layer *layer = print.objects().front()->layers().front();
+    LayerRegion &foundation = *layer->regions().front();
+    foundation.perimeters.clear();
+    foundation.fills.clear();
+    ExtrusionPath base(erBridgeInfill, 0.08, 0.4, 0.2);
+    base.polyline.points = {Point3(scale_(0.), scale_(0.), scale_(0.)),
+                           Point3(scale_(1.), scale_(0.), scale_(0.))};
+    foundation.fills.entities.push_back(base.clone());
+    ExtrusionPath first(base);
+    first.set_extrusion_role(erSolidInfill);
+    first.height = 0.08;
+    for (Point3 &point : first.polyline.points)
+        point.z() = scale_(0.08);
+    const ExtrusionEntitiesPtr course{&first}; // Borrowed, no owning collection.
+    CHECK(native_foundation_supports_course(course, foundation,
+        layer->print_z, layer->print_z, 0.07, 0.3));
+
+    ExtrusionPath brick(base);
+    brick.set_extrusion_role(erPerimeter);
+    brick.staggered_perimeter = true;
+    for (Point3 &point : brick.polyline.points)
+        point.z() = scale_(0.1);
+    foundation.perimeters.entities.push_back(brick.clone());
+    // The flat bridge still supplies contact, but the raised wall would
+    // intersect the first angled course. It cannot be filtered out as support.
+    CHECK_FALSE(native_foundation_supports_course(course, foundation,
+        layer->print_z, layer->print_z, 0.07, 0.3));
+}
+
+TEST_CASE("Native flat foundations support continuously varying first-course thickness",
+          "[Fill][NonplanarSurface][NativeFoundation][Regression]")
+{
+    Print print;
+    Test::init_and_process_print({make_cube(2., 2., 1.)}, print, {
+        {"layer_height", 0.2}, {"initial_layer_print_height", 0.2},
+        {"top_surface_z_mode", "disabled"}, {"perimeter_layering", "standard"}
+    });
+    const Layer *layer = print.objects().front()->layers().front();
+    LayerRegion &foundation = *layer->regions().front();
+    foundation.perimeters.clear();
+    foundation.fills.clear();
+    ExtrusionPath base(erSolidInfill, 0.08, 0.4, 0.2);
+    base.polyline.points = {Point3(0, 0, 0), Point3(scale_(8.), scale_(0.), scale_(0.))};
+    foundation.fills.entities.push_back(base.clone());
+    ExtrusionPath ramp(base);
+    ramp.polyline.points.front().z() = scale_(0.08);
+    ramp.polyline.points.back().z() = scale_(0.28);
+    const ExtrusionEntitiesPtr course{&ramp};
+    CHECK(native_foundation_supports_course(course, foundation,
+        layer->print_z, layer->print_z, 0.07, 0.3));
+    ramp.reverse();
+    CHECK(native_foundation_supports_course(course, foundation,
+        layer->print_z, layer->print_z, 0.07, 0.3));
+    // Local thickness limits and lateral bonding remain required.
+    ramp.polyline.points.front().z() = scale_(0.31);
+    CHECK_FALSE(native_foundation_supports_course(course, foundation,
+        layer->print_z, layer->print_z, 0.07, 0.3));
+    ramp.polyline.points.front().z() = scale_(0.28);
+    for (Point3 &point : ramp.polyline.points)
+        point.y() = scale_(0.8);
+    CHECK_FALSE(native_foundation_supports_course(course, foundation,
+        layer->print_z, layer->print_z, 0.07, 0.3));
+}
+
+TEST_CASE("First non-planar courses use only printed foundations at the matching parent inset",
+          "[Fill][NonplanarSurface][NonplanarFoundation][Regression]")
+{
+    const bool future_foundation = GENERATE(false, true);
+    const bool contoured_foundation = GENERATE(false, true);
+    const unsigned int foundation_inset = GENERATE(1u, 2u);
+    const double gap = GENERATE(0.25, 0.35);
+    CAPTURE(future_foundation, contoured_foundation, foundation_inset, gap);
+    Print print;
+    const TriangleMesh mesh = make_cube(2., 2., 1.);
+    Test::init_and_process_print({mesh}, print, {
+        {"layer_height", 0.2}, {"initial_layer_print_height", 0.2},
+        {"max_layer_height", "0.3"}, {"nozzle_diameter", "0.4"},
+        {"top_surface_z_mode", "disabled"}, {"perimeter_layering", "standard"}
+    });
+    std::vector<Layer *> layers;
+    for (Layer *layer : print.objects().front()->layers())
+        layers.push_back(layer);
+    REQUIRE(layers.size() >= 3);
+    for (Layer *layer : layers)
+        for (LayerRegion *region : layer->regions()) {
+            region->perimeters.clear();
+            region->fills.clear();
+        }
+    const Flow flow(0.45f, 0.2f, 0.4f);
+    const auto wall_path = [&](double z) {
+        Points3 points;
+        for (const Vec2d &xy : {Vec2d(0.5, 0.5), Vec2d(1.5, 0.5),
+                                Vec2d(1.5, 1.5), Vec2d(0.5, 1.5), Vec2d(0.5, 0.5)})
+            points.emplace_back(scale_(xy.x()), scale_(xy.y()),
+                scale_(z + (contoured_foundation ? 0.02 * (xy.x() - 0.5) : 0.)));
+        ExtrusionPath path(erPerimeter, flow.mm3_per_mm(), flow.width(), flow.height());
+        path.polyline = Polyline3(std::move(points));
+        return path;
+    };
+    const size_t foundation_owner = future_foundation ? 2 : 0;
+    ExtrusionPath foundation = wall_path(0.2 - layers[foundation_owner]->print_z);
+    foundation.z_contoured = contoured_foundation;
+    auto *base = new ExtrusionLoop(foundation);
+    base->inset_idx = foundation_inset; // Native generators may only set the parent inset.
+    layers[foundation_owner]->regions().front()->perimeters.entities.push_back(base);
+
+    ExtrusionPath feature = wall_path(0.2 + gap - layers[1]->print_z);
+    feature.inset_idx = 1;
+    feature.nonplanar_surface = true;
+    feature.nonplanar_feature_transition = true;
+    feature.nonplanar_feature_course = 1;
+    auto *upper = new ExtrusionLoop(feature);
+    upper->inset_idx = 1;
+    layers[1]->regions().front()->perimeters.entities.push_back(upper);
+    // No new surface patches: exercise validation of the existing wall graph.
+    consolidate_nonplanar_top_surfaces(layers, sla::IndexedMesh(mesh), {});
+    REQUIRE(layers[1]->regions().front()->perimeters.entities.size() == 1);
+    const auto *result = dynamic_cast<const ExtrusionLoop *>(
+        layers[1]->regions().front()->perimeters.entities.front());
+    REQUIRE(result != nullptr);
+    REQUIRE(result->paths.size() == 1);
+    const auto &path = result->paths.front();
+    const double expected_height = !future_foundation && foundation_inset == 1 && gap <= 0.3 ? gap : 0.2;
+    CHECK_THAT(path.height, Catch::Matchers::WithinAbs(expected_height, 1e-6));
+    CHECK_THAT(path.mm3_per_mm,
+        Catch::Matchers::WithinAbs(flow.with_height(expected_height).mm3_per_mm(), 1e-6));
+    CHECK(path.polyline.points == feature.polyline.points);
+    CHECK(path.inset_idx == 1);
+    REQUIRE_FALSE(layers[foundation_owner]->regions().front()->perimeters.empty());
+    const auto *support_loop = dynamic_cast<const ExtrusionLoop *>(
+        layers[foundation_owner]->regions().front()->perimeters.entities.front());
+    REQUIRE(support_loop != nullptr);
+    REQUIRE_FALSE(support_loop->paths.empty());
+    CHECK(support_loop->paths.front().inset_idx == int(foundation_inset));
+    CHECK(support_loop->paths.front().polyline.points == foundation.polyline.points);
+}
 
 bool test_if_solid_surface_filled(const ExPolygon& expolygon, double flow_spacing, double angle = 0, double density = 1.0);
 
@@ -59,15 +344,34 @@ static std::optional<ExtrusionPath> first_arc_overhang_path(const Print &print)
     return std::nullopt;
 }
 
+static std::vector<const ExtrusionPath *> test_extrusion_paths(const ExtrusionEntity &entity)
+{
+    std::vector<const ExtrusionPath *> paths;
+    const auto collect = [&](auto &&self, const ExtrusionEntity &item) -> void {
+        if (const auto *path = dynamic_cast<const ExtrusionPath *>(&item))
+            paths.push_back(path);
+        else if (const auto *loop = dynamic_cast<const ExtrusionLoop *>(&item))
+            for (const ExtrusionPath &path : loop->paths)
+                paths.push_back(&path);
+        else if (const auto *multi = dynamic_cast<const ExtrusionMultiPath *>(&item))
+            for (const ExtrusionPath &path : multi->paths)
+                paths.push_back(&path);
+        else if (const auto *collection = dynamic_cast<const ExtrusionEntityCollection *>(&item))
+            for (const ExtrusionEntity *child : collection->entities)
+                self(self, *child);
+    };
+    collect(collect, entity);
+    return paths;
+}
+
 static std::vector<ExtrusionPath> nonplanar_top_paths(const Print &print)
 {
     std::vector<ExtrusionPath> paths;
     for (const PrintObject *object : print.objects())
         for (const Layer *layer : object->layers())
             for (const LayerRegion *region : layer->regions())
-                for (const ExtrusionEntity *entity : region->fills.flatten().entities)
-                    if (const auto *path = dynamic_cast<const ExtrusionPath *>(entity);
-                        path != nullptr && path->nonplanar_surface && path->role() == erTopSolidInfill)
+                for (const ExtrusionPath *path : test_extrusion_paths(region->fills))
+                    if (path->nonplanar_surface && path->role() == erTopSolidInfill)
                         paths.push_back(*path);
     return paths;
 }
@@ -97,6 +401,35 @@ static std::vector<ExtrusionPath> nonplanar_perimeter_paths(const Print &print)
                 collect(region->fills);
             }
     return paths;
+}
+
+static bool has_variable_z_nonplanar_path(const ExtrusionEntity &entity)
+{
+    const auto variable_path = [](const ExtrusionPath &path) {
+        if (!path.nonplanar_surface || path.polyline.points.empty())
+            return false;
+        const auto [minimum, maximum] = std::minmax_element(
+            path.polyline.points.begin(), path.polyline.points.end(),
+            [](const Point3 &left, const Point3 &right) {
+                return left.z() < right.z();
+            });
+        return maximum->z() - minimum->z() >= scale_(0.001);
+    };
+    if (const auto *path = dynamic_cast<const ExtrusionPath *>(&entity))
+        return variable_path(*path);
+    if (const auto *multipath = dynamic_cast<const ExtrusionMultiPath *>(&entity))
+        return std::any_of(
+            multipath->paths.begin(), multipath->paths.end(), variable_path);
+    if (const auto *loop = dynamic_cast<const ExtrusionLoop *>(&entity))
+        return std::any_of(loop->paths.begin(), loop->paths.end(), variable_path);
+    if (const auto *collection =
+            dynamic_cast<const ExtrusionEntityCollection *>(&entity))
+        return std::any_of(
+            collection->entities.begin(), collection->entities.end(),
+            [](const ExtrusionEntity *child) {
+                return has_variable_z_nonplanar_path(*child);
+            });
+    return false;
 }
 
 static bool has_connected_nonplanar_wall_loop(const Print &print)
@@ -276,9 +609,8 @@ static bool has_nonplanar_path_with_role(const Print &print, ExtrusionRole role)
     for (const PrintObject *object : print.objects())
         for (const Layer *layer : object->layers())
             for (const LayerRegion *region : layer->regions())
-                for (const ExtrusionEntity *entity : region->fills.flatten().entities)
-                    if (const auto *path = dynamic_cast<const ExtrusionPath *>(entity);
-                        path != nullptr && path->nonplanar_surface && path->role() == role)
+                for (const ExtrusionPath *path : test_extrusion_paths(region->fills))
+                    if (path->nonplanar_surface && path->role() == role)
                         return true;
     return false;
 }
@@ -289,9 +621,8 @@ static bool has_planar_path_inside_nonplanar_top_coverage(const Print &print)
         for (const Layer *layer : object->layers()) {
             Polygons coverage;
             for (const LayerRegion *region : layer->regions()) {
-                for (const ExtrusionEntity *entity : region->fills.flatten().entities) {
-                    if (const auto *path = dynamic_cast<const ExtrusionPath *>(entity);
-                        path != nullptr && path->nonplanar_surface && path->role() == erTopSolidInfill)
+                for (const ExtrusionPath *path : test_extrusion_paths(region->fills)) {
+                    if (path->nonplanar_surface && path->role() == erTopSolidInfill)
                         path->polygons_covered_by_spacing(coverage, float(scale_(0.02)));
                 }
             }
@@ -449,7 +780,8 @@ static TriangleMesh benchy_roof_with_chimney(double angle_degrees)
 }
 
 static bool arc_paths_have_proper_crossing(const Polylines &paths,
-                                           std::string *details = nullptr)
+                                           std::string *details = nullptr,
+                                           double endpoint_epsilon = scale_(0.225))
 {
     struct PathLine {
         Line line;
@@ -463,12 +795,22 @@ static bool arc_paths_have_proper_crossing(const Polylines &paths,
                                   paths[path_idx].points[line_idx]),
                              path_idx, line_idx - 1});
 
+    // Exact sweep broad phase: recursive fills have many more segments than
+    // one concentric family. Do not spend quadratic time on disjoint boxes.
+    std::sort(lines.begin(), lines.end(), [](const PathLine &a, const PathLine &b) {
+        return std::min(a.line.a.x(), a.line.b.x()) < std::min(b.line.a.x(), b.line.b.x());
+    });
     for (size_t first_idx = 0; first_idx < lines.size(); ++first_idx) {
         for (size_t second_idx = first_idx + 1; second_idx < lines.size(); ++second_idx) {
             const PathLine &first = lines[first_idx];
             const PathLine &second = lines[second_idx];
+            if (std::min(second.line.a.x(), second.line.b.x()) > std::max(first.line.a.x(), first.line.b.x()))
+                break;
+            if (std::min(second.line.a.y(), second.line.b.y()) > std::max(first.line.a.y(), first.line.b.y()) ||
+                std::max(second.line.a.y(), second.line.b.y()) < std::min(first.line.a.y(), first.line.b.y()))
+                continue;
             if (first.path_idx == second.path_idx &&
-                second.line_idx <= first.line_idx + 1)
+                std::max(second.line_idx, first.line_idx) - std::min(second.line_idx, first.line_idx) <= 1)
                 continue;
             Point intersection;
             if (!first.line.intersection(second.line, &intersection))
@@ -497,7 +839,6 @@ static bool arc_paths_have_proper_crossing(const Polylines &paths,
             // an anchored T-junction while it lies within half of the standard
             // 0.45 mm deposited bead. An intersection farther into both
             // complete paths is a real crossing.
-            const double endpoint_epsilon = scale_(0.225);
             // A child arc is allowed to terminate on its supporting parent.
             // Only an intersection in the interior of both complete paths
             // means extrusion actually continues across an existing path.
@@ -1381,13 +1722,24 @@ TEST_CASE("Narrow bridge curvature and coverage hold across practical nozzle-sca
     }
 }
 
-TEST_CASE("One-sided narrow overhang fills from supported arc origins",
+TEST_CASE("One-sided overhang fills from already supported arc endpoints",
           "[Fill][ArcOverhang][Narrow][Anchor][Coverage]")
 {
+    // The wider case exercises the disk-family planner, not only translated
+    // narrow arches. Its former final cleanup removed parents that children
+    // already depended on, leaving short arcs supported only by future paths.
+    const double width = GENERATE(2.4, 3.2, 4.5, 5.8, 6.8, 12.0);
+    const bool raised_wall = GENERATE(false, true);
+    const double overlap = GENERATE(0., 25.);
+    const bool native_foundation = GENERATE(false, true);
+    CAPTURE(width);
+    CAPTURE(raised_wall);
+    CAPTURE(overlap);
+    CAPTURE(native_foundation);
     const ExPolygon expolygon(Points{
         Point::new_scale(0., 0.),
-        Point::new_scale(4.5, 0.),
-        Point::new_scale(4.5, 20.),
+        Point::new_scale(width, 0.),
+        Point::new_scale(width, 20.),
         Point::new_scale(0., 20.)
     });
     const ExPolygons supported{
@@ -1408,11 +1760,29 @@ TEST_CASE("One-sided narrow overhang fills from supported arc origins",
 
     PrintRegionConfig config;
     config.arc_overhang_recursive_fill.value = true;
+    config.arc_overhang_overlap.value = overlap;
     FillParams params;
     params.density = 1.f;
     params.resolution = 0.05f;
     params.config = &config;
     params.arc_anchor_regions = &supported;
+
+    if (native_foundation) {
+        params.arc_root_anchor_regions = &supported;
+        params.resolution = 0.003f;
+    }
+
+    // A raised brick wall remains a collision obstacle, not an endpoint
+    // foundation at the arc layer's Z. The prefix checks below deliberately
+    // never count this projected wall as deposited support.
+    const Polylines raised_obstacles{Polyline(Points{
+        Point::new_scale(width + 0.05, 0.),
+        Point::new_scale(width + 0.05, 20.)})};
+    const Polylines level_walls;
+    if (raised_wall) {
+        params.arc_obstacle_paths = &raised_obstacles;
+        params.arc_support_paths = &level_walls;
+    }
 
     const Polylines paths = filler->fill_surface(&surface, params);
     REQUIRE_FALSE(paths.empty());
@@ -1424,12 +1794,11 @@ TEST_CASE("One-sided narrow overhang fills from supported arc origins",
         std::max<coord_t>(
             coord_t(std::lround(scale_(0.20 * 0.45))),
             coord_t(std::lround(0.55 * double(arc_pitch))));
-    const double maximum_distance_squared =
-        std::pow(scale_(0.45 + params.resolution), 2);
-    Lines deposited;
+    const float support_reach = float(scale_(0.45 + params.resolution -
+        (native_foundation ? 0.45 * overlap / 200. : 0.)));
+    ExPolygons deposited;
     const auto point_is_supported =
-        [&supported, &deposited,
-         maximum_distance_squared](const Point &point) {
+        [&supported, &deposited](const Point &point) {
             if (std::any_of(
                     supported.begin(), supported.end(),
                     [&point](const ExPolygon &region) {
@@ -1438,14 +1807,16 @@ TEST_CASE("One-sided narrow overhang fills from supported arc origins",
                 return true;
             return std::any_of(
                 deposited.begin(), deposited.end(),
-                [&point, maximum_distance_squared](const Line &line) {
-                    return line.distance_to_squared(point) <=
-                           maximum_distance_squared;
+                [&point](const ExPolygon &corridor) {
+                    return corridor.contains(point);
                 });
         };
     const auto lead_is_supported =
         [&point_is_supported](const Polyline &path) {
-            double remaining = scale_(0.75 * 0.45);
+            // A sub-1.5-bead fragment needs contact along its entire length,
+            // not two endpoint contacts surrounding a tiny unsupported middle.
+            double remaining = path.length() < scale_(1.5 * 0.45) ?
+                path.length() : scale_(0.75 * 0.45);
             const double sample_step = scale_(0.20 * 0.45);
             for (size_t point_idx = 1;
                  point_idx < path.points.size() && remaining > 0.;
@@ -1482,8 +1853,16 @@ TEST_CASE("One-sided narrow overhang fills from supported arc origins",
         // fragments: their deposited width closes visible pockets which a
         // full-bead centerline threshold would leave open.
         CHECK(path.length() >= scale_(0.75 * 0.45));
+        INFO("arc " << (&path - paths.data()) << " start " << unscale(path.first_point()).transpose()
+             << " end " << unscale(path.last_point()).transpose());
         CHECK(lead_is_supported(path));
-        append(deposited, to_lines(path));
+        Polyline reversed(path);
+        reversed.reverse();
+        CHECK(lead_is_supported(reversed));
+        // Butt-ended corridors independently check side contact. A disk
+        // around a free tip must not become the next arc's foundation.
+        append(deposited, union_ex(offset(path, support_reach,
+            ClipperLib::jtRound, DefaultLineMiterLimit, ClipperLib::etOpenButt)));
     }
 
     std::string retrace_details;
@@ -1513,19 +1892,286 @@ TEST_CASE("One-sided narrow overhang fills from supported arc origins",
         [](double total, const ExPolygon &part) {
             return total + std::abs(part.area());
         });
+    if (const char *diagnostic = std::getenv("ORCA_ARC_SUPPORT_SVG")) {
+        SVG svg(std::string(diagnostic) + std::to_string(width) + (raised_wall ? "-raised.svg" : ".svg"), get_extents(expolygon));
+        svg.draw(expolygon, "white");
+        svg.draw(supported, "gray");
+        svg.draw(paths, "blue", 0.2 * spacing);
+        svg.draw(uncovered, "red");
+        svg.Close();
+    }
     CHECK(uncovered_area < 0.08 * std::abs(expolygon.area()));
     CHECK_FALSE(arc_paths_have_proper_crossing(paths));
 }
 
-TEST_CASE("Narrow bridge grows tight arcs from both supported ends", "[Fill][ArcOverhang][Narrow]")
+TEST_CASE("Arc anchor rims do not invent a lower-layer foundation", "[Fill][ArcOverhang][Anchor]")
 {
+    const ExPolygon region(Points{
+        Point::new_scale(0., 0.), Point::new_scale(8., 0.),
+        Point::new_scale(8., 8.), Point::new_scale(0., 8.)});
+    const ExPolygons anchor_rims{region};
+    const ExPolygons no_foundation;
+    const Polylines no_deposited_walls;
+    Surface surface(stBottomBridge, region);
+    surface.bridge_angle = 0.;
+    std::unique_ptr<Fill> fill(Fill::new_from_type("arc-overhang"));
+    fill->spacing = 0.45;
+    fill->bounding_box = get_extents(region);
+    PrintRegionConfig config;
+    config.arc_overhang_recursive_fill.value = true;
+    FillParams params;
+    params.density = 1.f;
+    params.resolution = 0.003f;
+    params.config = &config;
+    params.arc_anchor_regions = &anchor_rims;
+    params.arc_support_paths = &no_deposited_walls;
+    const bool explicit_foundation = GENERATE(false, true);
+    if (explicit_foundation)
+        params.arc_root_anchor_regions = &no_foundation;
+    const Polylines paths = fill->fill_surface(&surface, params);
+    // Legacy standalone callers use anchor_regions as their foundation.
+    // Native callers explicitly distinguish it from current-wall end caps.
+    if (explicit_foundation)
+        CHECK(paths.empty());
+    else
+        CHECK_FALSE(paths.empty());
+}
+
+TEST_CASE("Arc anchoring uses the retained wall width", "[Fill][ArcOverhang][Anchor][Regression]")
+{
+    const ExPolygon region(Points{
+        Point::new_scale(0., 0.), Point::new_scale(12., 0.),
+        Point::new_scale(12., 12.), Point::new_scale(0., 12.)});
+    const ExPolygons foundation{ExPolygon(Points{
+        Point::new_scale(0., 0.), Point::new_scale(0.6, 0.),
+        Point::new_scale(0.6, 12.), Point::new_scale(0., 12.)})};
+    const Polylines wall{Polyline(Points{Point::new_scale(-1., 12.3), Point::new_scale(13., 12.3)})};
+    Surface surface(stBottomBridge, region);
+    surface.bridge_angle = 0.;
+    std::unique_ptr<Fill> fill(Fill::new_from_type("arc-overhang"));
+    fill->spacing = 0.45;
+    fill->bounding_box = get_extents(region);
+    PrintRegionConfig config;
+    config.arc_overhang_recursive_fill.value = true;
+    config.arc_overhang_overlap.value = 25.;
+    FillParams params;
+    params.density = 1.f;
+    params.resolution = 0.003f;
+    params.config = &config;
+    params.arc_anchor_regions = &foundation;
+    params.arc_root_anchor_regions = &foundation;
+    params.arc_obstacle_paths = &wall;
+    params.arc_support_paths = &wall;
+    const double wall_width = GENERATE(0.1, 0.45, 0.8);
+    CAPTURE(wall_width);
+    const std::vector<coord_t> widths{coord_t(scale_(wall_width))};
+    params.arc_support_widths = &widths;
+    const Polylines paths = fill->fill_surface(&surface, params);
+    REQUIRE_FALSE(paths.empty());
+    ExPolygons deposited = offset_ex(foundation, float(scale_(0.4 * fill->spacing)));
+    // Independently use the sum of the two physical half-widths. The thin
+    // wall's 0.275 mm contact reach cannot bridge the 0.3 mm gap by itself.
+    append(deposited, union_ex(offset(wall, float(scale_(0.5 * (wall_width + fill->spacing) + params.resolution)),
+                                     ClipperLib::jtRound, DefaultLineMiterLimit, ClipperLib::etOpenButt)));
+    deposited = union_ex(deposited);
+    for (const Polyline &path : paths) {
+        for (const Point &end : {path.first_point(), path.last_point()})
+            CHECK(std::any_of(deposited.begin(), deposited.end(),
+                             [&](const ExPolygon &polygon) { return polygon.contains(end); }));
+        append(deposited, union_ex(offset(path, float(scale_(fill->spacing + params.resolution)),
+                                        ClipperLib::jtRound, DefaultLineMiterLimit, ClipperLib::etOpenRound)));
+        deposited = union_ex(deposited);
+    }
+}
+
+TEST_CASE("Recursive arc growth preserves coverage and coherent families", "[Fill][ArcOverhang][Recursive][Coverage]")
+{
+    const bool narrow = GENERATE(false, true);
+    const double bridge_angle = narrow ? GENERATE(0., 0.5 * M_PI) : 0.;
+    const bool both_ends = narrow ? GENERATE(false, true) : false;
+    CAPTURE(narrow);
+    CAPTURE(bridge_angle);
+    CAPTURE(both_ends);
+    const ExPolygon region(narrow ? Points{
+        Point::new_scale(0., 0.), Point::new_scale(4.5, 0.),
+        Point::new_scale(4.5, 40.), Point::new_scale(0., 40.)} : Points{
+        Point::new_scale(0., 0.), Point::new_scale(30., 0.),
+        Point::new_scale(30., 10.), Point::new_scale(40., 10.),
+        Point::new_scale(40., 40.), Point::new_scale(0., 40.)});
+    ExPolygons foundation{ExPolygon(narrow ? Points{
+        Point::new_scale(0., 0.), Point::new_scale(4.5, 0.),
+        Point::new_scale(4.5, 0.6), Point::new_scale(0., 0.6)} : Points{
+        Point::new_scale(0., 0.), Point::new_scale(0.6, 0.),
+        Point::new_scale(0.6, 40.), Point::new_scale(0., 40.)})};
+    if (both_ends)
+        foundation.emplace_back(Points{
+            Point::new_scale(0., 39.4), Point::new_scale(4.5, 39.4),
+            Point::new_scale(4.5, 40.), Point::new_scale(0., 40.)});
+    Surface surface(stBottomBridge, region);
+    surface.bridge_angle = bridge_angle;
+    std::unique_ptr<Fill> fill(Fill::new_from_type("arc-overhang"));
+    fill->spacing = 0.45;
+    fill->bounding_box = get_extents(region);
+    PrintRegionConfig config;
+    config.arc_overhang_recursive_fill.value = true;
+    config.arc_overhang_overlap.value = 25.;
+    FillParams params;
+    params.density = 1.f;
+    params.resolution = 0.003f;
+    params.config = &config;
+    params.arc_anchor_regions = &foundation;
+    params.arc_root_anchor_regions = &foundation;
+    Polylines starter_wall{Polyline(Points{
+        Point::new_scale(0., 0.225), Point::new_scale(4.5, 0.225)})};
+    if (both_ends)
+        starter_wall.emplace_back(Points{
+            Point::new_scale(0., 39.775), Point::new_scale(4.5, 39.775)});
+    if (narrow) {
+        params.arc_obstacle_paths = &starter_wall;
+        params.arc_support_paths = &starter_wall;
+    }
+    const Polylines paths = fill->fill_surface(&surface, params);
+    REQUIRE_FALSE(paths.empty());
+    ExPolygons covered = union_ex(offset(paths, float(scale_(0.5 * fill->spacing))));
+    append(covered, foundation);
+    const ExPolygons holes = opening_ex(diff_ex(ExPolygons{region}, union_ex(covered)),
+                                        float(scale_(0.75 * fill->spacing)));
+    const double missing = std::accumulate(holes.begin(), holes.end(), 0.,
+        [](double sum, const ExPolygon &hole) { return sum + std::abs(hole.area()); });
+    if (const char *diagnostic = std::getenv("ORCA_ARC_REGRESSION_SVG")) {
+        SVG svg(diagnostic, get_extents(region));
+        svg.draw(region, "white");
+        svg.draw(paths, "blue", scale_(0.08));
+        svg.draw(holes, "red");
+        svg.Close();
+    }
+    CHECK(missing < 0.005 * std::abs(region.area()));
+    CHECK_FALSE(arc_paths_have_proper_crossing(paths));
+
+    // Exclude the large primary family: recursive restarts themselves must
+    // predominantly form concentric courses, not a field of one-ring seeds.
+    Vec2d primary_center = Vec2d::Zero(), family_center = Vec2d::Zero();
+    bool first = true;
+    size_t rings = 0;
+    double radius = 0., family_length = 0., recursive_length = 0., grouped_length = 0.;
+    const auto finish_family = [&] {
+        if (!first && (family_center - primary_center).norm() > 0.02) {
+            recursive_length += family_length;
+            if (rings >= 3) grouped_length += family_length;
+        }
+    };
+    for (const Polyline &path : paths) {
+        if (path.points.size() < 3) {
+            // Short straight fragments cannot count as concentric courses.
+            recursive_length += unscale<double>(path.length());
+            continue;
+        }
+        const Vec2d a = path.points[0].cast<double>() * SCALING_FACTOR;
+        const Vec2d b = path.points[path.points.size() / 3].cast<double>() * SCALING_FACTOR;
+        const Vec2d c = path.points[2 * path.points.size() / 3].cast<double>() * SCALING_FACTOR;
+        const Vec2d center = Geometry::circle_center(a, b, c, 1e-10);
+        const double current_radius = (a - center).norm();
+        // A narrow bridge also has a coherent family when equal-radius arches
+        // translate by one pitch. Do not mistake that uniform backbone for
+        // unrelated concentric restarts just because its centers move.
+        const double center_step = (center - family_center).norm();
+        const bool translated = narrow && !first && std::abs(current_radius - radius) < 0.02 &&
+            center_step > 0.25 * fill->spacing && center_step < 1.5 * fill->spacing;
+        if (first || (!translated && center_step > 0.02)) {
+            finish_family();
+            if (first) primary_center = center;
+            first = false;
+            family_center = center;
+            family_length = 0.;
+            rings = 1;
+        } else if (translated || current_radius > radius + 0.5 * fill->spacing * 0.75) {
+            ++rings;
+        }
+        if (translated) family_center = center;
+        radius = current_radius;
+        family_length += unscale<double>(path.length());
+    }
+    finish_family();
+    REQUIRE(recursive_length > 0.);
+    CAPTURE(grouped_length, recursive_length);
+    CHECK(grouped_length > 0.65 * recursive_length);
+}
+
+TEST_CASE("Arc bodies grow from previously deposited material", "[Fill][ArcOverhang][Recursive][Regression]")
+{
+    const ExPolygon region(Points{
+        Point::new_scale(0., 0.), Point::new_scale(30., 0.),
+        Point::new_scale(30., 10.), Point::new_scale(40., 10.),
+        Point::new_scale(40., 40.), Point::new_scale(0., 40.)});
+    const ExPolygons foundation{ExPolygon(Points{
+        Point::new_scale(0., 0.), Point::new_scale(0.6, 0.),
+        Point::new_scale(0.6, 40.), Point::new_scale(0., 40.)})};
+    Surface surface(stBottomBridge, region);
+    surface.bridge_angle = 0.;
+    std::unique_ptr<Fill> fill(Fill::new_from_type("arc-overhang"));
+    fill->spacing = 0.45;
+    fill->bounding_box = get_extents(region);
+    PrintRegionConfig config;
+    config.arc_overhang_recursive_fill.value = true;
+    config.arc_overhang_overlap.value = 25.;
+    FillParams params;
+    params.density = 1.f;
+    params.resolution = 0.003f;
+    params.config = &config;
+    params.arc_anchor_regions = &foundation;
+    params.arc_root_anchor_regions = &foundation;
+    const Polylines paths = fill->fill_surface(&surface, params);
+    REQUIRE_FALSE(paths.empty());
+    // Lower-layer footprint plus less than half of the new bead's width:
+    // the first course must retain overlap, not be wholly inside the support.
+    ExPolygons deposited = offset_ex(foundation, float(scale_(0.4 * fill->spacing)),
+                                    ClipperLib::jtRound, scale_(0.0001));
+    double unsupported_length = 0.;
+    double longest_unsupported = 0.;
+    double short_restart_length = 0.;
+    for (const Polyline &path : paths) {
+        // A short fully grounded path is harmless, but a free-air restart
+        // cannot count the same sub-bead run as both its entry and exit lead.
+        if (path.length() + scale_(params.resolution) < scale_(1.5 * fill->spacing)) {
+            for (const Polyline &part : diff_pl(Polylines{path}, foundation))
+                short_restart_length += unscale<double>(part.length());
+        }
+        // Check the complete path against the printed prefix, not just its
+        // anchored ends. An outer arc cannot borrow support from future inner
+        // rings. Allow the configured tessellation tolerance in bead contact.
+        for (const Polyline &unsupported : diff_pl(Polylines{path}, deposited)) {
+            const double length = unscale<double>(unsupported.length());
+            unsupported_length += length;
+            longest_unsupported = std::max(longest_unsupported, length);
+        }
+        // Bead bodies include deposited round caps. Endpoint anchoring is
+        // checked separately with butt-ended corridors in the lead tests.
+        append(deposited, union_ex(offset(Polylines{path}, float(scale_(fill->spacing + params.resolution)),
+                                         ClipperLib::jtRound, scale_(0.0001), ClipperLib::etOpenRound)));
+        deposited = union_ex(deposited);
+    }
+    // Polygon offsets and sampled support checks differ at tangent contacts.
+    // No gap may exceed one support sample; total error is sub-bead as well.
+    CHECK(longest_unsupported < 0.05 * fill->spacing);
+    CHECK(unsupported_length < 0.1 * fill->spacing);
+    CHECK(short_restart_length < params.resolution);
+}
+
+TEST_CASE("Narrow bridge grows tight arcs from available end foundations", "[Fill][ArcOverhang][Narrow]")
+{
+    const double length = GENERATE(12., 40.);
+    const double overlap = GENERATE(0., 25.);
+    const bool both_ends = GENERATE(false, true);
+    const bool retained_walls = GENERATE(false, true);
+    const bool explicit_roots = GENERATE(false, true);
+    CAPTURE(length, overlap, both_ends, retained_walls, explicit_roots);
     const ExPolygon expolygon(Points{
         Point::new_scale(0., 0.),
         Point::new_scale(4.5, 0.),
-        Point::new_scale(4.5, 12.),
-        Point::new_scale(0., 12.)
+        Point::new_scale(4.5, length),
+        Point::new_scale(0., length)
     });
-    const ExPolygons supported{
+    ExPolygons supported{
         ExPolygon(Points{
             Point::new_scale(0., 0.),
             Point::new_scale(4.5, 0.),
@@ -1533,12 +2179,14 @@ TEST_CASE("Narrow bridge grows tight arcs from both supported ends", "[Fill][Arc
             Point::new_scale(0., 0.6)
         }),
         ExPolygon(Points{
-            Point::new_scale(0., 11.4),
-            Point::new_scale(4.5, 11.4),
-            Point::new_scale(4.5, 12.),
-            Point::new_scale(0., 12.)
+            Point::new_scale(0., length - 0.6),
+            Point::new_scale(4.5, length - 0.6),
+            Point::new_scale(4.5, length),
+            Point::new_scale(0., length)
         })
     };
+    if (!both_ends)
+        supported.pop_back();
     Surface surface(stBottomBridge, expolygon);
     surface.bridge_angle = 0.;
 
@@ -1549,20 +2197,33 @@ TEST_CASE("Narrow bridge grows tight arcs from both supported ends", "[Fill][Arc
 
     PrintRegionConfig config;
     config.arc_overhang_recursive_fill.value = true;
+    config.arc_overhang_overlap.value = overlap;
     FillParams params;
     params.density = 1.f;
     params.resolution = 0.05f;
     params.config = &config;
     params.arc_anchor_regions = &supported;
 
+    if (explicit_roots)
+        params.arc_root_anchor_regions = &supported;
+
+    Polylines walls{Polyline(Points{Point::new_scale(0., 0.225), Point::new_scale(4.5, 0.225)})};
+    if (both_ends)
+        walls.emplace_back(Points{Point::new_scale(0., length - 0.225), Point::new_scale(4.5, length - 0.225)});
+    if (retained_walls) {
+        params.arc_obstacle_paths = &walls;
+        params.arc_support_paths = &walls;
+    }
+
     const Polylines paths = filler->fill_surface(&surface, params);
     REQUIRE_FALSE(paths.empty());
     CHECK(std::any_of(paths.begin(), paths.end(), [](const Polyline &path) {
         return path.first_point().y() <= scale_(0.65);
     }));
-    CHECK(std::any_of(paths.begin(), paths.end(), [](const Polyline &path) {
-        return path.first_point().y() >= scale_(11.35);
-    }));
+    if (both_ends)
+        CHECK(std::any_of(paths.begin(), paths.end(), [length](const Polyline &path) {
+            return path.first_point().y() >= scale_(length - 0.65);
+        }));
 
     const double spacing = scale_(filler->spacing);
     size_t tight_path_count = 0;
@@ -1588,7 +2249,7 @@ TEST_CASE("Narrow bridge grows tight arcs from both supported ends", "[Fill][Arc
     // must reach within one deposited bead of the first family at the bridge
     // midpoint; demanding a rectangular footprint here would incorrectly
     // reject the deliberately curved space inside each arch.
-    const double midpoint_y = scale_(6.);
+    const double midpoint_y = scale_(0.5 * length);
     double lower_reach = std::numeric_limits<double>::lowest();
     double upper_reach = std::numeric_limits<double>::max();
     for (const Polyline &path : paths) {
@@ -1603,6 +2264,13 @@ TEST_CASE("Narrow bridge grows tight arcs from both supported ends", "[Fill][Arc
     REQUIRE(lower_reach > std::numeric_limits<double>::lowest());
     REQUIRE(upper_reach < std::numeric_limits<double>::max());
     CHECK(upper_reach - lower_reach <= spacing);
+    ExPolygons covered = union_ex(offset(paths, float(0.52 * spacing)));
+    append(covered, supported);
+    const ExPolygons holes = opening_ex(diff_ex(ExPolygons{expolygon}, union_ex(covered)),
+                                        float(0.75 * spacing));
+    const double missing = std::accumulate(holes.begin(), holes.end(), 0.,
+        [](double sum, const ExPolygon &hole) { return sum + std::abs(hole.area()); });
+    CHECK(missing < 0.08 * std::abs(expolygon.area()));
 }
 
 TEST_CASE("Long narrow arc overhang retains complete primary coverage", "[Fill][ArcOverhang][Coverage][Performance]")
@@ -1794,6 +2462,202 @@ TEST_CASE("Recursive arc refinement follows the complete large family", "[Fill][
     CHECK(uncovered_area < 0.02 * std::abs(expolygon.area()));
 }
 
+TEST_CASE("Arc crossing audit detects crossings after spatial sorting",
+          "[Fill][ArcOverhang][Audit][Regression]")
+{
+    const Polyline rising(Points{Point::new_scale(0., 0.), Point::new_scale(10., 10.)});
+    const Polyline falling(Points{Point::new_scale(0., 10.), Point::new_scale(10., 0.)});
+    CHECK(arc_paths_have_proper_crossing(Polylines{rising, falling}));
+    const Polyline separate(Points{Point::new_scale(20., 0.), Point::new_scale(30., 10.)});
+    CHECK_FALSE(arc_paths_have_proper_crossing(Polylines{rising, separate}));
+    const Polyline self_crossing(Points{Point::new_scale(10., 10.), Point::new_scale(0., 0.),
+                                      Point::new_scale(0., 10.), Point::new_scale(10., 0.)});
+    CHECK(arc_paths_have_proper_crossing(Polylines{self_crossing}));
+    const Polyline terminal(Points{Point::new_scale(0., 0.), Point::new_scale(1., 0.)});
+    const Polyline near_end(Points{Point::new_scale(0.99, -1.), Point::new_scale(0.99, 1.)});
+    CHECK(arc_paths_have_proper_crossing(Polylines{terminal, near_end}, nullptr, scale_(0.005)));
+    const Polyline endpoint_contact(Points{Point::new_scale(1., -1.), Point::new_scale(1., 1.)});
+    CHECK_FALSE(arc_paths_have_proper_crossing(Polylines{terminal, endpoint_contact}, nullptr, scale_(0.005)));
+}
+
+TEST_CASE("Infill reports completion beyond its starting percentage",
+          "[Fill][Progress][Regression]")
+{
+    Model model;
+    Print print;
+    Test::init_print({make_cube(8., 8., 2.)}, print, model, {
+        {"layer_height", 0.2}, {"initial_layer_print_height", 0.2},
+        {"top_surface_z_mode", "disabled"}, {"fill_density", "15%"}
+    });
+    std::atomic<bool> reported_completion{false};
+    print.set_status_callback([&](const PrintBase::SlicingStatus &status) {
+        if (status.percent > 35 && status.percent < 40 && !status.text.empty())
+            reported_completion.store(true);
+    });
+    print.process();
+    CHECK(reported_completion.load());
+}
+
+TEST_CASE("Arc progress preserves paths and allows cancellation inside a family",
+          "[Fill][ArcOverhang][Progress][Regression]")
+{
+    Surface surface(stBottomBridge, ExPolygon(Points{
+        Point::new_scale(0., 0.), Point::new_scale(8., 0.),
+        Point::new_scale(8., 6.), Point::new_scale(0., 6.)}));
+    surface.bridge_angle = 0.;
+    std::unique_ptr<Fill> filler(Fill::new_from_type("arc-overhang"));
+    filler->spacing = 0.45;
+    filler->bounding_box = get_extents(surface.expolygon);
+    FillParams params;
+    params.density = 1.f;
+    const Polylines original = filler->fill_surface(&surface, params);
+    REQUIRE_FALSE(original.empty());
+    size_t reported = 0;
+    bool invalid_count = false;
+    const FillProgressCallback progress = [&](FillProgressStage, size_t current, size_t total) {
+        ++reported;
+        invalid_count |= total == 0 || current > total;
+    };
+    params.progress = &progress;
+    const Polylines observed = filler->fill_surface(&surface, params);
+    REQUIRE(observed.size() == original.size());
+    for (size_t i = 0; i < original.size(); ++i)
+        CHECK(observed[i].points == original[i].points);
+    CHECK(reported > 1);
+    CHECK_FALSE(invalid_count);
+    struct Cancelled {};
+    const FillProgressCallback cancel = [](FillProgressStage stage, size_t current, size_t) {
+        if (stage == FillProgressStage::GenerateArcs && current > 0)
+            throw Cancelled{};
+    };
+    params.progress = &cancel;
+    CHECK_THROWS_AS(filler->fill_surface(&surface, params), Cancelled);
+}
+
+TEST_CASE("Recursive arc families cover a wide roof without unbounded root growth",
+          "[Fill][ArcOverhang][Recursive][BoundedRadius][Regression]")
+{
+    const ExPolygon region(Points{Point::new_scale(0., 0.), Point::new_scale(50., 0.),
+                                  Point::new_scale(50., 30.), Point::new_scale(0., 30.)});
+    const ExPolygons support{ExPolygon(Points{
+        Point::new_scale(0., 0.), Point::new_scale(0.8, 0.),
+        Point::new_scale(0.8, 30.), Point::new_scale(0., 30.)})};
+    Surface surface(stBottomBridge, region);
+    surface.bridge_angle = 0.;
+    std::unique_ptr<Fill> filler(Fill::new_from_type("arc-overhang"));
+    filler->spacing = 0.45;
+    filler->bounding_box = get_extents(region);
+    PrintRegionConfig config;
+    config.arc_overhang_recursive_fill.value = true;
+    FillParams params;
+    params.config = &config;
+    params.density = 1.f;
+    params.resolution = 0.01f;
+    params.arc_anchor_regions = &support;
+    const Polylines paths = filler->fill_surface(&surface, params);
+    REQUIRE_FALSE(paths.empty());
+    double maximum_radius = 0.;
+    for (const Polyline &path : paths) {
+        if (path.points.size() < 3 || path.length() < scale_(4.))
+            continue;
+        const Vec2d a = (path.points[path.points.size() / 2] - path.first_point()).cast<double>();
+        const Vec2d b = (path.last_point() - path.first_point()).cast<double>();
+        const double cross = std::abs(a.x() * b.y() - a.y() * b.x());
+        maximum_radius = std::max(maximum_radius, cross > 0. ?
+            a.norm() * b.norm() * (b - a).norm() / (2. * cross) :
+            std::numeric_limits<double>::infinity());
+    }
+    // The root must obey the same 15 mm growth policy as recursive children.
+    // Measure curvature, not chord length: a large circle clipped to a short
+    // strip can have a small chord while being almost straight.
+    CHECK(maximum_radius <= scale_(15.2));
+    CHECK_FALSE(arc_paths_have_proper_crossing(paths));
+    ExPolygons covered = union_ex(offset(paths, float(scale_(0.45 * 0.52))));
+    append(covered, support);
+    const ExPolygons missing = opening_ex(diff_ex(ExPolygons{region}, union_ex(covered)),
+                                          float(scale_(0.45 * 0.75)));
+    double missing_area = 0.;
+    for (const ExPolygon &part : missing)
+        missing_area += std::abs(part.area());
+    CHECK(missing_area < 0.02 * std::abs(region.area()));
+}
+
+TEST_CASE("Fitted recursive arcs retain terminal clearance after coordinate rounding",
+          "[Fill][ArcOverhang][ArcFitting][Regression]")
+{
+    const double resolution = GENERATE(0.01, 0.05);
+    const double origin = GENERATE(0., 0.0004);
+    const double width = GENERATE(4.5, 50.);
+    Surface surface(stBottomBridge, ExPolygon(Points{
+        Point::new_scale(0., 0.), Point::new_scale(width, 0.),
+        Point::new_scale(width, 30.), Point::new_scale(0., 30.)}));
+    surface.bridge_angle = 0.;
+    const ExPolygons support{ExPolygon(Points{
+        Point::new_scale(0., 0.), Point::new_scale(width < 10. ? width : 0.8, 0.),
+        Point::new_scale(width < 10. ? width : 0.8, width < 10. ? 0.8 : 30.),
+        Point::new_scale(0., width < 10. ? 0.8 : 30.)})};
+    std::unique_ptr<Fill> filler(Fill::new_from_type("arc-overhang"));
+    filler->spacing = 0.45;
+    filler->bounding_box = get_extents(surface.expolygon);
+    PrintRegionConfig config;
+    config.arc_overhang_recursive_fill.value = true;
+    config.arc_overhang_overlap.value = width < 10. ? 25. : 0.;
+    FillParams params;
+    params.config = &config;
+    params.density = 1.f;
+    params.resolution = float(resolution);
+    params.arc_anchor_regions = &support;
+    const Polylines paths = filler->fill_surface(&surface, params);
+    REQUIRE_FALSE(paths.empty());
+
+    // Independently reconstruct XY/IJ rounding, rather than inspecting only
+    // the unfitted points. The former audit allowed half a bead at endpoints,
+    // masking the micron-scale crossings created by fitting terminal arcs.
+    const auto rounded = [](const Vec2d &point) -> Point {
+        return Point::new_scale(std::round(point.x() * 1000.) / 1000.,
+                                std::round(point.y() * 1000.) / 1000.);
+    };
+    const Vec2d shift(origin, origin);
+    Polylines emitted;
+    for (const Polyline &path : paths) {
+        Polyline output;
+        output.append(rounded(unscale(path.first_point()) + shift));
+        for (const PathFittingData &fit : path.fitting_result) {
+            if (fit.path_type == EMovePathType::Linear_move) {
+                for (size_t i = fit.start_point_index + 1; i <= fit.end_point_index; ++i)
+                    output.append(rounded(unscale(path.points[i]) + shift));
+                continue;
+            }
+            const Vec2d start = unscale(output.last_point());
+            const Vec2d center = start + unscale(rounded(unscale(Point(fit.arc_data.center - fit.arc_data.start_point))));
+            const Point end_point = rounded(unscale(fit.arc_data.end_point) + shift);
+            const Vec2d end = unscale(end_point);
+            const double radius = (start - center).norm();
+            const double start_angle = std::atan2(start.y() - center.y(), start.x() - center.x());
+            const double end_angle = std::atan2(end.y() - center.y(), end.x() - center.x());
+            const double sign = fit.path_type == EMovePathType::Arc_move_ccw ? 1. : -1.;
+            double sweep = sign * (end_angle - start_angle);
+            if (sweep <= 0.) sweep += 2. * M_PI;
+            const size_t steps = std::max<size_t>(2, size_t(std::ceil(sweep / (2. * std::acos(std::clamp(1. - 0.0005 / radius, -1., 1.))))));
+            for (size_t i = 1; i < steps; ++i) {
+                const double angle = start_angle + sign * sweep * double(i) / double(steps);
+                output.append(Point::new_scale(center.x() + radius * std::cos(angle),
+                                               center.y() + radius * std::sin(angle)));
+            }
+            output.append(end_point);
+        }
+        if (path.fitting_result.empty())
+            for (size_t i = 1; i < path.points.size(); ++i)
+                output.append(rounded(unscale(path.points[i]) + shift));
+        emitted.emplace_back(std::move(output));
+    }
+    std::string details;
+    const bool crosses = arc_paths_have_proper_crossing(emitted, &details, scale_(0.005));
+    CAPTURE(resolution, origin, width);
+    INFO(details);
+    CHECK_FALSE(crosses);
+}
+
 TEST_CASE("Recursive arc fill branches into uncovered space", "[Fill][ArcOverhang][Recursive]")
 {
     ExPolygon expolygon(Points{
@@ -1848,6 +2712,13 @@ TEST_CASE("Recursive arc fill branches into uncovered space", "[Fill][ArcOverhan
     INFO("root paths: " << root_paths.size() << ", recursive paths: " << recursive_paths.size());
     INFO("root uncovered: " << root_uncovered_area << ", recursive uncovered: " << uncovered_area(recursive_paths));
     const ExPolygons recursive_uncovered = uncovered_regions(recursive_paths);
+    if (const char *diagnostic = std::getenv("ORCA_ARC_REGRESSION_SVG")) {
+        SVG svg(diagnostic, get_extents(expolygon));
+        svg.draw(expolygon, "white");
+        svg.draw(recursive_paths, "blue", 0.2 * spacing);
+        svg.draw(recursive_uncovered, "red");
+        svg.Close();
+    }
     const auto largest_recursive_region = std::max_element(
         recursive_uncovered.begin(), recursive_uncovered.end(),
         [](const ExPolygon &lhs, const ExPolygon &rhs) {
@@ -2138,6 +3009,7 @@ TEST_CASE("Narrow bridge G-code keeps every arc path anchored and curved",
                     }
                     INFO("arc start " << start.x() << "," << start.y()
                                       << " layer " << move.layer_id
+                                      << " width " << move.width
                                       << " clearance " << bead_clearance
                                       << " any " << any_previous_clearance);
                     CHECK(bead_clearance <= 0.051);
@@ -2286,6 +3158,8 @@ TEST_CASE("Arc overhang fitting follows the global arc fitting setting",
                 {"arc_overhang_min_overhang_distance", "0"},
                 {"arc_overhang_recursive_fill", "1"},
                 {"enable_arc_fitting", enable_arc_fitting ? "1" : "0"},
+                {"enable_overhang_speed", "1"},
+                {"enable_overhang_bridge_fan", "1"},
                 {"resolution", "0"},
                 {"enable_support", "0"}
             });
@@ -3143,7 +4017,8 @@ TEST_CASE("True non-planar top surfaces work without Z contouring", "[Fill][Nonp
     Print print;
     Slic3r::Test::init_and_process_print(
         {shallow_top_wedge(8.)}, print,
-        {{"nonplanar_top_surface", 1},
+        {{"top_surface_z_mode", "nonplanar_top_surface"},
+         {"nonplanar_top_surface", 1},
          {"nonplanar_top_surface_max_angle", 45},
          {"nonplanar_top_surface_resolution", 0.2},
          {"nonplanar_top_surface_min_height", 0.08},
@@ -3211,7 +4086,11 @@ TEST_CASE("True non-planar top surfaces work without Z contouring", "[Fill][Nonp
         });
     CAPTURE(uncovered_surface_area);
     CHECK(uncovered_surface_area < 0.05);
-    CHECK_FALSE(has_nonplanar_path_with_role(print, erSolidInfill));
+    // The exposed raster remains top surface, while its ordinary top-shell
+    // support courses are explicitly internal solid infill. Treating every
+    // generated course as top surface was the excessive-material regression;
+    // omitting these normal support courses leaves the finishing skin floating.
+    CHECK(has_nonplanar_path_with_role(print, erSolidInfill));
     bool has_continuous_z_change = false;
     coord_t maximum_path_z_span = 0;
     size_t x_aligned_segments = 0;
@@ -3267,9 +4146,8 @@ TEST_CASE("True non-planar top surfaces work without Z contouring", "[Fill][Nonp
     for (const PrintObject *object : print.objects())
         for (const Layer *layer : object->layers())
             for (const LayerRegion *region : layer->regions())
-                for (const ExtrusionEntity *entity : region->fills.flatten().entities)
-                    if (const auto *path = dynamic_cast<const ExtrusionPath *>(entity);
-                        path != nullptr && path->nonplanar_surface &&
+                for (const ExtrusionPath *path : test_extrusion_paths(region->fills))
+                    if (path->nonplanar_surface &&
                         !path->nonplanar_transition &&
                         path->role() == erTopSolidInfill)
                         for (const Point3 &point : path->polyline.points) {
@@ -3296,6 +4174,27 @@ TEST_CASE("True non-planar top surfaces work without Z contouring", "[Fill][Nonp
     // layer heights continuously. The stepped planar shell below supports it.
     CHECK(unscale<double>(maximum_path_z_span) > 0.2 + EPSILON);
 
+    // Every owner course that survives final graph validation must reach the
+    // writer. Conventional island tours are built from 2D slice centroids and
+    // may omit an island containing only variable-Z material. That previously
+    // dropped two complete penultimate courses from the Benchy stern while
+    // the finishing course was still emitted above them.
+    std::set<int64_t> expected_nonplanar_owner_z;
+    for (const PrintObject *object : print.objects())
+        for (const Layer *layer : object->layers()) {
+            bool owns_variable_z_path = false;
+            for (const LayerRegion *region : layer->regions()) {
+                owns_variable_z_path |=
+                    has_variable_z_nonplanar_path(region->perimeters);
+                owns_variable_z_path |=
+                    has_variable_z_nonplanar_path(region->fills);
+            }
+            if (owns_variable_z_path)
+                expected_nonplanar_owner_z.emplace(
+                    int64_t(std::llround(layer->print_z * 100000.)));
+        }
+    REQUIRE_FALSE(expected_nonplanar_owner_z.empty());
+
     ScopedTemporaryFile gcode_file(".gcode");
     GCodeProcessorResult preview;
     REQUIRE_NOTHROW(print.export_gcode(gcode_file.string(), &preview, nullptr));
@@ -3306,6 +4205,22 @@ TEST_CASE("True non-planar top surfaces work without Z contouring", "[Fill][Nonp
     CHECK_FALSE(gcode.empty());
     CHECK(gcode.find(";TYPE:Non-planar top surface") != std::string::npos);
     CHECK(gcode.find(";TYPE:Non-planar transition") != std::string::npos);
+    std::set<int64_t> emitted_nonplanar_owner_z;
+    std::optional<int64_t> current_owner_z;
+    std::istringstream owner_lines(gcode);
+    for (std::string line; std::getline(owner_lines, line);) {
+        if (line.rfind(";Z:", 0) == 0) {
+            current_owner_z = int64_t(std::llround(
+                std::stod(line.substr(3)) * 100000.));
+        } else if (current_owner_z &&
+                   line.find("; non-planar ") != std::string::npos) {
+            emitted_nonplanar_owner_z.emplace(*current_owner_z);
+        }
+    }
+    for (const int64_t owner_z : expected_nonplanar_owner_z) {
+        CAPTURE(double(owner_z) / 100000.);
+        CHECK(emitted_nonplanar_owner_z.count(owner_z) == 1);
+    }
     // Adjacent variable-width pieces are one wall even when Arachne represents
     // them as separate ExtrusionPaths. Their intentional bead contact must not
     // be mistaken for a travel collision. Genuine moves between disconnected
@@ -3399,7 +4314,8 @@ TEST_CASE("A connected non-planar top surface transitions across upper layer ope
     Print print;
     Slic3r::Test::init_and_process_print(
         {shallow_top_wedge(8.)}, print,
-        {{"nonplanar_top_surface", 1},
+        {{"top_surface_z_mode", "nonplanar_top_surface"},
+         {"nonplanar_top_surface", 1},
          {"nonplanar_top_surface_max_angle", 45},
          {"nonplanar_top_surface_layers", 5},
          {"zaa_enabled", 0},
@@ -3412,6 +4328,7 @@ TEST_CASE("A connected non-planar top surface transitions across upper layer ope
     size_t planar_wall_anchor_paths = 0;
     size_t unsupported_wall_anchor_points = 0;
     std::map<std::pair<coord_t, coord_t>, std::vector<double>> shell_z_by_xy;
+    std::set<std::pair<coord_t, coord_t>> sparse_transition_xy;
     std::set<const Layer *> nonplanar_top_owner_layers;
     std::set<const Layer *> nonplanar_wall_owner_layers;
     for (const PrintObject *object : print.objects()) {
@@ -3419,18 +4336,28 @@ TEST_CASE("A connected non-planar top surface transitions across upper layer ope
             bool owns_nonplanar_top = false;
             for (const LayerRegion *region : layer->regions()) {
                 const auto inspect = [&](const ExtrusionEntityCollection &collection) {
-                    for (const ExtrusionEntity *entity : collection.flatten().entities) {
-                        const auto *path = dynamic_cast<const ExtrusionPath *>(entity);
-                        if (path == nullptr || !path->nonplanar_surface)
+                    for (const ExtrusionPath *path : test_extrusion_paths(collection)) {
+                        if (!path->nonplanar_surface)
                             continue;
-                        if (path->role() != erTopSolidInfill)
+                        const bool finishing_skin =
+                            path->role() == erTopSolidInfill;
+                        const bool transition_support =
+                            path->nonplanar_transition &&
+                            (path->role() == erInternalInfill ||
+                             path->role() == erSolidInfill);
+                        if (!finishing_skin && !transition_support)
                             continue;
-                        owns_nonplanar_top = true;
-                        nonplanar_top_owner_layers.insert(layer);
+                        if (finishing_skin) {
+                            owns_nonplanar_top = true;
+                            nonplanar_top_owner_layers.insert(layer);
+                        }
                         for (const Point3 &point : path->polyline.points) {
                             deepest_relative_z = std::min(deepest_relative_z, point.z());
-                            shell_z_by_xy[{point.x(), point.y()}].push_back(
+                            const auto xy = std::make_pair(point.x(), point.y());
+                            shell_z_by_xy[xy].push_back(
                                 layer->print_z + unscale_(point.z()));
+                            if (transition_support)
+                                sparse_transition_xy.insert(xy);
                         }
 
                         if (!path->nonplanar_transition ||
@@ -3525,17 +4452,20 @@ TEST_CASE("A connected non-planar top surface transitions across upper layer ope
         }
     }
 
-    // The configured count is the minimum transition depth. A broad slope may
-    // require additional intermediate courses so its high edge still remains
-    // within one nominal layer of the preceding extrusion.
-    REQUIRE(owning_layers >= 5);
-    // The boundary-reaching wedge retains a complete multi-course perimeter
-    // transition, and that transition begins no later than the generated top
-    // stack. Perimeters keep their original slicer owner when one connected
+    // Only the exposed course is top-surface fill. The configured lower
+    // courses are sparse structural transitions; labeling or filling all of
+    // them as top skin consumes excessive material and replaces valid infill.
+    REQUIRE(owning_layers == 1);
+    // The boundary-reaching wedge retains one connected planar foundation and
+    // one exposed surface-following boundary. Intermediate generated skin
+    // courses are allowed to bond to the conventional slicer-owned wall graph;
+    // requiring a newly projected closed perimeter on every raster course
+    // recreates the dense, mutually colliding rings this regression guards
+    // against. Perimeters keep their original slicer owner when one connected
     // wall spans multiple absolute Z courses, so owner IDs need not match the
     // raster owners one-for-one.
     REQUIRE_FALSE(nonplanar_top_owner_layers.empty());
-    REQUIRE(nonplanar_wall_owner_layers.size() >= 5);
+    REQUIRE(nonplanar_wall_owner_layers.size() >= 2);
     const auto earlier_layer = [](const Layer *left, const Layer *right) {
         return left->print_z < right->print_z;
     };
@@ -3578,6 +4508,13 @@ TEST_CASE("A connected non-planar top surface transitions across upper layer ope
     REQUIRE(print.objects().size() == 1);
     const auto object_layers = print.objects().front()->layers();
     for (auto &[xy, z_values] : shell_z_by_xy) {
+        // Rows which exist only in the requested upper solid skins are
+        // intentionally absent from deep sparse transition support. They are
+        // bridge/top-skin spans and cannot be extrapolated to a per-row flat
+        // anchor. Validate the complete aligned stack on rows retained by the
+        // sparse structural transition.
+        if (sparse_transition_xy.count(xy) == 0)
+            continue;
         std::sort(z_values.begin(), z_values.end());
         z_values.erase(std::unique(z_values.begin(), z_values.end(),
             [](double left, double right) {
@@ -3667,7 +4604,8 @@ TEST_CASE("Non-planar walls respect the configured wall sequence", "[Fill][Nonpl
         Print print;
         Slic3r::Test::init_and_process_print(
             {shallow_top_wedge(8.)}, print,
-            {{"nonplanar_top_surface", 1},
+            {{"top_surface_z_mode", "nonplanar_top_surface"},
+             {"nonplanar_top_surface", 1},
              {"nonplanar_top_surface_max_angle", 45},
              {"wall_loops", 3},
              {"wall_sequence", wall_sequence},
@@ -3694,12 +4632,37 @@ TEST_CASE("True non-planar top surfaces leave paths planar when disabled", "[Fil
     CHECK(nonplanar_top_paths(print).empty());
 }
 
+TEST_CASE("Disabled surface Z mode ignores stale legacy non-planar flags",
+          "[Fill][NonplanarSurface][GCode][Regression]")
+{
+    Print print;
+    Slic3r::Test::init_and_process_print(
+        {shallow_top_wedge(8.)}, print,
+        {{"top_surface_z_mode", "disabled"},
+         // Older projects may retain both compatibility booleans. The visible
+         // selector is authoritative when it is explicitly present.
+         {"nonplanar_top_surface", 1}, {"zaa_enabled", 1},
+         {"layer_height", 0.2}});
+
+    CHECK(nonplanar_top_paths(print).empty());
+    CHECK(nonplanar_perimeter_paths(print).empty());
+    ScopedTemporaryFile gcode_file(".gcode");
+    REQUIRE_NOTHROW(print.export_gcode(gcode_file.string(), nullptr, nullptr));
+    std::ifstream stream(gcode_file.string());
+    const std::string gcode{
+        std::istreambuf_iterator<char>(stream),
+        std::istreambuf_iterator<char>()};
+    CHECK(gcode.find(";TYPE:Non-planar top surface") == std::string::npos);
+    CHECK(gcode.find(";TYPE:Non-planar transition") == std::string::npos);
+}
+
 TEST_CASE("Horizontal top surfaces are not classified as non-planar", "[Fill][NonplanarSurface]")
 {
     Print print;
     Slic3r::Test::init_and_process_print(
         {Slic3r::Test::cube(10.)}, print,
-        {{"nonplanar_top_surface", 1},
+        {{"top_surface_z_mode", "nonplanar_top_surface"},
+         {"nonplanar_top_surface", 1},
          {"nonplanar_top_surface_max_angle", 45},
          {"zaa_enabled", 0},
          {"layer_height", 0.2}});
@@ -3713,7 +4676,8 @@ TEST_CASE("True non-planar top surfaces respect the configured surface angle", "
     Print accepted;
     Slic3r::Test::init_and_process_print(
         {shallow_top_wedge(8.)}, accepted,
-        {{"nonplanar_top_surface", 1},
+        {{"top_surface_z_mode", "nonplanar_top_surface"},
+         {"nonplanar_top_surface", 1},
          {"nonplanar_top_surface_max_angle", 10},
          {"zaa_enabled", 0},
          {"layer_height", 0.2}});
@@ -3722,7 +4686,8 @@ TEST_CASE("True non-planar top surfaces respect the configured surface angle", "
     Print rejected;
     Slic3r::Test::init_and_process_print(
         {shallow_top_wedge(8.)}, rejected,
-        {{"nonplanar_top_surface", 1},
+        {{"top_surface_z_mode", "nonplanar_top_surface"},
+         {"nonplanar_top_surface", 1},
          {"nonplanar_top_surface_max_angle", 5},
          {"zaa_enabled", 0},
          {"layer_height", 0.2}});
@@ -3737,7 +4702,8 @@ TEST_CASE("Doubly curved top surfaces use closed non-planar tracks", "[Fill][Non
     Print print;
     Slic3r::Test::init_and_process_print(
         {dome}, print,
-        {{"nonplanar_top_surface", 1},
+        {{"top_surface_z_mode", "nonplanar_top_surface"},
+         {"nonplanar_top_surface", 1},
          {"nonplanar_top_surface_max_angle", 20},
          {"nonplanar_top_surface_resolution", 0.2},
          {"nonplanar_top_surface_min_height", 0.05},
@@ -3757,29 +4723,165 @@ TEST_CASE("Doubly curved top surfaces use closed non-planar tracks", "[Fill][Non
     }));
 }
 
-TEST_CASE("Compact wall-only slopes without a solid source course stay planar",
+TEST_CASE("Compact wall-only slopes do not emit isolated non-planar loops",
           "[Fill][NonplanarSurface][PerimeterOnly]")
 {
-    Polygon footprint = make_circle_num_segments(scale_(1.7), 48);
+    const bool hybrid = GENERATE(false, true);
+    const bool brick = GENERATE(false, true);
+    CAPTURE(hybrid, brick);
+    ExPolygon footprint(make_circle_num_segments(scale_(3.), 48));
+    Polygon hole = make_circle_num_segments(scale_(1.5), 48);
+    hole.reverse();
+    footprint.holes.emplace_back(std::move(hole));
     const double slope = std::tan(8. * M_PI / 180.);
     TriangleMesh model = extrude_sloped_footprint(
-        ExPolygon(footprint), [](double) { return 0.; },
+        footprint, [](double) { return 0.; },
         [slope](double x) { return 8. + slope * x; });
 
     Print print;
     Slic3r::Test::init_and_process_print(
         {std::move(model)}, print,
-        {{"nonplanar_top_surface", 1},
+        {{"top_surface_z_mode", hybrid ? "nonplanar_with_z_contouring_fallback" : "nonplanar_top_surface"},
+         {"nonplanar_top_surface", 1},
          {"nonplanar_top_surface_max_angle", 45},
-         {"wall_loops", 3}, {"zaa_enabled", 0}, {"layer_height", 0.2}});
+         {"perimeter_layering", brick ? "brick" : "standard"},
+         {"staggered_perimeter_offset", "50%"},
+         {"wall_loops", 3}, {"zaa_enabled", hybrid}, {"layer_height", 0.2}});
 
-    // A wall-only component has no dense course from which to build a bonded
-    // transition. Warping its rings alone creates an isolated recess (the
-    // Benchy flag-hole regression), so preserve the conventional slice until
-    // a coherent skin and support course exist.
-    CHECK(nonplanar_top_paths(print).empty());
+    // The hollow rim must actually be accepted, not merely left planar to
+    // satisfy a vacuous no-collision test. Its hole and outer envelope must
+    // survive the common wall/skin generation path.
     const std::vector<ExtrusionPath> walls = nonplanar_perimeter_paths(print);
-    CHECK(walls.empty());
+    REQUIRE_FALSE(walls.empty());
+    size_t variable_width_joins = 0;
+    const auto check_joined_walls = [&](auto &&self, const ExtrusionEntity &entity) -> void {
+        const ExtrusionPaths *paths = nullptr;
+        if (const auto *loop = dynamic_cast<const ExtrusionLoop *>(&entity))
+            paths = &loop->paths;
+        else if (const auto *multipath = dynamic_cast<const ExtrusionMultiPath *>(&entity))
+            paths = &multipath->paths;
+        else if (const auto *collection = dynamic_cast<const ExtrusionEntityCollection *>(&entity))
+            for (const ExtrusionEntity *child : collection->entities)
+                self(self, *child);
+        if (paths == nullptr)
+            return;
+        for (size_t i = 1; i < paths->size(); ++i) {
+            const ExtrusionPath &before = (*paths)[i - 1], &after = (*paths)[i];
+            if (!before.nonplanar_surface || !after.nonplanar_surface ||
+                before.nonplanar_feature_transition || after.nonplanar_feature_transition ||
+                std::abs(before.width - after.width) <= EPSILON)
+                continue;
+            ++variable_width_joins;
+            CHECK(before.last_point3() == after.first_point3());
+            CHECK(before.inset_idx == after.inset_idx);
+            CHECK(entity.inset_idx == before.inset_idx);
+            CHECK(before.mm3_per_mm > 0.);
+            CHECK(after.mm3_per_mm > 0.);
+        }
+    };
+    for (const PrintObject *object : print.objects())
+        for (const Layer *layer : object->layers())
+            for (const LayerRegion *region : layer->regions()) {
+                check_joined_walls(check_joined_walls, region->perimeters);
+                check_joined_walls(check_joined_walls, region->fills);
+            }
+    // Changing Arachne width must not force a separate pressure/travel event.
+    CHECK(variable_width_joins > 0);
+    const Vec2d center = get_extents(print.objects().front()->layers().front()->lslices)
+                             .center().cast<double>() * SCALING_FACTOR;
+    for (const ExtrusionPath &wall : walls)
+        for (const Point3 &point : wall.polyline.points) {
+            const double radius = (point.to_point().cast<double>() * SCALING_FACTOR - center).norm();
+            CAPTURE(wall.width, wall.height, wall.inset_idx, radius, center.x(), center.y());
+            CHECK(radius - 0.5 * wall.width >= 1.45);
+            CHECK(radius + 0.5 * wall.width <= 3.05);
+        }
+
+    // Keep the G-code support audit as a guard against a future implementation
+    // reintroducing an unbonded partial wall while still satisfying the simple
+    // entity-count assertion above.
+    struct Segment { Vec3d start; Vec3d end; bool conventional_wall; };
+    std::vector<Segment> deposited;
+    size_t wall_crossings = 0;
+    size_t wall_underpasses = 0;
+    double unsupported_run = 0.;
+    double maximum_unsupported_run = 0.;
+    std::optional<Vec3d> previous_extrusion_end;
+    std::string type;
+    GCodeReader reader;
+    reader.parse_buffer(Slic3r::Test::gcode(print),
+        [&](GCodeReader &self, const GCodeReader::GCodeLine &line) {
+            const std::string comment(line.comment());
+            if (comment.rfind("TYPE:", 0) == 0)
+                type = comment.substr(5);
+            if (!line.extruding(self) || line.dist_XY(self) <= 0.01)
+                return;
+            const Segment current{
+                Vec3d(self.x(), self.y(), self.z()),
+                Vec3d(line.new_X(self), line.new_Y(self), line.new_Z(self)),
+                type == "Outer wall" || type == "Inner wall" || type == "Brick wall"};
+            if (type == "Non-planar top surface" || type == "Non-planar transition") {
+                const Vec2d delta = (current.end - current.start).head<2>();
+                const auto cross = [](const Vec2d &a, const Vec2d &b) {
+                    return a.x() * b.y() - a.y() * b.x();
+                };
+                for (const Segment &previous : deposited) {
+                    if (!previous.conventional_wall)
+                        continue;
+                    const Vec2d other_delta = (previous.end - previous.start).head<2>();
+                    const double denominator = cross(delta, other_delta);
+                    if (std::abs(denominator) < 1e-10)
+                        continue;
+                    const Vec2d offset = (previous.start - current.start).head<2>();
+                    const double t = cross(offset, other_delta) / denominator;
+                    const double u = cross(offset, delta) / denominator;
+                    if (t <= 1e-6 || t >= 1. - 1e-6 || u <= 1e-6 || u >= 1. - 1e-6)
+                        continue;
+                    const double z = current.start.z() + t * (current.end.z() - current.start.z());
+                    const double previous_z = previous.start.z() + u * (previous.end.z() - previous.start.z());
+                    if (std::abs(z - previous_z) < 0.05)
+                        ++wall_crossings;
+                    if (previous_z - z >= 0.05 && previous_z - z < 0.18)
+                        ++wall_underpasses;
+                }
+            }
+            if (!previous_extrusion_end ||
+                (current.start - *previous_extrusion_end).norm() > 0.01)
+                unsupported_run = 0.;
+            if (comment.find("non-planar perimeter") != std::string::npos ||
+                type == "Non-planar transition") {
+                const Vec3d midpoint = 0.5 * (current.start + current.end);
+                const bool supported = std::any_of(
+                    deposited.rbegin(), deposited.rend(),
+                    [&](const Segment &candidate) {
+                        const Vec2d delta = candidate.end.head<2>() -
+                                            candidate.start.head<2>();
+                        const double denominator = delta.squaredNorm();
+                        const double t = denominator <= EPSILON ? 0. :
+                            std::clamp(
+                                (midpoint.head<2>() -
+                                 candidate.start.head<2>()).dot(delta) /
+                                    denominator,
+                                0., 1.);
+                        const Vec3d support = candidate.start +
+                                              t * (candidate.end - candidate.start);
+                        const double gap = midpoint.z() - support.z();
+                        return (midpoint.head<2>() - support.head<2>()).norm() <= 0.4 &&
+                               gap >= 0.04 && gap <= 0.26;
+                    });
+                unsupported_run = supported ? 0. :
+                    unsupported_run + (current.end - current.start).head<2>().norm();
+                maximum_unsupported_run = std::max(
+                    maximum_unsupported_run, unsupported_run);
+            }
+            deposited.emplace_back(current);
+            previous_extrusion_end = current.end;
+        });
+    // Normal perimeter overhang policy permits a short cantilever, but a
+    // projected ring may never become a long floating post-process loop.
+    CHECK(maximum_unsupported_run <= 0.8);
+    CHECK(wall_crossings == 0);
+    CHECK(wall_underpasses == 0);
 }
 
 TEST_CASE("Narrow supported top caps remain eligible for non-planar finishing",
@@ -3815,8 +4917,9 @@ TEST_CASE("Non-planar skins exclude normal paths from their top footprint", "[Fi
     Print nonplanar;
     Slic3r::Test::init_and_process_print(
         {shallow_top_wedge(8.)}, nonplanar,
-        {{"nonplanar_top_surface", 1}, {"wall_loops", 3},
-         {"staggered_perimeters", 1},
+        {{"top_surface_z_mode", "nonplanar_top_surface"},
+         {"nonplanar_top_surface", 1}, {"wall_loops", 3},
+         {"perimeter_layering", "brick"},
          {"top_surface_expansion", 0.}, {"zaa_enabled", 0}, {"layer_height", 0.2}});
 
     // Clipping closed loops may split one wall into several path entities, so
@@ -3849,7 +4952,8 @@ TEST_CASE("Non-planar top skins smooth exposed interlocking wall courses",
     Print print;
     Slic3r::Test::init_and_process_print(
         {shallow_top_wedge(8.), std::move(interlocking_control)}, print,
-        {{"nonplanar_top_surface", 1},
+        {{"top_surface_z_mode", "nonplanar_top_surface"},
+         {"nonplanar_top_surface", 1},
          {"perimeter_layering", "interlocking_walls"},
          {"interlocking_wall_amplitude", 0.08},
          {"interlocking_wall_wavelength", 6.0},
@@ -3875,33 +4979,40 @@ TEST_CASE("Non-planar top skins smooth exposed interlocking wall courses",
 TEST_CASE("Non-planar Benchy roof output preserves chimney walls and connected blends",
           "[Fill][NonplanarSurface][GCode][Regression]")
 {
+    const unsigned int original_log_level = get_logging_level();
+    ScopeGuard restore_log_level([original_log_level]() { set_logging_level(original_log_level); });
+    if (std::getenv("ORCA_NONPLANAR_REGRESSION_GCODE") != nullptr)
+        set_logging_level(4);
     const std::string perimeter_mode = GENERATE(
         std::string("standard"), std::string("brick"),
         std::string("interlocking_walls"));
-    CAPTURE(perimeter_mode);
+    const bool hybrid = GENERATE(false, true);
+    CAPTURE(perimeter_mode, hybrid);
 
     DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
     config.set_deserialize_strict({
-        {"top_surface_z_mode", "nonplanar_top_surface"},
+        {"top_surface_z_mode", hybrid ?
+            "nonplanar_with_z_contouring_fallback" : "nonplanar_top_surface"},
         {"nonplanar_top_surface", true},
         {"nonplanar_top_surface_max_angle", 45.},
         {"nonplanar_top_surface_layers", 5},
         {"nonplanar_top_surface_resolution", 0.3},
         {"nonplanar_top_surface_min_height", 0.05},
         {"perimeter_layering", perimeter_mode},
-        {"staggered_perimeter_offset", 1},
+        {"staggered_perimeter_offset", "50%"},
         {"interlocking_wall_amplitude", 0.08},
         {"interlocking_wall_wavelength", 6.0},
         {"interlocking_wall_resolution", 0.4},
         {"wall_generator", "arachne"},
         {"wall_loops", 3},
         {"top_shell_layers", 4},
+        {"top_shell_thickness", 0.6},
         {"sparse_infill_density", "15%"},
         {"layer_height", 0.25},
         {"initial_layer_print_height", 0.25},
         {"skirt_loops", 0},
         {"brim_type", "no_brim"},
-        {"zaa_enabled", false}
+        {"zaa_enabled", hybrid}
     });
 
     Print print;
@@ -3916,6 +5027,163 @@ TEST_CASE("Non-planar Benchy roof output preserves chimney walls and connected b
     const std::vector<ExtrusionPath> wall_paths = nonplanar_perimeter_paths(print);
     REQUIRE_FALSE(top_paths.empty());
     REQUIRE_FALSE(wall_paths.empty());
+    // A top-level non-planar entity is emitted as an independent pressure
+    // event. Sub-bead remnants are not useful Arachne width transitions here:
+    // they become isolated dots/dashes with their own seam and retract. The
+    // generator must either merge a fragment into its connected path or keep
+    // the conventional slice for that patch.
+    const auto has_short_standalone_path = [](const ExtrusionPath &path) {
+        const double minimum_run = std::max(
+            0.40, double(path.width));
+        const bool short_run = unscale<double>(path.length()) + EPSILON < minimum_run;
+        if (short_run)
+            WARN("Standalone non-planar path: length=" << unscale<double>(path.length())
+                 << " width=" << path.width << " role=" << int(path.role())
+                 << " feature_course=" << path.nonplanar_feature_course
+                 << " transition=" << path.nonplanar_transition
+                 << " validated=" << path.nonplanar_clearance_validated
+                 << " replacement_remainder=" << path.nonplanar_replacement_remainder
+                 << " start=" << path.first_point3().transpose()
+                 << " end=" << path.last_point3().transpose());
+        return short_run;
+    };
+    // The flattened wall_paths list loses parent-loop identity. A short
+    // width/height subpath inside a continuous loop is not a separate print
+    // event. Test the actual entities, and retain the XYZ join checks below.
+    const auto has_short_wall = [&](auto &&self, const ExtrusionEntity &entity) -> bool {
+        if (const auto *path = dynamic_cast<const ExtrusionPath *>(&entity))
+            return path->nonplanar_surface && has_short_standalone_path(*path);
+        const ExtrusionPaths *parts = nullptr;
+        if (const auto *loop = dynamic_cast<const ExtrusionLoop *>(&entity))
+            parts = &loop->paths;
+        else if (const auto *multipath = dynamic_cast<const ExtrusionMultiPath *>(&entity))
+            parts = &multipath->paths;
+        if (parts) {
+            double length = 0., minimum_run = 0.4;
+            bool nonplanar = false;
+            for (const ExtrusionPath &part : *parts) {
+                length += unscale<double>(part.length());
+                minimum_run = std::max(minimum_run, double(part.width));
+                nonplanar |= part.nonplanar_surface;
+            }
+            const bool short_run = nonplanar && length + EPSILON < minimum_run;
+            if (short_run)
+                WARN("Standalone non-planar chain: length=" << length
+                     << " minimum=" << minimum_run << " parts=" << parts->size()
+                     << " role=" << int(parts->front().role()));
+            return short_run;
+        }
+        if (const auto *collection = dynamic_cast<const ExtrusionEntityCollection *>(&entity))
+            return std::any_of(collection->entities.begin(), collection->entities.end(),
+                [&](const ExtrusionEntity *child) { return self(self, *child); });
+        return false;
+    };
+    for (const PrintObject *object : print.objects())
+        for (const Layer *layer : object->layers())
+            for (const LayerRegion *region : layer->regions()) {
+                CHECK_FALSE(has_short_wall(has_short_wall, region->perimeters));
+                CHECK_FALSE(has_short_wall(has_short_wall, region->fills));
+            }
+    ExtrusionPath short_control(erPerimeter, 0.08, 0.4, 0.2);
+    short_control.nonplanar_surface = true;
+    short_control.polyline.points = {Point3(0, 0, 0), Point3(scale_(0.25), scale_(0.), scale_(0.))};
+    CHECK(has_short_wall(has_short_wall, short_control));
+    ExtrusionPath continuation(short_control);
+    continuation.polyline.points = {short_control.last_point3(), Point3(scale_(0.5), scale_(0.), scale_(0.))};
+    ExtrusionMultiPath connected_control(ExtrusionPaths{short_control, continuation});
+    CHECK_FALSE(has_short_wall(has_short_wall, connected_control));
+
+    size_t sparse_transition_paths = 0;
+    size_t solid_support_transition_paths = 0;
+    size_t solid_transition_paths = 0;
+    std::map<size_t, double> sparse_transition_length_by_layer;
+    std::map<size_t, double> solid_transition_length_by_layer;
+    for (const PrintObject *object : print.objects())
+        for (const Layer *layer : object->layers())
+            for (const LayerRegion *region : layer->regions()) {
+                for (const ExtrusionPath *path : test_extrusion_paths(region->fills)) {
+                    if (!path->nonplanar_transition)
+                        continue;
+                    if (path->role() == erInternalInfill) {
+                        ++sparse_transition_paths;
+                        sparse_transition_length_by_layer[layer->id()] +=
+                            unscale<double>(path->length());
+                    } else if (path->role() == erSolidInfill) {
+                        ++solid_support_transition_paths;
+                    } else if (path->role() == erTopSolidInfill) {
+                        ++solid_transition_paths;
+                        solid_transition_length_by_layer[layer->id()] +=
+                            unscale<double>(path->length());
+                    }
+                }
+            }
+    CAPTURE(sparse_transition_paths, solid_support_transition_paths,
+            solid_transition_paths);
+    CHECK(sparse_transition_paths > 0);
+    CHECK(solid_support_transition_paths > 0);
+    REQUIRE_FALSE(sparse_transition_length_by_layer.empty());
+    // The exposed course is the only top-solid raster. A transition carrying
+    // top-solid role is a duplicated finishing skin and recreates the former
+    // excessive-material/post-processing behavior.
+    CHECK(solid_transition_paths == 0);
+    CHECK(solid_transition_length_by_layer.empty());
+    const double maximum_sparse_course_length = std::max_element(
+        sparse_transition_length_by_layer.begin(),
+        sparse_transition_length_by_layer.end(),
+        [](const auto &left, const auto &right) {
+            return left.second < right.second;
+        })->second;
+    const double finishing_surface_length = std::accumulate(
+        top_paths.begin(), top_paths.end(), 0.,
+        [](double length, const ExtrusionPath &path) {
+            return length + unscale<double>(path.length());
+        });
+    CAPTURE(maximum_sparse_course_length, finishing_surface_length);
+    // Role metadata alone is insufficient: a complete top raster relabeled
+    // as internal infill would still make every transition course solid.
+    // At the explicit 15% density above, the deposited structural course must
+    // contain materially less extrusion than a requested finishing course.
+    CHECK(maximum_sparse_course_length < 0.5 * finishing_surface_length);
+    // A fixed-Z wall is an ordinary owner-layer perimeter. Leaving only the
+    // provisional non-planar flag on it makes the writer emit a separate
+    // closed operation without any transition or support relationship.
+    // A pitched roof's level end edges are legitimate portions of a sloped
+    // loop. Test the complete extrusion entity, not flattened width/height
+    // samples which no longer retain their parent wall's topology.
+    const auto has_fixed_nonplanar_wall = [&](auto &&self, const ExtrusionEntity &entity) -> bool {
+        if (const auto *collection = dynamic_cast<const ExtrusionEntityCollection *>(&entity))
+            return std::any_of(collection->entities.begin(), collection->entities.end(),
+                [&](const ExtrusionEntity *child) { return self(self, *child); });
+        coord_t minimum_z = std::numeric_limits<coord_t>::max();
+        coord_t maximum_z = std::numeric_limits<coord_t>::lowest();
+        bool nonplanar_wall = false;
+        for (const ExtrusionPath *path : test_extrusion_paths(entity)) {
+            nonplanar_wall |= is_perimeter(path->role()) && path->nonplanar_surface &&
+                !path->nonplanar_schedule_owned &&
+                !(path->nonplanar_feature_transition && path->nonplanar_leveling_transition);
+            for (const Point3 &point : path->polyline.points) {
+                minimum_z = std::min(minimum_z, point.z());
+                maximum_z = std::max(maximum_z, point.z());
+            }
+        }
+        return nonplanar_wall && minimum_z <= maximum_z &&
+            maximum_z - minimum_z < scale_(0.001);
+    };
+    for (const PrintObject *object : print.objects())
+        for (const Layer *layer : object->layers())
+            for (const LayerRegion *region : layer->regions()) {
+                CHECK_FALSE(has_fixed_nonplanar_wall(has_fixed_nonplanar_wall, region->perimeters));
+                CHECK_FALSE(has_fixed_nonplanar_wall(has_fixed_nonplanar_wall, region->fills));
+            }
+    CHECK(has_fixed_nonplanar_wall(has_fixed_nonplanar_wall, short_control));
+    ExtrusionPath sloped_control(continuation);
+    sloped_control.polyline.points.back().z() = scale_(0.1);
+    ExtrusionMultiPath mixed_slope_control(ExtrusionPaths{short_control, sloped_control});
+    CHECK_FALSE(has_fixed_nonplanar_wall(has_fixed_nonplanar_wall, mixed_slope_control));
+    // Grouping disconnected paths in a collection must not hide a bad wall.
+    ExtrusionEntityCollection disconnected_control;
+    disconnected_control.entities = {short_control.clone(), sloped_control.clone()};
+    CHECK(has_fixed_nonplanar_wall(has_fixed_nonplanar_wall, disconnected_control));
     // The finishing skin owns the requested wall stack. Feature-transition
     // rings around the chimney are a separate dependency and must not hide a
     // missing roof inset in this assertion: omitting an inner roof wall while
@@ -3935,7 +5203,12 @@ TEST_CASE("Non-planar Benchy roof output preserves chimney walls and connected b
     CHECK_FALSE(has_planar_path_inside_nonplanar_top_coverage(print));
 
     const std::string generated_gcode = Slic3r::Test::gcode(print);
-    std::ofstream("/tmp/nonplanar-benchy-focused.gcode") << generated_gcode;
+    if (const char *output = std::getenv("ORCA_NONPLANAR_REGRESSION_GCODE")) {
+        std::ofstream file(output);
+        REQUIRE(file.good());
+        file << generated_gcode;
+        REQUIRE(file.good());
+    }
     REQUIRE_FALSE(generated_gcode.empty());
     CHECK(generated_gcode.find(";TYPE:Non-planar top surface") != std::string::npos);
     CHECK(generated_gcode.find(";TYPE:Non-planar transition") != std::string::npos);
@@ -3957,16 +5230,33 @@ TEST_CASE("Non-planar Benchy roof output preserves chimney walls and connected b
         Vec3d end;
     };
     std::vector<DepositedSegment> deposited_segments;
+    // Broad phase only: every bead within the existing 0.4 mm contact radius
+    // is indexed. Keep the exact distance/Z/order checks below unchanged.
+    std::map<std::pair<int, int>, std::vector<size_t>> support_grid;
+    const auto deposit = [&](const Vec3d &start, const Vec3d &end) {
+        const size_t index = deposited_segments.size();
+        deposited_segments.push_back({start, end});
+        const Vec2d lower = start.head<2>().cwiseMin(end.head<2>()) - Vec2d::Constant(0.4);
+        const Vec2d upper = start.head<2>().cwiseMax(end.head<2>()) + Vec2d::Constant(0.4);
+        for (int x = int(std::floor(lower.x())); x <= int(std::floor(upper.x())); ++x)
+            for (int y = int(std::floor(lower.y())); y <= int(std::floor(upper.y())); ++y)
+                support_grid[{x, y}].push_back(index);
+    };
     size_t unsupported_nonplanar_segments = 0;
     std::map<std::string, size_t> unsupported_nonplanar_by_comment;
     std::vector<std::string> unsupported_nonplanar_samples;
+    std::map<std::string, std::vector<std::string>>
+        unsupported_nonplanar_samples_by_comment;
     std::string support_type;
+    double support_height = config.opt_float("layer_height");
     GCodeReader support_reader;
     support_reader.parse_buffer(generated_gcode,
         [&](GCodeReader &self, const GCodeReader::GCodeLine &line) {
             const std::string comment(line.comment());
             if (comment.rfind("TYPE:", 0) == 0)
                 support_type = comment.substr(5);
+            if (comment.rfind("HEIGHT:", 0) == 0)
+                support_height = std::stod(comment.substr(7));
             if (!line.extruding(self) || line.dist_XY(self) <= 0.01)
                 return;
             const Vec3d start(self.x(), self.y(), self.z());
@@ -3982,63 +5272,98 @@ TEST_CASE("Non-planar Benchy roof output preserves chimney walls and connected b
                 // surface courses that incorrectly float while claiming to be
                 // supported; bridge paths are validated by bridge tests.
                 if (comment.find("(bridge)") != std::string::npos) {
-                    deposited_segments.push_back({
+                    deposit(
                         Vec3d(self.x(), self.y(), self.z()),
-                        Vec3d(line.new_X(self), line.new_Y(self), line.new_Z(self))});
+                        Vec3d(line.new_X(self), line.new_Y(self), line.new_Z(self)));
                     return;
                 }
-                const Vec3d midpoint = 0.5 * (start + end);
-                bool supported = false;
-                double nearest_support_xy = std::numeric_limits<double>::max();
-                double nearest_support_gap = std::numeric_limits<double>::max();
-                for (auto candidate = deposited_segments.rbegin();
-                     candidate != deposited_segments.rend(); ++candidate) {
-                    const Vec2d delta =
-                        candidate->end.head<2>() - candidate->start.head<2>();
-                    const double denominator = delta.squaredNorm();
-                    const double t = denominator <= EPSILON ? 0. : std::clamp(
-                        (midpoint.head<2>() - candidate->start.head<2>()).dot(delta) /
-                            denominator,
-                        0., 1.);
-                    const Vec2d projected = candidate->start.head<2>() + t * delta;
-                    const double xy_distance =
-                        (projected - midpoint.head<2>()).norm();
-                    const double support_z = candidate->start.z() +
-                        t * (candidate->end.z() - candidate->start.z());
-                    const double gap = midpoint.z() - support_z;
-                    if (xy_distance < nearest_support_xy) {
-                        nearest_support_xy = xy_distance;
-                        nearest_support_gap = gap;
+                // A single midpoint can pass while the ends of a long roof
+                // raster hang over missing fillets. Check the entire exposed
+                // skin at sub-bead spacing against already deposited material.
+                const size_t support_samples = support_type == "Non-planar top surface" ?
+                    std::max<size_t>(1, size_t(std::ceil((end - start).norm() / 0.2))) : 1;
+                for (size_t sample_idx = 0; sample_idx < support_samples; ++sample_idx) {
+                    const Vec3d midpoint = start +
+                        (double(sample_idx) + 0.5) / double(support_samples) * (end - start);
+                    bool supported = false;
+                    double nearest_support_xy = std::numeric_limits<double>::max();
+                    double nearest_support_gap = std::numeric_limits<double>::max();
+                    double smallest_support_gap = std::numeric_limits<double>::max();
+                    const auto bucket = support_grid.find({int(std::floor(midpoint.x())),
+                                                           int(std::floor(midpoint.y()))});
+                    if (bucket != support_grid.end())
+                    for (auto index = bucket->second.rbegin(); index != bucket->second.rend(); ++index) {
+                        const DepositedSegment *candidate = &deposited_segments[*index];
+                        const Vec2d delta =
+                            candidate->end.head<2>() - candidate->start.head<2>();
+                        const double denominator = delta.squaredNorm();
+                        const double t = denominator <= EPSILON ? 0. : std::clamp(
+                            (midpoint.head<2>() - candidate->start.head<2>()).dot(delta) /
+                                denominator,
+                            0., 1.);
+                        const Vec2d projected = candidate->start.head<2>() + t * delta;
+                        const double xy_distance =
+                            (projected - midpoint.head<2>()).norm();
+                        const double support_z = candidate->start.z() +
+                            t * (candidate->end.z() - candidate->start.z());
+                        const double gap = midpoint.z() - support_z;
+                        if (xy_distance < nearest_support_xy) {
+                            nearest_support_xy = xy_distance;
+                            nearest_support_gap = gap;
+                        }
+                        if (xy_distance > 0.4)
+                            continue;
+                        if (gap >= 0.04)
+                            smallest_support_gap = std::min(smallest_support_gap, gap);
+                        // Both the deposited and tested XYZ coordinates are
+                        // rounded to 0.001 mm in G-code. Their separation can
+                        // consequently differ by up to 0.001 mm from the
+                        // geometric support limit; do not report that rounding
+                        // as a missing support course.
+                        constexpr double gcode_z_rounding = 0.001;
+                        if (gap >= 0.04 && gap <=
+                                support_height + 0.06 + gcode_z_rounding) {
+                            supported = true;
+                            break;
+                        }
                     }
-                    if (xy_distance > 0.4)
-                        continue;
-                    if (gap >= 0.04 && gap <=
-                            config.opt_float("layer_height") + 0.06) {
-                        supported = true;
-                        break;
+                    if (!supported) {
+                        ++unsupported_nonplanar_segments;
+                        const std::string unsupported_kind =
+                            support_type + (comment.empty() ? "" : ":" + comment);
+                        ++unsupported_nonplanar_by_comment[unsupported_kind];
+                        const std::string sample =
+                                "(" + std::to_string(midpoint.x()) + "," +
+                                std::to_string(midpoint.y()) + "," +
+                                std::to_string(midpoint.z()) + ") " +
+                                unsupported_kind +
+                                " nearest_local_xy=" + std::to_string(nearest_support_xy) +
+                                " gap=" + std::to_string(nearest_support_gap) +
+                                " smallest_gap=" + std::to_string(smallest_support_gap);
+                        if (unsupported_nonplanar_samples.size() < 8)
+                            unsupported_nonplanar_samples.emplace_back(sample);
+                        auto &kind_samples =
+                            unsupported_nonplanar_samples_by_comment[unsupported_kind];
+                        if (kind_samples.size() < 5)
+                            kind_samples.emplace_back(sample);
                     }
-                }
-                if (!supported) {
-                    ++unsupported_nonplanar_segments;
-                    ++unsupported_nonplanar_by_comment[
-                        comment.empty() ? support_type : comment];
-                    if (unsupported_nonplanar_samples.size() < 8)
-                        unsupported_nonplanar_samples.emplace_back(
-                            "(" + std::to_string(midpoint.x()) + "," +
-                            std::to_string(midpoint.y()) + "," +
-                            std::to_string(midpoint.z()) + ") " +
-                            (comment.empty() ? support_type : comment) +
-                            " nearest_xy=" + std::to_string(nearest_support_xy) +
-                            " gap=" + std::to_string(nearest_support_gap));
                 }
             }
-            deposited_segments.push_back({start, end});
+            deposit(start, end);
         });
     std::string unsupported_summary;
     for (const auto &[comment, count] : unsupported_nonplanar_by_comment)
         unsupported_summary += comment + '=' + std::to_string(count) + ' ';
     CAPTURE(unsupported_summary);
     CAPTURE(unsupported_nonplanar_samples);
+    std::string categorized_unsupported_samples;
+    for (const auto &[comment, samples] :
+         unsupported_nonplanar_samples_by_comment) {
+        categorized_unsupported_samples += comment + ": ";
+        for (const std::string &sample : samples)
+            categorized_unsupported_samples += sample + " | ";
+    }
+    CAPTURE(categorized_unsupported_samples);
     CHECK(unsupported_nonplanar_segments == 0);
 
     struct EmittedSegment {
@@ -4526,8 +5851,19 @@ TEST_CASE("Non-planar Benchy roof output preserves chimney walls and connected b
         bool has_detached_open_fragment {false};
     };
     std::map<size_t, FeatureCourseWalls> feature_course_walls;
+    const auto check_feature_connections = [](const ExtrusionPaths &paths) {
+        for (size_t idx = 1; idx < paths.size(); ++idx) {
+            const ExtrusionPath &before = paths[idx - 1];
+            const ExtrusionPath &after = paths[idx];
+            if (!before.nonplanar_feature_transition || !after.nonplanar_feature_transition ||
+                before.nonplanar_feature_course != after.nonplanar_feature_course)
+                continue;
+            CAPTURE(before.nonplanar_feature_course, before.inset_idx, after.inset_idx);
+            CHECK((before.last_point3() - after.first_point3()).cast<double>().norm() <= scale_(0.005));
+        }
+    };
     const auto collect_feature_courses =
-        [&feature_course_walls](auto &&self,
+        [&feature_course_walls, &check_feature_connections](auto &&self,
                                 const ExtrusionEntity &entity,
                                 bool connected_parent) -> void {
             const auto collect_path = [&feature_course_walls](
@@ -4553,11 +5889,14 @@ TEST_CASE("Non-planar Benchy roof output preserves chimney walls and connected b
             };
             if (const auto *path = dynamic_cast<const ExtrusionPath *>(&entity))
                 collect_path(*path, connected_parent);
-            else if (const auto *loop = dynamic_cast<const ExtrusionLoop *>(&entity))
+            else if (const auto *loop = dynamic_cast<const ExtrusionLoop *>(&entity)) {
+                check_feature_connections(loop->paths);
                 for (const ExtrusionPath &path : loop->paths)
                     collect_path(path, true);
+            }
             else if (const auto *multipath =
                          dynamic_cast<const ExtrusionMultiPath *>(&entity)) {
+                check_feature_connections(multipath->paths);
                 for (const ExtrusionPath &path : multipath->paths)
                     collect_path(path, true);
                 const auto feature = std::find_if(
@@ -4783,7 +6122,8 @@ TEST_CASE("Detailed toolhead geometry limits non-planar surface angle", "[Fill][
     Print print;
     Slic3r::Test::init_and_process_print(
         {shallow_top_wedge(8.)}, print,
-        {{"nonplanar_top_surface", 1},
+        {{"top_surface_z_mode", "nonplanar_top_surface"},
+         {"nonplanar_top_surface", 1},
          {"nonplanar_top_surface_max_angle", 45},
          {"sequential_print_gantry_geometry",
           R"({"slices":[{"height":"1","type":"convex","polygons":["-10,-10;10,-10;10,10;-10,10"]}]})"},
@@ -4806,6 +6146,43 @@ TEST_CASE("Detailed toolhead geometry limits non-planar surface angle", "[Fill][
                         path->role() == erTopSolidInfill)
                         has_planar_top_solid = true;
     CHECK(has_planar_top_solid);
+}
+
+TEST_CASE("Z contouring processes eight translated and rotated instances",
+          "[Fill][ContourZ][Instances][Regression]")
+{
+    const bool rotate_copies = GENERATE(false, true);
+    DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+    config.set_deserialize_strict({{"top_surface_z_mode", "z_contouring"},
+                                   {"zaa_enabled", true}, {"layer_height", 0.2}});
+    Model model;
+    Print print;
+    Test::init_print({shallow_top_wedge(8.)}, print, model, config);
+    ModelObject *object = model.objects.front();
+    const ModelInstance &source = *object->instances.front();
+    for (size_t i = 1; i < 8; ++i) {
+        ModelInstance *instance = object->add_instance(source);
+        instance->set_offset(source.get_offset() + Vec3d(40. * (i % 4), 40. * (i / 4), 0.));
+        if (rotate_copies && i % 2)
+            instance->set_rotation(Vec3d(0., 0., M_PI / 2.));
+    }
+    object->invalidate_bounding_box();
+    print.apply(model, config);
+    REQUIRE_NOTHROW(print.process());
+    size_t instances = 0;
+    for (const PrintObject *printed : print.objects()) {
+        instances += printed->instances().size();
+        size_t contoured_paths = 0;
+        for (const Layer *layer : printed->layers())
+            for (const LayerRegion *region : layer->regions())
+                for (const ExtrusionEntityCollection *collection : {&region->perimeters, &region->fills})
+                    for (const ExtrusionEntity *entity : collection->flatten().entities)
+                        if (const auto *path = dynamic_cast<const ExtrusionPath *>(entity))
+                            contoured_paths += path->z_contoured;
+        CHECK(contoured_paths > 0);
+    }
+    CHECK(instances == 8);
+    CHECK(print.objects().size() == (rotate_copies ? 2 : 1));
 }
 
 TEST_CASE("Hybrid top surfaces Z contour only paths rejected by non-planar clearance",
@@ -4842,6 +6219,34 @@ TEST_CASE("Hybrid top surfaces Z contour only paths rejected by non-planar clear
          {"wall_loops", 3}, {"layer_height", 0.2}});
     CHECK_FALSE(nonplanar_top_paths(accepted).empty());
     CHECK_FALSE(has_planar_path_inside_nonplanar_top_coverage(accepted));
+
+    size_t accepted_fallback_paths = 0;
+    size_t planar_replacement_remainders = 0;
+    for (const PrintObject *object : accepted.objects())
+        for (const Layer *layer : object->layers())
+            for (const LayerRegion *region : layer->regions())
+                for (const ExtrusionEntityCollection *collection :
+                     {&region->fills, &region->perimeters})
+                    for (const ExtrusionEntity *entity : collection->flatten().entities)
+                        if (const auto *path = dynamic_cast<const ExtrusionPath *>(entity)) {
+                            accepted_fallback_paths +=
+                                !path->nonplanar_surface && path->z_contoured &&
+                                path->role() == erTopSolidInfill;
+                            if (path->nonplanar_replacement_remainder) {
+                                ++planar_replacement_remainders;
+                                CHECK_FALSE(path->z_contoured);
+                                if (path->role() == erTopSolidInfill)
+                                    CHECK(unscale<double>(path->length()) + EPSILON >=
+                                          std::max(0.05, double(path->width)));
+                            }
+                        }
+    // The hybrid pass is a fallback for rejected patches, not a second
+    // deformation pass over conventional fragments left by an accepted skin.
+    // Contouring those fragments creates isolated variable-Z dashes which
+    // remain as floating garbage when the non-planar extrusion is hidden.
+    CAPTURE(planar_replacement_remainders);
+    CHECK(planar_replacement_remainders > 0);
+    CHECK(accepted_fallback_paths == 0);
 }
 
 TEST_CASE("Ironing follows eligible non-planar top surfaces", "[Fill][NonplanarSurface]")
@@ -4849,7 +6254,8 @@ TEST_CASE("Ironing follows eligible non-planar top surfaces", "[Fill][NonplanarS
     Print print;
     Slic3r::Test::init_and_process_print(
         {shallow_top_wedge(8.)}, print,
-        {{"nonplanar_top_surface", 1},
+        {{"top_surface_z_mode", "nonplanar_top_surface"},
+         {"nonplanar_top_surface", 1},
          {"nonplanar_top_surface_max_angle", 45},
          {"nonplanar_top_surface_layers", 5},
          {"ironing_type", "top"},

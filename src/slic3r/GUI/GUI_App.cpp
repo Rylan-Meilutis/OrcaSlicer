@@ -3,6 +3,7 @@
 #include "libslic3r/Technologies.hpp"
 #include "libslic3r/Platform.hpp"
 #include "GUI_App.hpp"
+#include "libslic3r/AppUpdate.hpp"
 #include "BindDialog.hpp"
 #include "DeviceManager.hpp"
 #include "HMS.hpp"
@@ -3185,10 +3186,10 @@ bool GUI_App::on_init_inner()
                 bool skip_this_version = false;
                 if (!skip_version_str.empty()) {
                     BOOST_LOG_TRIVIAL(info) << "new version = " << version_info.version_str << ", skip version = " << skip_version_str;
-                    if (version_info.version_str <= skip_version_str) {
+                    if (app_release_is_skipped(version_info.version_str, skip_version_str)) {
                         skip_this_version = true;
                     } else {
-                        app_config->set("skip_version", "");
+                        app_config->set("app", "skip_version", "");
                         skip_this_version = false;
                     }
                 }
@@ -5806,19 +5807,6 @@ void GUI_App::check_new_version(bool show_tips, int by_user)
     }).perform();
 }
 
-//parse the string, if it doesn't contain a valid version string, return invalid version.
-Semver get_version(const std::string& str, const std::regex& regexp) {
-    std::smatch match;
-    if (std::regex_match(str, match, regexp)) {
-        std::string version_cleaned = match[0];
-        const boost::optional<Semver> version = Semver::parse(version_cleaned);
-        if (version.has_value()) {
-            return *version;
-        }
-    }
-    return Semver::invalid();
-}
-
 namespace
 {
 
@@ -6065,7 +6053,7 @@ void GUI_App::check_new_version_sf(bool show_tips, int by_user)
     };
 
     const std::string query_string = build_updater_query(query);
-    if (!query_string.empty()) {
+    if (!query_string.empty() && version_check_url.find("https://api.github.com/") != 0) {
         const bool has_query = version_check_url.find('?') != std::string::npos;
         if (!has_query)
             version_check_url.push_back('?');
@@ -6075,33 +6063,42 @@ void GUI_App::check_new_version_sf(bool show_tips, int by_user)
     }
 
     auto http = Http::get(version_check_url);
-    maybe_attach_updater_signature(http, query_string, version_check_url);
+    if (version_check_url.find("https://api.github.com/") != 0)
+        maybe_attach_updater_signature(http, query_string, version_check_url);
 
     http.header("accept", "application/vnd.github.v3+json")
         .timeout_connect(5)
         .timeout_max(10)
-        .on_error([&](std::string body, std::string error, unsigned http_status) {
+        .on_error([this, by_user](std::string body, std::string error, unsigned http_status) {
           (void)body;
           BOOST_LOG_TRIVIAL(error) << format("Error getting: `%1%`: HTTP %2%, %3%", "check_new_version_sf", http_status,
                                              error);
+          if (by_user != 0)
+              CallAfter([this] {
+                  MessageDialog dialog(mainframe,
+                      _L("Unable to check for updates. Check your connection and try again."),
+                      _L("Software update"), wxOK | wxICON_WARNING);
+                  dialog.ShowModal();
+              });
         })
         .on_complete([this, by_user, check_stable_only](std::string body, unsigned http_status) {
           if (http_status != 200)
             return;
+          // version_info is read by the modal dialog and skip-version handler;
+          // publish it on the GUI thread, not the HTTP worker.
+          CallAfter([this, by_user, check_stable_only, body = std::move(body)]() mutable {
           try {
             boost::trim(body);
-            if (body.empty()) {
-                if (by_user != 0)
-                    this->no_new_version();
-                return;
-            }
+            if (body.empty())
+                throw std::runtime_error("Empty application update response");
 
             boost::property_tree::ptree root;
             std::stringstream           json_stream(body);
             boost::property_tree::read_json(json_stream, root);
 
-            std::regex matcher("[0-9]+\\.[0-9]+(\\.[0-9]+)*(-[A-Za-z0-9]+)?(\\+[A-Za-z0-9]+)?");
-            Semver    current_version = get_version(SoftFever_VERSION, matcher);
+            const auto current_version = parse_app_release_version(SoftFever_VERSION);
+            if (!current_version)
+                throw std::runtime_error("Invalid installed application version");
             Semver    best_pre(0, 0, 0);
             Semver    best_release(0, 0, 0);
             bool      best_pre_valid = false;
@@ -6120,12 +6117,15 @@ void GUI_App::check_new_version_sf(bool show_tips, int by_user)
                 if (!tag.empty() && tag.front() == 'v')
                     tag.erase(0, 1);
 
-                Semver tag_version = get_version(tag, matcher);
-                if (!tag_version.valid())
+                const auto parsed_version = parse_app_release_version(tag);
+                if (!parsed_version || node.get_optional<bool>("draft").get_value_or(false))
                     return;
+                const Semver &tag_version = *parsed_version;
 
                 const bool is_prerelease = node.get_optional<bool>("prerelease").get_value_or(false);
                 const std::string html_url = node.get_optional<std::string>("html_url").get_value_or(std::string());
+                if (html_url.rfind("https://", 0) != 0)
+                    return;
                 const std::string body_copy = node.get_optional<std::string>("body").get_value_or(std::string());
 
                 if (is_prerelease) {
@@ -6148,6 +6148,8 @@ void GUI_App::check_new_version_sf(bool show_tips, int by_user)
             if (root.get_optional<std::string>("tag_name")) {
                 consider_release(root);
             } else {
+                if (body.front() != '[')
+                    throw std::runtime_error("Expected release object or array");
                 for (const auto& child : root)
                     consider_release(child.second);
             }
@@ -6175,7 +6177,7 @@ void GUI_App::check_new_version_sf(bool show_tips, int by_user)
                 return;
             }
 
-            if (current_version.valid() && chosen_version <= current_version) {
+            if (chosen_version <= *current_version) {
                 if (by_user != 0)
                     this->no_new_version();
                 return;
@@ -6187,9 +6189,20 @@ void GUI_App::check_new_version_sf(bool show_tips, int by_user)
             version_info.force_upgrade = false;
 
             wxCommandEvent* evt = new wxCommandEvent(EVT_SLIC3R_VERSION_ONLINE);
+            evt->SetInt(by_user);
             evt->SetString((prefer_release ? best_release : best_pre).to_string());
             GUI::wxGetApp().QueueEvent(evt);
-          } catch (...) {}
+          } catch (const std::exception &error) {
+              BOOST_LOG_TRIVIAL(error) << "Invalid application update response: " << error.what();
+              if (by_user != 0)
+                  CallAfter([this] {
+                      MessageDialog dialog(mainframe,
+                          _L("The update server returned an invalid response. Please try again later."),
+                          _L("Software update"), wxOK | wxICON_WARNING);
+                      dialog.ShowModal();
+                  });
+          }
+          });
         });
 
     http.perform();
@@ -9357,13 +9370,6 @@ void GUI_App::refresh_profile_sources(bool force)
     if (candidates.empty())
         return;
 
-    constexpr const char *last_check_key = "profile_sources_last_check";
-    constexpr long long check_interval = 24 * 60 * 60;
-    const long long now = std::time(nullptr);
-    const long long last_check = std::atoll(app_config->get(last_check_key).c_str());
-    if (last_check > 0 && now - last_check < check_interval)
-        return;
-
     // Fetch only revision metadata here. The potentially large profile archives
     // are not downloaded until the user accepts a prompt naming sources whose
     // profile-tree revision actually changed.
@@ -9377,10 +9383,9 @@ void GUI_App::refresh_profile_sources(bool force)
                 return;
             ProfileSourceUpdateResult result = background_manager.check_for_update(
                 source, [token] { return token.expired(); });
-            if (result.error.empty())
-                checked.emplace_back(source, std::move(result));
-            else
+            if (!result.error.empty())
                 BOOST_LOG_TRIVIAL(warning) << "Profile source update check failed for " << source.name << ": " << result.error;
+            checked.emplace_back(source, std::move(result));
         }
         if (token.expired())
             return;
@@ -9399,6 +9404,11 @@ void GUI_App::refresh_profile_sources(bool force)
             const long long now = std::time(nullptr);
             std::vector<ProfileSource> updates;
             for (const auto &[candidate, result] : checked) {
+                for (ProfileSource &source : sources)
+                    if (source.id == candidate.id)
+                        source.last_check = now;
+                if (!result.error.empty())
+                    continue;
                 if (result.update_available) {
                     updates.push_back(candidate);
                     continue;
@@ -9409,7 +9419,6 @@ void GUI_App::refresh_profile_sources(bool force)
                     if (source.id == candidate.id && source.revision.empty())
                         source.revision = result.revision;
             }
-            app_config->set("profile_sources_last_check", std::to_string(now));
             manager.set_sources(sources);
 
             if (updates.empty())
@@ -9451,7 +9460,7 @@ void GUI_App::refresh_profile_sources(bool force)
                         auto found = std::find_if(synchronized.begin(), synchronized.end(),
                             [&](const auto &item) { return item.first == source.id; });
                         if (found != synchronized.end()) {
-                            source.last_sync = now;
+                            source.last_check = source.last_sync = now;
                             source.revision = found->second;
                         }
                     }

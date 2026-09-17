@@ -120,6 +120,28 @@ TEST_CASE("Prusa profile sources replace malformed UTF-8 without terminating syn
     CHECK(filament.at("notes").get<std::string>().find("\xef\xbf\xbd") != std::string::npos);
 }
 
+TEST_CASE("Large Prusa profile sources write Unicode filament names reliably",
+          "[ProfileSources][Regression]")
+{
+    TemporaryDirectory temporary;
+    const fs::path input = temporary.path / "input";
+    const fs::path output = temporary.path / "output";
+
+    std::string contents;
+    for (size_t index = 0; index < 6000; ++index)
+        contents += "[filament:Generated " + std::to_string(index) + "]\nfilament_type = PLA\n";
+    contents += "[filament:igus\xc2\xae iglidur\xc2\xae i150]\nfilament_type = PETG\n";
+    write_file(input / "profiles.ini", contents);
+
+    const Slic3r::ProfileSourceSyncResult result =
+        Slic3r::ProfileSourceManager::convert_prusa_profiles(input.string(), output.string());
+
+    REQUIRE(result.success());
+    CHECK(result.filaments == 6001);
+    const json filament = read_json(output / "filament" / "igus_iglidur_i150.json");
+    CHECK(filament.at("name") == "igus\xc2\xae iglidur\xc2\xae i150");
+}
+
 TEST_CASE("Prusa custom G-code uses Orca placeholders", "[ProfileSources][Regression]")
 {
     TemporaryDirectory temporary;

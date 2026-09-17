@@ -112,6 +112,9 @@ bool Print::invalidate_state_by_config_options(const ConfigOptionResolver & /* n
     // Cache the plenty of parameters, which influence the G-code generator only,
     // or they are only notes not influencing the generated G-code.
     static std::unordered_set<std::string> steps_gcode = {
+        // Resolved role IDs independently invalidate the affected toolpaths.
+        "project_filament_bindings",
+        "project_filament_roles",
         //BBS
         "additional_cooling_fan_speed",
         "reduce_crossing_wall",
@@ -1734,6 +1737,28 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
 
     if (m_objects.empty())
         return {std::string()};
+
+    // Keep old projects readable, but do not let imported or cloud presets
+    // bypass the temporary UI quarantine of unqualified non-planar paths.
+    const auto nonplanar_disabled = [](const char *key) -> StringObjectException {
+        return {L("Non-planar features are temporarily unavailable because their toolpaths are not reliable. Disable this feature before slicing."),
+                nullptr, key};
+    };
+    for (const PrintRegion *region : m_print_regions) {
+        const auto &config = region->config();
+        if (config.nonplanar_top_surface ||
+            config.top_surface_z_mode == TopSurfaceZMode::NonplanarTopSurface ||
+            config.top_surface_z_mode == TopSurfaceZMode::NonplanarWithZContouringFallback)
+            return nonplanar_disabled("top_surface_z_mode");
+        if (config.perimeter_layering == PerimeterLayeringMode::InterlockingWalls ||
+            config.perimeter_layering == PerimeterLayeringMode::Nonplanar)
+            return nonplanar_disabled("perimeter_layering");
+        if (config.nonplanar_infill)
+            return nonplanar_disabled("nonplanar_infill");
+    }
+    for (const PrintObject *object : m_objects)
+        if (object->config().support_ironing_nonplanar)
+            return nonplanar_disabled("support_ironing_nonplanar");
 
     if (extruders.empty())
         return { L("No extrusions under current settings.") };

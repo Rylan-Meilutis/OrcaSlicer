@@ -247,7 +247,7 @@ void UpdatePluginDialog::update_info(std::string json_path)
 }
 
 UpdateVersionDialog::UpdateVersionDialog(wxWindow *parent)
-    : DPIDialog(parent, wxID_ANY, _L("New version of Orca Slicer"), wxDefaultPosition, wxDefaultSize, wxCAPTION | wxCLOSE_BOX | wxRESIZE_BORDER)
+    : DPIDialog(parent, wxID_ANY, _L("Software update"), wxDefaultPosition, wxDefaultSize, wxCAPTION | wxCLOSE_BOX | wxRESIZE_BORDER)
 {
     SetBackgroundColour(*wxWHITE);
 
@@ -289,15 +289,13 @@ UpdateVersionDialog::UpdateVersionDialog(wxWindow *parent)
     if (wxGetApp().app_config->get_bool("developer_mode"))
         m_vebview_release_note->EnableAccessToDevTools();
 
-    m_vebview_release_note->Bind(wxEVT_WEBVIEW_NAVIGATING,[=, count = 0](wxWebViewEvent& event) mutable {
-        count++;
-        if (count == 1) {
-            m_vebview_release_note->SetPage(wxString::FromUTF8(html_source), "");
-        } else if (count >= 3) {
-            // Launch the default browser for links clicked by the user
-            wxLaunchDefaultBrowser(event.GetURL());
-            event.Veto();
-        }
+    m_vebview_release_note->Bind(wxEVT_WEBVIEW_NAVIGATING, [](wxWebViewEvent &event) {
+        const wxString url = event.GetURL();
+        if (url.empty() || url == "about:blank" || url.StartsWith("about:blank#"))
+            return;
+        event.Veto();
+        if (url.StartsWith("https://") || url.StartsWith("http://"))
+            wxLaunchDefaultBrowser(url);
     });
 
 	// fs::path ph(data_dir());
@@ -316,7 +314,7 @@ UpdateVersionDialog::UpdateVersionDialog(wxWindow *parent)
 
     auto sizer_button = new wxBoxSizer(wxHORIZONTAL);
 
-    m_button_download = new Button(this, is_running_in_msix() ? _L("Open Microsoft Store") : _L("Download"));
+    m_button_download = new Button(this, is_running_in_msix() ? _L("Open Microsoft Store") : _L("Open release page"));
     m_button_download->SetStyle(ButtonStyle::Confirm, ButtonType::Choice);
 
     m_button_download->Bind(wxEVT_LEFT_DOWN, [this](wxMouseEvent &e) {
@@ -370,12 +368,8 @@ UpdateVersionDialog::UpdateVersionDialog(wxWindow *parent)
     m_sizer_main->Add(m_simplebook_release_note, 1, wxEXPAND | wxTOP | wxLEFT | wxRIGHT, FromDIP(15));
     m_sizer_main->Add(sizer_button             , 0, wxEXPAND | wxALL                   , FromDIP(15));
 
-    SetSizer(m_sizer_main);
-    Layout();
-    Fit();
-
+    SetSizerAndFit(m_sizer_main);
     SetMinSize(GetSize());
-
     Centre(wxBOTH);
     wxGetApp().UpdateDlgDarkUI(this);
 }
@@ -496,7 +490,8 @@ void UpdateVersionDialog::update_version_info(wxString release_note, wxString ve
     if (is_running_in_msix())
         m_text_up_info->SetLabel(wxString::Format(_L("New version available: %s. Please update OrcaSlicer from the Microsoft Store."), version));
     else
-        m_text_up_info->SetLabel(wxString::Format(_L("Click to download new version in default browser: %s"), version));
+        m_text_up_info->SetLabel(wxString::Format(
+            _L("OrcaSlicer RME %s is available. Open the release page to download the installer for your system."), version));
     auto data_buf_in = release_note.utf8_str();
     auto bg_color = StateColor::darkModeColorFor(wxColour("#FFFFFF")).GetAsString();
     auto fg_color = StateColor::darkModeColorFor(wxColour("#262E30")).GetAsString();
@@ -508,12 +503,11 @@ void UpdateVersionDialog::update_version_info(wxString release_note, wxString ve
     md_html(data_buf_in.data(), data_buf_in.length(), [](const MD_CHAR* text, MD_SIZE size, void* userdata) {
         std::string* out_buf = (std::string*)userdata;
         out_buf->append(text, size);
-    }, (void*) &html_source, MD_DIALECT_GITHUB | MD_FLAG_STRIKETHROUGH | MD_FLAG_WIKILINKS, 0);
+    }, (void*) &html_source, MD_DIALECT_GITHUB | MD_FLAG_STRIKETHROUGH | MD_FLAG_WIKILINKS | MD_FLAG_NOHTML, 0);
     html_source.append("</body></html>");
-    m_vebview_release_note->LoadURL("file://" + (boost::filesystem::path (resources_dir()) / "web/guide/0/index.html").string());
+    m_vebview_release_note->SetPage(wxString::FromUTF8(html_source), "about:blank");
 
     SetMinSize(GetSize());
-    SetMaxSize(GetSize());
     // }
 
     wxGetApp().UpdateDlgDarkUI(this);

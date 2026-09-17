@@ -20,6 +20,7 @@
 #include "../ExtrusionEntity.hpp"
 #include "../ExtrusionEntityCollection.hpp"
 #include "../ShortestPath.hpp"
+#include "FillProgress.hpp"
 
 namespace Slic3r {
 
@@ -110,6 +111,10 @@ struct FillParams
     // Centerlines of retained perimeter paths already scheduled before arc
     // overhangs. Arc paths must terminate rather than cross these obstacles.
     const           Polylines* arc_obstacle_paths{ nullptr };
+    // Subset at the arc's printing height. Raised brick/variable-Z walls are
+    // still collision obstacles, but cannot anchor an arc at a different Z.
+    const           Polylines* arc_support_paths{ nullptr };
+    const           std::vector<coord_t>* arc_support_widths{ nullptr };
     // Arc paths accepted by earlier fill invocations on this layer. Fill
     // surfaces and regions are generated independently, but their final
     // toolpaths share one layer and must not cross one another.
@@ -118,6 +123,9 @@ struct FillParams
     // fragments out of this region prevents the G-code path chain from joining
     // opposite-side fragments back across an existing perimeter.
     const           ExPolygons* arc_obstacle_regions{ nullptr };
+    // Borrowed only for the synchronous fill call. Keeps FillParams trivially
+    // copyable while allowing nested arc families to report/cancel work.
+    const FillProgressCallback* progress{ nullptr };
     bool            dont_sort{ false }; // do not sort the lines, just simply connect them
     bool            can_reverse{true};
 

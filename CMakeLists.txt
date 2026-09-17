@@ -718,6 +718,10 @@ if (SLIC3R_PROFILE)
     add_definitions(-DSLIC3R_PROFILE)
 endif ()
 
+# Keep the developer's step-through build available without forcing the
+# distributed/tested RelWithDebInfo app to run its geometry kernels at -O0.
+option(SLIC3R_UNOPTIMIZED_RELWITHDEBINFO "Disable optimization for step-through debugging" ON)
+if(SLIC3R_UNOPTIMIZED_RELWITHDEBINFO)
 # Disable optimization for RelWithDebInfo
 if(CMAKE_C_FLAGS_RELWITHDEBINFO MATCHES "/O2")
     string(REGEX REPLACE "/O2" "/Od" CMAKE_C_FLAGS_RELWITHDEBINFO "${CMAKE_C_FLAGS_RELWITHDEBINFO}")
@@ -747,6 +751,8 @@ if(MSVC)
 
     set(CMAKE_C_FLAGS_RELWITHDEBINFO "${CMAKE_C_FLAGS_RELWITHDEBINFO} /RTC1")
     set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "${CMAKE_CXX_FLAGS_RELWITHDEBINFO} /RTC1")
+endif()
+
 endif()
 
 list(REMOVE_DUPLICATES CMAKE_C_FLAGS_RELWITHDEBINFO)

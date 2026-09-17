@@ -16,6 +16,7 @@ struct ProfileSource
     std::string name;
     std::string url;
     Format      format {Format::Prusa};
+    long long   last_check {0};
     long long   last_sync {0};
     bool        enabled {false};
     std::string revision;

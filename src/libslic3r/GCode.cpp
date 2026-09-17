@@ -121,13 +121,17 @@ static bool has_variable_z_path(const ExtrusionEntity &entity)
 static bool has_nonplanar_surface_path(const ExtrusionEntity &entity)
 {
     if (const auto *path = dynamic_cast<const ExtrusionPath *>(&entity))
-        return path->nonplanar_surface;
+        return path->nonplanar_surface || path->nonplanar_schedule_owned;
     if (const auto *multipath = dynamic_cast<const ExtrusionMultiPath *>(&entity))
         return std::any_of(multipath->paths.begin(), multipath->paths.end(),
-            [](const ExtrusionPath &path) { return path.nonplanar_surface; });
+            [](const ExtrusionPath &path) {
+                return path.nonplanar_surface || path.nonplanar_schedule_owned;
+            });
     if (const auto *loop = dynamic_cast<const ExtrusionLoop *>(&entity))
         return std::any_of(loop->paths.begin(), loop->paths.end(),
-            [](const ExtrusionPath &path) { return path.nonplanar_surface; });
+            [](const ExtrusionPath &path) {
+                return path.nonplanar_surface || path.nonplanar_schedule_owned;
+            });
     if (const auto *collection = dynamic_cast<const ExtrusionEntityCollection *>(&entity))
         return std::any_of(collection->entities.begin(), collection->entities.end(),
             [](const ExtrusionEntity *child) { return has_nonplanar_surface_path(*child); });
@@ -6679,16 +6683,6 @@ LayerResult GCode::process_layer(
                 // conventional 2D layer grouping; island-local scheduling
                 // could therefore emit a late horizontal course followed by
                 // an earlier sloped course from a neighboring island.
-                for (size_t island_idx : island_order) {
-                    ObjectByExtruder::Island &island = islands[island_idx];
-                    const auto &regions = is_anything_overridden ?
-                        island.by_region_per_copy(
-                            by_region_per_copy_cache,
-                            static_cast<unsigned int>(instance_to_print.instance_id),
-                            extruder_id, print_wipe_extrusions != 0) :
-                        island.by_region;
-                    gcode += this->extrude_nonplanar_surface(print, regions, true);
-                }
                 size_t early_feature_courses = 0;
                 for (size_t island_idx : island_order)
                     early_feature_courses = std::max(
@@ -6703,8 +6697,45 @@ LayerResult GCode::process_layer(
                                 islands[island_idx].by_region, true, course);
                         });
                     if (leveling_course)
-                        gcode += ";" +
-                            GCodeProcessor::Nonplanar_Transition_Layer_Tag + "\n";
+                        continue;
+                    for (size_t island_idx : island_order) {
+                        ObjectByExtruder::Island &island = islands[island_idx];
+                        const auto &regions = is_anything_overridden ?
+                            island.by_region_per_copy(
+                                by_region_per_copy_cache,
+                                static_cast<unsigned int>(instance_to_print.instance_id),
+                                extruder_id, print_wipe_extrusions != 0) :
+                            island.by_region;
+                        gcode += this->extrude_nonplanar_surface(
+                            print, regions, true, course);
+                    }
+                }
+                // Attached feature walls are the lateral anchor for the
+                // matching surface course. Emit them first on their shared
+                // owner layer; writing the roof boundary before the chimney
+                // ring left the boundary unsupported, then made the delayed
+                // ring cross an already deposited non-planar bead.
+                for (size_t island_idx : island_order) {
+                    ObjectByExtruder::Island &island = islands[island_idx];
+                    const auto &regions = is_anything_overridden ?
+                        island.by_region_per_copy(
+                            by_region_per_copy_cache,
+                            static_cast<unsigned int>(instance_to_print.instance_id),
+                            extruder_id, print_wipe_extrusions != 0) :
+                        island.by_region;
+                    gcode += this->extrude_nonplanar_surface(print, regions, true);
+                }
+                for (size_t course = 1; course <= early_feature_courses; ++course) {
+                    const bool leveling_course = std::any_of(
+                        island_order.begin(), island_order.end(),
+                        [&](size_t island_idx) {
+                            return this->is_nonplanar_leveling_course(
+                                islands[island_idx].by_region, true, course);
+                        });
+                    if (!leveling_course)
+                        continue;
+                    gcode += ";" +
+                        GCodeProcessor::Nonplanar_Transition_Layer_Tag + "\n";
                     for (size_t island_idx : island_order) {
                         ObjectByExtruder::Island &island = islands[island_idx];
                         const auto &regions = is_anything_overridden ?
@@ -6830,7 +6861,15 @@ LayerResult GCode::process_layer(
             // completed its conventional walls, fill, and ironing. A visit may
             // cover only one island, so doing this in the visit loop still let
             // the next visit cross an already raised XYZ surface.
+            std::set<size_t> nonplanar_instances_emitted;
             for (const InstanceVisit &visit : instance_visits) {
+                // The ordinary island tour may omit an island whose only
+                // members are variable-Z courses: its centroid and visit
+                // graph were derived from the conventional 2D slice. The
+                // finishing pass runs after every ordinary visit, so emit all
+                // islands for an instance exactly once here.
+                if (!nonplanar_instances_emitted.insert(visit.instance_idx).second)
+                    continue;
                 InstanceToPrint &instance_to_print = instances_to_print[visit.instance_idx];
                 const LayerToPrint &layer_to_print = layers[instance_to_print.layer_id];
                 m_layer = layer_to_print.layer();
@@ -6840,27 +6879,11 @@ LayerResult GCode::process_layer(
                 this->set_origin(unscale(offset));
 
                 std::vector<ObjectByExtruder::Island> &islands = instance_to_print.object_by_extruder.islands;
-                std::vector<size_t> island_order = visit.islands;
-                if (island_order.empty()) {
-                    island_order.reserve(islands.size());
-                    for (size_t island_idx = 0; island_idx < islands.size(); ++island_idx)
-                        if (!islands[island_idx].by_region.empty())
-                            island_order.emplace_back(island_idx);
-                }
-                // Emit every draped skin in the visit first, then advance all
-                // continuing features through each shared sloped/leveling
-                // course together. This is the cross-island dependency order
-                // required by a roof intersected by a chimney or boss.
-                for (size_t island_idx : island_order) {
-                    ObjectByExtruder::Island &island = islands[island_idx];
-                    const auto &by_region_specific = is_anything_overridden ?
-                        island.by_region_per_copy(by_region_per_copy_cache,
-                            static_cast<unsigned int>(instance_to_print.instance_id),
-                            extruder_id, print_wipe_extrusions != 0) :
-                        island.by_region;
-                    gcode += this->extrude_nonplanar_surface(
-                        print, by_region_specific, false);
-                }
+                std::vector<size_t> island_order;
+                island_order.reserve(islands.size());
+                for (size_t island_idx = 0; island_idx < islands.size(); ++island_idx)
+                    if (!islands[island_idx].by_region.empty())
+                        island_order.emplace_back(island_idx);
                 size_t feature_courses = 0;
                 for (size_t island_idx : island_order)
                     feature_courses = std::max(
@@ -6875,8 +6898,45 @@ LayerResult GCode::process_layer(
                                 islands[island_idx].by_region, false, course);
                         });
                     if (leveling_course)
-                        gcode += ";" +
-                            GCodeProcessor::Nonplanar_Transition_Layer_Tag + "\n";
+                        continue;
+                    for (size_t island_idx : island_order) {
+                        ObjectByExtruder::Island &island = islands[island_idx];
+                        const auto &by_region_specific = is_anything_overridden ?
+                            island.by_region_per_copy(
+                                by_region_per_copy_cache,
+                                static_cast<unsigned int>(instance_to_print.instance_id),
+                                extruder_id, print_wipe_extrusions != 0) :
+                            island.by_region;
+                        gcode += this->extrude_nonplanar_surface(
+                            print, by_region_specific, false, course);
+                    }
+                }
+                // The feature course and surface opening share one physical
+                // height field. The feature is printed first as the boundary
+                // anchor, then the complete draped skin meets it. Leveling
+                // courses remain ordered by feature_course above and resume
+                // the ordinary feature only after the surface stack is done.
+                for (size_t island_idx : island_order) {
+                    ObjectByExtruder::Island &island = islands[island_idx];
+                    const auto &by_region_specific = is_anything_overridden ?
+                        island.by_region_per_copy(by_region_per_copy_cache,
+                            static_cast<unsigned int>(instance_to_print.instance_id),
+                            extruder_id, print_wipe_extrusions != 0) :
+                        island.by_region;
+                    gcode += this->extrude_nonplanar_surface(
+                        print, by_region_specific, false);
+                }
+                for (size_t course = 1; course <= feature_courses; ++course) {
+                    const bool leveling_course = std::any_of(
+                        island_order.begin(), island_order.end(),
+                        [&](size_t island_idx) {
+                            return this->is_nonplanar_leveling_course(
+                                islands[island_idx].by_region, false, course);
+                        });
+                    if (!leveling_course)
+                        continue;
+                    gcode += ";" +
+                        GCodeProcessor::Nonplanar_Transition_Layer_Tag + "\n";
                     for (size_t island_idx : island_order) {
                         ObjectByExtruder::Island &island = islands[island_idx];
                         const auto &by_region_specific = is_anything_overridden ?
@@ -7498,6 +7558,36 @@ static std::unique_ptr<EdgeGrid::Grid> calculate_layer_edge_grid(const Layer& la
     return out;
 }
 
+// Bound the local brick seam ramp to 1:2 rise/run. This is a local path
+// qualification, not a replacement for full machine/toolhead clearance.
+static bool internal_seam_height_compatible(coord_t from_z, coord_t to_z, double xy_distance)
+{
+    return std::abs(double(to_z) - double(from_z)) <= 0.5 * xy_distance + SCALED_EPSILON;
+}
+
+bool GCode::scarf_seam_qualified(const ExtrusionLoop &loop, float overhang) const
+{
+    const auto type = m_config.seam_slope_type.value;
+    const bool hole = (loop.loop_role() & elrHole) == elrHole;
+    if (!((type == SeamScarfType::External && !hole) || type == SeamScarfType::All) ||
+        m_config.spiral_mode || layer_id() <= 0 || has_nonplanar_surface_path(loop) ||
+        std::any_of(loop.paths.begin(), loop.paths.end(),
+            [](const ExtrusionPath &path) { return path.z_contoured; }) ||
+        !(loop.role() == erExternalPerimeter ||
+          (loop.role() == erPerimeter && m_config.seam_slope_inner_walls)))
+        return false;
+    if (!m_config.seam_slope_conditional.value)
+        return true;
+    const double nozzle = EXTRUDER_CONFIG(nozzle_diameter);
+    if (!loop.is_smooth(m_config.scarf_angle_threshold.value * M_PI / 180., nozzle))
+        return false;
+    const double width = loop.role() == erExternalPerimeter ?
+        m_config.outer_wall_line_width.get_abs_value(nozzle) :
+        m_config.inner_wall_line_width.get_abs_value(nozzle);
+    return m_config.scarf_overhang_threshold.value <= 0. ||
+           overhang < m_config.scarf_overhang_threshold.value * 0.01 * width;
+}
+
 std::string GCode::extrude_loop(const ExtrusionLoop&        loop_ref,
                                 const std::string&          description,
                                 double                      speed,
@@ -7513,6 +7603,21 @@ std::string GCode::extrude_loop(const ExtrusionLoop&        loop_ref,
     // after projection relocates the zero-Z samples into the middle of the
     // loop, producing two apparent laps and an abrupt entry at the new start.
     const bool preserve_nonplanar_loop = has_nonplanar_surface_path(loop);
+    // Reservation and consumption of an inner-wall primer must have the same
+    // eligibility. Otherwise a skipped variable-Z outer primer leaves a hole
+    // in the adjacent inner wall (one nozzle diameter on every course).
+    const bool brick_mode = m_config.perimeter_layering.value == PerimeterLayeringMode::Brick;
+    const auto planned_seam = m_outer_seam_plans.find(&loop_ref);
+    const bool prepare_inner_seam = m_config.seam_start_on_inner_wall &&
+        (m_config.perimeter_layering.value == PerimeterLayeringMode::Standard || brick_mode) &&
+        !preserve_nonplanar_loop &&
+        std::none_of(loop.paths.begin(), loop.paths.end(),
+            [brick_mode](const ExtrusionPath &path) {
+                return path.z_contoured && !(brick_mode &&
+                    (path.staggered_perimeter || path.staggered_transition));
+            }) &&
+        ((planned_seam != m_outer_seam_plans.end() && planned_seam->second.inner_entry) ||
+         m_inner_seam_fallback_loops.count(&loop_ref) != 0);
 
     bool is_hole = (loop.loop_role() & elrHole) == elrHole;
 
@@ -7531,10 +7636,13 @@ std::string GCode::extrude_loop(const ExtrusionLoop&        loop_ref,
     // or, if `start_point` is specified, start the loop at point closest to it
     Point last_pos = start_point ? *start_point : this->last_pos();
     float seam_overhang = std::numeric_limits<float>::lowest();
-    if (!preserve_nonplanar_loop && !m_config.spiral_mode && description == "perimeter") {
+    const auto seam_plan = m_outer_seam_plans.find(&loop_ref);
+    if (seam_plan != m_outer_seam_plans.end()) {
+        loop = seam_plan->second.loop;
+    } else if (!preserve_nonplanar_loop && !m_config.spiral_mode && description == "perimeter") {
         assert(m_layer != nullptr);
         const bool stagger_inner_seam =
-            !(m_config.seam_start_on_inner_wall && loop.role() == erPerimeter && loop.inset_idx == 1);
+            !(prepare_inner_seam && loop.role() == erPerimeter && loop.inset_idx == 1);
         m_seam_placer.place_seam(m_layer, loop, last_pos, seam_overhang, stagger_inner_seam);
     } else if (!preserve_nonplanar_loop)
         loop.split_at(last_pos, false);
@@ -7545,22 +7653,13 @@ std::string GCode::extrude_loop(const ExtrusionLoop&        loop_ref,
     // planar/non-planar wall that the surface generator deliberately closed.
     // Preserve the loop verbatim; its entry and exit blend is generated from
     // the projected surface before G-code ordering and clearance validation.
-    const auto seam_scarf_type = m_config.seam_slope_type.value;
-    bool enable_seam_slope = ((seam_scarf_type == SeamScarfType::External && !is_hole) || seam_scarf_type == SeamScarfType::All) &&
-        !m_config.spiral_mode &&
-        !preserve_nonplanar_loop &&
-        (loop.role() == erExternalPerimeter || (loop.role() == erPerimeter && m_config.seam_slope_inner_walls)) &&
-        layer_id() > 0;
+    bool enable_seam_slope = seam_plan != m_outer_seam_plans.end() ?
+        seam_plan->second.scarf : scarf_seam_qualified(loop, seam_overhang);
+    // A reserved tail must be printed once at normal height, not expanded
+    // into a scarf lap on the adjacent inner wall as well.
+    if (prepare_inner_seam && loop.role() == erPerimeter && loop.inset_idx == 1)
+        enable_seam_slope = false;
     const auto nozzle_diameter = EXTRUDER_CONFIG(nozzle_diameter);
-    if (enable_seam_slope && m_config.seam_slope_conditional.value) {
-        enable_seam_slope = loop.is_smooth(m_config.scarf_angle_threshold.value * M_PI / 180., nozzle_diameter);
-    }
-
-    if (enable_seam_slope && m_config.seam_slope_conditional.value && m_config.scarf_overhang_threshold.value > 0.0f) {
-        const auto _line_width = loop.role() == erExternalPerimeter ? m_config.outer_wall_line_width.get_abs_value(nozzle_diameter) :
-                                                                      m_config.inner_wall_line_width.get_abs_value(nozzle_diameter);
-        enable_seam_slope      = seam_overhang < m_config.scarf_overhang_threshold.value * 0.01f * _line_width;
-    }
 
     // clip the path to avoid the extruder to get exactly on the first point of the loop;
     // if polyline was shorter than the clipping distance we'd get a null polyline, so
@@ -7578,7 +7677,7 @@ std::string GCode::extrude_loop(const ExtrusionLoop&        loop_ref,
     // clipping that tail opens its middle wall and the planar primer cannot
     // reproduce the missing surface-following segment.
     const bool adjacent_inner_seam =
-        !preserve_nonplanar_loop && m_config.seam_start_on_inner_wall &&
+        prepare_inner_seam &&
         loop.role() == erPerimeter && loop.inset_idx == 1;
     if (adjacent_inner_seam) {
         const double maximum_outer_distance2 =
@@ -7747,22 +7846,17 @@ std::string GCode::extrude_loop(const ExtrusionLoop&        loop_ref,
         return is_small_small_perimeter ? small_peri_speed : speed;
     };
 
-    // Prepare only the external wall from the adjacent inner wall. The move
-    // performs the unretract inside the part but deposits no material across
-    // the wall gap, keeping the external seam at nominal width. The nearest
-    // point projection makes the transition leave the inner wall directly
-    // outwards. Reject ambiguous geometry where that short transition would
-    // intersect an inner wall anywhere except its starting point.
-    const bool variable_z_wall_loop = std::any_of(
-        paths.begin(), paths.end(),
-        [](const ExtrusionPath &path) { return path.z_contoured; });
-    const bool variable_z_wall_features =
-        brick_perimeters_enabled(m_config) ||
-        nonplanar_perimeters_enabled(m_config);
-    if (m_config.seam_start_on_inner_wall && paths.front().role() == erExternalPerimeter &&
-        !region_perimeters.empty() && !variable_z_wall_loop &&
-        !variable_z_wall_features) {
-        const auto align_prime_with_outer_entry = [&paths](ExtrusionPaths &primer_paths) {
+    ExtrusionPaths inner_seam_finish;
+    // Start and finish on disjoint parts of a reserved inner-wall tail. The
+    // connectors remain inside the wall envelope; ambiguous geometry keeps
+    // the non-extruding approach instead of crossing another perimeter.
+    if (prepare_inner_seam && !enable_seam_slope && paths.front().role() == erExternalPerimeter &&
+        !region_perimeters.empty()) {
+        const auto align_prime_with_outer_entry = [&paths, brick_mode](ExtrusionPaths &primer_paths) {
+            // Keep brick tails at their real height. The connectors ramp
+            // between courses; flattening the tail would leave a missing bead.
+            if (brick_mode)
+                return;
             // The first stored point may be the nominal seam endpoint while
             // the first deposited segment immediately descends into the flat
             // anchor of a surface-following wall. Use the local entry range,
@@ -7791,6 +7885,7 @@ std::string GCode::extrude_loop(const ExtrusionLoop&        loop_ref,
                 primer.z_contoured = target_z != 0;
                 primer.staggered_perimeter = false;
                 primer.nonplanar_surface = false;
+                primer.nonplanar_schedule_owned = false;
                 primer.set_extrusion_role(erPerimeter);
                 primer.polyline.fitting_result.clear();
             }
@@ -7804,15 +7899,18 @@ std::string GCode::extrude_loop(const ExtrusionLoop&        loop_ref,
                 for (const ExtrusionEntity *child : collection->entities)
                     collect_inner_walls(*child);
             } else if (entity.inset_idx > 0 && entity.role() == erPerimeter) {
-                if (entity.inset_idx == 1)
-                    if (const auto *inner_loop = dynamic_cast<const ExtrusionLoop *>(&entity))
-                        adjacent_inner_wall_loops.emplace_back(inner_loop);
+                const auto *inner_loop = dynamic_cast<const ExtrusionLoop *>(&entity);
+                const bool adjacent = entity.inset_idx == 1 && (!brick_mode ||
+                    (inner_loop && planned_seam != m_outer_seam_plans.end() &&
+                     inner_loop == planned_seam->second.inner_loop));
+                if (adjacent && inner_loop)
+                    adjacent_inner_wall_loops.emplace_back(inner_loop);
                 Polylines polylines;
                 entity.collect_polylines(polylines);
                 for (const Polyline &polyline : polylines) {
                     Lines lines = polyline.lines();
                     append(all_inner_wall_lines, lines);
-                    if (entity.inset_idx == 1)
+                    if (adjacent)
                         append(adjacent_inner_wall_lines, std::move(lines));
                 }
             }
@@ -7901,11 +7999,8 @@ std::string GCode::extrude_loop(const ExtrusionLoop&        loop_ref,
                         primer_path.inset_idx = 1;
                     }
                     if (!planned_outer_first_prime.empty()) {
-                        // A raised brick or surface-following inner wall may
-                        // supply this omitted seam tail. The prime belongs to
-                        // the lower outer-wall dependency, so align the whole
-                        // tail to the outer entry instead of emitting a high
-                        // bead and immediately descending through it.
+                        // Brick tails retain their course height; ordinary
+                        // planar tails use the outer entry height.
                         align_prime_with_outer_entry(planned_outer_first_prime);
                         inner_start = planned_outer_first_prime.back().last_point();
                     }
@@ -7917,22 +8012,18 @@ std::string GCode::extrude_loop(const ExtrusionLoop&        loop_ref,
 
             if (line_idx != size_t(-1) && transition_distance > scaled<double>(0.05) &&
                 transition_distance <= max_transition_length) {
+                ExtrusionPaths primer_paths;
                 if (prime_gap_idx != size_t(-1) &&
                     prime_gap_distance2 <= max_transition_length * max_transition_length) {
-                    ExtrusionPaths primer_paths =
+                    primer_paths =
                         std::move(m_inner_seam_prime_gaps[prime_gap_idx]);
                     m_inner_seam_prime_gaps.erase(
                         m_inner_seam_prime_gaps.begin() + prime_gap_idx);
                     align_prime_with_outer_entry(primer_paths);
-                    for (const ExtrusionPath &primer_path : primer_paths)
-                        gcode += this->_extrude(
-                            primer_path, "outer wall seam prime", speed_for_path(primer_path));
                 } else if (!planned_outer_first_prime.empty()) {
-                    for (const ExtrusionPath &primer_path : planned_outer_first_prime)
-                        gcode += this->_extrude(
-                            primer_path, "outer wall seam prime", speed_for_path(primer_path));
                     m_pending_inner_seam_primes.emplace_back(
                         planned_outer_first_prime);
+                    primer_paths = std::move(planned_outer_first_prime);
                 } else {
                     // Outer-first order has no already omitted material to
                     // prime safely. Remember it so the adjacent inner wall
@@ -7953,12 +8044,85 @@ std::string GCode::extrude_loop(const ExtrusionLoop&        loop_ref,
                                endpoint_tolerance2;
                     });
 
+                const auto seam_connector = [](const Point3 &from, const Point3 &to,
+                                               const ExtrusionPath &before, const ExtrusionPath &after) {
+                    ExtrusionPath connector(Polyline3(Points3{from, to}), before);
+                    connector.set_extrusion_role(erPerimeter);
+                    connector.z_contoured = before.z_contoured || after.z_contoured;
+                    connector.staggered_perimeter = before.staggered_perimeter || after.staggered_perimeter;
+                    connector.staggered_transition = before.staggered_transition || after.staggered_transition ||
+                        from.z() != to.z();
+                    // Integrate the linear cross-section change over the
+                    // ramp. _extrude uses the full XYZ segment length.
+                    connector.height = 0.5f * (before.height + after.height);
+                    connector.width = 0.5f * (before.width + after.width);
+                    connector.mm3_per_mm = 0.5 * (before.mm3_per_mm + after.mm3_per_mm);
+                    return connector;
+                };
+
+                // Reserve the complete inner-wall tail, but deposit its latter
+                // half on entry and its former half on exit. Both meet inside
+                // the wall, without retracing the primer or the inner loop.
+                if (!transition_crosses_inner_wall && !primer_paths.empty()) {
+                    const Point exit_inner = primer_paths.front().first_point();
+                    const Line exit(paths.back().last_point(), exit_inner);
+                    const auto exit_intersections =
+                        all_inner_wall_distancer.intersections_with_line<true>(exit);
+                    const bool crosses_inner = std::any_of(
+                        exit_intersections.begin(), exit_intersections.end(),
+                        [&exit_inner, endpoint_tolerance2](const auto &intersection) {
+                            return (intersection.first - exit_inner).template cast<double>().squaredNorm() >
+                                   endpoint_tolerance2;
+                        });
+                    Lines outer_lines;
+                    for (const ExtrusionPath &path : paths)
+                        append(outer_lines, path.polyline.to_polyline().lines());
+                    AABBTreeLines::LinesDistancer<Line> outer_distancer{outer_lines};
+                    const auto crosses_outer = [&](const Line &connector, const Point &endpoint) {
+                        const auto intersections = outer_distancer.intersections_with_line<true>(connector);
+                        return std::any_of(intersections.begin(), intersections.end(),
+                            [&](const auto &intersection) {
+                                return (intersection.first - endpoint).template cast<double>().squaredNorm() >
+                                       endpoint_tolerance2;
+                            });
+                    };
+                    Point intersection;
+                    const bool crossed_connectors = transition.intersection(exit, &intersection) &&
+                        (intersection - outer_start).cast<double>().squaredNorm() > endpoint_tolerance2;
+                    if (!crosses_inner && !crossed_connectors &&
+                        !crosses_outer(transition, outer_start) &&
+                        !crosses_outer(exit, paths.back().last_point()) &&
+                        internal_seam_height_compatible(primer_paths.back().last_point3().z(),
+                            paths.front().first_point3().z(), transition.length()) &&
+                        internal_seam_height_compatible(paths.back().last_point3().z(),
+                            primer_paths.front().first_point3().z(), exit.length()) &&
+                        exit.length() <= 2. * max_transition_length) {
+                        ExtrusionLoop tail(primer_paths);
+                        const double half_length = tail.length() * 0.5;
+                        tail.clip_end(half_length, &inner_seam_finish);
+                        tail.reverse();
+                        tail.clip_end(half_length, &primer_paths);
+                        std::reverse(primer_paths.begin(), primer_paths.end());
+                        for (ExtrusionPath &path : primer_paths)
+                            path.reverse();
+                        ExtrusionPath connector = seam_connector(paths.back().last_point3(),
+                            inner_seam_finish.front().first_point3(), paths.back(), inner_seam_finish.front());
+                        inner_seam_finish.insert(inner_seam_finish.begin(), std::move(connector));
+                    }
+                }
+                for (const ExtrusionPath &primer_path : primer_paths)
+                    gcode += this->_extrude(
+                        primer_path, "outer wall seam prime", speed_for_path(primer_path));
                 if (!transition_crosses_inner_wall) {
                     ExtrusionPath seam_transition(
-                        Polyline3(Points3{Point3(inner_start), paths.front().first_point3()}),
+                        Polyline3(Points3{Point3(inner_start, paths.front().first_point3().z()), paths.front().first_point3()}),
                         paths.front());
-                    seam_transition.set_force_no_extrusion(true);
-                    seam_transition.mm3_per_mm = 0.0;
+                    if (inner_seam_finish.empty()) {
+                        seam_transition.set_force_no_extrusion(true);
+                        seam_transition.mm3_per_mm = 0.0;
+                    } else
+                        seam_transition = seam_connector(primer_paths.back().last_point3(),
+                            paths.front().first_point3(), primer_paths.back(), paths.front());
                     gcode += this->_extrude(seam_transition, "outer wall seam transition", speed_for_path(paths.front()));
                 }
             }
@@ -8039,6 +8203,17 @@ std::string GCode::extrude_loop(const ExtrusionLoop&        loop_ref,
         }
     }
 
+    if (!inner_seam_finish.empty()) {
+        for (size_t idx = 0; idx < inner_seam_finish.size(); ++idx)
+            gcode += this->_extrude(inner_seam_finish[idx],
+                idx == 0 ? "outer wall seam return" : "outer wall seam finish",
+                speed_for_path(inner_seam_finish[idx]));
+        // Wiping must start at the actual inside endpoint, not jump back to
+        // the outer seam and sweep across either freshly deposited connector.
+        paths = inner_seam_finish;
+        paths.erase(paths.begin()); // Wipe only the reserved inner-wall finish.
+    }
+
     if (description == "perimeter") {
         m_processor.result().print_statistics.total_seam_gap_distance += static_cast<float>(seam_gap_distance_mm);
         m_processor.result().print_statistics.total_seam_scarf_distance += static_cast<float>(seam_scarf_distance_mm);
@@ -8103,6 +8278,8 @@ std::string GCode::extrude_loop(const ExtrusionLoop&        loop_ref,
                 }
             }
         }
+        if (!inner_seam_finish.empty())
+            m_wipe.path.reverse();
     }
 
     // Orca: make the configured inward move before leaving the loop.
@@ -8203,9 +8380,12 @@ std::string GCode::extrude_entity_nonplanar_filtered(
                (!feature_course ||
                 path.nonplanar_feature_course == *feature_course);
     };
+    const auto is_nonplanar_scheduled = [](const ExtrusionPath &path) {
+        return path.nonplanar_surface || path.nonplanar_schedule_owned;
+    };
 
     if (const auto *path = dynamic_cast<const ExtrusionPath *>(&entity))
-        return path->nonplanar_surface == nonplanar &&
+        return is_nonplanar_scheduled(*path) == nonplanar &&
             (!before_current_layer ||
              path->nonplanar_before_current_layer == *before_current_layer) &&
             (!feature_transition ||
@@ -8218,10 +8398,10 @@ std::string GCode::extrude_entity_nonplanar_filtered(
     if (const auto *multipath = dynamic_cast<const ExtrusionMultiPath *>(&entity)) {
         const bool any_nonplanar = std::any_of(
             multipath->paths.begin(), multipath->paths.end(),
-            [](const ExtrusionPath &path) { return path.nonplanar_surface; });
+            is_nonplanar_scheduled);
         const bool all_nonplanar = std::all_of(
             multipath->paths.begin(), multipath->paths.end(),
-            [](const ExtrusionPath &path) { return path.nonplanar_surface; });
+            is_nonplanar_scheduled);
         const bool all_in_requested_schedule = std::all_of(
             multipath->paths.begin(), multipath->paths.end(),
             path_is_in_requested_schedule);
@@ -8234,7 +8414,7 @@ std::string GCode::extrude_entity_nonplanar_filtered(
         if (any_nonplanar && !all_nonplanar) {
             const auto owner = std::find_if(
                 multipath->paths.begin(), multipath->paths.end(),
-                [](const ExtrusionPath &path) { return path.nonplanar_surface; });
+                is_nonplanar_scheduled);
             return nonplanar && path_is_in_requested_schedule(*owner) ?
                 this->extrude_multi_path(*multipath, description, -1.) :
                 std::string{};
@@ -8242,7 +8422,7 @@ std::string GCode::extrude_entity_nonplanar_filtered(
         if (all_nonplanar == nonplanar && all_in_requested_schedule)
             return this->extrude_multi_path(*multipath, description, -1.);
         for (const ExtrusionPath &path : multipath->paths)
-            if (path.nonplanar_surface == nonplanar &&
+            if (is_nonplanar_scheduled(path) == nonplanar &&
                 (!before_current_layer ||
                  path.nonplanar_before_current_layer == *before_current_layer) &&
                 (!feature_transition ||
@@ -8253,17 +8433,17 @@ std::string GCode::extrude_entity_nonplanar_filtered(
     } else if (const auto *loop = dynamic_cast<const ExtrusionLoop *>(&entity)) {
         const bool any_nonplanar = std::any_of(
             loop->paths.begin(), loop->paths.end(),
-            [](const ExtrusionPath &path) { return path.nonplanar_surface; });
+            is_nonplanar_scheduled);
         const bool all_nonplanar = std::all_of(
             loop->paths.begin(), loop->paths.end(),
-            [](const ExtrusionPath &path) { return path.nonplanar_surface; });
+            is_nonplanar_scheduled);
         const bool all_in_requested_schedule = std::all_of(
             loop->paths.begin(), loop->paths.end(),
             path_is_in_requested_schedule);
         if (any_nonplanar && !all_nonplanar) {
             const auto owner = std::find_if(
                 loop->paths.begin(), loop->paths.end(),
-                [](const ExtrusionPath &path) { return path.nonplanar_surface; });
+                is_nonplanar_scheduled);
             return nonplanar && path_is_in_requested_schedule(*owner) ?
                 this->extrude_loop(
                     *loop, description, -1., region_perimeters) :
@@ -8272,7 +8452,7 @@ std::string GCode::extrude_entity_nonplanar_filtered(
         if (all_nonplanar == nonplanar && all_in_requested_schedule)
             return this->extrude_loop(*loop, description, -1., region_perimeters);
         for (const ExtrusionPath &path : loop->paths)
-            if (path.nonplanar_surface == nonplanar &&
+            if (is_nonplanar_scheduled(path) == nonplanar &&
                 (!before_current_layer ||
                  path.nonplanar_before_current_layer == *before_current_layer) &&
                 (!feature_transition ||
@@ -8330,6 +8510,8 @@ std::string GCode::extrude_perimeters(const Print &print, const std::vector<Obje
             m_pending_inner_seam_primes.clear();
             m_emitted_inner_seam_loops.clear();
             m_unprimed_outer_seams.clear();
+            m_outer_seam_plans.clear();
+            m_inner_seam_fallback_loops.clear();
             m_config.apply(print.get_print_region(&region - &by_region.front()).config());
             const bool replace_unsupported_perimeters = std::any_of(
                 region.infills.begin(), region.infills.end(),
@@ -8342,6 +8524,82 @@ std::string GCode::extrude_perimeters(const Print &print, const std::vector<Obje
                 (is_first_layer ? !is_infill_first : (m_config.is_infill_first == is_infill_first));
             if (!should_print) continue;
 
+            if (!replace_unsupported_perimeters) {
+                const bool brick_mode = m_config.perimeter_layering.value == PerimeterLayeringMode::Brick;
+                if (m_config.seam_start_on_inner_wall &&
+                    (m_config.perimeter_layering.value == PerimeterLayeringMode::Standard || brick_mode) &&
+                    !m_config.spiral_mode) {
+                    std::vector<const ExtrusionLoop *> inner_loops;
+                    std::function<void(const ExtrusionEntity &)> plan_seams;
+                    plan_seams = [&](const ExtrusionEntity &entity) {
+                        if (const auto *collection = dynamic_cast<const ExtrusionEntityCollection *>(&entity)) {
+                            for (const ExtrusionEntity *child : collection->entities)
+                                plan_seams(*child);
+                        } else if (const auto *source = dynamic_cast<const ExtrusionLoop *>(&entity)) {
+                            // Enabling top-surface processing must not disable
+                            // seams on unrelated planar courses. Qualify the
+                            // actual paths, not the global surface-mode setting.
+                            if (has_nonplanar_surface_path(*source) || std::any_of(
+                                    source->paths.begin(), source->paths.end(),
+                                    [brick_mode](const ExtrusionPath &path) {
+                                        return path.z_contoured && !(brick_mode &&
+                                            (path.staggered_perimeter || path.staggered_transition));
+                                    }))
+                                return;
+                            if (source->role() == erPerimeter && source->inset_idx == 1)
+                                inner_loops.push_back(source);
+                            if (source->role() != erExternalPerimeter || has_nonplanar_surface_path(*source))
+                                return;
+                            ExtrusionLoop placed = *source;
+                            float overhang = std::numeric_limits<float>::lowest();
+                            m_seam_placer.place_seam(m_layer, placed, last_pos(), overhang, false);
+                            const bool scarf = scarf_seam_qualified(placed, overhang);
+                            m_outer_seam_plans.emplace(source, OuterSeamPlan{std::move(placed), scarf});
+                        }
+                    };
+                    for (const ExtrusionEntity *entity : region.perimeters)
+                        plan_seams(*entity);
+                    // Constant-height brick courses may have different Z.
+                    // Preserve their tails and qualify the joining ramp;
+                    // arbitrary surface-following loops need a separate plan.
+                    const auto course_z = [](const ExtrusionLoop &loop) -> std::optional<coord_t> {
+                        if (loop.paths.empty()) return std::nullopt;
+                        const coord_t z = loop.first_point3().z();
+                        for (const auto &path : loop.paths)
+                            for (const auto &point : path.polyline.points)
+                                if (point.z() != z) return std::nullopt;
+                        return z;
+                    };
+                    for (auto &entry : m_outer_seam_plans) {
+                        if (entry.second.scarf)
+                            continue;
+                        const Point seam = entry.second.loop.first_point();
+                        const ExtrusionLoop *nearest = nullptr;
+                        double nearest_distance = scaled<double>(2.0 * EXTRUDER_CONFIG(nozzle_diameter));
+                        nearest_distance *= nearest_distance;
+                        for (const ExtrusionLoop *inner : inner_loops) {
+                            const Point point = inner->get_closest_path_and_point(seam, false).foot_pt;
+                            const double distance = (point - seam).cast<double>().squaredNorm();
+                            if (brick_mode) {
+                                const auto outer_z = course_z(entry.second.loop);
+                                const auto inner_z = course_z(*inner);
+                                if (!outer_z || !inner_z ||
+                                    !internal_seam_height_compatible(*inner_z, *outer_z, std::sqrt(distance)))
+                                    continue;
+                            }
+                            if (distance < nearest_distance) {
+                                nearest = inner;
+                                nearest_distance = distance;
+                            }
+                        }
+                        if (nearest != nullptr) {
+                            m_inner_seam_fallback_loops.insert(nearest);
+                            entry.second.inner_entry = true;
+                            entry.second.inner_loop = nearest;
+                        }
+                    }
+                }
+            }
             if (replace_unsupported_perimeters) {
             // Arc anchors were already emitted before the infill. Do not repeat
             // them in the deferred unsupported-wall pass.
@@ -8418,6 +8676,8 @@ std::string GCode::extrude_perimeters(const Print &print, const std::vector<Obje
                     wipe_support->append(*ee);
             }
         }
+    m_outer_seam_plans.clear();
+    m_inner_seam_fallback_loops.clear();
     return gcode;
 }
 
@@ -8513,16 +8773,22 @@ std::string GCode::extrude_nonplanar_surface(
         return gcode;
     }
 
+    const std::string perimeter_description =
+        "surface-following feature perimeter course " +
+        std::to_string(*feature_course);
+    const std::string fill_description =
+        "surface-following feature fill course " +
+        std::to_string(*feature_course);
     for (const ObjectByExtruder::Island::Region &region : by_region) {
         m_config.apply(print.get_print_region(&region - &by_region.front()).config());
         for (const ExtrusionEntity *entity : region.perimeters)
             gcode += this->extrude_entity_nonplanar_filtered(
-                *entity, "surface-following feature perimeter", true,
+                *entity, perimeter_description, true,
                 region.perimeters, before_current_layer, true, feature_course);
         for (const ExtrusionEntity *entity : region.infills)
             if (entity->role() != erIroning)
                 gcode += this->extrude_entity_nonplanar_filtered(
-                    *entity, "surface-following feature fill", true, {},
+                    *entity, fill_description, true, {},
                     before_current_layer, true, feature_course);
     }
     return gcode;
@@ -8908,6 +9174,7 @@ std::string GCode::_extrude(const ExtrusionPath &input_path, std::string descrip
                     // Retain the feature role so preview coloring and ordering
                     // do not incorrectly present it as a late ordinary wall.
                     segment.nonplanar_surface = true;
+                    segment.nonplanar_schedule_owned = false;
                     for (Point3 &point : segment.polyline.points)
                         point.z() = 0;
                     mode = toolpath_collision(segment, true) ?
@@ -9423,7 +9690,10 @@ std::string GCode::_extrude(const ExtrusionPath &input_path, std::string descrip
     // closing sample of a 3D loop, opening an otherwise validated perimeter.
     // Variable-Z paths have already passed their support and toolhead checks;
     // emit their original 3D point sequence without planar resampling.
-    if (need_overhang_detection && !path.z_contoured &&
+    // Arc fill has its own speed/fan policy and support-ordered fitted geometry.
+    // Planar overlap resampling discards those fitted arcs and can replace the
+    // configured arc speed with ordinary bridge/wall speeds.
+    if (need_overhang_detection && !path.z_contoured && !is_arc_fill(path.role()) &&
         !this->on_first_layer() && !object_layer_over_raft() &&
         (is_bridge(path.role()) || is_perimeter(path.role()))) {
             bool is_external = is_external_perimeter(path.role());
@@ -9571,15 +9841,17 @@ std::string GCode::_extrude(const ExtrusionPath &input_path, std::string descrip
     const bool planar_nonplanar_foundation =
         path.nonplanar_surface && !path.z_contoured &&
         !path.nonplanar_transition;
-    const ExtrusionRole processor_role =
+    // Brick height is still present on a compensated or draped wall. Keep
+    // that structural classification visible instead of masking it with an
+    // additional modifier. Realignment caps clear staggered_perimeter.
+    const ExtrusionRole processor_role = path.staggered_perimeter ? erStaggeredPerimeter :
         (path.nonplanar_feature_transition || surface_following_support) ? path.role() :
         (path.nonplanar_transition ? erNonplanarSupport :
         (path.nonplanar_surface && !planar_nonplanar_foundation ? erNonplanarSurface :
         (path.nonplanar_infill ? erNonplanarInfill :
         (path.shrinkage_compensation ? erShrinkageCompensation :
-        (path.staggered_perimeter ? erStaggeredPerimeter :
         (path.smooth_outer_wall ? erSmoothOuterWall :
-        (path.nonplanar_interlocking_wall ? erNonplanarInterlockingWall : path.role())))))));
+        (path.nonplanar_interlocking_wall ? erNonplanarInterlockingWall : path.role()))))));
     if (processor_role != m_last_processor_extrusion_role) {
         m_last_processor_extrusion_role = processor_role;
         sprintf(buf, ";%s%s\n", GCodeProcessor::reserved_tag(GCodeProcessor::ETags::Role).c_str(), ExtrusionEntity::role_to_string(m_last_processor_extrusion_role).c_str());

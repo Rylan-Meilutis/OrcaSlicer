@@ -778,23 +778,22 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, in
             top_surface_z_mode == TopSurfaceZMode::ZContouring ||
             hybrid_top_surface));
 
-    const bool use_brick_perimeters = perimeter_layering == PerimeterLayeringMode::Brick ||
-        (perimeter_layering == PerimeterLayeringMode::Standard &&
-         staggered_perimeters != nullptr && staggered_perimeters->value);
+    const bool use_brick_perimeters =
+        perimeter_layering == PerimeterLayeringMode::Brick;
     bool use_nonplanar_top_surfaces =
         perimeter_layering != PerimeterLayeringMode::SmoothOuterWall &&
         (top_surface_z_mode == TopSurfaceZMode::NonplanarTopSurface ||
          hybrid_top_surface);
 
-    // Keep the two legacy booleans loadable, but only synchronize values that
-    // are implied or forbidden by the selected wall-course method. Brick and
-    // mesh-following top surfaces are intentionally independent.
-    if (staggered_perimeters != nullptr) {
-        if (perimeter_layering == PerimeterLayeringMode::Brick && !staggered_perimeters->value)
-            config->set_key_value("staggered_perimeters", new ConfigOptionBool(true));
-        else if ((use_smooth_outer_walls || use_interlocking_walls) && staggered_perimeters->value)
-            config->set_key_value("staggered_perimeters", new ConfigOptionBool(false));
-    }
+    // Keep the legacy key serialized for old builds, but make it an exact
+    // mirror of the selector. Previously Standard left a stale true value in
+    // place; reloading that profile migrated it back to Brick and the UI
+    // appeared unable to disable the feature.
+    if (staggered_perimeters != nullptr &&
+        staggered_perimeters->value != use_brick_perimeters)
+        config->set_key_value(
+            "staggered_perimeters",
+            new ConfigOptionBool(use_brick_perimeters));
     if (use_smooth_outer_walls && use_nonplanar_top_surfaces) {
         config->set_key_value("nonplanar_top_surface", new ConfigOptionBool(false));
         config->set_key_value("top_surface_z_mode",
@@ -803,7 +802,10 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, in
         hybrid_top_surface = false;
         use_nonplanar_top_surfaces = false;
     }
-    if ((perimeter_layering != PerimeterLayeringMode::Standard || use_nonplanar_top_surfaces) &&
+    const bool z_contouring_compatible_perimeters =
+        perimeter_layering == PerimeterLayeringMode::Standard ||
+        perimeter_layering == PerimeterLayeringMode::Brick;
+    if ((!z_contouring_compatible_perimeters || use_nonplanar_top_surfaces) &&
         top_surface_z_mode == TopSurfaceZMode::ZContouring) {
         config->set_key_value("zaa_enabled", new ConfigOptionBool(false));
         config->set_key_value("top_surface_z_mode",
@@ -1077,6 +1079,8 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, in
         config->option<ConfigOptionBool>("support_ironing_nonplanar");
     const bool has_nonplanar_support_ironing = has_support_ironing &&
         support_ironing_nonplanar != nullptr && support_ironing_nonplanar->value;
+    // Existing projects may turn quarantined features off, but not enable them.
+    toggle_field("support_ironing_nonplanar", has_nonplanar_support_ironing);
     for (auto el : {"support_ironing_nonplanar_max_angle", "support_ironing_nonplanar_resolution"})
         if (config->has(el))
             toggle_line(el, has_nonplanar_support_ironing);
@@ -1120,7 +1124,7 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, in
     const auto *zaa_enabled = config->option<ConfigOptionBool>("zaa_enabled");
     const bool has_zaa =
         (top_surface_z_mode == TopSurfaceZMode::ZContouring &&
-         perimeter_layering == PerimeterLayeringMode::Standard) ||
+         z_contouring_compatible_perimeters) ||
         (hybrid_top_surface &&
          (perimeter_layering == PerimeterLayeringMode::Standard ||
           perimeter_layering == PerimeterLayeringMode::Brick));
@@ -1224,6 +1228,7 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, in
     const auto *nonplanar_infill = config->option<ConfigOptionBool>("nonplanar_infill");
     const bool have_nonplanar_infill =
         nonplanar_infill != nullptr && nonplanar_infill->value;
+    toggle_field("nonplanar_infill", have_nonplanar_infill);
     for (auto el : {"nonplanar_infill_amplitude", "nonplanar_infill_wavelength", "nonplanar_infill_resolution"})
         if (config->has(el))
             toggle_line(el, have_nonplanar_infill);

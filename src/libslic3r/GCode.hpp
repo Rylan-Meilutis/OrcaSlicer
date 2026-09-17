@@ -575,6 +575,16 @@ private:
     std::set<ObjectInstanceID>      m_objsWithBrim; // indicates the object instances with brim
     // Cache for custom seam enforcers/blockers for each layer.
     SeamPlacer                          m_seam_placer;
+    struct OuterSeamPlan {
+        ExtrusionLoop loop;
+        bool scarf;
+        bool inner_entry = false;
+        const ExtrusionLoop *inner_loop = nullptr;
+    };
+    // Decide scarf versus internal entry before reserving any inner-wall tail.
+    std::map<const ExtrusionLoop *, OuterSeamPlan> m_outer_seam_plans;
+    std::set<const ExtrusionLoop *> m_inner_seam_fallback_loops;
+    bool scarf_seam_qualified(const ExtrusionLoop &loop, float overhang) const;
     // Exact nozzle-length tails omitted from already emitted adjacent inner
     // walls. The external seam may consume one as its pressure-prime path;
     // regenerating the tail from an unplaced source loop can select a

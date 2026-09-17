@@ -348,16 +348,11 @@ void ExtrusionLoop::split_at(const Point &point, bool prefer_non_overhang, const
     
     // now split path_idx in two parts
     const ExtrusionPath &path = this->paths[path_idx];
-    ExtrusionPath p1(path.role(), path.mm3_per_mm, path.width, path.height);
-    ExtrusionPath p2(path.role(), path.mm3_per_mm, path.width, path.height);
-    p1.z_contoured = p2.z_contoured = path.z_contoured;
-    p1.nonplanar_surface = p2.nonplanar_surface = path.nonplanar_surface;
-    p1.nonplanar_transition = p2.nonplanar_transition = path.nonplanar_transition;
-    p1.nonplanar_clearance_validated = p2.nonplanar_clearance_validated = path.nonplanar_clearance_validated;
-    p1.nonplanar_before_current_layer = p2.nonplanar_before_current_layer = path.nonplanar_before_current_layer;
-    p1.nonplanar_feature_transition = p2.nonplanar_feature_transition = path.nonplanar_feature_transition;
-    p1.nonplanar_feature_course = p2.nonplanar_feature_course = path.nonplanar_feature_course;
-    p1.nonplanar_leveling_transition = p2.nonplanar_leveling_transition = path.nonplanar_leveling_transition;
+    // Splitting changes geometry, not extrusion semantics. In particular,
+    // losing the brick flag keeps the raised Z but changes both preview role
+    // and the variable-Z flow calculation on multi-part walls.
+    ExtrusionPath p1(Polyline3{}, path);
+    ExtrusionPath p2(Polyline3{}, path);
     path.polyline.split_at(p, &p1.polyline, &p2.polyline);
 
     if (this->paths.size() == 1) {

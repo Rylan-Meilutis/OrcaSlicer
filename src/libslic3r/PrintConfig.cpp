@@ -4,6 +4,7 @@
 #include "Config.hpp"
 #include "FilamentMixer.hpp"
 #include "MaterialType.hpp"
+#include "Model.hpp"
 #include "I18N.hpp"
 #include "format.hpp"
 
@@ -52,6 +53,95 @@ void ReplaceString(std::string &resource_str, const std::string &old_str, const 
 }
 
 namespace Slic3r {
+
+const std::vector<std::string> &project_filament_role_keys()
+{
+    static const std::vector<std::string> keys{
+        "support_filament", "support_interface_filament", "outer_wall_filament_id",
+        "inner_wall_filament_id", "sparse_infill_filament_id", "internal_solid_filament_id",
+        "top_surface_filament_id", "bottom_surface_filament_id"};
+    return keys;
+}
+
+int project_default_filament(const Model &model)
+{
+    std::map<int, size_t> counts;
+    for (const ModelObject *object : model.objects) {
+        const size_t instances = std::count_if(object->instances.begin(), object->instances.end(),
+            [](const ModelInstance *instance) { return instance->is_printable(); });
+        if (instances == 0)
+            continue;
+        const auto *base = object->config.get().option<ConfigOptionInt>("extruder");
+        for (const ModelVolume *volume : object->volumes) {
+            if (!volume->is_model_part())
+                continue;
+            const auto *override = volume->config.get().option<ConfigOptionInt>("extruder");
+            const int slot = override != nullptr && override->value > 0 ? override->value :
+                             base != nullptr && base->value > 0 ? base->value : 1;
+            counts[slot] += instances;
+        }
+    }
+    int selected = 1;
+    size_t most = 0;
+    for (const auto &[slot, count] : counts)
+        if (count > most) {
+            selected = slot;
+            most = count;
+        }
+    return selected;
+}
+
+void capture_project_filament_roles(DynamicPrintConfig &config)
+{
+    std::vector<std::string> roles;
+    for (const std::string &key : project_filament_role_keys())
+        if (const auto *value = config.option<ConfigOptionInt>(key); value != nullptr && value->value == -1)
+            roles.push_back(key);
+    config.set_key_value("project_filament_roles", new ConfigOptionStrings(std::move(roles)));
+}
+
+void restore_project_filament_roles(DynamicPrintConfig &config)
+{
+    if (const auto *roles = config.option<ConfigOptionStrings>("project_filament_roles"))
+        for (const std::string &key : project_filament_role_keys())
+            if (std::find(roles->values.begin(), roles->values.end(), key) != roles->values.end())
+                config.set_key_value(key, new ConfigOptionInt(-1));
+}
+
+void resolve_project_filament_bindings(DynamicPrintConfig &config, int default_slot)
+{
+    const auto *colors = config.option<ConfigOptionStrings>("filament_colour");
+    const auto *diameters = config.option<ConfigOptionFloats>("filament_diameter");
+    const int count = std::max(1, int(colors != nullptr ? colors->values.size() :
+                                    diameters != nullptr ? diameters->values.size() : 1));
+    default_slot = std::clamp(default_slot, 1, count);
+    const auto *bindings = config.option<ConfigOptionInts>("project_filament_bindings");
+    const auto *roles = config.option<ConfigOptionStrings>("project_filament_roles");
+    const auto &keys = project_filament_role_keys();
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const auto *value = config.option<ConfigOptionInt>(keys[i]);
+        const bool per_print = value != nullptr && value->value == -1;
+        const bool saved_role = roles != nullptr &&
+            std::find(roles->values.begin(), roles->values.end(), keys[i]) != roles->values.end();
+        if (!per_print && !saved_role)
+            continue;
+        const int slot = bindings != nullptr && i < bindings->values.size() ? bindings->values[i] : 0;
+        config.set_key_value(keys[i], new ConfigOptionInt(slot > 0 && slot <= count ? slot : default_slot));
+    }
+}
+
+void remap_project_filament_bindings(DynamicPrintConfig &config, int deleted_slot, int replacement_slot)
+{
+    if (deleted_slot <= 0)
+        return;
+    if (auto *bindings = config.option<ConfigOptionInts>("project_filament_bindings"))
+        for (int &slot : bindings->values) {
+            if (slot == deleted_slot)
+                slot = replacement_slot == deleted_slot ? 0 : std::max(0, replacement_slot);
+            if (slot > deleted_slot)
+                --slot;
+        }
+}
 
 //! macro used to mark string used at localization,
 //! return same string
@@ -1592,7 +1682,8 @@ void PrintConfigDef::init_fff_params()
     def->label = L("Shrinkage contour compensation");
     def->category = L("Quality");
     def->tooltip = L("Expands contours only on automatically detected solid-to-wall transition layers to compensate for local thermal contraction. "
-                     "Use small values and calibrate for the material; 0 disables expansion.");
+                     "Positive values are used exactly, including values below 0.1 mm. Calibrate for the material to avoid an outward ridge. "
+                     "0 disables expansion in Manual tuning mode; Balanced and Dimensional compensation use 0.1 mm when this value is 0.");
     def->sidetext = L("mm");
     def->min = 0.;
     def->max = 0.5;
@@ -1940,8 +2031,10 @@ void PrintConfigDef::init_fff_params()
     def->enum_keys_map = &ConfigOptionEnum<PerimeterLayeringMode>::get_enum_values();
     // "nonplanar" remains in enum_keys_map so old projects deserialize, but it
     // is migrated and is intentionally not presented as a new UI choice.
-    def->enum_values = {"standard", "brick", "smooth_outer_wall", "interlocking_walls"};
-    def->enum_labels = {L("Standard"), L("Brick"), L("Smooth outer wall"), L("Non-planar interlocking walls")};
+    // Keep enum_keys_map intact for existing projects, but quarantine the
+    // unfinished non-planar generators from new UI selections.
+    def->enum_values = {"standard", "brick", "smooth_outer_wall"};
+    def->enum_labels = {L("Standard"), L("Brick"), L("Smooth outer wall")};
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionEnum<PerimeterLayeringMode>(PerimeterLayeringMode::Standard));
 
@@ -5449,12 +5542,10 @@ void PrintConfigDef::init_fff_params()
                       "Non-planar top layers retain ordinary slicing planes and finish eligible shallow surfaces with continuous mesh-following Z motion. "
                       "The hybrid method uses Z contouring only where collision or support validation rejects a non-planar surface.");
     def->enum_keys_map = &ConfigOptionEnum<TopSurfaceZMode>::get_enum_values();
-    def->enum_values = {"disabled", "z_contouring", "nonplanar_top_surface",
-                        "nonplanar_with_z_contouring_fallback"};
-    def->enum_labels = {L("Disabled"), L("Z contouring"), L("Non-planar top layers"),
-                        L("Non-planar with Z-contouring fallback")};
+    def->enum_values = {"disabled", "z_contouring"};
+    def->enum_labels = {L("Disabled"), L("Z contouring")};
     def->enum_icons = false;
-    def->mode = comExpert;
+    def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionEnum<TopSurfaceZMode>(TopSurfaceZMode::Disabled));
 
     def = this->add("zaa_enabled", coBool);
@@ -5473,14 +5564,14 @@ void PrintConfigDef::init_fff_params()
     def->sidetext = u8"°";	// degrees, don't need translation
     def->min      = 0;
     def->max      = 90;
-    def->mode     = comExpert;
+    def->mode     = comAdvanced;
     def->set_default_value(new ConfigOptionFloat(35));
 
     def = this->add("zaa_dont_alternate_fill_direction", coBool);
     def->label    = L("Don't alternate fill direction");
     def->category = L("Quality");
     def->tooltip  = L("Disable alternating fill direction when using Z contouring.");
-    def->mode     = comExpert;
+    def->mode     = comAdvanced;
     def->set_default_value(new ConfigOptionBool(false));
 
     def = this->add("zaa_min_z", coFloat);
@@ -5491,7 +5582,7 @@ void PrintConfigDef::init_fff_params()
     def->sidetext = L("mm");	// millimeters, CIS languages need translation
     def->min      = 0;
     def->max      = 100;
-    def->mode     = comExpert;
+    def->mode     = comAdvanced;
     def->set_default_value(new ConfigOptionFloat(0.05));
 
     def = this->add("nonplanar_top_surface", coBool);
@@ -5560,9 +5651,11 @@ void PrintConfigDef::init_fff_params()
     def->set_default_value(new ConfigOptionString(""));
 
     def = this->add("silent_mode", coBool);
-    def->label = L("Silent Mode");
-    def->tooltip = L("Whether the machine supports silent mode in which machine uses lower acceleration to print more quietly");
-    def->mode = comDevelop;
+    def->label = L("Separate Stealth mode limits");
+    def->tooltip = L("Shows separate Normal and Stealth motion limits for Prusa printers and enables Stealth print-time estimation. "
+                     "The values are saved in the printer profile. Emit limits to G-code sends the Normal limits; "
+                     "separate Stealth limits are not programmed into firmware by this option.");
+    def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionBool(false));
 
     def = this->add("emit_machine_limits_to_gcode", coBool);
@@ -6767,10 +6860,15 @@ void PrintConfigDef::init_fff_params()
     def = this->add("seam_start_on_inner_wall", coBool);
     def->label = L("Start seam on inner wall");
     def->category = L("Quality");
-    def->tooltip = L("For two or more walls, prepare the outer-wall seam on the adjacent inner-wall line, then move directly "
-                     "outwards without extruding across the wall gap. The selected wall sequence is preserved, and the "
-                     "transition is rejected if it would cross an inner-wall line. This restores pressure inside the part "
-                     "so the dimensional outer wall starts once at normal flow without a thick seam spot.");
+    def->tooltip = L("For two or more walls, start on the adjacent inner wall, connect to the outer wall, then return "
+                     "inside to finish the seam. The entry and finish use separate portions of a reserved inner-wall "
+                     "segment, without printing that segment twice. The selected wall sequence is preserved. "
+                     "If the connections would cross another wall, use a non-extruding approach instead. "
+                     "Brick courses keep their original heights and use sloped entry and exit connections where "
+                     "the local slope and wall intersections permit. Surface-following walls do not use this internal seam. "
+                     "When scarf joints are enabled, qualified outer walls use scarf seams instead; this internal entry "
+                     "is the fallback for walls that do not qualify. The adjacent inner-wall tail reserved for a fallback "
+                     "is printed at normal height rather than scarfed.");
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionBool(false));
     
@@ -8982,6 +9080,17 @@ void PrintConfigDef::init_fff_params()
                      "Otherwise, the rectilinear pattern will be used by default.");
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionBool(true));
+
+    // -1 is a profile-level request; it is resolved to a real, 1-based slot
+    // before slicing. Project exports also carry resolved values for older
+    // readers, plus role metadata so reopening restores the profile choice.
+    for (const std::string &key : project_filament_role_keys())
+        this->options.at(key).min = -1;
+    def = this->add("project_filament_bindings", coInts);
+    def->min = 0;
+    def->set_default_value(new ConfigOptionInts(std::vector<int>(project_filament_role_keys().size(), 0)));
+    def = this->add("project_filament_roles", coStrings);
+    def->set_default_value(new ConfigOptionStrings());
 }
 
 void PrintConfigDef::init_extruder_option_keys()
@@ -9993,7 +10102,7 @@ void PrintConfigDef::handle_legacy(t_config_option_key &opt_key, std::string &va
         "z_hop_type", "z_lift_type", "bed_temperature_difference","long_retraction_when_cut",
         "retraction_distance_when_cut",
         "internal_bridge_support_thickness", "top_area_threshold", "reduce_wall_solid_infill","filament_load_time","filament_unload_time",
-        "smooth_coefficient", "overhang_totally_speed", "silent_mode",
+        "smooth_coefficient", "overhang_totally_speed",
         "overhang_speed_classic",
         "anisotropic_surfaces", // superseded by top_surface_fill_order / bottom_surface_fill_order
     };
@@ -10022,6 +10131,8 @@ void PrintConfigDef::handle_legacy_composite(DynamicPrintConfig &config)
     bool old_nonplanar = config.has("nonplanar_top_surface") &&
                          config.opt_bool("nonplanar_top_surface");
     bool old_zaa = config.has("zaa_enabled") && config.opt_bool("zaa_enabled");
+    const bool had_perimeter_layering = config.has("perimeter_layering");
+    const bool had_top_surface_z_mode = config.has("top_surface_z_mode");
     const bool old_brick = config.has("staggered_perimeters") &&
         config.opt_bool("staggered_perimeters");
     if (config.has("perimeter_layering") &&
@@ -10031,18 +10142,17 @@ void PrintConfigDef::handle_legacy_composite(DynamicPrintConfig &config)
             new ConfigOptionEnum<PerimeterLayeringMode>(PerimeterLayeringMode::Standard));
         old_nonplanar = true;
     }
-    const bool selector_is_default = config.has("perimeter_layering") &&
-        config.opt_enum<PerimeterLayeringMode>("perimeter_layering") ==
-            PerimeterLayeringMode::Standard;
-    if (!config.has("perimeter_layering") ||
-        (selector_is_default && (old_nonplanar || old_brick))) {
+    // Only a file which predates the selector may derive it from the legacy
+    // boolean. An explicitly serialized Standard value is a user choice, not
+    // a default to be overridden by a stale compatibility key.
+    if (!had_perimeter_layering) {
         const PerimeterLayeringMode mode = old_brick ? PerimeterLayeringMode::Brick :
             PerimeterLayeringMode::Standard;
         config.set_key_value("perimeter_layering", new ConfigOptionEnum<PerimeterLayeringMode>(mode));
     }
 
     TopSurfaceZMode top_surface_z_mode = TopSurfaceZMode::Disabled;
-    if (config.has("top_surface_z_mode")) {
+    if (had_top_surface_z_mode) {
         top_surface_z_mode = config.opt_enum<TopSurfaceZMode>("top_surface_z_mode");
     } else {
         // A malformed legacy profile with both flags enabled resolves to the
@@ -10052,16 +10162,6 @@ void PrintConfigDef::handle_legacy_composite(DynamicPrintConfig &config)
         config.set_key_value("top_surface_z_mode",
             new ConfigOptionEnum<TopSurfaceZMode>(top_surface_z_mode));
     }
-    // Full legacy configs already contain defaults for keys introduced by a
-    // newer build. Preserve an enabled legacy mesh-following flag in that
-    // case; the GUI always synchronizes the flag when a user changes the new
-    // selector, so a newly saved explicit Disabled selection remains false.
-    if (old_nonplanar && top_surface_z_mode == TopSurfaceZMode::Disabled &&
-        config.has("perimeter_layering") &&
-        config.opt_enum<PerimeterLayeringMode>("perimeter_layering") ==
-            PerimeterLayeringMode::Standard)
-        top_surface_z_mode = TopSurfaceZMode::NonplanarTopSurface;
-
     const bool hybrid = top_surface_z_mode ==
         TopSurfaceZMode::NonplanarWithZContouringFallback;
     config.set_key_value("zaa_enabled", new ConfigOptionBool(
@@ -10070,6 +10170,9 @@ void PrintConfigDef::handle_legacy_composite(DynamicPrintConfig &config)
         top_surface_z_mode == TopSurfaceZMode::NonplanarTopSurface || hybrid));
     config.set_key_value("top_surface_z_mode",
         new ConfigOptionEnum<TopSurfaceZMode>(top_surface_z_mode));
+    config.set_key_value("staggered_perimeters", new ConfigOptionBool(
+        config.opt_enum<PerimeterLayeringMode>("perimeter_layering") ==
+            PerimeterLayeringMode::Brick));
 
     if (config.has("thumbnails")) {
         std::string extention;

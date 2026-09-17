@@ -939,63 +939,66 @@ Slic3r::Polylines intersection_pl(const Slic3r::Polygons &subject, const Slic3r:
 
 // Orca: Sort and orient open polyline fragments produced by clipping `source` with
 // intersection_pl(), so that they run in the same order and direction as the source
-// polyline. Clipping creates new endpoints at the clip boundary, but it keeps the
-// interior source vertices intact, so a fragment's position on the source path is
-// recovered exactly by looking its vertices up in the source. Fragments without any
-// surviving source vertex lie on a single source segment, found by a nearest-segment
-// search.
+// polyline. Order by distance along the source, using interior segment samples
+// to disambiguate corners and splitting fragments that wrap a closed seam.
 void restore_source_path_order(const Slic3r::Polyline &source, Slic3r::Polylines &fragments)
 {
     const Points &src = source.points;
     if (src.size() < 2 || fragments.empty())
         return;
 
-    std::unordered_map<Point, size_t, PointHash> source_index;
-    source_index.reserve(src.size());
-    for (size_t i = 0; i < src.size(); ++ i)
-        source_index.emplace(src[i], i);
-
-    // Sort key: index of the source vertex where the fragment starts, then the signed
-    // offset of the fragment's start from that vertex, to order multiple fragments cut
-    // from one long source segment.
-    std::vector<std::pair<size_t, double>> keys(fragments.size());
-    for (size_t n = 0; n < fragments.size(); ++ n) {
-        Polyline    &pl    = fragments[n];
-        const size_t npos  = size_t(-1);
-        size_t       front = npos;
-        size_t       back  = npos;
-        for (const Point &pt : pl.points)
-            if (auto it = source_index.find(pt); it != source_index.end()) {
-                front = it->second;
-                break;
+    // Clipper can join the two ends of a closed source across its seam. Split
+    // there before assigning distances, so no fragment wraps from length to 0.
+    if (src.front() == src.back()) {
+        const size_t count = fragments.size();
+        for (size_t n = 0; n < count; ++n) {
+            Points &points = fragments[n].points;
+            if (points.size() < 3)
+                continue;
+            const auto seam = std::find(points.begin() + 1, points.end() - 1, src.front());
+            if (seam != points.end() - 1) {
+                Polyline tail(Points(seam, points.end()));
+                points.erase(seam + 1, points.end());
+                fragments.emplace_back(std::move(tail));
             }
-        for (auto i = pl.points.rbegin(); i != pl.points.rend(); ++ i)
-            if (auto it = source_index.find(*i); it != source_index.end()) {
-                back = it->second;
-                break;
-            }
-        Vec2crd source_dir;
-        if (front == npos) {
-            // All vertices were created by clipping, thus the whole fragment lies on a
-            // single source segment. Find that segment.
+        }
+    }
+    std::vector<double> distances(src.size(), 0.);
+    for (size_t i = 1; i < src.size(); ++i)
+        distances[i] = distances[i - 1] + (src[i] - src[i - 1]).cast<double>().norm();
+    std::vector<double> keys(fragments.size());
+    for (size_t n = 0; n < fragments.size(); ++n) {
+        Polyline &pl = fragments[n];
+        pl.remove_duplicate_points();
+        if (pl.points.size() < 2)
+            continue;
+        const auto source_segment = [&src](const Point &a, const Point &b) {
+            // An interior sample selects the correct side at source corners;
+            // a shared endpoint alone is ambiguous, especially at the seam.
+            const Point middle = ((a.cast<double>() + b.cast<double>()) * 0.5).cast<coord_t>();
+            size_t index = 0;
             double best = std::numeric_limits<double>::max();
-            for (size_t i = 0; i + 1 < src.size(); ++ i)
-                if (double d = Line::distance_to_squared(pl.first_point(), src[i], src[i + 1]); d < best) {
-                    best  = d;
-                    front = i;
+            for (size_t i = 0; i + 1 < src.size(); ++i) {
+                if (src[i] == src[i + 1])
+                    continue;
+                const double distance = Line::distance_to_squared(middle, src[i], src[i + 1]);
+                if (distance < best) {
+                    best = distance;
+                    index = i;
                 }
-            back       = front;
-            source_dir = src[front + 1] - src[front];
-        } else
-            source_dir = src[std::min(back + 1, src.size() - 1)] - src[front > 0 ? front - 1 : 0];
-        if (front > back) {
+            }
+            return index;
+        };
+        size_t index = source_segment(pl.points[0], pl.points[1]);
+        if ((pl.points[1] - pl.points[0]).cast<double>().dot(
+                (src[index + 1] - src[index]).cast<double>()) < 0.) {
             pl.reverse();
-            std::swap(front, back);
-        } else if (front == back &&
-                   (pl.last_point() - pl.first_point()).cast<double>().dot(source_dir.cast<double>()) < 0.)
-            pl.reverse();
-        const Vec2crd seg = src[std::min(front + 1, src.size() - 1)] - src[front];
-        keys[n] = { front, (pl.first_point() - src[front]).cast<double>().dot(seg.cast<double>()) };
+            index = source_segment(pl.points[0], pl.points[1]);
+        }
+        const Vec2d direction = (src[index + 1] - src[index]).cast<double>();
+        const double length = direction.norm();
+        keys[n] = distances[index] + (length > 0. ? std::clamp(
+            (pl.first_point() - src[index]).cast<double>().dot(direction) / length, 0., length) : 0.);
     }
 
     std::vector<size_t> order(fragments.size());

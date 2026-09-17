@@ -31,6 +31,7 @@
 
 #include <cstddef>
 #include <atomic>
+#include <chrono>
 #include <float.h>
 #include <iterator>
 #include <mutex>
@@ -581,6 +582,54 @@ void PrintObject::make_perimeters()
                     }
                 }
             });
+
+        // A contraction load is not confined to the single slice immediately
+        // below an abrupt floor/deck transition.  Applying compensation on
+        // only that slice creates another stiffness discontinuity one course
+        // lower and was visible in preview as a lone highlighted layer.  Carry
+        // the detected footprint through a short band below the transition,
+        // clipped to material which actually overlaps that footprint.  Gather
+        // the original detections first so newly marked layers cannot
+        // recursively extend the band.
+        constexpr size_t shrinkage_transition_band_layers = 3;
+        struct ShrinkageTransition {
+            size_t layer_idx;
+            ExPolygons footprint;
+        };
+        std::vector<ShrinkageTransition> shrinkage_transitions;
+        for (size_t layer_idx = 0; layer_idx + 1 < m_layers.size(); ++layer_idx) {
+            const LayerRegion &layer_region =
+                *m_layers[layer_idx]->get_region(region_id);
+            Polygons footprints;
+            for (const Surface &slice : layer_region.slices.surfaces)
+                if (slice.hull_line_transition)
+                    append(footprints, to_polygons(slice.expolygon));
+            if (!footprints.empty())
+                shrinkage_transitions.push_back(
+                    {layer_idx, union_ex(footprints)});
+        }
+        for (const ShrinkageTransition &transition : shrinkage_transitions) {
+            const size_t first_layer = transition.layer_idx >=
+                    shrinkage_transition_band_layers - 1 ?
+                transition.layer_idx - (shrinkage_transition_band_layers - 1) : 0;
+            for (size_t layer_idx = first_layer;
+                 layer_idx < transition.layer_idx; ++layer_idx) {
+                LayerRegion &layer_region =
+                    *m_layers[layer_idx]->get_region(region_id);
+                for (Surface &slice : layer_region.slices.surfaces) {
+                    if (intersection_ex(
+                            ExPolygons{slice.expolygon},
+                            transition.footprint).empty())
+                        continue;
+                    slice.hull_line_transition = true;
+                    slice.extra_perimeters = static_cast<unsigned short>(
+                        std::min<int>(
+                            std::numeric_limits<unsigned short>::max(),
+                            std::max<int>(slice.extra_perimeters,
+                                          shrinkage_extra_perimeters)));
+                }
+            }
+        }
         m_print->throw_if_canceled();
         BOOST_LOG_TRIVIAL(debug) << "Generating extra perimeters for region " << region_id << " in parallel - end";
     }
@@ -844,12 +893,47 @@ void PrintObject::infill()
         const auto& support_fill_octree = this->m_adaptive_fill_octrees.second;
 
         BOOST_LOG_TRIVIAL(debug) << "Filling layers in parallel - start";
+        std::atomic<size_t> completed_layers{0};
+        std::mutex progress_mutex;
+        auto last_report = std::chrono::steady_clock::time_point{};
+        const auto report_fill = [&](size_t layer_idx, FillProgressStage stage, size_t current, size_t total) {
+            // Cancellation is checked even when another worker owns the UI
+            // update or the throttle suppresses this particular report.
+            m_print->throw_if_canceled();
+            const auto now = std::chrono::steady_clock::now();
+            std::unique_lock lock(progress_mutex, std::try_to_lock);
+            if (!lock.owns_lock())
+                return;
+            const size_t completed = completed_layers.load();
+            if (completed != m_layers.size() && now - last_report < std::chrono::milliseconds(250))
+                return;
+            last_report = now;
+            std::string operation;
+            switch (stage) {
+            case FillProgressStage::GroupSurfaces: operation = L("Grouping infill surfaces"); break;
+            case FillProgressStage::GenerateArcs: operation = L("Growing arc families"); break;
+            case FillProgressStage::RecursiveArcs: operation = L("Growing recursive arc families"); break;
+            case FillProgressStage::ValidateArcs: operation = L("Validating arc paths"); break;
+            case FillProgressStage::RefineArcs: operation = L("Filling remaining arc pockets"); break;
+            case FillProgressStage::Complete: break;
+            }
+            const std::string message = operation.empty() ?
+                (boost::format(L("Generating infill: %1% of %2% layers complete")) % completed % m_layers.size()).str() :
+                (boost::format(L("Generating infill: layer %1% of %2% — %3% (%4%/%5%)")) %
+                    (layer_idx + 1) % m_layers.size() % operation % current % total).str();
+            m_print->set_status(35 + int(4 * completed / std::max<size_t>(1, m_layers.size())), message);
+        };
         tbb::parallel_for(
             tbb::blocked_range<size_t>(0, m_layers.size()),
-            [this, &adaptive_fill_octree = adaptive_fill_octree, &support_fill_octree = support_fill_octree](const tbb::blocked_range<size_t>& range) {
+            [this, &adaptive_fill_octree, &support_fill_octree, &report_fill, &completed_layers](const tbb::blocked_range<size_t>& range) {
                 for (size_t layer_idx = range.begin(); layer_idx < range.end(); ++ layer_idx) {
                     m_print->throw_if_canceled();
-                    m_layers[layer_idx]->make_fills(adaptive_fill_octree.get(), support_fill_octree.get(), this->m_lightning_generator.get());
+                    const FillProgressCallback progress = [&, layer_idx](FillProgressStage stage, size_t current, size_t total) {
+                        report_fill(layer_idx, stage, current, total);
+                    };
+                    m_layers[layer_idx]->make_fills(adaptive_fill_octree.get(), support_fill_octree.get(), this->m_lightning_generator.get(), &progress);
+                    ++completed_layers;
+                    report_fill(layer_idx, FillProgressStage::Complete, 1, 1);
                 }
             }
         );
@@ -917,15 +1001,14 @@ void PrintObject::contour_z()
     BOOST_LOG_TRIVIAL(debug) << "Surface path generation in parallel - start";
 
     TriangleMesh mesh = this->m_model_object->raw_mesh();
-    if (m_model_object->instances.size() != 1) {
-        throw RuntimeError("ContourZ: unexpected number of instances");
-    }
-
-    ModelInstance *inst = m_model_object->instances.front();
+    // Copies sharing a transform are sliced once. Other rotations/scales form
+    // separate PrintObjects, so use this group's instance, not the model's
+    // first copy (which may belong to a different group).
+    const ModelInstance *inst = instances().front().model_instance;
     Point                    center_offset = this->center_offset();
     Geometry::Transformation trans = inst->get_transformation();
 
-    double z = this->m_model_object->min_z();
+    double z = m_model_object->instance_bounding_box(*inst).min.z();
     trans.set_offset(Vec3d(-unscale<double>(center_offset.x()), -unscale<double>(center_offset.y()), 0));
     mesh.transform(trans.get_matrix());
 
@@ -1253,16 +1336,14 @@ void PrintObject::generate_support_material()
                 !m_support_layers.empty()) {
                 m_print->set_status(70, L("Analyzing surface-following support ironing"));
                 TriangleMesh mesh = m_model_object->raw_mesh();
-                if (m_model_object->instances.size() != 1)
-                    throw RuntimeError("Support ironing: unexpected number of instances");
-                ModelInstance *instance = m_model_object->instances.front();
+                const ModelInstance *instance = instances().front().model_instance;
                 Geometry::Transformation transformation = instance->get_transformation();
                 const Point center = center_offset();
                 transformation.set_offset(Vec3d(
                     -unscale<double>(center.x()), -unscale<double>(center.y()), 0.));
                 mesh.transform(transformation.get_matrix());
                 sla::IndexedMesh indexed_mesh(mesh);
-                indexed_mesh.ground_level_offset(-m_model_object->min_z());
+                indexed_mesh.ground_level_offset(-m_model_object->instance_bounding_box(*instance).min.z());
 
                 project_nonplanar_support_interface(
                     m_layers, m_support_layers, indexed_mesh,
@@ -4190,6 +4271,9 @@ PrintObjectConfig PrintObject::object_config_from_model_object(const PrintObject
     {
         DynamicPrintConfig src_normalized(object.config.get());
         src_normalized.normalize_fdm();
+        for (const char *key : {"support_filament", "support_interface_filament"})
+            if (const auto *slot = src_normalized.option<ConfigOptionInt>(key); slot != nullptr && slot->value == -1)
+                src_normalized.erase(key); // Keep the resolved print-level binding.
         update_static_print_config_from_dynamic(config, src_normalized, variant_index, print_options_with_variant, 1);
     }
     // Clamp invalid extruders to the default extruder (with index 1).
@@ -4231,6 +4315,8 @@ static void apply_to_print_region_config(PrintRegionConfig &out, const DynamicPr
                 if (one_of(it->first, keys_extruders)) {
                     // "Default" (0) clears explicit override for this scope and lets fallback apply.
                     int extruder = static_cast<const ConfigOptionInt*>(it->second.get())->value;
+                    if (extruder == -1)
+                        continue; // Per-print inherits the already resolved role, not the part filament.
                     if (extruder > 0) {
                         my_opt->setInt(extruder);
                         if (it->first == "sparse_infill_filament_id")

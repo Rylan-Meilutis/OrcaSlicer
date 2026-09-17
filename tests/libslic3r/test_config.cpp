@@ -6,6 +6,8 @@
 #include "libslic3r/PrintConfigConstants.hpp"
 #include "libslic3r/LocalesUtils.hpp"
 #include "libslic3r/Preset.hpp"
+#include "libslic3r/PresetBundle.hpp"
+#include "libslic3r/Model.hpp"
 #include "libslic3r/SequentialGantryGeometry.hpp"
 #include "libslic3r/Utils.hpp"
 
@@ -23,6 +25,181 @@
 #include <sstream>
 
 using namespace Slic3r;
+
+TEST_CASE("Unqualified nonplanar modes are not offered by settings selectors", "[Config][Nonplanar]")
+{
+    const auto *surface = print_config_def.get("top_surface_z_mode");
+    const auto *wall = print_config_def.get("perimeter_layering");
+    REQUIRE(surface);
+    REQUIRE(wall);
+    CHECK(surface->enum_values == std::vector<std::string>{"disabled", "z_contouring"});
+    CHECK(wall->enum_values == std::vector<std::string>{"standard", "brick", "smooth_outer_wall"});
+    // Old projects remain readable so users can switch the feature off.
+    CHECK(surface->enum_keys_map->count("nonplanar_top_surface") == 1);
+    CHECK(wall->enum_keys_map->count("interlocking_walls") == 1);
+}
+
+TEST_CASE("Per-print filament roles preserve profile intent and project slots",
+          "[Config][ProjectFilamentBindings][Regression]")
+{
+    const auto &roles = project_filament_role_keys();
+    DynamicPrintConfig profile;
+    for (const std::string &key : roles) {
+        profile.set_deserialize_strict(key, "-1");
+        CHECK(profile.opt_serialize(key) == "-1");
+    }
+    CHECK_FALSE(profile.has("project_filament_bindings"));
+    ScopedTemporaryFile json_file(".json");
+    profile.save_to_json(json_file.string(), "Project-assigned roles", "User", "1.0.0.0");
+    DynamicPrintConfig reloaded_profile;
+    ConfigSubstitutionContext substitutions(ForwardCompatibilitySubstitutionRule::Disable);
+    std::map<std::string, std::string> metadata;
+    std::string reason;
+    REQUIRE(reloaded_profile.load_from_json(json_file.string(), substitutions, true, metadata, reason) == 0);
+    for (const std::string &key : roles)
+        CHECK(reloaded_profile.opt_int(key) == -1);
+    CHECK_FALSE(reloaded_profile.has("project_filament_bindings"));
+    DynamicPrintConfig project = DynamicPrintConfig::full_print_config();
+    project.apply(profile);
+    project.set_deserialize_strict("filament_colour", "#ffffff;#000000;#ff0000");
+    project.set_key_value("project_filament_bindings", new ConfigOptionInts{3, 0, 2, 1, 99, -2, 0, 3});
+    capture_project_filament_roles(project);
+    resolve_project_filament_bindings(project, 2);
+    const std::vector<int> expected{3, 2, 2, 1, 2, 2, 2, 3};
+    for (size_t i = 0; i < roles.size(); ++i)
+        CHECK(project.opt_int(roles[i]) == expected[i]);
+    DynamicPrintConfig restored;
+    std::vector<std::string> saved_keys = roles;
+    append(saved_keys, std::vector<std::string>{"project_filament_roles", "project_filament_bindings", "filament_colour"});
+    for (const std::string &key : saved_keys)
+        restored.set_deserialize_strict(key, project.opt_serialize(key));
+    restore_project_filament_roles(restored);
+    for (const std::string &key : roles)
+        CHECK(restored.opt_int(key) == -1);
+    // A new profile with explicit choices must not inherit stale role metadata.
+    restored.set_key_value(roles.front(), new ConfigOptionInt(1));
+    capture_project_filament_roles(restored);
+    resolve_project_filament_bindings(restored, 2);
+    CHECK(restored.opt_int(roles.front()) == 1);
+    // Removing a slot falls back to automatic, not a dangling extruder index.
+    restored.set_deserialize_strict("filament_colour", "#ffffff");
+    resolve_project_filament_bindings(restored, 2);
+    for (const std::string &key : roles)
+        CHECK(restored.opt_int(key) == 1);
+}
+
+TEST_CASE("Project filament slots do not leak into process profiles",
+          "[Config][ProjectFilamentBindings][Regression]")
+{
+    PresetBundle bundle;
+    bundle.filament_presets = {bundle.filaments.get_selected_preset_name()};
+    auto &profile = bundle.prints.get_edited_preset().config;
+    profile.set_key_value("outer_wall_filament_id", new ConfigOptionInt(-1));
+    CHECK_FALSE(profile.has("project_filament_bindings"));
+    auto *slots = bundle.project_config.option<ConfigOptionInts>("project_filament_bindings");
+    REQUIRE(slots != nullptr);
+    REQUIRE(slots->values.size() == project_filament_role_keys().size());
+    slots->values[2] = 1;
+    DynamicPrintConfig combined = bundle.full_config();
+    CHECK(combined.opt_int("outer_wall_filament_id") == 1);
+    CHECK(profile.opt_int("outer_wall_filament_id") == -1);
+    restore_project_filament_roles(combined);
+    CHECK(combined.opt_int("outer_wall_filament_id") == -1);
+    CHECK(combined.option<ConfigOptionInts>("project_filament_bindings")->values[2] == 1);
+}
+
+TEST_CASE("Automatic area bindings count printable part instances",
+          "[Config][ProjectFilamentBindings][Regression]")
+{
+    Model model;
+    CHECK(project_default_filament(model) == 1);
+    ModelObject *first = model.add_object();
+    first->add_volume(make_cube(2., 2., 2.));
+    first->config.set("extruder", 1);
+    first->add_instance();
+    ModelObject *second = model.add_object();
+    second->add_volume(make_cube(2., 2., 2.));
+    second->config.set("extruder", 3);
+    second->add_instance();
+    second->add_instance();
+    CHECK(project_default_filament(model) == 3);
+    second->instances.back()->printable = false;
+    CHECK(project_default_filament(model) == 1);
+    second->instances.back()->printable = true;
+    second->volumes.front()->config.set("extruder", 2);
+    CHECK(project_default_filament(model) == 2);
+    second->printable = false;
+    CHECK(project_default_filament(model) == 1);
+}
+
+TEST_CASE("Removing a filament remaps only project area slots",
+          "[Config][ProjectFilamentBindings][Regression]")
+{
+    DynamicPrintConfig config;
+    config.set_key_value("project_filament_bindings", new ConfigOptionInts{0, 1, 2, 3, 4});
+    config.set_key_value("support_filament", new ConfigOptionInt(-1));
+    remap_project_filament_bindings(config, 2, 4);
+    CHECK(config.option<ConfigOptionInts>("project_filament_bindings")->values == std::vector<int>{0, 1, 3, 2, 3});
+    CHECK(config.opt_int("support_filament") == -1);
+    remap_project_filament_bindings(config, 3);
+    CHECK(config.option<ConfigOptionInts>("project_filament_bindings")->values == std::vector<int>{0, 1, 0, 2, 0});
+}
+
+TEST_CASE("CLI diagnostic log paths deserialize as strings", "[Config][Regression]")
+{
+    DynamicPrintAndCLIConfig config;
+    config.set_deserialize_strict("logfile", "nonplanar diagnostics.log");
+    REQUIRE(config.option<ConfigOptionString>("logfile") != nullptr);
+    CHECK(config.opt_string("logfile") == "nonplanar diagnostics.log");
+}
+
+TEST_CASE("Separate Stealth limits survive profile deserialization",
+          "[Config][Stealth][Regression]")
+{
+    DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+    CHECK_FALSE(config.opt_bool("silent_mode"));
+    config.set_deserialize_strict("silent_mode", "1");
+    config.set_deserialize_strict("machine_max_speed_x", "350,160");
+    config.set_deserialize_strict("machine_max_acceleration_x", "4000,1000");
+    REQUIRE(config.opt_bool("silent_mode"));
+    DynamicPrintConfig restored;
+    for (const char *key : {"silent_mode", "machine_max_speed_x", "machine_max_acceleration_x"})
+        restored.set_deserialize_strict(key, config.opt_serialize(key));
+    CHECK(restored.opt_bool("silent_mode"));
+    CHECK(restored.opt_serialize("machine_max_speed_x") == config.opt_serialize("machine_max_speed_x"));
+    CHECK(restored.opt_serialize("machine_max_acceleration_x") == config.opt_serialize("machine_max_acceleration_x"));
+    restored.set_deserialize_strict("silent_mode", "0");
+    CHECK_FALSE(restored.opt_bool("silent_mode"));
+    CHECK(restored.opt_serialize("machine_max_speed_x") == config.opt_serialize("machine_max_speed_x"));
+}
+
+TEST_CASE("Shrinkage contour compensation honors small calibrated expansion",
+          "[Config][LocalizedShrinkage][Regression]")
+{
+    const auto strategy = GENERATE(LocalizedShrinkageStrategy::Custom,
+        LocalizedShrinkageStrategy::DimensionalCompensation,
+        LocalizedShrinkageStrategy::Balanced);
+    const double amount = GENERATE(0.01, 0.025, 0.05, 0.1, 0.2);
+    CAPTURE(strategy, amount);
+    CHECK_THAT(localized_shrinkage_contour_compensation(strategy, amount),
+        Catch::Matchers::WithinAbs(amount, 1e-12));
+}
+
+TEST_CASE("Shrinkage modes preserve automatic and disabled expansion behavior",
+          "[Config][LocalizedShrinkage][Regression]")
+{
+    CHECK_THAT(localized_shrinkage_contour_compensation(LocalizedShrinkageStrategy::Balanced, 0.),
+        Catch::Matchers::WithinAbs(0.1, 1e-12));
+    CHECK_THAT(localized_shrinkage_contour_compensation(LocalizedShrinkageStrategy::DimensionalCompensation, 0.),
+        Catch::Matchers::WithinAbs(0.1, 1e-12));
+    CHECK_THAT(localized_shrinkage_contour_compensation(LocalizedShrinkageStrategy::Custom, 0.),
+        Catch::Matchers::WithinAbs(0., 1e-12));
+    for (const auto strategy : {LocalizedShrinkageStrategy::Disabled,
+            LocalizedShrinkageStrategy::ReinforcedWalls,
+            LocalizedShrinkageStrategy::ReducedWallCoupling})
+        CHECK_THAT(localized_shrinkage_contour_compensation(strategy, 0.2),
+            Catch::Matchers::WithinAbs(0., 1e-12));
+}
 
 TEST_CASE("New strength and overhang options preserve existing print defaults", "[Config]")
 {
@@ -249,11 +426,12 @@ TEST_CASE("Legacy perimeter layering options preserve compatible brick and nonpl
     CHECK(legacy_brick.opt_enum<PerimeterLayeringMode>("perimeter_layering") ==
           PerimeterLayeringMode::Brick);
 
-    DynamicPrintConfig full_legacy_brick = DynamicPrintConfig::full_print_config();
-    full_legacy_brick.set_key_value("staggered_perimeters", new ConfigOptionBool(true));
-    full_legacy_brick.handle_legacy_composite();
-    CHECK(full_legacy_brick.opt_enum<PerimeterLayeringMode>("perimeter_layering") ==
-          PerimeterLayeringMode::Brick);
+    DynamicPrintConfig explicit_standard = DynamicPrintConfig::full_print_config();
+    explicit_standard.set_key_value("staggered_perimeters", new ConfigOptionBool(true));
+    explicit_standard.handle_legacy_composite();
+    CHECK(explicit_standard.opt_enum<PerimeterLayeringMode>("perimeter_layering") ==
+          PerimeterLayeringMode::Standard);
+    CHECK_FALSE(explicit_standard.opt_bool("staggered_perimeters"));
 
     DynamicPrintConfig legacy_nonplanar;
     legacy_nonplanar.set_key_value("nonplanar_top_surface", new ConfigOptionBool(true));
@@ -301,6 +479,15 @@ TEST_CASE("Legacy perimeter layering options preserve compatible brick and nonpl
     CHECK(selected_hybrid.opt_bool("zaa_enabled"));
     CHECK(selected_hybrid.opt_bool("nonplanar_top_surface"));
 
+    DynamicPrintConfig explicit_disabled = DynamicPrintConfig::full_print_config();
+    explicit_disabled.set_key_value("nonplanar_top_surface", new ConfigOptionBool(true));
+    explicit_disabled.set_key_value("zaa_enabled", new ConfigOptionBool(true));
+    explicit_disabled.handle_legacy_composite();
+    CHECK(explicit_disabled.opt_enum<TopSurfaceZMode>("top_surface_z_mode") ==
+          TopSurfaceZMode::Disabled);
+    CHECK_FALSE(explicit_disabled.opt_bool("nonplanar_top_surface"));
+    CHECK_FALSE(explicit_disabled.opt_bool("zaa_enabled"));
+
     DynamicPrintConfig serialized_hybrid = DynamicPrintConfig::full_print_config();
     REQUIRE_NOTHROW(serialized_hybrid.set_deserialize_strict(
         "top_surface_z_mode", "nonplanar_with_z_contouring_fallback"));
@@ -318,6 +505,7 @@ TEST_CASE("Legacy perimeter layering options preserve compatible brick and nonpl
     compatible.perimeter_layering.value = PerimeterLayeringMode::Brick;
     compatible.staggered_perimeters.value = true;
     compatible.nonplanar_top_surface.value = true;
+    compatible.top_surface_z_mode.value = TopSurfaceZMode::NonplanarTopSurface;
     CHECK(brick_perimeters_enabled(compatible));
     CHECK(nonplanar_perimeters_enabled(compatible));
 

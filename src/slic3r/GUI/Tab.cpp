@@ -4810,6 +4810,13 @@ void TabFilament::build()
         optgroup->append_single_option_line("filament_multitool_ramming_flow", "material_multimaterial#multi-tool-ramming-flow");
 
     page = add_options_page(L("Dependencies"), "advanced");
+        optgroup = page->new_optgroup(L("Profile inheritance"), "param_dependencies_presets");
+        optgroup->m_on_change = [this](const t_config_option_key& opt_key, const boost::any& value) {
+            if (opt_key == "inherits")
+                on_inherits_changed(value);
+        };
+        optgroup->append_single_option_line(get_inherits_option(optgroup.get()));
+
         optgroup = page->new_optgroup(L("Compatible printers"), "param_dependencies_printers");
         create_line_with_widget(optgroup.get(), "compatible_printers", "", [this](wxWindow* parent) {
             return compatible_widget_create(parent, m_compatible_printers);
@@ -5581,6 +5588,14 @@ void TabPrinter::append_option_line(ConfigOptionsGroupShp optgroup, const std::s
     optgroup->append_line(line);
 }
 
+static bool supports_prusa_stealth_limits(const DynamicPrintConfig &config)
+{
+    const std::string &model = config.opt_string("printer_model");
+    const auto flavor = config.opt_enum<GCodeFlavor>("gcode_flavor");
+    return (boost::istarts_with(model, "Prusa ") || boost::istarts_with(model, "Original Prusa ")) &&
+           (flavor == gcfMarlinLegacy || flavor == gcfMarlinFirmware);
+}
+
 PageShp TabPrinter::build_kinematics_page()
 {
     auto page = add_options_page(L("Motion ability"), "custom-gcode_motion", true); // ORCA: icon only visible on placeholders
@@ -5594,7 +5609,7 @@ PageShp TabPrinter::build_kinematics_page()
         def.type = coString;
         def.width = Field::def_width();
         def.gui_type = ConfigOptionDef::GUIType::legend;
-        def.mode = comDevelop;
+        def.mode = comAdvanced;
         //def.tooltip = L("Values in this column are for Normal mode");
         def.set_default_value(new ConfigOptionString{ _(L("Normal")).ToUTF8().data() });
 
@@ -5602,13 +5617,14 @@ PageShp TabPrinter::build_kinematics_page()
         line.append_option(option);
 
         //def.tooltip = L("Values in this column are for Stealth mode");
-        def.set_default_value(new ConfigOptionString{ _(L("Silent")).ToUTF8().data() });
+        def.set_default_value(new ConfigOptionString{ _(L("Stealth")).ToUTF8().data() });
         option = Option(def, "silent_legend");
         line.append_option(option);
 
         optgroup->append_line(line);
     }
     auto optgroup = page->new_optgroup(L("Advanced"), "param_advanced");
+    optgroup->append_single_option_line("silent_mode");
     optgroup->append_single_option_line("emit_machine_limits_to_gcode", "printer_motion_ability#emit-limits-to-g-code");
 
     // resonance avoidance ported over from qidi slicer
@@ -6411,6 +6427,7 @@ void TabPrinter::toggle_options()
     }
 
     if (m_active_page->title() == L("Motion ability")) {
+        toggle_line("silent_mode", supports_prusa_stealth_limits(*m_config));
         auto gcf = m_config->option<ConfigOptionEnum<GCodeFlavor>>("gcode_flavor")->value;
         update_input_shaper_menu(gcf);
 
@@ -6420,8 +6437,7 @@ void TabPrinter::toggle_options()
         const bool gcf_is_klipper = gcf == GCodeFlavor::gcfKlipper;
         const bool gcf_is_reprap_firmware = gcf == GCodeFlavor::gcfRepRapFirmware;
 
-        bool silent_mode = m_config->opt_bool("silent_mode");
-        int  max_field   = silent_mode ? 2 : 1;
+        int max_field = m_use_silent_mode ? 2 : 1;
         for (int i = 0; i < max_field; ++i)
             toggle_option("machine_max_acceleration_travel", !gcf_is_marlin_legacy && !gcf_is_klipper, i);
         toggle_line("machine_max_acceleration_travel", !gcf_is_marlin_legacy && !gcf_is_klipper);
@@ -6555,9 +6571,21 @@ void TabPrinter::update()
 
 void TabPrinter::update_fff()
 {
-    if (m_use_silent_mode != m_config->opt_bool("silent_mode"))	{
+    const bool separate_stealth = supports_prusa_stealth_limits(*m_config) &&
+                                  m_config->opt_bool("silent_mode");
+    if (m_use_silent_mode != separate_stealth)	{
         m_rebuild_kinematics_page = true;
-        m_use_silent_mode = m_config->opt_bool("silent_mode");
+        m_use_silent_mode = separate_stealth;
+        // Rebuild after the checkbox callback returns: its controls belong to
+        // the page being replaced. Also covers loading another printer preset.
+        CallAfter([this]() {
+            if (!m_rebuild_kinematics_page)
+                return;
+            build_unregular_pages();
+            init_options_list();
+            update_dirty();
+            toggle_options();
+        });
     }
 
     toggle_options();
@@ -7813,7 +7841,7 @@ void Tab::show_profile_manager_menu()
     wxMenuItem* export_item = menu.Append(wxID_ANY, _L("Export current profile as JSON") + dots);
 
     menu.Bind(wxEVT_MENU, [this](wxCommandEvent&) { edit_user_profile(); }, edit_item->GetId());
-    menu.Bind(wxEVT_MENU, [this](wxCommandEvent&) {
+    menu.Bind(wxEVT_MENU, [](wxCommandEvent&) {
         if (wxGetApp().mainframe != nullptr)
             wxGetApp().mainframe->load_config_file();
     }, import_item->GetId());

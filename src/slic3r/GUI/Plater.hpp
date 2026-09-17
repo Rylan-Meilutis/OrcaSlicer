@@ -202,6 +202,7 @@ public:
     std::map<int, DynamicPrintConfig> build_filament_ams_list(MachineObject* obj);
     void sync_ams_list(bool is_from_big_sync_btn = false);
     void sync_spool_manager_filaments(DynamicPrintConfig *host_config = nullptr);
+    void manage_octoprint_filament_mappings();
     bool sync_extruder_list();
     bool is_fila_switch_ready();
     void reset_fila_switch();
@@ -220,6 +221,7 @@ public:
     void set_extruder_nozzle_count(int extruder_id, int nozzle_count);
     void enable_nozzle_count_edit(bool enable);
     void update_dynamic_filament_list();
+    void update_area_bindings();
 
     PlaterPresetComboBox *  printer_combox();
     ObjectList*             obj_list();

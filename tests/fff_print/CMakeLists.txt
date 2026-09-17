@@ -30,3 +30,10 @@ set_property(TARGET ${_TEST_NAME}_tests PROPERTY FOLDER "tests")
 orcaslicer_copy_test_dlls()
 
 orcaslicer_discover_tests(${_TEST_NAME}_tests)
+
+# Exercise the emitted-G-code audit itself, including known-invalid controls.
+# A validator which silently accepts unsupported walls must fail the test run.
+add_test(NAME gcode_audit_regressions
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/test_audit_gcode_moves.py")
+set_tests_properties(gcode_audit_regressions PROPERTIES
+    LABELS "GCode;NonplanarSurface;Regression" TIMEOUT 120)

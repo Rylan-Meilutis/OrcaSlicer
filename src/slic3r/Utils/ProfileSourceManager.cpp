@@ -11,7 +11,9 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cctype>
+#include <cstring>
 #include <ctime>
 #include <iomanip>
 #include <limits>
@@ -19,6 +21,7 @@
 #include <optional>
 #include <set>
 #include <sstream>
+#include <thread>
 #include <unordered_map>
 
 #include <boost/algorithm/string.hpp>
@@ -912,16 +915,48 @@ bool write_preset(const fs::path &root, const std::string &section_name, const S
 
     const char *subdir = type == "process" ? PRESET_PRINT_NAME :
                          type == "filament" ? PRESET_FILAMENT_NAME : PRESET_PRINTER_NAME;
-    fs::create_directories(root / subdir);
+    boost::system::error_code directory_error;
+    fs::create_directories(root / subdir, directory_error);
+    if (directory_error) {
+        result.error = "Could not create converted preset directory " +
+            (root / subdir).string() + ": " + directory_error.message();
+        return false;
+    }
     fs::path file = root / subdir / (sanitize(name) + ".json");
-    boost::nowide::ofstream stream(file.string());
     // Upstream INI files are not guaranteed to be UTF-8. A malformed vendor
     // or preset description must not terminate OrcaSlicer while the daily
     // profile refresh is running. Preserve the preset and replace only invalid
     // input bytes in the generated JSON.
-    stream << output.dump(1, '\t', false, json::error_handler_t::replace) << '\n';
-    if (!stream.good())
+    const std::string contents = output.dump(1, '\t', false, json::error_handler_t::replace) + '\n';
+    int io_error = 0;
+    bool written = false;
+    for (int attempt = 0; attempt < 3 && !written; ++attempt) {
+        errno = 0;
+        {
+            boost::nowide::ofstream stream(file.string(), std::ios::binary | std::ios::trunc);
+            if (stream.is_open()) {
+                stream.write(contents.data(), static_cast<std::streamsize>(contents.size()));
+                stream.flush();
+                written = stream.good();
+                stream.close();
+                written = written && !stream.fail();
+            }
+        }
+        if (written)
+            break;
+        io_error = errno;
+        // GUI/WebKit/network activity may briefly exhaust the process file
+        // descriptor table while a large source is producing thousands of
+        // presets. All stream state is destroyed before yielding and retrying.
+        if (io_error != EMFILE && io_error != ENFILE && io_error != EINTR && io_error != EAGAIN)
+            break;
+        std::this_thread::yield();
+    }
+    if (!written) {
+        result.error = "Could not write converted preset " + file.string() +
+            (io_error != 0 ? ": " + std::string(std::strerror(io_error)) : std::string());
         return false;
+    }
     if (type == "process") ++result.processes;
     else if (type == "filament") ++result.filaments;
     else ++result.printers;
@@ -987,7 +1022,8 @@ ProfileSourceSyncResult convert_prusa_tree(const fs::path &input_root, const fs:
                 const std::string name = flat.count("profile_name") ?
                     flat.at("profile_name") : file.stem().string();
                 if (!write_preset(output_root, flat_type + ":" + name, flat, result, file_namespace)) {
-                    result.error = "Could not write converted preset " + name;
+                    if (result.error.empty())
+                        result.error = "Could not write converted preset " + name;
                     return result;
                 }
             }
@@ -1015,7 +1051,8 @@ ProfileSourceSyncResult convert_prusa_tree(const fs::path &input_root, const fs:
             qualify_section_reference(merged, "default_print_profile", names["process"], file_namespace);
             qualify_section_reference(merged, "default_filament_profile", names["filament"], file_namespace);
             if (!write_preset(output_root, name, merged, result, file_namespace)) {
-                result.error = "Could not write converted preset " + preset_name(name);
+                if (result.error.empty())
+                    result.error = "Could not write converted preset " + preset_name(name);
                 return result;
             }
         }
@@ -1210,6 +1247,7 @@ std::vector<ProfileSource> ProfileSourceManager::sources() const
             source.name      = entry.value("name", "");
             source.url       = entry.value("url", "");
             source.format    = entry.value("format", "prusa") == "orca" ? ProfileSource::Format::Orca : ProfileSource::Format::Prusa;
+            source.last_check = entry.value("last_check", 0LL);
             source.last_sync = entry.value("last_sync", 0LL);
             source.enabled   = entry.value("enabled", false);
             source.revision  = entry.value("revision", "");
@@ -1228,6 +1266,7 @@ void ProfileSourceManager::set_sources(const std::vector<ProfileSource> &sources
     for (const ProfileSource &source : sources)
         output.push_back({{"id", source.id}, {"name", source.name}, {"url", source.url},
                           {"format", source.format == ProfileSource::Format::Orca ? "orca" : "prusa"},
+                          {"last_check", source.last_check},
                           {"last_sync", source.last_sync}, {"enabled", source.enabled},
                           {"revision", source.revision}});
     m_config.set(CONFIG_KEY, output.dump(-1, ' ', false, json::error_handler_t::replace));
@@ -1289,6 +1328,13 @@ ProfileSourceSyncResult ProfileSourceManager::sync(const ProfileSource &source, 
     if (!revision_error.empty()) {
         result.error = revision_error;
         return result;
+    }
+    if (record_sync) {
+        auto current = sources();
+        for (ProfileSource &item : current)
+            if (item.id == source.id)
+                item.last_check = std::time(nullptr);
+        set_sources(current);
     }
     const std::string user = m_config.get("preset_folder").empty() ? DEFAULT_USER_FOLDER_NAME : m_config.get("preset_folder");
     const fs::path target = fs::path(data_dir()) / PRESET_USER_DIR / user / PRESET_LOCAL_DIR / ("profile_source_" + sanitize(source.id));
@@ -1396,7 +1442,7 @@ ProfileSourceSyncResult ProfileSourceManager::sync(const ProfileSource &source, 
         auto current = sources();
         for (ProfileSource &item : current)
             if (item.id == source.id) {
-                item.last_sync = std::time(nullptr);
+                item.last_check = item.last_sync = std::time(nullptr);
                 item.revision = result.revision;
             }
         set_sources(current);
@@ -1419,7 +1465,7 @@ std::vector<ProfileSource> ProfileSourceManager::stale_enabled_sources(long long
     const long long now = std::time(nullptr);
     std::vector<ProfileSource> result;
     for (const ProfileSource &source : sources())
-        if (source.enabled && (source.last_sync == 0 || now - source.last_sync >= max_age_seconds))
+        if (source.enabled && (source.last_check == 0 || now - source.last_check >= max_age_seconds))
             result.push_back(source);
     return result;
 }

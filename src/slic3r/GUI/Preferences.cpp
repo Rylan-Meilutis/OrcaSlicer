@@ -24,6 +24,7 @@
 #include "slic3r/Utils/ProfileSourceManager.hpp"
 
 #include <wx/choicdlg.h>
+#include <wx/combobox.h>
 #include <wx/listctrl.h>
 #include <wx/textdlg.h>
 
@@ -50,7 +51,7 @@ class ProfileSourcesDialog final : public DPIDialog
 {
 public:
     explicit ProfileSourcesDialog(wxWindow *parent, AppConfig &config)
-        : DPIDialog(parent, wxID_ANY, _L("Profile sources"), wxDefaultPosition, wxSize(FromDIP(780), FromDIP(460)),
+        : DPIDialog(parent, wxID_ANY, _L("Profile sources"), wxDefaultPosition, wxSize(FromDIP(1020), FromDIP(460)),
                     wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER)
         , m_manager(config)
     {
@@ -67,7 +68,8 @@ public:
         m_list->AppendColumn(_L("Name"), wxLIST_FORMAT_LEFT, FromDIP(180));
         m_list->AppendColumn(_L("Format"), wxLIST_FORMAT_LEFT, FromDIP(90));
         m_list->AppendColumn(_L("Source URL"), wxLIST_FORMAT_LEFT, FromDIP(290));
-        m_list->AppendColumn(_L("Last sync"), wxLIST_FORMAT_LEFT, FromDIP(110));
+        m_list->AppendColumn(_L("Last checked"), wxLIST_FORMAT_LEFT, FromDIP(145));
+        m_list->AppendColumn(_L("Last synchronized"), wxLIST_FORMAT_LEFT, FromDIP(145));
         root->Add(m_list, 1, wxEXPAND | wxLEFT | wxRIGHT, FromDIP(10));
 
         auto *buttons = new wxBoxSizer(wxHORIZONTAL);
@@ -118,11 +120,17 @@ private:
             m_list->SetItem(row, 1, from_u8(source.name));
             m_list->SetItem(row, 2, source.format == ProfileSource::Format::Prusa ? "PrusaSlicer" : "OrcaSlicer");
             m_list->SetItem(row, 3, from_u8(source.url));
-            if (source.last_sync != 0) {
-                wxDateTime time(static_cast<time_t>(source.last_sync));
+            if (source.last_check != 0) {
+                wxDateTime time(static_cast<time_t>(source.last_check));
                 m_list->SetItem(row, 4, time.FormatISOCombined(' '));
             } else {
                 m_list->SetItem(row, 4, _L("Never"));
+            }
+            if (source.last_sync != 0) {
+                wxDateTime time(static_cast<time_t>(source.last_sync));
+                m_list->SetItem(row, 5, time.FormatISOCombined(' '));
+            } else {
+                m_list->SetItem(row, 5, _L("Never"));
             }
         }
     }

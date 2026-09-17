@@ -108,8 +108,11 @@ inline double localized_shrinkage_contour_compensation(LocalizedShrinkageStrateg
 {
     switch (strategy) {
     case LocalizedShrinkageStrategy::Custom:                  return configured;
-    case LocalizedShrinkageStrategy::DimensionalCompensation: return std::max(0.1, configured);
-    case LocalizedShrinkageStrategy::Balanced:                return std::max(0.1, configured);
+    case LocalizedShrinkageStrategy::DimensionalCompensation:
+    case LocalizedShrinkageStrategy::Balanced:
+        // Zero keeps the preset's legacy automatic amount. A positive value
+        // is an explicit calibration, not a request for at least 0.1 mm.
+        return configured > 0. ? configured : 0.1;
     default:                                                   return 0.;
     }
 }
@@ -1648,19 +1651,22 @@ PRINT_CONFIG_CLASS_DEFINE(
 inline bool nonplanar_perimeters_enabled(const PrintRegionConfig &config)
 {
     const PerimeterLayeringMode mode = config.perimeter_layering.value;
+    const TopSurfaceZMode surface_mode = config.top_surface_z_mode.value;
     return (mode == PerimeterLayeringMode::Standard ||
             mode == PerimeterLayeringMode::Brick ||
             mode == PerimeterLayeringMode::InterlockingWalls ||
             mode == PerimeterLayeringMode::Nonplanar) &&
-           config.nonplanar_top_surface.value;
+           (surface_mode == TopSurfaceZMode::NonplanarTopSurface ||
+            surface_mode == TopSurfaceZMode::NonplanarWithZContouringFallback);
 }
 
 inline bool brick_perimeters_enabled(const PrintRegionConfig &config)
 {
-    const PerimeterLayeringMode mode = config.perimeter_layering.value;
-    return mode == PerimeterLayeringMode::Brick ||
-           (mode == PerimeterLayeringMode::Standard &&
-            config.staggered_perimeters.value);
+    // The selector is authoritative once a profile has been migrated.  The
+    // legacy boolean is synchronized while loading and by the GUI, but must
+    // never be allowed to silently re-enable Brick after the user selects
+    // Standard.
+    return config.perimeter_layering.value == PerimeterLayeringMode::Brick;
 }
 
 PRINT_CONFIG_CLASS_DEFINE(
@@ -2089,6 +2095,8 @@ PRINT_CONFIG_CLASS_DERIVED_DEFINE(
     ((ConfigOptionFloat,              wipe_tower_bridging))
     ((ConfigOptionPercent,            wipe_tower_extra_flow))
     ((ConfigOptionFloats,             flush_volumes_matrix))
+    ((ConfigOptionInts,               project_filament_bindings))
+    ((ConfigOptionStrings,            project_filament_roles))
     ((ConfigOptionFloats,             flush_volumes_vector))
 
     // Orca: mmu support
@@ -2702,6 +2710,15 @@ static bool has_zero_flush_volume_for_used_filaments(const std::vector<T> &fv_ma
 }
 
 size_t get_extruder_index(const GCodeConfig& config, unsigned int filament_id);
+
+// Role order is part of the project format: append new roles, never reorder.
+const std::vector<std::string> &project_filament_role_keys();
+class Model;
+int project_default_filament(const Model &model);
+void capture_project_filament_roles(DynamicPrintConfig &config);
+void restore_project_filament_roles(DynamicPrintConfig &config);
+void resolve_project_filament_bindings(DynamicPrintConfig &config, int default_slot = 1);
+void remap_project_filament_bindings(DynamicPrintConfig &config, int deleted_slot, int replacement_slot = 0);
 
 } // namespace Slic3r
 

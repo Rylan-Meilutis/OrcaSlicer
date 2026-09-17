@@ -15,6 +15,31 @@ namespace Slic3r {
 
 namespace {
 
+constexpr double arc_fit_tolerance_mm = 0.005;
+
+template<class Supported>
+bool arc_lead_supported(const Polyline &path, bool reverse, double remaining,
+                        double sample_step, const Supported &supported)
+{
+    if (path.points.size() < 2) return false;
+    for (size_t i = 1; i < path.points.size() && remaining > 0.; ++i) {
+        const Point &a = path.points[reverse ? path.points.size() - i : i - 1];
+        const Point &b = path.points[reverse ? path.points.size() - i - 1 : i];
+        const Vec2d delta = (b - a).cast<double>();
+        const double length = delta.norm();
+        if (length <= 0.) continue;
+        const double checked = std::min(length, remaining);
+        const size_t samples = std::max<size_t>(1, size_t(std::ceil(checked / sample_step)));
+        for (size_t j = 0; j <= samples; ++j) {
+            const Vec2d p = a.cast<double>() + delta * (checked * double(j) / double(samples) / length);
+            if (!supported(Point(coord_t(std::lround(p.x())), coord_t(std::lround(p.y())))))
+                return false;
+        }
+        remaining -= checked;
+    }
+    return true;
+}
+
 struct ArcGridCell {
     int64_t x;
     int64_t y;
@@ -41,10 +66,100 @@ public:
         : m_lines(lines), m_cell_size(std::max<coord_t>(1, cell_size))
     {}
 
-    void add(const Polyline &path)
+    void add(const Polyline &path, coord_t reach_correction = 0)
     {
+        const size_t first = m_lines.size();
         for (size_t point_idx = 1; point_idx < path.points.size(); ++point_idx)
             add(Line(path.points[point_idx - 1], path.points[point_idx]));
+        const size_t last = m_lines.size();
+        const bool closed = path.points.size() > 2 && path.first_point() == path.last_point();
+        for (size_t i = first; i < last; ++i)
+            m_path_info.push_back({m_paths.size(), !closed && i == first, !closed && i + 1 == last});
+        m_paths.push_back({path, 0, {}, reach_correction});
+        m_max_reach_correction = std::max(m_max_reach_correction, reach_correction);
+    }
+
+    struct Checkpoint { size_t lines, paths; };
+    Checkpoint checkpoint() const { return {m_lines.size(), m_paths.size()}; }
+
+    void rollback(Checkpoint checkpoint)
+    {
+        // Remove only the trial's appended segments, in reverse insertion
+        // order. Existing support and its cached corridors remain untouched.
+        for (size_t i = m_lines.size(); i > checkpoint.lines; --i) {
+            const Line &line = m_lines[i - 1];
+            for (int64_t x = cell(std::min(line.a.x(), line.b.x())); x <= cell(std::max(line.a.x(), line.b.x())); ++x)
+                for (int64_t y = cell(std::min(line.a.y(), line.b.y())); y <= cell(std::max(line.a.y(), line.b.y())); ++y) {
+                    auto found = m_cells.find({x, y});
+                    assert(found != m_cells.end() && found->second.back() == i - 1);
+                    found->second.pop_back();
+                    if (found->second.empty()) m_cells.erase(found);
+                }
+        }
+        m_lines.resize(checkpoint.lines);
+        m_seen.resize(checkpoint.lines);
+        m_path_info.resize(checkpoint.lines);
+        m_paths.resize(checkpoint.paths);
+        m_contacts.clear();
+    }
+
+    // A free end cap is not a lateral foundation. Find the closest feature
+    // of each deposited path, rather than accepting a nearby interior vertex
+    // when its actual nearest feature is an unsupported terminal extension.
+    bool has_side_contact(const Point &point, coord_t reach, bool exclude_free_tips = true)
+    {
+        m_contacts.clear();
+        visit_indices(Line(point, point), reach + m_max_reach_correction, [&](size_t i) {
+            const Line &line = m_lines[i];
+            const Vec2d delta = (line.b - line.a).cast<double>();
+            if (delta.squaredNorm() == 0.) return;
+            const double t = (point - line.a).cast<double>().dot(delta) / delta.squaredNorm();
+            const double distance = line.distance_to_squared(point);
+            const PathInfo &info = m_path_info[i];
+            const coord_t path_reach = reach + m_paths[info.path].reach_correction;
+            if (path_reach <= 0 || distance > double(path_reach) * path_reach) return;
+            // Reserve room for arc fitting and G-code coordinate rounding at
+            // terminal contacts, just as intersection trimming does.
+            const double end_guard = scale_(2. * arc_fit_tolerance_mm + 0.002) / delta.norm();
+            const bool side = !exclude_free_tips ||
+                (!(info.first && t < end_guard) && !(info.last && t > 1. - end_guard));
+            auto found = std::find_if(m_contacts.begin(), m_contacts.end(),
+                [&](const Contact &contact) { return contact.path == info.path; });
+            if (found == m_contacts.end())
+                m_contacts.push_back({info.path, distance, side});
+            else if (distance < found->distance)
+                *found = {info.path, distance, side};
+        });
+        for (const Contact &contact : m_contacts) {
+            if (!contact.side) continue;
+            if (!exclude_free_tips) return true;
+            SupportPath &support = m_paths[contact.path];
+            const coord_t path_reach = reach + support.reach_correction;
+            if (support.reach != path_reach) {
+                Polyline body = support.path;
+                if (body.first_point() != body.last_point()) {
+                    const double guard = std::max(scale_(0.012), 0.03 * double(path_reach));
+                    if (body.length() <= 2. * guard)
+                        body.clear();
+                    else {
+                        body.clip_start(guard);
+                        body.clip_end(guard);
+                    }
+                }
+                // Trim the free ends themselves before constructing contact
+                // corridors. A last tessellation segment can be shorter than
+                // the guard; checking only that segment's plane misses it.
+                // Do not shrink the sides: that would reject valid adjacent
+                // rings at the user's configured centerline pitch.
+                support.corridor = union_ex(offset(body, float(path_reach),
+                    ClipperLib::jtRound, DefaultLineMiterLimit, ClipperLib::etOpenButt));
+                support.reach = path_reach;
+            }
+            if (std::any_of(support.corridor.begin(), support.corridor.end(),
+                [&](const ExPolygon &region) { return region.contains(point); }))
+                return true;
+        }
+        return false;
     }
 
     template<typename Visitor>
@@ -55,6 +170,21 @@ public:
             [this, &visitor](size_t line_idx) {
                 visitor(m_lines[line_idx]);
             });
+    }
+
+    double nearest_distance_squared(const Point &point, coord_t radius)
+    {
+        double nearest = std::numeric_limits<double>::max();
+        visit(Line(point, point), radius, [&](const Line &line) {
+            nearest = std::min(nearest, line.distance_to_squared(point));
+        });
+        // A hit inside the query disk is globally nearest: every omitted
+        // segment lies outside its bounding square. Preserve exact ordering
+        // for detached candidates too, using the full scan only on a miss.
+        if (nearest > double(radius) * double(radius))
+            for (const Line &line : m_lines)
+                nearest = std::min(nearest, line.distance_to_squared(point));
+        return nearest;
     }
 
 private:
@@ -73,10 +203,12 @@ private:
             ++m_query_id;
         }
 
-        const int64_t min_x = cell(std::min(query.a.x(), query.b.x()) - padding);
-        const int64_t max_x = cell(std::max(query.a.x(), query.b.x()) + padding);
-        const int64_t min_y = cell(std::min(query.a.y(), query.b.y()) - padding);
-        const int64_t max_y = cell(std::max(query.a.y(), query.b.y()) + padding);
+        const coord_t left = std::min(query.a.x(), query.b.x()) - padding;
+        const coord_t right = std::max(query.a.x(), query.b.x()) + padding;
+        const coord_t bottom = std::min(query.a.y(), query.b.y()) - padding;
+        const coord_t top = std::max(query.a.y(), query.b.y()) + padding;
+        const int64_t min_x = cell(left), max_x = cell(right);
+        const int64_t min_y = cell(bottom), max_y = cell(top);
         for (int64_t x = min_x; x <= max_x; ++x) {
             for (int64_t y = min_y; y <= max_y; ++y) {
                 const auto found = m_cells.find({x, y});
@@ -86,6 +218,14 @@ private:
                     if (m_seen[line_idx] == m_query_id)
                         continue;
                     m_seen[line_idx] = m_query_id;
+                    // A cell is deliberately coarse (four bead pitches).
+                    // Reject disjoint line bounds before costly exact tests.
+                    const Line &line = m_lines[line_idx];
+                    if ((line.a.x() < left && line.b.x() < left) ||
+                        (line.a.x() > right && line.b.x() > right) ||
+                        (line.a.y() < bottom && line.b.y() < bottom) ||
+                        (line.a.y() > top && line.b.y() > top))
+                        continue;
                     visitor(line_idx);
                 }
             }
@@ -112,6 +252,13 @@ private:
     std::unordered_map<ArcGridCell, std::vector<size_t>,
                        ArcGridCellHash>                       m_cells;
     std::vector<uint32_t>                                    m_seen;
+    struct PathInfo { size_t path; bool first, last; };
+    std::vector<PathInfo>                                    m_path_info;
+    struct Contact { size_t path; double distance; bool side; };
+    std::vector<Contact>                                     m_contacts;
+    struct SupportPath { Polyline path; coord_t reach; ExPolygons corridor; coord_t reach_correction; };
+    std::vector<SupportPath>                                 m_paths;
+    coord_t                                                  m_max_reach_correction{0};
     uint32_t                                                 m_query_id{0};
 };
 
@@ -125,6 +272,11 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
 {
     if (expolygon.empty() || params.density <= 0.f)
         return;
+    const auto report = [&params](FillProgressStage stage, size_t current, size_t total) {
+        if (params.progress != nullptr)
+            (*params.progress)(stage, current, total);
+    };
+    report(FillProgressStage::GenerateArcs, 0, 1);
     const BoundingBox bbox = get_extents(expolygon);
     const coord_t line_width = std::max<coord_t>(
         1, scale_(params.flow.width() > 0.f ? params.flow.width() : this->spacing));
@@ -136,7 +288,35 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
     const coord_t line_overlap = coord_t(std::lround(
         double(line_width) * overlap_percent / 100.));
     const coord_t spacing = std::max<coord_t>(1, nominal_spacing - line_overlap);
+    const Polylines *support_paths = params.arc_support_paths != nullptr ?
+        params.arc_support_paths : params.arc_obstacle_paths;
+    // Without explicit support geometry the legacy standalone filler assumes
+    // the entire clipping boundary is supported. Native slicing supplies the
+    // support context, including empty sets, and must reject free-tip growth.
+    const bool explicit_support = params.arc_anchor_regions != nullptr ||
+        params.arc_root_anchor_regions != nullptr || support_paths != nullptr ||
+        params.arc_prior_paths != nullptr;
     Vec2d axis(std::cos(direction.first), std::sin(direction.first));
+    if (params.arc_root_anchor_regions != nullptr) {
+        // For an axis-aligned narrow strip the bridge direction may point
+        // across its short span. Grow translated arches down the long span
+        // instead; otherwise a short concentric seed is followed by hundreds
+        // of unrelated recursive restarts. Anchor qualification remains below.
+        const Vec2d size = bbox.size().cast<double>();
+        Vec2d strip_axis = axis;
+        if (size.x() <= 16. * spacing && size.y() > 1.5 * size.x())
+            strip_axis = Vec2d(0., 1.);
+        else if (size.y() <= 16. * spacing && size.x() > 1.5 * size.y())
+            strip_axis = Vec2d(1., 0.);
+        if (strip_axis != axis) {
+            const Point extent = (strip_axis * (size.norm() + 4. * spacing)).cast<coord_t>();
+            const Polyline strip_ray(Points{bbox.center() - extent, bbox.center() + extent});
+            // A long-side-only foundation does not anchor longitudinal arches.
+            // Retain the original direction when no real end foundation exists.
+            if (!intersection_pl(Polylines{strip_ray}, *params.arc_root_anchor_regions).empty())
+                axis = strip_axis;
+        }
+    }
     const Point midpoint = bbox.center();
     const double ray_length = bbox.size().cast<double>().norm() + 4. * spacing;
 
@@ -258,6 +438,7 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
     const Point center = anchor;
     const double resolution = std::max<double>(scale_(params.resolution), SCALED_EPSILON);
     const bool recursive_fill = params.config != nullptr && params.config->arc_overhang_recursive_fill.value;
+    constexpr double max_family_radius_mm = 15.;
     std::vector<BoundingBox> obstacle_region_bboxes;
     if (params.arc_obstacle_regions != nullptr) {
         obstacle_region_bboxes.reserve(
@@ -304,6 +485,8 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
             family_max_radius = std::min(family_max_radius, radius_limit);
 
         for (double radius = first_radius; radius <= family_max_radius; radius += spacing) {
+            report(FillProgressStage::GenerateArcs, size_t((radius - first_radius) / spacing) + 1,
+                   size_t(std::max(0., (family_max_radius - first_radius) / spacing)) + 1);
             const double angle_step = std::clamp(2. * std::acos(std::max(-1., 1. - resolution / radius)),
                                                  Geometry::deg2rad(2.), Geometry::deg2rad(15.));
             Polyline circle;
@@ -416,6 +599,13 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
     const bool narrow_region = axis_span <= 16. * spacing && normal_span > 1.5 * axis_span;
     const bool narrow_chord_region = normal_span <= 32. * spacing &&
                                      axis_span > 1.5 * normal_span;
+    const auto bridge_arch_radius = [&](double half_width) {
+        const double radius = std::max(half_width + spacing, 1.25 * half_width);
+        // Match an actual course of the concentric starter, not an unrelated
+        // radius: the first translated arch then continues the same curve.
+        return params.arc_root_anchor_regions != nullptr ?
+            0.5 * spacing + std::floor((radius - 0.5 * spacing) / spacing) * spacing : radius;
+    };
     const double narrow_radius_limit =
         narrow_region ? std::max(1.5 * spacing, axis_span + spacing) :
         narrow_chord_region ? std::max(1.5 * spacing, normal_span) : 0.;
@@ -423,10 +613,12 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
     const bool chained_primary = (narrow_region || narrow_chord_region) &&
                                  has_supported_anchor &&
                                  narrow_radius_limit > 0.;
+    const bool frontier_growth = chained_primary ||
+        (has_supported_anchor && recursive_fill && !chained_primary &&
+         (params.arc_anchor_regions != nullptr || params.arc_root_anchor_regions != nullptr));
     if (chained_primary) {
         const bool has_retained_obstacle_paths =
-            params.arc_obstacle_paths != nullptr &&
-            !params.arc_obstacle_paths->empty();
+            support_paths != nullptr && !support_paths->empty();
         // Very large circles clipped to a narrow span become nearly straight
         // bridge lines. Tile the span with parallel, fixed-radius circular
         // arches instead. Translating one arch by one line width preserves its
@@ -446,13 +638,13 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
                 transverse_max = std::max(transverse_max, projection);
             }
             const double half_width = 0.5 * (transverse_max - transverse_min);
-            const double radius = std::max(half_width + spacing,
-                                           1.25 * half_width);
+            const double radius = bridge_arch_radius(half_width);
             const double half_angle = std::asin(
                 std::clamp(half_width / radius, 0., 1.));
             const double sagitta =
                 radius - std::sqrt(std::max(0., radius * radius -
                                                  half_width * half_width));
+            const double initial_peak = params.arc_root_anchor_regions != nullptr ? radius : sagitta;
             const double angle_step = std::clamp(
                 2. * std::acos(std::max(-1., 1. - resolution / radius)),
                 Geometry::deg2rad(2.), Geometry::deg2rad(15.));
@@ -476,17 +668,25 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
             const double usable_distance =
                 std::max(
                     0.,
-                    target_distance - sagitta -
+                    target_distance - initial_peak -
                         phase_offset);
             const size_t path_count = std::max<size_t>(
                 1, size_t(std::floor(usable_distance / path_pitch)) + 1);
+            if (params.arc_root_anchor_regions != nullptr) {
+                // Start each seed on its own foundation-facing side, including
+                // the mirrored family coming from the opposite end.
+                const Point supported_start = start_anchor - (family_axis * spacing).cast<coord_t>();
+                generate_family(supported_start, start_anchor, 0.5 * double(spacing),
+                                radius, expolygon, std::numeric_limits<size_t>::max(),
+                                true, arcs, nullptr, nullptr);
+            }
             Point previous = start_anchor;
             for (size_t path_idx = 0;
                  path_idx < path_count;
                  ++path_idx) {
                 const double peak_projection =
                     start_projection +
-                    sagitta + phase_offset +
+                    initial_peak + phase_offset +
                     path_idx * path_pitch;
                 const double center_projection = peak_projection - radius;
                 Polyline arch;
@@ -533,37 +733,7 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
             }
         };
 
-        if (narrow_region) {
-            // The bridge direction crosses the short dimension. Growing one
-            // ever-larger circle along the long dimension eventually produces
-            // almost straight clipped chords. Print a curved transverse arch at
-            // the supported midpoint, then advance in both directions. The
-            // validation pass below retains these only when both ends attach or
-            // the complete arch follows an already deposited bead.
-            Vec2d positive_chain_axis = normal;
-            if (positive_chain_axis.squaredNorm() == 0.)
-                positive_chain_axis = Vec2d(-axis.y(), axis.x());
-            positive_chain_axis.normalize();
-            double positive_distance = 0.;
-            double negative_distance = 0.;
-            for (const Point &corner : bbox_corners) {
-                const double distance =
-                    (corner - anchor).cast<double>().dot(positive_chain_axis);
-                positive_distance = std::max(positive_distance, distance);
-                negative_distance = std::max(negative_distance, -distance);
-            }
-            // When a retained wall exists the supported concentric frontier
-            // below is translated instead. Avoid constructing this generic
-            // one-ended family only to discard it afterwards.
-            if (!has_retained_obstacle_paths) {
-                generate_parallel_arcs(
-                    anchor, positive_chain_axis,
-                    positive_distance, 0.);
-                generate_parallel_arcs(
-                    anchor, -positive_chain_axis,
-                    negative_distance, 0.);
-            }
-        } else {
+        if (!narrow_region) {
             Point opposite_anchor = anchor;
             double opposite_distance = 0.;
             const ExPolygons *opposite_anchor_regions =
@@ -571,14 +741,26 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
                 !params.arc_root_anchor_regions->empty() ?
                     params.arc_root_anchor_regions :
                     params.arc_anchor_regions;
-            const Polylines support_on_axis =
-                intersection_pl(Polylines{ray}, *opposite_anchor_regions);
-            for (const Polyline &segment : support_on_axis) {
-                for (const Point &point : {segment.first_point(), segment.last_point()}) {
-                    const double distance = (point - anchor).cast<double>().norm();
-                    if (distance > opposite_distance) {
-                        opposite_distance = distance;
-                        opposite_anchor = point;
+            if (params.arc_root_anchor_regions != nullptr && midpoint != anchor) {
+                const Vec2d forward = (midpoint - anchor).cast<double>().normalized();
+                const Polyline opposite_ray(Points{midpoint,
+                    midpoint + (forward * ray_length).cast<coord_t>()});
+                // Use the same embedded starter at both ends. Choosing the
+                // farthest boundary vertex gives the second family only point
+                // contact and strands it before it can enter the bridge.
+                if (supported_anchor_in_regions(opposite_ray, midpoint,
+                        opposite_anchor_regions, opposite_anchor))
+                    opposite_distance = (opposite_anchor - anchor).cast<double>().norm();
+            } else {
+                const Polylines support_on_axis =
+                    intersection_pl(Polylines{ray}, *opposite_anchor_regions);
+                for (const Polyline &segment : support_on_axis) {
+                    for (const Point &point : {segment.first_point(), segment.last_point()}) {
+                        const double distance = (point - anchor).cast<double>().norm();
+                        if (distance > opposite_distance) {
+                            opposite_distance = distance;
+                            opposite_anchor = point;
+                        }
                     }
                 }
             }
@@ -589,10 +771,9 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
             if (opposite_distance > std::max(2. * spacing, 0.5 * axis_span)) {
                 // Meet in the middle when both sides are supported. Each half is
                 // independently printable and its first extrusion starts on its
-                // own perimeter wall. Align the second half to the first
-                // family's pitch so their last arches meet without leaving a
-                // one-pitch center gap or depositing two nearly coincident
-                // arches.
+                // own perimeter wall. Legacy arches align the second half's
+                // phase; native arches keep the seed's regular pitch at both
+                // ends and leave only the center junction for local cleanup.
                 chain_axis.normalize();
                 const Vec2d family_normal(
                     -chain_axis.y(), chain_axis.x());
@@ -612,10 +793,7 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
                 const double half_width =
                     0.5 * (transverse_max -
                            transverse_min);
-                const double radius =
-                    std::max(
-                        half_width + spacing,
-                        1.25 * half_width);
+                const double radius = bridge_arch_radius(half_width);
                 const double sagitta =
                     radius -
                     std::sqrt(std::max(
@@ -625,7 +803,7 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
                 double opposite_phase =
                     std::fmod(
                         opposite_distance -
-                            2. * sagitta,
+                            2. * (params.arc_root_anchor_regions != nullptr ? radius : sagitta),
                         double(spacing));
                 if (opposite_phase < 0.)
                     opposite_phase += spacing;
@@ -636,7 +814,7 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
                 generate_parallel_arcs(opposite_anchor,
                                        (midpoint - opposite_anchor).cast<double>(),
                                        0.5 * opposite_distance,
-                                       opposite_phase);
+                                       params.arc_root_anchor_regions != nullptr ? 0. : opposite_phase);
             } else {
                 chain_axis.normalize();
                 double target_distance = 0.;
@@ -650,196 +828,25 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
             }
         }
 
-        if (has_retained_obstacle_paths) {
-            // A translated narrow family may initially have only its departure
-            // end on a retained wall. Seed it with the reference concentric
-            // family instead of accepting that one-ended extrusion. Validation
-            // prints these rings first; deferred translated arches are retried
-            // afterwards and may then attach to the completed backbone.
+        if ((has_retained_obstacle_paths || narrow_region) &&
+            !(params.arc_root_anchor_regions != nullptr && !narrow_region)) {
+            // Start on a returning concentric family, not a transverse arch
+            // with its far end in free air. Bound the narrow seed to the short
+            // dimension; the accepted frontier supplies subsequent child seeds.
             Polylines translated_arcs = std::move(arcs);
             arcs.clear();
             generate_family(
-                anchor, center, 0.5 * double(spacing), 0., expolygon,
+                anchor, center, 0.5 * double(spacing),
+                narrow_region ? axis_max - center.cast<double>().dot(axis) : 0., expolygon,
                 std::numeric_limits<size_t>::max(), true, arcs,
                 nullptr, nullptr);
-            if (narrow_region && !arcs.empty()) {
-                // The generic translated arches span the slot from one wall
-                // to the other. With support on only one wall their first
-                // member necessarily ends in free air and is correctly
-                // rejected below, leaving the long ends of the slot empty.
-                //
-                // Instead translate the two halves of the largest accepted
-                // concentric arch. Each new half is one bead pitch beside its
-                // predecessor, starts on the retained wall, and retains the
-                // same substantial curvature. This builds outward in both
-                // directions without crossings or a one-ended seed.
-                size_t frontier_idx = 0;
-                double frontier_extent =
-                    std::numeric_limits<double>::lowest();
-                const double anchor_projection =
-                    anchor.cast<double>().dot(axis);
-                for (size_t path_idx = 0;
-                     path_idx < arcs.size(); ++path_idx) {
-                    const double first_projection =
-                        arcs[path_idx].first_point()
-                            .cast<double>()
-                            .dot(axis);
-                    const double last_projection =
-                        arcs[path_idx].last_point()
-                            .cast<double>()
-                            .dot(axis);
-                    // A usable backbone half leaves and returns to the
-                    // retained wall. Outer clipped circle fragments with one
-                    // endpoint on the far edge are precisely the shallow,
-                    // one-ended paths this construction is replacing.
-                    if (std::abs(first_projection -
-                                 anchor_projection) >
-                            double(line_width) ||
-                        std::abs(last_projection -
-                                 anchor_projection) >
-                            double(line_width))
-                        continue;
-                    double maximum =
-                        std::numeric_limits<double>::lowest();
-                    double minimum =
-                        std::numeric_limits<double>::max();
-                    for (const Point &point :
-                         arcs[path_idx].points) {
-                        const double projection =
-                            point.cast<double>().dot(axis);
-                        maximum = std::max(maximum, projection);
-                        minimum = std::min(minimum, projection);
-                    }
-                    if (maximum - minimum >
-                        frontier_extent) {
-                        frontier_extent = maximum - minimum;
-                        frontier_idx = path_idx;
-                    }
-                }
-
-                const Polyline &frontier = arcs[frontier_idx];
-                size_t peak_idx = 0;
-                double peak_projection =
-                    std::numeric_limits<double>::lowest();
-                for (size_t point_idx = 0;
-                     point_idx < frontier.points.size();
-                     ++point_idx) {
-                    const double projection =
-                        frontier.points[point_idx]
-                            .cast<double>()
-                            .dot(axis);
-                    if (projection > peak_projection) {
-                        peak_projection = projection;
-                        peak_idx = point_idx;
-                    }
-                }
-
-                if (peak_idx > 0 &&
-                    peak_idx + 1 <
-                        frontier.points.size()) {
-                    std::array<Polyline, 2> halves;
-                    halves[0].points.insert(
-                        halves[0].points.end(),
-                        frontier.points.begin(),
-                        frontier.points.begin() +
-                            peak_idx + 1);
-                    halves[1].points.insert(
-                        halves[1].points.end(),
-                        frontier.points.begin() +
-                            peak_idx,
-                        frontier.points.end());
-
-                    for (Polyline &half : halves) {
-                        const double mean_normal =
-                            std::accumulate(
-                                half.points.begin(),
-                                half.points.end(), 0.,
-                                [&normal](double sum,
-                                          const Point &point) {
-                                    return sum +
-                                        point.cast<double>()
-                                            .dot(normal);
-                                }) /
-                            double(half.points.size());
-                        const double center_normal =
-                            center.cast<double>().dot(normal);
-                        const double side =
-                            mean_normal >= center_normal ?
-                                1. : -1.;
-                        if ((half.last_point() - anchor)
-                                .cast<double>()
-                                .squaredNorm() <
-                            (half.first_point() - anchor)
-                                .cast<double>()
-                                .squaredNorm())
-                            half.reverse();
-
-                        const size_t maximum_steps =
-                            size_t(std::ceil(
-                                normal_span /
-                                double(spacing))) + 2;
-                        for (size_t step = 1;
-                             step <= maximum_steps;
-                             ++step) {
-                            const Vec2d offset =
-                                side * double(step) *
-                                double(spacing) * normal;
-                            Polyline shifted = half;
-                            for (Point &point :
-                                 shifted.points) {
-                                const Vec2d position =
-                                    point.cast<double>() +
-                                    offset;
-                                point = Point(
-                                    coord_t(std::lround(
-                                        position.x())),
-                                    coord_t(std::lround(
-                                        position.y())));
-                            }
-                            Polylines clipped =
-                                intersection_pl(
-                                    Polylines{
-                                        std::move(shifted)},
-                                    expolygon);
-                            if (clipped.empty())
-                                break;
-                            auto longest =
-                                std::max_element(
-                                    clipped.begin(),
-                                    clipped.end(),
-                                    [](const Polyline &lhs,
-                                       const Polyline &rhs) {
-                                        return lhs.length() <
-                                               rhs.length();
-                                    });
-                            if (longest->length() <
-                                0.25 * spacing)
-                                break;
-                            if ((longest->last_point() -
-                                 anchor)
-                                    .cast<double>()
-                                    .squaredNorm() <
-                                (longest->first_point() -
-                                 anchor)
-                                    .cast<double>()
-                                    .squaredNorm())
-                                longest->reverse();
-                            arcs.emplace_back(
-                                std::move(*longest));
-                        }
-                    }
-                } else {
-                    append(arcs,
-                           std::move(translated_arcs));
-                }
-            } else {
+            if (!narrow_region)
                 append(arcs, std::move(translated_arcs));
-            }
         }
     } else {
         // Outside narrow spans, one complete directly anchored family supplies
         // the large-arc backbone before any recursive detail is considered.
-        generate_family(anchor, center, spacing, 0., expolygon,
+        generate_family(anchor, center, spacing, recursive_fill ? scale_(max_family_radius_mm) : 0., expolygon,
                         std::numeric_limits<size_t>::max(), false, arcs,
                         nullptr, nullptr);
     }
@@ -851,6 +858,17 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
             printed_index.add(path);
     }
     Lines obstacle_lines;
+    Lines support_lines;
+    PrintedArcIndex support_index(support_lines, 4 * spacing);
+    if (support_paths != nullptr)
+        for (size_t i = 0; i < support_paths->size(); ++i) {
+            // Contact reach is half the sum of the actual bead widths, not
+            // the arc width twice. Standalone callers may omit wall widths.
+            const coord_t correction = params.arc_support_widths != nullptr &&
+                params.arc_support_widths->size() == support_paths->size() ?
+                ((*params.arc_support_widths)[i] - line_width) / 2 : 0;
+            support_index.add((*support_paths)[i], correction);
+        }
     PrintedArcIndex obstacle_index(obstacle_lines, 4 * spacing);
     if (params.arc_obstacle_paths != nullptr) {
         for (const Polyline &obstacle : *params.arc_obstacle_paths)
@@ -878,6 +896,38 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
         return true;
     };
     const coord_t gcode_coordinate_step = scale_(0.001);
+    // Both contacting paths may move during fitting, then XY and IJ are
+    // rounded by the writer. Reserve that error in the normal direction to
+    // the occupied bead, not just one output step along an acute approach.
+    const double contact_clearance = scale_(0.01) + 2. * gcode_coordinate_step;
+    const auto trim_contact_end = [contact_clearance](Polyline &path, const Line &occupied) {
+        const double clearance_squared = contact_clearance * contact_clearance;
+        while (path.points.size() >= 2) {
+            const Point end = path.last_point();
+            if (occupied.distance_to_squared(end) >= clearance_squared)
+                return;
+            const Point start = path.points[path.points.size() - 2];
+            if (occupied.distance_to_squared(start) < clearance_squared) {
+                path.points.pop_back();
+                continue;
+            }
+            double outside = 0., inside = 1.;
+            const Vec2d delta = (end - start).cast<double>();
+            // Only the terminal chord straddles the clearance boundary. Keep
+            // its original direction and trim it before support is committed.
+            for (unsigned i = 0; i < 24; ++i) {
+                const double t = 0.5 * (outside + inside);
+                const Point point = start + (t * delta).cast<coord_t>();
+                if (occupied.distance_to_squared(point) >= clearance_squared)
+                    outside = t;
+                else
+                    inside = t;
+            }
+            path.points.back() = start + (outside * delta).cast<coord_t>();
+            return;
+        }
+        path.points.clear();
+    };
     const auto rounded_proper_intersection =
         [gcode_coordinate_step](const Line &first,
                                 const Line &second,
@@ -1014,7 +1064,7 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
     // case. Reject a sustained near-coincident run while still allowing the
     // short endpoint contact needed to anchor one arc to another.
     const auto trim_leading_sustained_retrace =
-        [line_width, spacing](Polyline &path,
+        [line_width, spacing, narrow_region](Polyline &path,
                               PrintedArcIndex &occupied_index) {
         if (path.points.size() < 2)
             return;
@@ -1026,8 +1076,11 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
                     0.20 * double(line_width),
                     0.55 * double(spacing)))));
         const double sample_step =
-            std::max<double>(SCALED_EPSILON, 0.15 * line_width);
-        const double maximum_duplicate_run = 0.65 * double(line_width);
+            std::max<double>(SCALED_EPSILON, narrow_region ?
+                std::min(double(scale_(0.05)), 0.15 * line_width) : 0.15 * line_width);
+        // Account for the interval straddling the contact boundary. Otherwise
+        // a sub-step shift can leave a longer duplicate run than the limit.
+        const double maximum_duplicate_run = 0.65 * double(line_width) - sample_step;
         double duplicate_run = 0.;
         double path_position = 0.;
         for (size_t point_idx = 1;
@@ -1116,9 +1169,9 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
     };
 
     const auto trim_at_printed_path =
-        [spacing, line_width, &params,
-         &printed_index, &obstacle_index, &segment_intersection,
-         &rounded_proper_intersection](Polyline path,
+        [spacing, line_width, &params, support_paths,
+         &printed_index, &obstacle_index, &support_index, &segment_intersection,
+         &rounded_proper_intersection, &trim_contact_end](Polyline path,
                                        bool require_anchor) {
         Polyline trimmed;
         if (path.points.size() < 2)
@@ -1131,10 +1184,9 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
             // beads still have an air gap between them.
             const coord_t anchor_distance = line_width;
             const bool has_retained_perimeters =
-                params.arc_obstacle_paths != nullptr &&
-                !params.arc_obstacle_paths->empty();
+                support_paths != nullptr && !support_paths->empty();
             const auto is_anchored =
-                [&params, &printed_index, &obstacle_index,
+                [&params, &printed_index, &support_index,
                  anchor_distance, has_retained_perimeters](const Point &point) {
                 double printed_distance_squared =
                     std::numeric_limits<double>::max();
@@ -1156,7 +1208,7 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
                         obstacle_distance_squared,
                         obstacle.distance_to_squared(point));
                 };
-                obstacle_index.visit(
+                support_index.visit(
                     Line(point, point), anchor_distance,
                     measure_obstacle_distance);
 
@@ -1210,6 +1262,7 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
         for (size_t point_idx = 1; point_idx < path.points.size(); ++point_idx) {
             const Line segment(path.points[point_idx - 1], path.points[point_idx]);
             Point nearest_intersection;
+            Line nearest_occupied;
             double nearest_distance_squared = std::numeric_limits<double>::max();
             const auto record_occupied_intersection =
                 [&](const Line &occupied) {
@@ -1227,6 +1280,7 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
                     segment.length() >= 0.25 * spacing) {
                     nearest_distance_squared = 0.;
                     nearest_intersection = segment.a;
+                    nearest_occupied = occupied;
                     return;
                 }
                 Point intersection;
@@ -1245,6 +1299,7 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
                 if (distance_squared < nearest_distance_squared) {
                     nearest_distance_squared = distance_squared;
                     nearest_intersection = intersection;
+                    nearest_occupied = occupied;
                 }
             };
             printed_index.visit(
@@ -1262,6 +1317,7 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
             if (nearest_distance_squared < std::numeric_limits<double>::max()) {
                 if (nearest_intersection != trimmed.last_point())
                     trimmed.points.emplace_back(nearest_intersection);
+                trim_contact_end(trimmed, nearest_occupied);
                 break;
             }
             trimmed.points.emplace_back(segment.b);
@@ -1464,13 +1520,15 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
                 return fragment.length() < 0.25 * spacing;
             });
     };
-    // Polygonized circles approximate the requested radius within the fill
-    // resolution. Include that geometric tolerance, but require genuine bead
-    // overlap rather than accepting another complete pitch of unsupported
-    // travel.
-    const coord_t lateral_support_distance =
-        std::min(line_width, spacing) +
-        coord_t(std::ceil(resolution));
+    // Contact depends on deposited width, not centerline pitch. Reducing the
+    // pitch with the overlap setting must not also shrink the physical bead
+    // used to validate anchors. Polygonized circles add the fill tolerance.
+    // A translated bridge may span free air, but its two anchoring runs still
+    // need bead overlap. Use the same bonding allowance as concentric growth;
+    // nominal touching distance admits weak starts on narrow bridge slots.
+    const coord_t lateral_support_distance = params.arc_root_anchor_regions != nullptr ?
+        line_width - line_overlap / 2 :
+        line_width + (narrow_region ? 0 : coord_t(std::ceil(resolution)));
     const auto point_has_root_support =
         [&params](const Point &point) {
             return params.arc_root_anchor_regions != nullptr &&
@@ -1482,8 +1540,8 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
                        });
         };
     const auto point_has_lateral_support =
-        [lateral_support_distance, &params, &printed_index,
-         &obstacle_index](const Point &point) {
+        [lateral_support_distance, explicit_support, &params, &printed_index,
+         &support_index](const Point &point) {
         const auto point_in_regions =
             [&point](const ExPolygons *regions) {
                 return regions != nullptr &&
@@ -1492,63 +1550,28 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
                                        return region.contains(point);
                                    });
             };
-        if (point_in_regions(params.arc_root_anchor_regions) ||
-            point_in_regions(params.arc_anchor_regions))
+        // Native anchor rims include round caps around retained wall tips.
+        // Only lower-layer foundations may bypass deposited-path contact;
+        // current-layer walls must pass the same butt-ended check as arcs.
+        if (point_in_regions(params.arc_root_anchor_regions != nullptr ?
+                params.arc_root_anchor_regions : params.arc_anchor_regions))
             return true;
 
-        double nearest_distance_squared =
-            std::numeric_limits<double>::max();
-        const auto measure_distance =
-            [&nearest_distance_squared, &point](const Line &support) {
-                nearest_distance_squared = std::min(
-                    nearest_distance_squared,
-                    support.distance_to_squared(point));
-            };
-        printed_index.visit(
-            Line(point, point), lateral_support_distance, measure_distance);
-        obstacle_index.visit(
-            Line(point, point), lateral_support_distance, measure_distance);
-        return nearest_distance_squared <=
-               double(lateral_support_distance) *
-                   double(lateral_support_distance);
+        return printed_index.has_side_contact(point, lateral_support_distance, explicit_support) ||
+               support_index.has_side_contact(point, lateral_support_distance, explicit_support);
     };
     const coord_t supported_lead_length =
         std::max<coord_t>(1, coord_t(std::ceil(0.75 * double(line_width))));
     const coord_t support_sample_step =
-        std::max<coord_t>(1, coord_t(std::ceil(0.20 * double(line_width))));
+        std::max<coord_t>(1, coord_t(std::ceil(explicit_support ?
+            0.05 * double(std::min(line_width, spacing)) : 0.20 * double(line_width))));
     const auto has_supported_origin = [&point_has_lateral_support, supported_lead_length, support_sample_step](const Polyline& path) {
         // A single coincident vertex is not an anchor. Require a useful initial
         // length to remain over the previous-layer footprint or alongside an
         // already deposited bead, so extrusion pressure and adhesion are
         // established before the arc enters free air.
-        if (path.points.size() < 2)
-            return false;
-        coord_t remaining = supported_lead_length;
-        for (size_t point_idx = 1;
-             point_idx < path.points.size() && remaining > 0; ++point_idx) {
-            const Point &start = path.points[point_idx - 1];
-            const Point &end = path.points[point_idx];
-            const Vec2d delta = (end - start).cast<double>();
-            const double segment_length = delta.norm();
-            if (segment_length <= 0.)
-                continue;
-            const double checked_length =
-                std::min<double>(segment_length, remaining);
-            const size_t samples = std::max<size_t>(
-                1, size_t(std::ceil(
-                       checked_length / double(support_sample_step))));
-            for (size_t sample_idx = 0; sample_idx <= samples; ++sample_idx) {
-                const double distance = checked_length * double(sample_idx) / double(samples);
-                const Vec2d position  = start.cast<double>() + delta * (distance / segment_length);
-                const Point sample(coord_t(std::lround(position.x())), coord_t(std::lround(position.y())));
-                if (!point_has_lateral_support(sample))
-                    return false;
-            }
-            remaining -= coord_t(std::lround(checked_length));
-        }
-        // A path shorter than the target lead is acceptable only because every
-        // point of that complete path was checked above.
-        return true;
+        return arc_lead_supported(path, false, supported_lead_length,
+                                  support_sample_step, point_has_lateral_support);
     };
     const auto has_supported_ends = [&has_supported_origin](const Polyline& path) {
         if (!has_supported_origin(path))
@@ -1585,35 +1608,52 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
         }
         return true;
     };
+    // A first course may overhang a lower-layer footprint by less than half
+    // its bead width while retaining overlap. Subsequent courses must grow
+    // from actual paths in printed_index, not from this expanded foundation.
+    // Narrow translated bridge arches deliberately span between end anchors;
+    // unlike a concentric overhang front they need not have lateral contact
+    // along their first span. Keep their existing bridge qualification.
+    const bool require_body_support = params.arc_root_anchor_regions != nullptr && !chained_primary;
+    const coord_t bonded_support_distance = line_width - line_overlap / 2;
+    const auto point_has_bonded_support = [&](const Point &point) {
+        return point_has_root_support(point) ||
+            printed_index.has_side_contact(point, bonded_support_distance) ||
+            support_index.has_side_contact(point, bonded_support_distance);
+    };
+    const auto has_bonded_ends = [&](const Polyline &path) {
+        return arc_lead_supported(path, false, supported_lead_length, support_sample_step, point_has_bonded_support) &&
+               arc_lead_supported(path, true, supported_lead_length, support_sample_step, point_has_bonded_support);
+    };
+    const ExPolygons body_foundation = !require_body_support ? ExPolygons{} :
+        offset_ex(*params.arc_root_anchor_regions, float(0.4 * line_width), ClipperLib::jtRound, scale_(0.001));
+    const auto point_has_body_support = [&](const Point &point) {
+        // The interior may bond to the deposited cap of another path. Only
+        // the two leads must exclude caps to prevent free tips walking out
+        // into air; applying that restriction to the body strands real fill.
+        return std::any_of(body_foundation.begin(), body_foundation.end(),
+                   [&](const ExPolygon &region) { return region.contains(point); }) ||
+               printed_index.has_side_contact(point, bonded_support_distance, false) ||
+               support_index.has_side_contact(point, bonded_support_distance, false);
+    };
+    const auto has_supported_body = [&](const Polyline &path) {
+        return arc_lead_supported(path, false, path.length(), support_sample_step, point_has_body_support);
+    };
     const auto point_has_emitted_bead_support =
-        [lateral_support_distance, &params, &printed_index,
-         &obstacle_index](const Point &point) {
-        if (params.arc_root_anchor_regions != nullptr &&
+        [lateral_support_distance, explicit_support, &params, &printed_index,
+         &support_index](const Point &point) {
+        const ExPolygons *roots = params.arc_root_anchor_regions != nullptr ?
+            params.arc_root_anchor_regions : params.arc_anchor_regions;
+        if (roots != nullptr &&
             std::any_of(
-                params.arc_root_anchor_regions->begin(),
-                params.arc_root_anchor_regions->end(),
+                roots->begin(), roots->end(),
                 [&point](const ExPolygon &region) {
                     return region.contains(point);
                 }))
             return true;
 
-        double nearest_distance_squared =
-            std::numeric_limits<double>::max();
-        const auto measure_distance =
-            [&nearest_distance_squared, &point](const Line &support) {
-                nearest_distance_squared = std::min(
-                    nearest_distance_squared,
-                    support.distance_to_squared(point));
-            };
-        printed_index.visit(
-            Line(point, point), lateral_support_distance,
-            measure_distance);
-        obstacle_index.visit(
-            Line(point, point), lateral_support_distance,
-            measure_distance);
-        return nearest_distance_squared <=
-               double(lateral_support_distance) *
-                   double(lateral_support_distance);
+        return printed_index.has_side_contact(point, lateral_support_distance, explicit_support) ||
+               support_index.has_side_contact(point, lateral_support_distance, explicit_support);
     };
     const auto is_fully_emitted_bead_supported =
         [&point_has_emitted_bead_support,
@@ -1906,7 +1946,7 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
         const bool validate_primary_anchors = has_supported_anchor ||
                                               (params.arc_obstacle_paths != nullptr && !params.arc_obstacle_paths->empty()) ||
                                               (params.arc_prior_paths != nullptr && !params.arc_prior_paths->empty());
-        const bool require_supported_ends = params.arc_obstacle_paths != nullptr && !params.arc_obstacle_paths->empty();
+        const bool require_supported_ends = validate_primary_anchors;
         for (Polyline& arc : arcs)
             append(pending_arcs, split_at_obstacle_paths(std::move(arc)));
 
@@ -1920,6 +1960,8 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
         // prevents printable regions from being permanently discarded merely
         // because of their initial traversal order.
         while (!pending_arcs.empty()) {
+            report(FillProgressStage::ValidateArcs, noncrossing_arcs.size(),
+                   noncrossing_arcs.size() + pending_arcs.size());
             Polylines deferred;
             deferred.reserve(pending_arcs.size());
             const size_t accepted_before = noncrossing_arcs.size();
@@ -1973,7 +2015,8 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
                             std::move(anchored_fragment));
                         continue;
                     }
-                    if (validate_primary_anchors && require_supported_ends && !has_supported_endpoint(trimmed) &&
+                    if (validate_primary_anchors && require_supported_ends &&
+                        !(chained_primary && params.arc_root_anchor_regions != nullptr) && !has_supported_endpoint(trimmed) &&
                         !extend_to_nearby_support(trimmed)) {
                         deferred.emplace_back(std::move(anchored_fragment));
                         continue;
@@ -1984,11 +2027,38 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
                     }
                     trim_sustained_retrace(
                         trimmed, printed_index);
+                    if (chained_primary && params.arc_root_anchor_regions != nullptr) {
+                        // Clipping a bridge arch against the fill boundary can
+                        // leave a terminal tip beyond its neighbour's bonded
+                        // corridor. Start/end on the supported part of the
+                        // same curve instead of rejecting the entire family.
+                        for (int end = 0; end < 2; ++end) {
+                            trimmed.reverse();
+                            for (coord_t removed = 0; removed < line_width &&
+                                 trimmed.length() > 2. * supported_lead_length &&
+                                 !has_supported_origin(trimmed); removed += support_sample_step)
+                                trimmed.clip_start(support_sample_step);
+                        }
+                    }
                     if (trimmed.length() <
                         std::max(
                             0.25 * double(spacing),
                             0.75 * double(line_width)))
                         continue;
+                    if (require_supported_ends &&
+                        (!has_supported_ends(trimmed) || is_short_free_air_path(trimmed))) {
+                        deferred.emplace_back(std::move(anchored_fragment));
+                        continue;
+                    }
+                    // Endpoint anchors alone do not establish a growing arc
+                    // front: they can admit a large ring before its inner
+                    // rings, then fill those rings backwards. Native slicing
+                    // supplies an explicit foundation; require bead contact
+                    // along the entire new arc against the deposited prefix.
+                    if (require_body_support && !has_supported_body(trimmed)) {
+                        deferred.emplace_back(std::move(anchored_fragment));
+                        continue;
+                    }
                     printed_index.add(trimmed);
                     noncrossing_arcs.emplace_back(std::move(trimmed));
                 }
@@ -2000,7 +2070,7 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
         arcs = std::move(noncrossing_arcs);
     }
     const size_t primary_arc_count = arcs.size();
-    if (recursive_fill && !arcs.empty()) {
+    if ((recursive_fill || frontier_growth) && (!arcs.empty() || !body_foundation.empty())) {
         // Follow the breadth-first construction used by the reference arc
         // overhang implementation: finish the directly anchored concentric
         // family, subtract its deposited area, then grow complete child
@@ -2052,14 +2122,17 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
         prune_remaining(remaining);
 
         constexpr size_t max_child_paths     = 8192;
-        constexpr size_t max_parents         = 2048;
-        constexpr double max_child_radius_mm = 15.;
+        // Every accepted child can expose another printable pocket. Keep the
+        // frontier budget consistent with the child budget: a smaller parent
+        // cap silently stranded edge pockets on large bottom surfaces.
+        constexpr size_t max_parents         = max_child_paths;
         size_t child_path_count              = 0;
 
         struct RecursiveParent
         {
             Polylines frontier;
             Point center;
+            bool foundation = false;
         };
         std::vector<RecursiveParent> parents;
         parents.reserve(256);
@@ -2082,9 +2155,20 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
             for (const Polyline& path : select_outer_frontier(arcs, center))
                 parents.push_back({Polylines{path}, center});
         }
-        if (params.arc_obstacle_paths != nullptr) {
-            for (const Polyline& path : *params.arc_obstacle_paths)
+        if (support_paths != nullptr) {
+            for (const Polyline& path : *support_paths)
                 parents.push_back({Polylines{path}, path.first_point()});
+        }
+        // Rejected clipped rings can leave pockets beside the original
+        // foundation. These still have a printable root, even if no accepted
+        // outer ring borders them. Seed them from the foundation itself.
+        const ExPolygons *roots = params.arc_root_anchor_regions != nullptr ?
+            params.arc_root_anchor_regions : params.arc_anchor_regions;
+        if (roots != nullptr) {
+            for (const ExPolygon &root : *roots) {
+                for (Polyline &path : intersection_pl(to_polylines(root), expolygon))
+                    parents.push_back({Polylines{path}, path.first_point(), true});
+            }
         }
         if (params.arc_prior_paths != nullptr) {
             for (const Polyline& path : *params.arc_prior_paths)
@@ -2094,23 +2178,47 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
         const AABBTreeLines::LinesDistancer<Line> surface_boundary_index(std::move(surface_boundary_lines));
 
         size_t parent_idx = 0;
-        while (parent_idx < parents.size() && parent_idx < max_parents && !remaining.empty() && child_path_count < max_child_paths) {
+        size_t pass_start_count = 0;
+        // Exhaust coherent concentric families before allowing shorter groups
+        // to finish residual pockets. Failed trials must not become support.
+        size_t minimum_family_rings = require_body_support ? 12 : 1;
+        while (!parents.empty() && !remaining.empty() && child_path_count < max_child_paths) {
+            if (parent_idx >= std::min(parents.size(), max_parents)) {
+                // A frontier rejected earlier may become printable once a
+                // neighboring family supplies its missing side contact. Retry
+                // after real deposition, or lower the family-size requirement
+                // when the current tier can no longer grow.
+                if (child_path_count == pass_start_count) {
+                    if (minimum_family_rings == 1) break;
+                    minimum_family_rings = minimum_family_rings > 3 ?
+                        minimum_family_rings / 2 : minimum_family_rings - 1;
+                }
+                pass_start_count = child_path_count;
+                parent_idx = 0;
+            }
+            report(FillProgressStage::RecursiveArcs, parent_idx + 1, parents.size());
             Lines parent_lines = to_lines(parents[parent_idx].frontier);
             if (parent_lines.empty()) {
                 ++parent_idx;
                 continue;
             }
             const AABBTreeLines::LinesDistancer<Line> parent_index(std::move(parent_lines));
+            BoundingBox seed_window = get_extents(parents[parent_idx].frontier);
+            seed_window.offset(coord_t(std::ceil(1.50 * line_width)));
             bool spawned_child = false;
 
-            for (size_t region_idx = 0; region_idx < remaining.size() && child_path_count < max_child_paths; ++region_idx) {
+            for (size_t region_idx = 0; region_idx < remaining.size() && child_path_count < max_child_paths && !spawned_child; ++region_idx) {
+                // The exact seed test below accepts only points within 1.5
+                // bead widths of this parent. Skip distant pockets before
+                // sampling their complete boundaries; deposited prior paths
+                // can otherwise multiply this work across the whole surface.
+                if (!seed_window.overlap(get_extents(remaining[region_idx])))
+                    continue;
                 // Port the reference get_farthest_point rule: select an
                 // exposed point on the current parent which is still adjacent
                 // to the unfilled region and farthest from the model boundary.
-                Point child_anchor;
-                Point child_region_point;
-                double nearest_distance           = std::numeric_limits<double>::max();
-                double farthest_boundary_distance = std::numeric_limits<double>::lowest();
+                struct Seed { Point anchor, region_point; double clearance, distance; };
+                std::vector<Seed> seeds;
                 for (const Line& boundary : to_lines(remaining[region_idx])) {
                     const double boundary_length = std::max<double>(boundary.length(), 1.);
                     const size_t samples         = std::max<size_t>(1, size_t(std::ceil(boundary_length / std::max<double>(spacing, 1.))));
@@ -2124,191 +2232,383 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
                         const Point parent_point(coord_t(std::lround(nearest_point.x())), coord_t(std::lround(nearest_point.y())));
                         const auto [boundary_distance, boundary_line_idx,
                                     nearest_boundary_point] = surface_boundary_index.distance_from_lines_extra<false>(parent_point);
-                        if (boundary_distance > farthest_boundary_distance ||
-                            (boundary_distance == farthest_boundary_distance && distance < nearest_distance)) {
-                            farthest_boundary_distance = boundary_distance;
-                            nearest_distance           = distance;
-                            child_region_point         = point;
-                            child_anchor               = parent_point;
-                        }
+                        seeds.push_back({parent_point, point, boundary_distance, distance});
                     }
                 }
-                if (nearest_distance > 1.50 * line_width)
-                    continue;
+                // Rank once, not once per retry: geometry is unchanged until
+                // a family succeeds. Stable ties preserve boundary traversal.
+                std::stable_sort(seeds.begin(), seeds.end(), [](const Seed &a, const Seed &b) {
+                    return a.clearance != b.clearance ? a.clearance > b.clearance : a.distance < b.distance;
+                });
+                std::vector<Point> attempted_seeds;
+                // Try separated seeds on the accepted frontier. A rejected
+                // preferred center must not strand an otherwise fillable lobe.
+                const size_t seed_attempt_limit = parents[parent_idx].foundation ? 64 : (explicit_support ? 32 : 8);
+                for (const Seed &seed : seeds) {
+                    if (attempted_seeds.size() == seed_attempt_limit)
+                        break;
+                    const Point child_anchor = seed.anchor;
+                    const Point child_region_point = seed.region_point;
+                    const double farthest_boundary_distance = seed.clearance;
+                    if (std::any_of(attempted_seeds.begin(), attempted_seeds.end(),
+                        [&child_anchor, line_width](const Point &tried) {
+                            return (child_anchor - tried).cast<double>().squaredNorm() < double(line_width) * double(line_width);
+                        }))
+                        continue;
+                    attempted_seeds.push_back(child_anchor);
 
-                Vec2d remaining_direction = (child_region_point - child_anchor).cast<double>();
-                if (remaining_direction.squaredNorm() == 0.)
-                    remaining_direction = axis;
-                else
-                    remaining_direction.normalize();
+                    Vec2d remaining_direction = (child_region_point - child_anchor).cast<double>();
+                    if (remaining_direction.squaredNorm() == 0.)
+                        remaining_direction = axis;
+                    else
+                        remaining_direction.normalize();
 
-                Polylines accepted_family;
-                Point child_center           = child_anchor;
-                double accepted_outer_radius = 0.;
-                // The postprocessor uses a 2 mm center offset, then retries
-                // tight regions with zero offset. Keep a bead-width midpoint
-                // attempt because it gives small details a supported runway.
-                const std::array<double, 3> center_offsets{scale_(2.), double(line_width), 0.};
-                for (const double center_offset : center_offsets) {
-                    child_center              = child_anchor - Point(coord_t(std::lround(center_offset * remaining_direction.x())),
-                                                                     coord_t(std::lround(center_offset * remaining_direction.y())));
-                    const double first_radius = center_offset + double(line_width) / 1.5;
-                    const double radius_limit = std::max(first_radius, std::min(scale_(max_child_radius_mm),
-                                                                                farthest_boundary_distance - 0.5 * double(spacing)));
-                    Polylines child_arcs;
-                    generate_family(child_anchor, child_center, first_radius, radius_limit, remaining[region_idx],
-                                    max_child_paths - child_path_count, false, child_arcs, nullptr, nullptr);
+                    Polylines accepted_family;
+                    Point child_center           = child_anchor;
+                    double accepted_outer_radius = 0.;
+                    // Start with the established 2 mm / bead-width / zero
+                    // offsets. Full-body contact can require a different
+                    // curvature at an edge; try additional radii only if all
+                    // three fail. Narrow bridge behavior is unchanged.
+                    const std::array<double, 7> center_offsets = parents[parent_idx].foundation ?
+                        std::array<double, 7>{0., double(line_width), scale_(2.), scale_(4.), scale_(8.), scale_(1.), 0.5 * line_width} :
+                        std::array<double, 7>{scale_(2.), double(line_width), 0., scale_(4.), scale_(8.), scale_(1.), 0.5 * line_width};
+                    for (size_t offset_idx = 0; offset_idx < (require_body_support ? center_offsets.size() : 3); ++offset_idx) {
+                        const auto trial_start = printed_index.checkpoint();
+                        size_t accepted_rings = 0;
+                        const double center_offset = center_offsets[offset_idx];
+                        child_center = child_anchor - Point(coord_t(std::lround(center_offset * remaining_direction.x())),
+                                                           coord_t(std::lround(center_offset * remaining_direction.y())));
+                        const double first_radius = center_offset + double(line_width) *
+                            (parents[parent_idx].foundation && require_body_support ? 0.35 : 1. / 1.5);
+                        const double radius_limit = minimum_family_rings > 1 || parents[parent_idx].foundation ? scale_(max_family_radius_mm) :
+                            std::max(first_radius, std::min(scale_(max_family_radius_mm),
+                                farthest_boundary_distance - 0.5 * double(spacing)));
+                        // Process paths in radius order so every accepted ring can
+                        // support the next. A clipped component with only one
+                        // supported end is omitted, while independently printable
+                        // siblings remain available to fill the layer.
+                        // Generate lazily: most rejected seeds fail on their
+                        // first ring. Clipping the entire 15 mm disk before
+                        // that decision dominated recursive retry time.
+                        const size_t family_budget = max_child_paths - child_path_count;
+                        for (double radius = first_radius;
+                             radius <= radius_limit && accepted_family.size() < family_budget;
+                             radius += spacing) {
+                            Polylines child_arcs;
+                            generate_family(child_anchor, child_center, radius, radius, remaining[region_idx],
+                                            family_budget - accepted_family.size(), false, child_arcs, nullptr, nullptr);
+                            if (child_arcs.empty()) continue;
+                            const double group_radius = family_path_radius(child_arcs.front(), child_center);
 
-                    // Process paths in radius order so every accepted ring can
-                    // support the next. A clipped component with only one
-                    // supported end is omitted, while independently printable
-                    // siblings remain available to fill the layer.
-                    size_t child_idx = 0;
-                    while (child_idx < child_arcs.size()) {
-                        const double group_radius = family_path_radius(child_arcs[child_idx], child_center);
-                        size_t group_end          = child_idx + 1;
-                        while (group_end < child_arcs.size() &&
-                               std::abs(family_path_radius(child_arcs[group_end], child_center) - group_radius) < 0.25 * spacing)
-                            ++group_end;
-
-                        Polylines candidate_group;
-                        bool crossing_group = false;
-                        for (size_t path_idx = child_idx; path_idx < group_end; ++path_idx) {
-                            Polylines fragments = split_at_obstacle_paths(std::move(child_arcs[path_idx]));
-                            if (fragments.empty())
-                                continue;
-                            for (Polyline& fragment : fragments) {
-                                Polyline trimmed = trim_at_printed_path(std::move(fragment), true);
-                                if (trimmed.empty() ||
-                                    is_short_free_air_path(trimmed) ||
-                                    is_shallow_child_arc(trimmed))
+                            Polylines candidate_group;
+                            bool crossing_group = false;
+                            for (size_t path_idx = 0; path_idx < child_arcs.size(); ++path_idx) {
+                                if (require_body_support) {
+                                    Polyline &arc = child_arcs[path_idx];
+                                    // Extend only the ends of an existing new
+                                    // arc, not the clipping region: expanding
+                                    // that region creates unrelated tiny arcs
+                                    // entirely within the already-filled rim.
+                                    if (arc.points.size() >= 2 && arc.first_point() != arc.last_point()) {
+                                        const double extension = std::min<double>(line_width,
+                                            std::max(0., 0.5 * (2. * M_PI * radius - arc.length()) - support_sample_step));
+                                        for (int end = 0; end < 2; ++end) {
+                                            arc.reverse();
+                                            if (arc_lead_supported(arc, true, supported_lead_length, support_sample_step, point_has_bonded_support))
+                                                continue;
+                                            const Vec2d radial = (arc.last_point() - child_center).cast<double>();
+                                            const Vec2d previous = (arc.points[arc.points.size() - 2] - child_center).cast<double>();
+                                            const double direction = previous.x() * radial.y() - previous.y() * radial.x() >= 0. ? 1. : -1.;
+                                            const double angle = std::atan2(radial.y(), radial.x());
+                                            for (double distance = support_sample_step; distance <= extension; distance += support_sample_step) {
+                                                const double theta = angle + direction * distance / radius;
+                                                const Point point(child_center.x() + coord_t(std::lround(radius * std::cos(theta))),
+                                                                  child_center.y() + coord_t(std::lround(radius * std::sin(theta))));
+                                                if (!expolygon.contains(point) &&
+                                                    (params.arc_anchor_regions == nullptr ||
+                                                     std::none_of(params.arc_anchor_regions->begin(), params.arc_anchor_regions->end(),
+                                                        [&](const ExPolygon &region) { return region.contains(point); }))) break;
+                                                const Line step(arc.last_point(), point);
+                                                bool crossing = false;
+                                                const auto check = [&](const Line &occupied) {
+                                                    Point intersection;
+                                                    if (segment_intersection(step, occupied, intersection)) crossing = true;
+                                                };
+                                                printed_index.visit(step, SCALED_EPSILON, check);
+                                                obstacle_index.visit(step, SCALED_EPSILON, check);
+                                                if (crossing) break;
+                                                if (point != arc.last_point()) arc.points.push_back(point);
+                                                if (arc_lead_supported(arc, true, supported_lead_length, support_sample_step, point_has_bonded_support))
+                                                    break;
+                                            }
+                                        }
+                                    }
+                                }
+                                Polylines fragments = split_at_obstacle_paths(std::move(child_arcs[path_idx]));
+                                if (fragments.empty())
                                     continue;
-                                if (!has_stable_emitted_branch_lead(
-                                        trimmed))
-                                    trimmed.reverse();
-                                if (!has_stable_emitted_branch_lead(
-                                        trimmed))
-                                    continue;
-                                // Reversing an independently clipped child can
-                                // turn its formerly harmless trailing contact
-                                // into a duplicate lead along the parent.
-                                // Re-run proximity trimming in the actual print
-                                // direction before accepting the path.
-                                trim_sustained_retrace(
-                                    trimmed, printed_index);
-                                if (trimmed.length() <
-                                        std::max(
-                                            0.25 * double(spacing),
-                                            0.75 * double(line_width)))
-                                    continue;
-                                candidate_group.emplace_back(
-                                    std::move(trimmed));
+                                for (Polyline& fragment : fragments) {
+                                    Polyline trimmed = trim_at_printed_path(std::move(fragment), true);
+                                    if (trimmed.empty() ||
+                                        is_short_free_air_path(trimmed) ||
+                                        is_shallow_child_arc(trimmed))
+                                        continue;
+                                    if (!has_stable_emitted_branch_lead(
+                                            trimmed))
+                                        trimmed.reverse();
+                                    // Prefer the longer supported departure,
+                                    // but validate both actual leads below.
+                                    // Requiring a 1.5-bead lead here prevents
+                                    // small, fully anchored interior pockets
+                                    // from ever seeding a replacement family.
+                                    // Reversing an independently clipped child can
+                                    // turn its formerly harmless trailing contact
+                                    // into a duplicate lead along the parent.
+                                    // Re-run proximity trimming in the actual print
+                                    // direction before accepting the path.
+                                    trim_sustained_retrace(
+                                        trimmed, printed_index);
+                                    if (trimmed.length() <
+                                            std::max(
+                                                0.25 * double(spacing),
+                                                0.75 * double(line_width)))
+                                        continue;
+                                    candidate_group.emplace_back(
+                                        std::move(trimmed));
+                                }
                             }
-                        }
-                        if (candidate_group.empty())
-                            break;
-                        // Components from one clipped circle are validated
-                        // before any of them enters printed_index. An
-                        // independently printable sibling must not be discarded
-                        // merely because another clipped component has only one
-                        // supported end. Reject the radius only if two of the
-                        // retained siblings actually cross.
-                        for (size_t lhs_idx = 0; lhs_idx < candidate_group.size() && !crossing_group; ++lhs_idx) {
-                            for (size_t rhs_idx = lhs_idx + 1; rhs_idx < candidate_group.size() && !crossing_group; ++rhs_idx) {
-                                const Polyline& lhs = candidate_group[lhs_idx];
-                                const Polyline& rhs = candidate_group[rhs_idx];
-                                for (size_t lhs_segment = 1; lhs_segment < lhs.points.size() && !crossing_group; ++lhs_segment) {
-                                    for (size_t rhs_segment = 1; rhs_segment < rhs.points.size(); ++rhs_segment) {
-                                        Point intersection;
-                                        if (!segment_intersection(Line(lhs.points[lhs_segment - 1], lhs.points[lhs_segment]),
-                                                                  Line(rhs.points[rhs_segment - 1], rhs.points[rhs_segment]), intersection))
-                                            continue;
-                                        const bool lhs_endpoint = intersection == lhs.first_point() || intersection == lhs.last_point();
-                                        const bool rhs_endpoint = intersection == rhs.first_point() || intersection == rhs.last_point();
-                                        if (!lhs_endpoint || !rhs_endpoint) {
-                                            crossing_group = true;
-                                            break;
+                            if (candidate_group.empty()) {
+                                if (require_body_support && accepted_family.empty() && radius < first_radius + 2. * spacing)
+                                    continue;
+                                break;
+                            }
+                            // Components from one clipped circle are validated
+                            // before any of them enters printed_index. An
+                            // independently printable sibling must not be discarded
+                            // merely because another clipped component has only one
+                            // supported end. Reject the radius only if two of the
+                            // retained siblings actually cross.
+                            for (size_t lhs_idx = 0; lhs_idx < candidate_group.size() && !crossing_group; ++lhs_idx) {
+                                for (size_t rhs_idx = lhs_idx + 1; rhs_idx < candidate_group.size() && !crossing_group; ++rhs_idx) {
+                                    const Polyline& lhs = candidate_group[lhs_idx];
+                                    const Polyline& rhs = candidate_group[rhs_idx];
+                                    for (size_t lhs_segment = 1; lhs_segment < lhs.points.size() && !crossing_group; ++lhs_segment) {
+                                        for (size_t rhs_segment = 1; rhs_segment < rhs.points.size(); ++rhs_segment) {
+                                            Point intersection;
+                                            if (!segment_intersection(Line(lhs.points[lhs_segment - 1], lhs.points[lhs_segment]),
+                                                                      Line(rhs.points[rhs_segment - 1], rhs.points[rhs_segment]), intersection))
+                                                continue;
+                                            const bool lhs_endpoint = intersection == lhs.first_point() || intersection == lhs.last_point();
+                                            const bool rhs_endpoint = intersection == rhs.first_point() || intersection == rhs.last_point();
+                                            if (!lhs_endpoint || !rhs_endpoint) {
+                                                crossing_group = true;
+                                                break;
+                                            }
                                         }
                                     }
                                 }
                             }
-                        }
-                        if (crossing_group)
-                            break;
+                            if (crossing_group)
+                                break;
 
-                        // Siblings from one radius may physically support each
-                        // other's trailing lead. Resolve that dependency in a
-                        // printable order: only add a path after both of its
-                        // ends are supported by previously deposited material.
-                        // If no candidate can advance, the remaining cyclic or
-                        // one-ended group is intentionally left for another
-                        // family.
-                        Polylines accepted_group;
-                        while (!candidate_group.empty()) {
-                            bool accepted_candidate = false;
-                            for (size_t candidate_idx = 0; candidate_idx < candidate_group.size(); ++candidate_idx) {
-                                if (!has_supported_ends(candidate_group[candidate_idx]))
+                            // Siblings from one radius may physically support each
+                            // other's trailing lead. Resolve that dependency in a
+                            // printable order: only add a path after both of its
+                            // ends are supported by previously deposited material.
+                            // If no candidate can advance, the remaining cyclic or
+                            // one-ended group is intentionally left for another
+                            // family.
+                            Polylines accepted_group;
+                            while (!candidate_group.empty()) {
+                                report(FillProgressStage::ValidateArcs, accepted_group.size(),
+                                       accepted_group.size() + candidate_group.size());
+                                bool accepted_candidate = false;
+                                for (size_t candidate_idx = 0; candidate_idx < candidate_group.size(); ++candidate_idx) {
+                                    if (frontier_growth || narrow_region)
+                                        trim_sustained_retrace(candidate_group[candidate_idx], printed_index);
+                                    if (narrow_region) {
+                                        if (!has_stable_emitted_branch_lead(candidate_group[candidate_idx])) {
+                                            candidate_group[candidate_idx].reverse();
+                                            trim_sustained_retrace(candidate_group[candidate_idx], printed_index);
+                                        }
+                                        if (candidate_group[candidate_idx].length() < 0.75 * line_width ||
+                                            is_shallow_arc(candidate_group[candidate_idx]) ||
+                                            is_shallow_child_arc(candidate_group[candidate_idx]))
+                                            continue;
+                                    }
+                                    // A restart needs separate departure and
+                                    // arrival runways; the same tiny fragment
+                                    // must not satisfy both lead checks.
+                                    if (candidate_group[candidate_idx].length() <
+                                            (require_body_support ? 2. * supported_lead_length : 0.75 * line_width) ||
+                                        is_short_free_air_path(candidate_group[candidate_idx]) ||
+                                        (require_body_support ? !has_bonded_ends(candidate_group[candidate_idx]) :
+                                                                !has_supported_ends(candidate_group[candidate_idx])) ||
+                                        (require_body_support &&
+                                         !has_supported_body(candidate_group[candidate_idx])))
+                                        continue;
+                                    printed_index.add(candidate_group[candidate_idx]);
+                                    accepted_group.emplace_back(std::move(candidate_group[candidate_idx]));
+                                    candidate_group.erase(candidate_group.begin() + candidate_idx);
+                                    accepted_candidate = true;
+                                    break;
+                                }
+                                if (!accepted_candidate)
+                                    break;
+                            }
+                            if (accepted_group.empty()) {
+                                if (require_body_support && accepted_family.empty() && radius < first_radius + 2. * spacing)
                                     continue;
-                                printed_index.add(candidate_group[candidate_idx]);
-                                accepted_group.emplace_back(std::move(candidate_group[candidate_idx]));
-                                candidate_group.erase(candidate_group.begin() + candidate_idx);
-                                accepted_candidate = true;
                                 break;
                             }
-                            if (!accepted_candidate)
-                                break;
+                            append(accepted_family, std::move(accepted_group));
+                            accepted_outer_radius = group_radius;
+                            ++accepted_rings;
                         }
-                        if (accepted_group.empty())
+                        if (accepted_rings < minimum_family_rings) {
+                            printed_index.rollback(trial_start);
+                            accepted_family.clear();
+                            accepted_outer_radius = 0.;
+                            continue;
+                        }
+                        if (!accepted_family.empty())
                             break;
-                        append(accepted_family, std::move(accepted_group));
-                        accepted_outer_radius = group_radius;
-                        child_idx             = group_end;
                     }
-                    if (!accepted_family.empty())
-                        break;
+                    if (accepted_family.empty())
+                        continue;
+
+                    // Use the reference filled-disk model when the deposited beads
+                    // cover it apart from sub-bead pitch seams. If rejecting a
+                    // one-ended component leaves a substantial portion absent,
+                    // subtract only actual bead footprints so another supported
+                    // family can fill that hole.
+                    ExPolygons ideal_swept_area =
+                        swept_disk(child_center, accepted_outer_radius,
+                                   remaining[region_idx]);
+                    ExPolygons deposited_area =
+                        union_ex(offset(
+                            accepted_family,
+                            float(0.52 * line_width)));
+                    const ExPolygons substantial_missing =
+                        opening_ex(
+                            diff_ex(ideal_swept_area, deposited_area),
+                            float(0.30 * spacing));
+                    ExPolygons accepted_swept_area =
+                        substantial_missing.empty() ?
+                            std::move(ideal_swept_area) :
+                            std::move(deposited_area);
+
+                    append(arcs, accepted_family);
+                    child_path_count += accepted_family.size();
+                    remaining = diff_ex(remaining, accepted_swept_area);
+                    prune_remaining(remaining);
+                    // Collision clipping can leave an unfilled pocket inside
+                    // a child's nominal disk too. Its inner accepted rings are
+                    // foundations for that pocket; queuing only the outermost
+                    // ring strands it after the parent has been exhausted.
+                    if (explicit_support) {
+                        const ExPolygons exposed = offset_ex(remaining, float(1.10 * line_width));
+                        for (const Polyline &path : accepted_family) {
+                            if (parents.size() == max_parents) break;
+                            if (std::any_of(path.points.begin(), path.points.end(), [&](const Point &point) {
+                                return std::any_of(exposed.begin(), exposed.end(),
+                                    [&](const ExPolygon &region) { return region.contains(point); });
+                            }))
+                                parents.push_back({Polylines{path}, child_center});
+                        }
+                    } else if (parents.size() < max_parents) {
+                        Polylines frontier = select_outer_frontier(accepted_family, child_center);
+                        if (!frontier.empty())
+                            parents.push_back({std::move(frontier), child_center});
+                    }
+                    spawned_child = true;
+                    // Re-evaluate this same parent against the newly exposed
+                    // remaining-space boundary. This is the reference BFS branch
+                    // loop and is essential when one parent arc feeds two pockets.
+                    break;
                 }
-                if (accepted_family.empty())
-                    continue;
-
-                Polylines accepted_frontier = select_outer_frontier(accepted_family, child_center);
-                // Use the reference filled-disk model when the deposited beads
-                // cover it apart from sub-bead pitch seams. If rejecting a
-                // one-ended component leaves a substantial portion absent,
-                // subtract only actual bead footprints so another supported
-                // family can fill that hole.
-                ExPolygons ideal_swept_area =
-                    swept_disk(child_center, accepted_outer_radius,
-                               remaining[region_idx]);
-                ExPolygons deposited_area =
-                    union_ex(offset(
-                        accepted_family,
-                        float(0.52 * line_width)));
-                const ExPolygons substantial_missing =
-                    opening_ex(
-                        diff_ex(ideal_swept_area, deposited_area),
-                        float(0.30 * spacing));
-                ExPolygons accepted_swept_area =
-                    substantial_missing.empty() ?
-                        std::move(ideal_swept_area) :
-                        std::move(deposited_area);
-
-                append(arcs, accepted_family);
-                child_path_count += accepted_family.size();
-                remaining = diff_ex(remaining, accepted_swept_area);
-                prune_remaining(remaining);
-                if (!accepted_frontier.empty() && parents.size() < max_parents)
-                    parents.push_back({std::move(accepted_frontier), child_center});
-                spawned_child = true;
-                // Re-evaluate this same parent against the newly exposed
-                // remaining-space boundary. This is the reference BFS branch
-                // loop and is essential when one parent arc feeds two pockets.
-                break;
             }
 
             if (!spawned_child)
                 ++parent_idx;
         }
-
+    }
+    const auto emit_arcs = [&] {
+        if (!frontier_growth && (params.arc_root_anchor_regions != nullptr ||
+            params.arc_anchor_regions != nullptr || params.arc_prior_paths != nullptr ||
+            params.arc_obstacle_paths != nullptr)) {
+            // Final trimming can remove a child's previously valid anchor.
+            // Rebuild dependencies from the deposited prefix only, never from
+            // the generation-time index containing future arcs. Keep blocked
+            // children pending until their parent has actually been emitted.
+            Lines committed_lines;
+            PrintedArcIndex committed(committed_lines, 4 * spacing);
+            if (params.arc_prior_paths)
+                for (const auto &path : *params.arc_prior_paths) committed.add(path);
+            if (support_paths)
+                for (const auto &path : *support_paths) committed.add(path);
+            const auto supported = [&](const Point &point) {
+                const ExPolygons *regions = params.arc_root_anchor_regions != nullptr ?
+                    params.arc_root_anchor_regions : params.arc_anchor_regions;
+                if (regions && std::any_of(regions->begin(), regions->end(),
+                    [&](const ExPolygon &region) { return region.contains(point); }))
+                    return true;
+                return committed.has_side_contact(point, line_width);
+            };
+            Lines accepted_lines;
+            PrintedArcIndex accepted_index(accepted_lines, 4 * spacing);
+            Polylines ordered;
+            ordered.reserve(arcs.size());
+            size_t remaining = arcs.size();
+            while (remaining > 0) {
+                const size_t before = remaining;
+                for (Polyline &source : arcs) {
+                    if (source.empty()) continue;
+                    report(FillProgressStage::ValidateArcs, ordered.size(), arcs.size());
+                    Polyline candidate = source;
+                    trim_sustained_retrace(candidate, accepted_index);
+                    if (candidate.length() < 0.75 * line_width ||
+                        (candidate.length() < minimum_free_air_path_length &&
+                         !arc_lead_supported(candidate, false, candidate.length(), support_sample_step, supported)) ||
+                        !arc_lead_supported(candidate, false, supported_lead_length, support_sample_step, supported) ||
+                        !arc_lead_supported(candidate, true, supported_lead_length, support_sample_step, supported))
+                        continue;
+                    committed.add(candidate);
+                    accepted_index.add(candidate);
+                    ordered.emplace_back(std::move(candidate));
+                    source.clear();
+                    --remaining;
+                }
+                // A cyclic or unanchored group cannot support itself. Do not
+                // invent a root by printing the shortest unsupported fragment.
+                if (remaining == before) break;
+            }
+            arcs = std::move(ordered);
+        }
+        for (Polyline &arc : arcs) {
+            arc.fitting_result.clear();
+            // Clipped disk families can approach an earlier family at a very
+            // shallow angle. Fit these contacts to output-coordinate accuracy;
+            // otherwise fitting can reintroduce a terminal crossing. Only the
+            // primary narrow arches retain their established fitting tolerance;
+            // their clipped recursive children need the tighter contact fit.
+            const bool narrow_primary = chained_primary &&
+                size_t(&arc - arcs.data()) < primary_arc_count;
+            const double fitting_tolerance = narrow_primary ? arc_fit_tolerance_mm : 0.001;
+            if (arc.points.size() >= 3)
+                ArcFitter::do_arc_fitting(arc.points, arc.fitting_result, double(scale_(fitting_tolerance)));
+        }
+        if (params.arc_prior_paths != nullptr)
+            append(*params.arc_prior_paths, arcs);
+        append(polylines_out, std::move(arcs));
+    };
+    if (frontier_growth) {
+        // Children were clipped, trimmed and checked against the committed
+        // prefix before entering the support index. Reordering or trimming
+        // their parents here would invalidate those support dependencies.
+        emit_arcs();
+        return;
     }
     // Families are generated and refined independently, and a complex bridge
     // surface may contain hundreds of clipped recursive fragments.  Validate
@@ -2408,6 +2708,7 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
             return true;
         };
     for (size_t arc_idx = 0; arc_idx < arcs.size(); ++arc_idx) {
+        report(FillProgressStage::ValidateArcs, arc_idx + 1, arcs.size());
         Polyline &arc = arcs[arc_idx];
         if (arc.points.size() < 2)
             continue;
@@ -2420,6 +2721,7 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
             const Line segment(
                 arc.points[point_idx - 1], arc.points[point_idx]);
             Point nearest_intersection;
+            Line nearest_occupied;
             double nearest_distance_squared =
                 std::numeric_limits<double>::max();
             final_index.visit(
@@ -2449,38 +2751,15 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
                         nearest_distance_squared) {
                         nearest_distance_squared = distance_squared;
                         nearest_intersection = intersection;
+                        nearest_occupied = occupied;
                     }
                 });
 
             if (nearest_distance_squared <
                 std::numeric_limits<double>::max()) {
-                Point safe_endpoint = nearest_intersection;
-                const Vec2d approach =
-                    (nearest_intersection -
-                     sanitized.last_point())
-                        .cast<double>();
-                const double approach_length =
-                    approach.norm();
-                // The G-code writer rounds XY to 0.001 mm. Ending exactly at
-                // an analytic intersection may consequently round a few
-                // microns past the occupied centerline. Stop one output step
-                // early; the deposited beads still overlap while their
-                // centerlines cannot cross after serialization.
-                if (approach_length >
-                    double(gcode_coordinate_step)) {
-                    const Vec2d position =
-                        nearest_intersection.cast<double>() -
-                        approach *
-                            (double(gcode_coordinate_step) /
-                             approach_length);
-                    safe_endpoint = Point(
-                        coord_t(std::lround(position.x())),
-                        coord_t(std::lround(position.y())));
-                }
-                if (safe_endpoint !=
-                    sanitized.last_point())
-                    sanitized.points.emplace_back(
-                        safe_endpoint);
+                if (nearest_intersection != sanitized.last_point())
+                    sanitized.points.emplace_back(nearest_intersection);
+                trim_contact_end(sanitized, nearest_occupied);
                 collided = true;
             } else {
                 sanitized.points.emplace_back(segment.b);
@@ -2673,7 +2952,7 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
         const auto order_group =
             [&ordering_index, &longest_unsupported_run,
              &fully_supported, &point_supported,
-             &has_root_supported_origin]
+             &has_root_supported_origin, &report]
             (Polylines pending, Polylines &ordered,
              bool seed_original_root) {
                 if (seed_original_root && !pending.empty()) {
@@ -2707,6 +2986,7 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
                     }
                 }
                 while (!pending.empty()) {
+                    report(FillProgressStage::ValidateArcs, ordered.size(), ordered.size() + pending.size());
                     Polylines deferred;
                     deferred.reserve(pending.size());
                     bool progressed = false;
@@ -2881,51 +3161,27 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
     PrintedArcIndex emitted_arc_index(
         emitted_arc_lines, 4 * spacing);
     Lines emitted_anchor_lines;
+    PrintedArcIndex emitted_anchor_index(emitted_anchor_lines, 4 * spacing);
     if (params.arc_prior_paths != nullptr)
         for (const Polyline &path : *params.arc_prior_paths)
-            append(emitted_anchor_lines, path.lines());
+            emitted_anchor_index.add(path);
     if (params.arc_obstacle_paths != nullptr)
         for (const Polyline &path : *params.arc_obstacle_paths)
-            append(emitted_anchor_lines, path.lines());
+            emitted_anchor_index.add(path);
     Point previous_emitted_end;
     bool has_previous_emitted_end = false;
     const double supported_endpoint_distance_squared =
         double(line_width) * double(line_width);
     const auto anchor_emitted_start =
-        [&emitted_anchor_lines, &previous_emitted_end,
+        [&emitted_anchor_lines, &emitted_anchor_index, line_width, &previous_emitted_end,
          &has_previous_emitted_end,
          supported_endpoint_distance_squared](Polyline &arc) {
             if (arc.points.size() < 2 || emitted_anchor_lines.empty())
                 return;
 
             const auto nearest_anchor_distance_squared =
-                [&emitted_anchor_lines](const Point &point) {
-                    double nearest_distance_squared =
-                        std::numeric_limits<double>::max();
-                    for (const Line &line : emitted_anchor_lines) {
-                        const Vec2d start = line.a.cast<double>();
-                        const Vec2d delta =
-                            (line.b - line.a).cast<double>();
-                        const double length_squared =
-                            delta.squaredNorm();
-                        const double position =
-                            length_squared == 0. ? 0. :
-                            std::clamp(
-                                (point.cast<double>() - start)
-                                        .dot(delta) /
-                                    length_squared,
-                                0., 1.);
-                        const Vec2d projected =
-                            start + position * delta;
-                        const double distance_squared =
-                            (point.cast<double>() - projected)
-                                .squaredNorm();
-                        if (distance_squared <
-                            nearest_distance_squared)
-                            nearest_distance_squared =
-                                distance_squared;
-                    }
-                    return nearest_distance_squared;
+                [&emitted_anchor_index, line_width](const Point &point) {
+                    return emitted_anchor_index.nearest_distance_squared(point, line_width);
                 };
 
             const double first_distance =
@@ -2956,6 +3212,7 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
     Polylines emitted_arcs;
     emitted_arcs.reserve(arcs.size());
     for (size_t arc_idx = 0; arc_idx < arcs.size(); ++arc_idx) {
+        report(FillProgressStage::ValidateArcs, arc_idx + 1, arcs.size());
         Polyline &arc = arcs[arc_idx];
         anchor_emitted_start(arc);
         trim_sustained_retrace(arc, emitted_arc_index);
@@ -2974,12 +3231,60 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
             is_shallow_child_arc(arc))
             continue;
         emitted_arc_index.add(arc);
-        append(emitted_anchor_lines, arc.lines());
+        emitted_anchor_index.add(arc);
         previous_emitted_end = arc.last_point();
         has_previous_emitted_end = true;
         emitted_arcs.emplace_back(std::move(arc));
     }
     arcs = std::move(emitted_arcs);
+
+    // Work from the material that survived clipping and print-order validation,
+    // not the nominal filled disks. A rejected arc must leave a residual which
+    // can grow a new family on its deposited neighbours. Each child uses the
+    // same collision, anchoring and curvature checks as its parent.
+    // Narrow strips use translated, directly anchored arches rather than
+    // capped disks. Preserve that planner's boundary runways; a disk refill
+    // in its narrow residual can detach a start from the original wall.
+    if (recursive_fill && !chained_primary && !arcs.empty() && m_refinement_depth < 4) {
+        ExPolygons residual = opening_ex(
+            diff_ex(ExPolygons{expolygon}, union_ex(offset(arcs, float(0.52 * line_width)))),
+            float(0.15 * spacing));
+        Polylines deposited = params.arc_prior_paths == nullptr ? Polylines{} : *params.arc_prior_paths;
+        append(deposited, arcs);
+        // Reuse the envelope while no new paths have been deposited. Children
+        // append to arc_prior_paths, so accepted siblings must refresh it.
+        ExPolygons anchors = union_ex(offset(deposited, float(0.5 * line_width)));
+        if (params.arc_anchor_regions != nullptr)
+            append(anchors, *params.arc_anchor_regions);
+        size_t anchored_path_count = deposited.size();
+        for (const ExPolygon &pocket : residual) {
+            report(FillProgressStage::RefineArcs, size_t(&pocket - residual.data()) + 1, residual.size());
+            if (std::abs(pocket.area()) < double(line_width) * double(line_width))
+                continue;
+            const ExPolygons targets = intersection_ex(
+                offset_ex(ExPolygons{pocket}, float(0.6 * line_width)), ExPolygons{expolygon});
+            for (const ExPolygon &target : targets) {
+                if (anchored_path_count != deposited.size()) {
+                    anchors = union_ex(offset(deposited, float(0.5 * line_width)));
+                    if (params.arc_anchor_regions != nullptr)
+                        append(anchors, *params.arc_anchor_regions);
+                    anchored_path_count = deposited.size();
+                }
+                // Anchor regions describe deposited material, not the reach
+                // of another bead. The support test adds the candidate's own
+                // half-width; inflating by a full width here counts it twice
+                // and allows detached arc starts after G-code ordering.
+                FillParams child_params = params;
+                child_params.arc_anchor_regions = &anchors;
+                child_params.arc_prior_paths = &deposited;
+                FillArcOverhang child(*this);
+                ++child.m_refinement_depth;
+                Polylines additions;
+                child._fill_surface_single(child_params, 1, direction, target, additions);
+                append(arcs, std::move(additions));
+            }
+        }
+    }
 
     // The retrace pass above may shorten a path after the dependency-ordering
     // direction was chosen. Standalone fill callers have no mechanical
@@ -3008,18 +3313,7 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
     // 0.001 mm). Use a fixed, tightly bounded tolerance here: these paths have
     // already passed the generator's collision checks, and 0.005 mm keeps the
     // fitted centerline within the validated extrusion corridor.
-    const double arc_fitting_tolerance = double(scale_(0.005));
-    for (Polyline &arc : arcs) {
-        arc.fitting_result.clear();
-        if (arc.points.size() >= 3)
-            ArcFitter::do_arc_fitting(
-                arc.points, arc.fitting_result,
-                arc_fitting_tolerance);
-    }
-
-    if (params.arc_prior_paths != nullptr)
-        append(*params.arc_prior_paths, arcs);
-    append(polylines_out, std::move(arcs));
+    emit_arcs();
 }
 
 } // namespace Slic3r

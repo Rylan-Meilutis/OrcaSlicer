@@ -4,6 +4,16 @@
 
 using namespace Slic3r;
 
+TEST_CASE("RME application updates use the fork without changing profile updates", "[AppConfig][AppUpdate]")
+{
+    AppConfig config;
+    CHECK(config.version_check_url() ==
+          "https://api.github.com/repos/Rylan-Meilutis/OrcaSlicer/releases?per_page=100");
+    CHECK(config.profile_update_url() == "https://check-version.orcaslicer.com/profile");
+    config.set("version_check_url", "https://example.test/releases");
+    CHECK(config.version_check_url() == "https://example.test/releases");
+}
+
 TEST_CASE("AppConfig network version helpers", "[AppConfig]") {
     AppConfig config;
 

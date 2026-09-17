@@ -335,9 +335,6 @@ void PhysicalPrinterDialog::build_printhost_settings(ConfigOptionsGroup* m_optgr
     m_optgroup->append_single_option_line("embed_spool_manager_filament_names");
     m_optgroup->append_single_option_line("spool_manager_sync_mode");
     m_optgroup->append_single_option_line("octoprint_filament_plugin_endpoint");
-    m_optgroup->append_single_option_line("octoprint_spool_profile_mappings");
-    m_optgroup->append_single_option_line("octoprint_material_profile_mappings");
-    m_optgroup->append_single_option_line("octoprint_default_filament_profile");
 
     option = m_optgroup->get_option("flashforge_serial_number");
     option.opt.width = Field::def_width_wider();
@@ -614,20 +611,11 @@ void PhysicalPrinterDialog::update(bool printer_change)
         m_optgroup->show_field("embed_spool_manager_filament_names", opt != nullptr && opt->value == htOctoPrint);
         m_optgroup->show_field("spool_manager_sync_mode", opt != nullptr && opt->value == htOctoPrint);
         m_optgroup->show_field("octoprint_filament_plugin_endpoint", opt != nullptr && opt->value == htOctoPrint);
-        m_optgroup->show_field("octoprint_spool_profile_mappings", opt != nullptr && opt->value == htOctoPrint);
-        m_optgroup->show_field("octoprint_material_profile_mappings", opt != nullptr && opt->value == htOctoPrint);
-        m_optgroup->show_field("octoprint_default_filament_profile", opt != nullptr && opt->value == htOctoPrint);
         const auto *sync_spools =
             m_config->option<ConfigOptionBool>("sync_spool_manager_filament_names");
         m_optgroup->enable_field("embed_spool_manager_filament_names",
                                  sync_spools != nullptr && sync_spools->value);
         m_optgroup->enable_field("octoprint_filament_plugin_endpoint",
-                                 sync_spools != nullptr && sync_spools->value);
-        m_optgroup->enable_field("octoprint_spool_profile_mappings",
-                                 sync_spools != nullptr && sync_spools->value);
-        m_optgroup->enable_field("octoprint_material_profile_mappings",
-                                 sync_spools != nullptr && sync_spools->value);
-        m_optgroup->enable_field("octoprint_default_filament_profile",
                                  sync_spools != nullptr && sync_spools->value);
 
         m_optgroup->enable_field("print_host");
@@ -742,9 +730,6 @@ void PhysicalPrinterDialog::update(bool printer_change)
         m_optgroup->hide_field("embed_spool_manager_filament_names");
         m_optgroup->hide_field("spool_manager_sync_mode");
         m_optgroup->hide_field("octoprint_filament_plugin_endpoint");
-        m_optgroup->hide_field("octoprint_spool_profile_mappings");
-        m_optgroup->hide_field("octoprint_material_profile_mappings");
-        m_optgroup->hide_field("octoprint_default_filament_profile");
         m_optgroup->hide_field("flashforge_serial_number");
 
         m_optgroup->show_field("printhost_authorization_type");

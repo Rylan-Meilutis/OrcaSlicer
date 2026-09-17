@@ -10,6 +10,32 @@
 
 using namespace Slic3r;
 
+TEST_CASE("Clipped perimeter pieces preserve source order at corners and seams", "[ClipperUtils][Regression]")
+{
+    Polyline source(Points{{0, 0}, {1000, 0}, {1000, 800}, {0, 800}, {0, 0}});
+    if (GENERATE(false, true))
+        source.points.pop_back();
+    if (GENERATE(false, true))
+        source.reverse();
+    const Polygon clip(Points{{-100, -100}, {500, -100}, {500, 900}, {-100, 900}});
+    Polylines fragments = intersection_pl(Polylines{source}, Polygons{clip});
+    append(fragments, diff_pl(Polylines{source}, Polygons{clip}));
+    REQUIRE(fragments.size() > 1);
+    std::reverse(fragments.begin(), fragments.end());
+    for (Polyline &fragment : fragments)
+        fragment.reverse();
+    restore_source_path_order(source, fragments);
+    REQUIRE(fragments.front().first_point() == source.first_point());
+    REQUIRE(fragments.back().last_point() == source.last_point());
+    double length = 0.;
+    for (size_t i = 0; i < fragments.size(); ++i) {
+        length += fragments[i].length();
+        if (i + 1 < fragments.size())
+            CHECK(fragments[i].last_point() == fragments[i + 1].first_point());
+    }
+    CHECK_THAT(length, Catch::Matchers::WithinAbs(source.length(), 1e-6));
+}
+
 SCENARIO("Various Clipper operations - xs/t/11_clipper.t", "[ClipperUtils]") {
     // CCW oriented contour
     Slic3r::Polygon   square{ { 200, 100 }, {200, 200}, {100, 200}, {100, 100} };

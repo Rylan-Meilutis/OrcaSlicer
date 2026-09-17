@@ -1204,6 +1204,7 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
     //BBS: add more logs
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(", Line %1%: enter")%__LINE__;
     // Normalize the config.
+    resolve_project_filament_bindings(new_full_config, project_default_filament(model));
 	new_full_config.option("print_settings_id",            true);
 	new_full_config.option("filament_settings_id",         true);
 	new_full_config.option("printer_settings_id",          true);

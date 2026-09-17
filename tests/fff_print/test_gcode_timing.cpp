@@ -15,6 +15,8 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <cstdlib>
+#include <set>
 
 using namespace Slic3r;
 using Catch::Matchers::WithinAbs;
@@ -88,6 +90,107 @@ double filament_change_delay(const GCodeProcessorResult& r)
 }
 
 } // namespace
+
+TEST_CASE("Separate Stealth limits affect only the Stealth time estimate", "[GCodeTiming][Stealth][Regression]")
+{
+    const bool enabled = GENERATE(false, true);
+    const double stealth_speed = GENERATE(10.0, 20.0);
+    FullPrintConfig config = make_config(0, 0, 0);
+    config.silent_mode.value = enabled;
+    config.machine_max_speed_x.values = {100.0, stealth_speed};
+    config.machine_max_acceleration_x.values = {10000.0, 10000.0};
+    config.machine_max_acceleration_travel.values = {10000.0, 10000.0};
+    GCodeProcessor processor;
+    // The export pipeline enables this estimator from the printer option.
+    processor.enable_stealth_time_estimator(config.silent_mode.value);
+    run_processor(processor, config, "G90\nG1 X100 F6000\nG1 X0\nG1 X100\n");
+    const float normal = processor.get_time(PrintEstimatedStatistics::ETimeMode::Normal);
+    const float stealth = processor.get_time(PrintEstimatedStatistics::ETimeMode::Stealth);
+    CHECK(normal > 0.0f);
+    CHECK(normal < 4.0f);
+    if (enabled) {
+        CHECK(stealth > normal);
+        CHECK(stealth >= 300.0 / stealth_speed);
+    } else {
+        CHECK_THAT(stealth, WithinAbs(0.0, 1e-6));
+    }
+}
+
+TEST_CASE("Cleaner flushing moves do not become model walls", "[GCodeTiming][GCodePreview][Regression]")
+{
+    const std::string indent = GENERATE(std::string(), std::string("    "));
+    const std::string separator = GENERATE(std::string(), std::string(" "));
+    const std::string gcode =
+        "G90\nM83\n; FEATURE: Inner wall\n"
+        "G1 X100 Y100 Z44 F6000\nG1 X110 E1 F600\n"
+        "G12 S90 ; firmware enters cleaner\n" +
+        indent + ";" + separator + "FLUSH_START\n"
+        "G91\nG1 E2.49578 F174.704\n"
+        "G1 Y-1.5 E1.87183 F174.704\nG1 Y1.5 E1.87183 F250\nG90\n" +
+        indent + ";" + separator + "FLUSH_END\n"
+        "G12 S91\nG1 X100 Y100 F6000\nG1 X110 E1 F600\n";
+    GCodeProcessor proc;
+    run_processor(proc, make_config(0, 0, 0), gcode.c_str());
+    const auto& result = proc.get_result();
+    size_t model_moves = 0;
+    for (const auto& move : result.moves)
+        if (move.type == EMoveType::Extrude) {
+            ++model_moves;
+            CHECK_THAT(move.position.y(), WithinAbs(100.0, 1e-5));
+        }
+    REQUIRE(model_moves >= 2); // Preview may insert duplicate boundary vertices.
+    double model_volume = 0.0, flush_volume = 0.0;
+    for (const auto& entry : result.print_statistics.model_volumes_per_extruder)
+        model_volume += entry.second;
+    for (const auto& entry : result.print_statistics.flush_per_filament)
+        flush_volume += entry.second;
+    const double area = M_PI * 1.75 * 1.75 / 4.0;
+    CHECK_THAT(model_volume, WithinAbs(2.0 * area, 1e-4));
+    CHECK_THAT(flush_volume, WithinAbs((2.49578 + 2 * 1.87183) * area, 1e-4));
+}
+
+// Opt-in inspection of a user-supplied export without storing large G-code
+// fixtures or machine-specific paths in the test suite.
+TEST_CASE("Exported cleaner strokes are excluded from model preview", "[.][GCodePreview]")
+{
+    const char *filename = std::getenv("ORCA_GCODE_PREVIEW_INPUT");
+    REQUIRE(filename != nullptr);
+    std::ifstream input(filename);
+    REQUIRE(input.good());
+    std::set<unsigned int> flush_lines;
+    bool flushing = false;
+    unsigned int line_id = 0;
+    for (std::string line; std::getline(input, line);) {
+        ++line_id;
+        const size_t delimiter = line.find(';');
+        if (delimiter != std::string::npos) {
+            const size_t tag = line.find_first_not_of(" \t", delimiter + 1);
+            if (tag != std::string::npos) {
+                if (line.compare(tag, 11, "FLUSH_START") == 0)
+                    flushing = true;
+                else if (line.compare(tag, 9, "FLUSH_END") == 0)
+                    flushing = false;
+            }
+        }
+        if (flushing)
+            flush_lines.insert(line_id);
+    }
+    REQUIRE_FALSE(flush_lines.empty());
+    GCodeProcessor processor;
+    processor.process_file(filename);
+    size_t model_moves = 0;
+    for (const auto &move : processor.get_result().moves)
+        if (move.type == EMoveType::Extrude) {
+            ++model_moves;
+            INFO("G-code line " << move.gcode_id);
+            REQUIRE(flush_lines.count(move.gcode_id) == 0);
+        }
+    REQUIRE(model_moves > 0);
+    double flush_volume = 0.0;
+    for (const auto &entry : processor.get_result().print_statistics.flush_per_filament)
+        flush_volume += entry.second;
+    CHECK(flush_volume > 0.0);
+}
 
 TEST_CASE("Filament-change time is attributed to tool-change moves, not extrusion roles", "[GCodeTiming]")
 {

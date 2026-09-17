@@ -873,14 +873,24 @@ void Polyline3::split_at(Point& point, Polyline3* p1, Polyline3* p2) const
     index = this->find_point(p);
     if (index != -1) {
         this->split_at_index(index, p1, p2);
-        p1->append(Point3(point, p1->last_point().z()));
-        p2->append_before(Point3(point, p2->first_point().z()));
+        point = this->points[index].to_point();
     } else {
+        // A seam candidate can be off the path. Use its projection, and give
+        // both halves the same interpolated Z. Using the requested XY and each
+        // half's old endpoint height creates a lateral spur and a Z jump on
+        // contoured walls, especially beside short segments.
+        const Line3 &segment = lines[line_idx];
+        const Vec2d delta = (segment.b.to_point() - segment.a.to_point()).cast<double>();
+        const double t = delta.squaredNorm() > 0. ? std::clamp(
+            (p - segment.a.to_point()).cast<double>().dot(delta) / delta.squaredNorm(), 0., 1.) : 0.;
+        const Point3 split(p, coord_t(std::llround(double(segment.a.z()) +
+            t * double(segment.b.z() - segment.a.z()))));
         Polyline3 temp;
         this->split_at_index(line_idx, p1, &temp);
-        p1->append(Point3(point, p1->last_point().z()));
+        p1->append(split);
         this->split_at_index(line_idx + 1, &temp, p2);
-        p2->append_before(Point3(point, p2->first_point().z()));
+        p2->append_before(split);
+        point = p;
     }
 }
 

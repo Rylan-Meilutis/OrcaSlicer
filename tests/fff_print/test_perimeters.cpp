@@ -3,6 +3,7 @@
 #include "libslic3r/ExtrusionEntity.hpp"
 #include "libslic3r/ExtrusionEntityCollection.hpp"
 #include "libslic3r/GCode/GCodeProcessor.hpp"
+#include "libslic3r/GCodeReader.hpp"
 #include "libslic3r/Layer.hpp"
 #include "libslic3r/Print.hpp"
 #include "libslic3r/GCodeReader.hpp"
@@ -10,9 +11,11 @@
 #include "libslic3r/TriangleMesh.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <limits>
 #include <string>
+#include <set>
 #include <vector>
 
 #include "test_helpers.hpp"
@@ -403,6 +406,63 @@ TEST_CASE("Localized shrinkage strategies expose their intended strength tradeof
     CHECK(max_difference(perforated.fills, fully_decoupled.fills) > 1.0);
 }
 
+TEST_CASE("Shrinkage reinforcement keeps the outer bead envelope unchanged",
+          "[Perimeters][LocalizedShrinkage][Regression]")
+{
+    const char *generator = GENERATE("classic", "arachne");
+    CAPTURE(generator);
+    const auto envelopes = [](const Print &print) {
+        std::vector<std::array<double, 4>> result;
+        for (const Layer *layer : print.objects().front()->layers()) {
+            std::array<double, 4> bounds{1e30, 1e30, -1e30, -1e30};
+            const auto add = [&](const ExtrusionPath &path) {
+                if (path.role() != erExternalPerimeter)
+                    return;
+                for (const Point3 &point : path.polyline.points) {
+                    const double x = unscale<double>(point.x()), y = unscale<double>(point.y());
+                    bounds[0] = std::min(bounds[0], x - path.width / 2.);
+                    bounds[1] = std::min(bounds[1], y - path.width / 2.);
+                    bounds[2] = std::max(bounds[2], x + path.width / 2.);
+                    bounds[3] = std::max(bounds[3], y + path.width / 2.);
+                }
+            };
+            const auto visit = [&](auto &&self, const ExtrusionEntity &entity) -> void {
+                if (const auto *path = dynamic_cast<const ExtrusionPath *>(&entity))
+                    add(*path);
+                else if (const auto *loop = dynamic_cast<const ExtrusionLoop *>(&entity))
+                    for (const auto &part : loop->paths) add(part);
+                else if (const auto *multi = dynamic_cast<const ExtrusionMultiPath *>(&entity))
+                    for (const auto &part : multi->paths) add(part);
+                else if (const auto *collection = dynamic_cast<const ExtrusionEntityCollection *>(&entity))
+                    for (const auto *child : collection->entities) self(self, *child);
+            };
+            for (const LayerRegion *region : layer->regions())
+                visit(visit, region->perimeters);
+            REQUIRE(bounds[0] < bounds[2]);
+            result.push_back(bounds);
+        }
+        return result;
+    };
+    DynamicPrintConfig config = base_config(generator);
+    config.set_deserialize_strict({{"localized_shrinkage_strategy", "disabled"},
+        {"hull_line_extra_perimeters", 0}, {"hull_line_perimeter_expansion", 0.},
+        {"inner_walls_flow_ratio", "110%"}});
+    Print baseline;
+    init_and_process_print({storage_box_transition()}, baseline, config);
+    const auto expected = envelopes(baseline);
+    config.set_deserialize_strict("localized_shrinkage_strategy", "reinforced_walls");
+    Print reinforced;
+    init_and_process_print({storage_box_transition()}, reinforced, config);
+    const auto actual = envelopes(reinforced);
+    REQUIRE(actual.size() == expected.size());
+    CHECK(perimeter_length_at(reinforced, ledge_z) > perimeter_length_at(baseline, ledge_z));
+    for (size_t layer = 0; layer < actual.size(); ++layer)
+        for (size_t side = 0; side < 4; ++side) {
+            CAPTURE(layer, side);
+            CHECK_THAT(actual[layer][side], Catch::Matchers::WithinAbs(expected[layer][side], 0.002));
+        }
+}
+
 TEST_CASE("Localized shrinkage walls carry a dedicated preview marker",
           "[Perimeters][LocalizedShrinkage][Preview]")
 {
@@ -420,6 +480,7 @@ TEST_CASE("Localized shrinkage walls carry a dedicated preview marker",
     REQUIRE_FALSE(print.objects().empty());
 
     size_t marked_paths = 0;
+    std::set<size_t> marked_layers;
     const auto count_marked = [&](const auto &self,
                                   const ExtrusionEntity &entity) -> void {
         if (const auto *path = dynamic_cast<const ExtrusionPath *>(&entity))
@@ -437,9 +498,197 @@ TEST_CASE("Localized shrinkage walls carry a dedicated preview marker",
                 self(self, *child);
     };
     for (const Layer *layer : print.objects().front()->layers())
-        for (const LayerRegion *region : layer->regions())
+        for (const LayerRegion *region : layer->regions()) {
+            const size_t before = marked_paths;
             count_marked(count_marked, region->perimeters);
+            if (marked_paths != before)
+                marked_layers.insert(layer->id());
+        }
     CHECK(marked_paths > 0);
+    // Mitigation is a short structural band, not a one-layer stiffness step.
+    CHECK(marked_layers.size() >= 3);
+}
+
+TEST_CASE("Compensated brick paths retain the brick preview classification",
+          "[Perimeters][StaggeredPerimeters][Preview][Regression]")
+{
+    auto config = base_config(GENERATE("classic", "arachne"));
+    config.set_deserialize_strict({{"perimeter_layering", "brick"},
+        {"wall_loops", 3}, {"seam_gap", 0.}, {"seam_start_on_inner_wall", false},
+        {"enable_arc_fitting", false}, {"gcode_comments", true}});
+    Print print;
+    init_and_process_print({make_cube(12., 12., 2.)}, print, config);
+    double expected = 0.;
+    const auto mark = [&](auto &&self, ExtrusionEntity &entity) -> void {
+        if (auto *path = dynamic_cast<ExtrusionPath *>(&entity)) {
+            if (path->staggered_perimeter) {
+                expected += unscale<double>(path->length());
+                path->shrinkage_compensation = true;
+            }
+        } else if (auto *loop = dynamic_cast<ExtrusionLoop *>(&entity)) {
+            for (auto &path : loop->paths) self(self, path);
+        } else if (auto *multi = dynamic_cast<ExtrusionMultiPath *>(&entity)) {
+            for (auto &path : multi->paths) self(self, path);
+        } else if (auto *collection = dynamic_cast<ExtrusionEntityCollection *>(&entity)) {
+            for (auto *child : collection->entities) self(self, *child);
+        }
+    };
+    for (Layer *layer : print.objects().front()->layers())
+        for (LayerRegion *region : layer->regions()) mark(mark, region->perimeters);
+    REQUIRE(expected > 0.);
+    double actual = 0.;
+    bool brick = false;
+    GCodeReader reader;
+    reader.parse_buffer(gcode(print), [&](GCodeReader &self, const GCodeReader::GCodeLine &line) {
+        const std::string comment(line.comment());
+        if (comment.find("TYPE:") != std::string::npos)
+            brick = comment.find("Brick wall") != std::string::npos;
+        if (brick && line.extruding(self)) actual += line.dist_XY(self);
+    });
+    CHECK_THAT(actual, Catch::Matchers::WithinAbs(expected, 0.05));
+}
+
+TEST_CASE("Compensated brick walls finish exposed tops at nominal height", "[Perimeters][LocalizedShrinkage][StaggeredPerimeters][Regression]")
+{
+    const char *generator = GENERATE("classic", "arachne");
+    const bool inner_only = GENERATE(false, true);
+    const char *strategy = GENERATE("balanced", "reinforced_walls");
+    const char *surface_mode = GENERATE("disabled", "nonplanar_with_z_contouring_fallback");
+    auto config = base_config(generator);
+    config.set_deserialize_strict({{"localized_shrinkage_strategy", strategy},
+        {"top_surface_z_mode", surface_mode},
+        {"nonplanar_top_surface", std::string(surface_mode) != "disabled"},
+        {"zaa_enabled", std::string(surface_mode) != "disabled"},
+        {"perimeter_layering", "brick"}, {"staggered_perimeter_offset", "50%"},
+        {"staggered_perimeters_inner_only", inner_only}, {"hull_line_perimeter_expansion", 0.15}});
+    Print print;
+    TriangleMesh shape = make_cube(40., 40., 5.);
+    TriangleMesh boss = make_cube(10., 10., 5.);
+    boss.translate(15., 15., 5.);
+    shape.merge(boss);
+    init_and_process_print({shape}, print, config);
+    const auto paths_in = [](const Layer *layer) {
+        std::vector<const ExtrusionPath *> paths;
+        const auto collect = [&](auto &&self, const ExtrusionEntity &entity) -> void {
+            if (const auto *path = dynamic_cast<const ExtrusionPath *>(&entity)) paths.push_back(path);
+            else if (const auto *loop = dynamic_cast<const ExtrusionLoop *>(&entity))
+                for (const auto &p : loop->paths) paths.push_back(&p);
+            else if (const auto *multi = dynamic_cast<const ExtrusionMultiPath *>(&entity))
+                for (const auto &p : multi->paths) paths.push_back(&p);
+            else if (const auto *collection = dynamic_cast<const ExtrusionEntityCollection *>(&entity))
+                for (const auto *child : collection->entities) self(self, *child);
+        };
+        for (const LayerRegion *region : layer->regions()) collect(collect, region->perimeters);
+        return paths;
+    };
+    size_t compensated = 0, brick = 0, restored = 0;
+    for (const Layer *layer : print.objects().front()->layers()) {
+        for (const ExtrusionPath *path : paths_in(layer)) {
+            CAPTURE(generator, inner_only, strategy, surface_mode, layer->print_z, path->inset_idx);
+            // This fixture's outer wall is vertical throughout the base, so
+            // intermediate raised courses must not repeatedly get entry flow.
+            if (layer->print_z > 1.0 && layer->print_z < 4.0 &&
+                path->inset_idx == 0 && path->staggered_perimeter)
+                CHECK_THAT(path->height, Catch::Matchers::WithinAbs(0.2, 1e-5));
+            compensated += path->shrinkage_compensation;
+            brick += path->staggered_perimeter;
+            if (layer->upper_layer == nullptr) {
+                CHECK_FALSE(path->staggered_perimeter);
+                for (const Point3 &point : path->polyline.points) CHECK(point.z() == 0);
+            }
+            if (std::abs(layer->print_z - 5.0) > 1e-5 || path->staggered_perimeter ||
+                !layer->lower_layer || path->polyline.points.size() < 2)
+                continue;
+            const Point3 &sample = path->polyline.points[path->polyline.points.size() / 2];
+            for (const ExtrusionPath *lower : paths_in(layer->lower_layer)) {
+                if (!lower->staggered_perimeter || lower->inset_idx != path->inset_idx)
+                    continue;
+                const auto &points = lower->polyline.points;
+                if (std::any_of(points.begin(), points.end(), [&](const Point3 &p) {
+                        return std::abs(unscale<double>(p.z()) - 0.1) < 1e-5;
+                    })) {
+                    ++restored;
+                    CHECK_THAT(path->height, Catch::Matchers::WithinAbs(0.1, 1e-5));
+                    CHECK(sample.z() == 0);
+                    break;
+                }
+            }
+        }
+    }
+    CHECK(compensated > 0);
+    CHECK(brick > 0);
+    CHECK(restored > 0);
+}
+
+TEST_CASE("Brick wall caps remain coplanar under hybrid surface fallback",
+          "[Perimeters][LocalizedShrinkage][StaggeredPerimeters][ContourZ][Regression]")
+{
+    const char *generator = GENERATE("classic", "arachne");
+    const bool brick = GENERATE(false, true);
+    auto config = base_config(generator);
+    config.set_deserialize_strict({{"localized_shrinkage_strategy", "reinforced_walls"},
+        {"perimeter_layering", brick ? "brick" : "standard"},
+        {"staggered_perimeters_inner_only", true}, {"staggered_perimeter_offset", "50%"},
+        {"top_surface_z_mode", "nonplanar_with_z_contouring_fallback"},
+        {"nonplanar_top_surface", true}, {"zaa_enabled", true}});
+    // A hollow bucket with a rim between nominal Z planes. Integral-height
+    // cubes miss the conflict: fallback lowers ordinary paths but skips the
+    // already Z-tagged half-height brick return course.
+    TriangleMesh bucket = make_cube(16., 16., 1.);
+    for (const auto &wall : std::vector<std::array<double, 4>>{
+             {0., 0., 16., 3.}, {0., 13., 16., 3.},
+             {0., 3., 3., 10.}, {13., 3., 3., 10.}}) {
+        TriangleMesh part = make_cube(wall[2], wall[3], 3.956);
+        part.translate(wall[0], wall[1], 1.);
+        bucket.merge(part);
+    }
+    Print print;
+    init_and_process_print({bucket}, print, config);
+    const Layer *top = print.objects().front()->layers().back();
+    size_t paths = 0, returns = 0, adjusted = 0;
+    const auto check = [&](auto &&self, const ExtrusionEntity &entity) -> void {
+        if (const auto *path = dynamic_cast<const ExtrusionPath *>(&entity)) {
+            ++paths;
+            returns += path->staggered_transition;
+            for (const Point3 &p : path->polyline.points) {
+                adjusted += p.z() != 0;
+                if (brick) CHECK(p.z() == 0);
+            }
+        } else if (const auto *loop = dynamic_cast<const ExtrusionLoop *>(&entity)) {
+            for (const auto &path : loop->paths) self(self, path);
+        } else if (const auto *multi = dynamic_cast<const ExtrusionMultiPath *>(&entity)) {
+            for (const auto &path : multi->paths) self(self, path);
+        } else if (const auto *collection = dynamic_cast<const ExtrusionEntityCollection *>(&entity)) {
+            for (const auto *child : collection->entities) self(self, *child);
+        }
+    };
+    CAPTURE(generator, brick, top->print_z);
+    for (const LayerRegion *region : top->regions()) {
+        check(check, region->perimeters);
+        check(check, region->fills);
+    }
+    REQUIRE(paths > 0);
+    if (brick) CHECK(returns > 0);
+    else CHECK(adjusted > 0); // Control: ordinary fallback still follows this mesh.
+
+    // Check the emitted coordinates too: seam handling and Z-state restoration
+    // must not reintroduce a lowered skin beside the nominal return course.
+    const double cap_z = top->print_z;
+    const std::string output = gcode(print);
+    double layer_z = 0.;
+    size_t cap_moves = 0;
+    GCodeReader reader;
+    reader.apply_config(config);
+    reader.parse_buffer(output, [&](GCodeReader &r, const GCodeReader::GCodeLine &line) {
+        if (line.raw().rfind(";Z:", 0) == 0)
+            layer_z = std::stod(line.raw().substr(3));
+        if (std::abs(layer_z - cap_z) < 1e-5 && line.extruding(r) &&
+            (line.has_x() || line.has_y())) {
+            ++cap_moves;
+            if (brick) CHECK_THAT(line.new_Z(r), Catch::Matchers::WithinAbs(cap_z, 1e-5));
+        }
+    });
+    CHECK(cap_moves > 0);
 }
 
 // The expansion only retypes area as top solid infill, so it can do nothing where there is no top

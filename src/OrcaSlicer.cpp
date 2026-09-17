@@ -3989,6 +3989,7 @@ int CLI::run(int argc, char **argv)
 
     // Apply command line options to a more specific DynamicPrintConfig which provides normalize()
     // (command line options override --load files)
+    restore_project_filament_roles(m_print_config);
     m_print_config.apply(m_extra_config, true);
 
     if (!cli_override_before.empty()) {
@@ -4046,6 +4047,9 @@ int CLI::run(int argc, char **argv)
             }
         }
     }
+    capture_project_filament_roles(m_print_config);
+    resolve_project_filament_bindings(m_print_config,
+        m_models.empty() ? 1 : project_default_filament(m_models.front()));
     // Normalizing after importing the 3MFs / AMFs
     m_print_config.normalize_fdm();
 

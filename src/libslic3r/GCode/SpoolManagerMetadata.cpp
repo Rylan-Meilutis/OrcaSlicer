@@ -341,6 +341,61 @@ bool parse_selected_spools(const std::string &response, std::vector<Filament> &s
     return true;
 }
 
+bool parse_spool_inventory(const std::string &response, std::vector<Filament> &inventory,
+                           std::string &error,
+                           const std::string &fallback_provider)
+{
+    try {
+        const nlohmann::json root = nlohmann::json::parse(response);
+        const nlohmann::json *payload = &root;
+        if (const auto data = root.find("data"); data != root.end() && data->is_object())
+            payload = &*data;
+
+        const std::string reported_provider = object_string(root, {"provider"});
+        const bool rme_report = object_string(root, {"schema"}) == "rme-filament-report-v1";
+        const auto provider_or = [&](const char *native_provider) {
+            if (rme_report)
+                return fallback_provider.empty() ? std::string("RME compatibility") : fallback_provider;
+            if (!reported_provider.empty())
+                return reported_provider;
+            return fallback_provider.empty() ? std::string(native_provider) : fallback_provider;
+        };
+
+        const nlohmann::json *spools = nullptr;
+        for (const char *key : {"allSpools", "all_spools", "spools"}) {
+            const auto found = payload->find(key);
+            if (found != payload->end() && found->is_array()) {
+                spools = &*found;
+                break;
+            }
+        }
+        if (spools == nullptr) {
+            error = "The OctoPrint filament provider did not report a spool inventory.";
+            inventory.clear();
+            return false;
+        }
+
+        const char *native_provider = payload->contains("allSpools") || payload->contains("all_spools") ?
+            "SpoolManager" : "Spoolman";
+        inventory.clear();
+        inventory.reserve(spools->size());
+        for (const nlohmann::json &entry : *spools) {
+            Filament filament = filament_from_spool(entry, provider_or(native_provider));
+            if (!filament.name.empty() || !filament.spool_id.empty())
+                inventory.emplace_back(std::move(filament));
+        }
+        if (inventory.empty()) {
+            error = "The OctoPrint filament provider reported an empty spool inventory.";
+            return false;
+        }
+        return true;
+    } catch (const std::exception &exception) {
+        error = exception.what();
+        inventory.clear();
+        return false;
+    }
+}
+
 std::string mapped_profile_name(const Filament &filament,
                                 const std::vector<std::string> &spool_mappings,
                                 const std::vector<std::string> &material_mappings,

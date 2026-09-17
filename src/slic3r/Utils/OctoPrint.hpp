@@ -36,6 +36,9 @@ public:
     const std::string& get_apikey() const { return m_apikey; }
     const std::string& get_cafile() const { return m_cafile; }
     bool get_selected_filament_spools(std::vector<SpoolManagerMetadata::Filament> &slots, wxString &error) const;
+    bool get_filament_spools(std::vector<SpoolManagerMetadata::Filament> &slots,
+                             std::vector<SpoolManagerMetadata::Filament> &inventory,
+                             wxString &error) const;
     bool get_spool_manager_selected_spools(std::vector<SpoolManagerMetadata::Filament> &slots, wxString &error) const
     { return get_selected_filament_spools(slots, error); }
 

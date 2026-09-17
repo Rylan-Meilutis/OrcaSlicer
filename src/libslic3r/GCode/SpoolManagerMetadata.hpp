@@ -56,6 +56,13 @@ bool parse_selected_spools(const std::string &response, std::vector<Filament> &s
                            std::string &error,
                            const std::string &fallback_provider = {});
 
+// Parses the complete roll inventory when the provider reports it. Unlike
+// parse_selected_spools(), this is independent of tool assignments and is used
+// by the graphical OctoPrint-to-Orca profile mapper.
+bool parse_spool_inventory(const std::string &response, std::vector<Filament> &inventory,
+                           std::string &error,
+                           const std::string &fallback_provider = {});
+
 // Resolves an explicitly configured profile name. Mapping entries use
 // "provider:spool-id=preset" (or "spool-id=preset") for a roll and
 // "vendor|material=preset" (or "material=preset") for a material family.

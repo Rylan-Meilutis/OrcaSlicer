@@ -11,6 +11,7 @@
 #include "ShortestPath.hpp"
 #include "SLA/IndexedMesh.hpp"
 #include "TriangleMesh.hpp"
+#include "Utils.hpp"
 #include "VariableWidth.hpp"
 
 #include <algorithm>
@@ -31,6 +32,194 @@
 #include <tbb/parallel_for.h>
 
 namespace Slic3r {
+
+Polylines nonplanar_wall_centerlines(const ExtrusionEntity &entity, int inset)
+{
+    Polylines result;
+    const auto collect = [&](const auto &self, const ExtrusionEntity &item, int parent_inset) -> void {
+        if (const auto *path = dynamic_cast<const ExtrusionPath *>(&item)) {
+            const int path_inset = parent_inset >= 0 ? parent_inset : path->inset_idx;
+            if (is_perimeter(path->role()) && path_inset == inset && path->polyline.points.size() >= 2) {
+                Polyline line;
+                line.points.reserve(path->polyline.points.size());
+                for (const Point3 &point : path->polyline.points)
+                    line.points.push_back(point.to_point());
+                line.remove_duplicate_points();
+                if (line.points.size() >= 2)
+                    result.emplace_back(std::move(line));
+            }
+            return;
+        }
+        const int owner_inset = item.inset_idx >= 0 ? item.inset_idx : parent_inset;
+        if (const auto *loop = dynamic_cast<const ExtrusionLoop *>(&item)) {
+            for (const ExtrusionPath &path : loop->paths)
+                self(self, path, owner_inset);
+        } else if (const auto *multipath = dynamic_cast<const ExtrusionMultiPath *>(&item)) {
+            for (const ExtrusionPath &path : multipath->paths)
+                self(self, path, owner_inset);
+        } else if (const auto *collection = dynamic_cast<const ExtrusionEntityCollection *>(&item)) {
+            for (const ExtrusionEntity *child : collection->entities)
+                if (child != nullptr)
+                    self(self, *child, owner_inset);
+        }
+    };
+    collect(collect, entity, -1);
+    return result;
+}
+
+bool filter_nonplanar_course_paths(ExtrusionEntitiesPtr &paths,
+                                   const std::vector<uint8_t> &retained)
+{
+    if (paths.size() != retained.size())
+        return false;
+    // A failed collision check is not proof that a wall is redundant. Test
+    // the entire selection before deleting anything, including repair fill.
+    for (size_t i = 0; i < paths.size(); ++i)
+        if (!retained[i] && (paths[i] == nullptr || is_perimeter(paths[i]->role())))
+            return false;
+    for (size_t i = paths.size(); i-- > 0;)
+        if (!retained[i]) {
+            delete paths[i];
+            paths.erase(paths.begin() + i);
+        }
+    return true;
+}
+
+size_t nonplanar_solid_course_begin(
+    const std::vector<NonplanarCourseProfile> &courses,
+    double minimum_surface_z, double maximum_surface_z,
+    size_t minimum_layers, double minimum_thickness)
+{
+    if (courses.empty())
+        return 0;
+    size_t begin = courses.size() -
+        std::min(courses.size(), std::max(size_t(1), minimum_layers));
+    const auto &top = courses.back();
+    while (begin > 0) {
+        const auto &below = courses[begin - 1];
+        const double high_thickness = top.plane_z - below.plane_z;
+        const double low_thickness = high_thickness +
+            (top.blend - below.blend) * (minimum_surface_z - maximum_surface_z);
+        // Thickness is affine in surface Z, so the two extrema bound the
+        // entire patch. Counting nominal owners overestimates thin low-side
+        // beads and can leave less solid material than the profile requests.
+        if (std::min(low_thickness, high_thickness) + EPSILON >= minimum_thickness)
+            break;
+        --begin;
+    }
+    return begin;
+}
+
+double nonplanar_wall_course_z(double planar_z, double projected_z,
+    double surface_z, double course_z, bool fully_selected_path)
+{
+    if (fully_selected_path)
+        return course_z;
+    const double surface_delta = surface_z - planar_z;
+    // Zero displacement is the planar attachment, not full selection. In
+    // particular, a surface crossing the owner plane cannot justify moving
+    // that shared endpoint onto a different transition course.
+    const double influence = std::abs(surface_delta) <= EPSILON ? 0. :
+        std::clamp((projected_z - planar_z) / surface_delta, 0., 1.);
+    return planar_z + influence * (course_z - planar_z);
+}
+
+std::vector<std::pair<double, double>> nonplanar_segment_overlap(
+    const Vec3d &a, const Vec3d &b, const Vec3d &c, const Vec3d &d,
+    double xy_tolerance, double z_tolerance)
+{
+    // Most pairs have disjoint bead bounds. Reject them before constructing
+    // the closest-point intervals (and their temporary vectors).
+    for (int axis = 0; axis < 3; ++axis) {
+        const double tolerance = axis == 2 ? z_tolerance : xy_tolerance;
+        if (std::min(a[axis], b[axis]) > std::max(c[axis], d[axis]) + tolerance ||
+            std::max(a[axis], b[axis]) < std::min(c[axis], d[axis]) - tolerance)
+            return {};
+    }
+    const Vec3d r = b - a;
+    const Vec3d s = d - c;
+    const double length_squared = s.head<2>().squaredNorm();
+    // u(t) is the support-segment parameter. First restrict it to the Z
+    // band, then minimize XY distance within that interval. Checking Z only
+    // at the unconstrained XY-nearest point misses real contact on a slope.
+    struct Affine {
+        double origin, slope;
+        double at(double t) const { return origin + slope * t; }
+    };
+    const Affine zero{0., 0.}, one{1., 0.};
+    const Affine nearest{
+        length_squared > 1e-16 ? (a - c).head<2>().dot(s.head<2>()) / length_squared : 0.,
+        length_squared > 1e-16 ? r.head<2>().dot(s.head<2>()) / length_squared : 0.};
+    const bool sloped_support = std::abs(s.z()) > 1e-16;
+    Affine z_low = zero, z_high = one;
+    if (sloped_support) {
+        z_low = {(a.z() - c.z() - z_tolerance) / s.z(), r.z() / s.z()};
+        z_high = {(a.z() - c.z() + z_tolerance) / s.z(), r.z() / s.z()};
+        if (s.z() < 0.)
+            std::swap(z_low, z_high);
+    }
+    // All changes in the active clamp bound occur at intersections of these
+    // affine functions. Within each interval the closest feasible point is
+    // affine, and its XY contact inequality is an exact quadratic.
+    const std::array<Affine, 5> bounds{zero, one, nearest, z_low, z_high};
+    std::vector<double> cuts{0., 1.};
+    for (size_t i = 0; i < bounds.size(); ++i)
+        for (size_t j = i + 1; j < bounds.size(); ++j) {
+            const double slope = bounds[i].slope - bounds[j].slope;
+            if (std::abs(slope) <= 1e-16)
+                continue;
+            const double t = (bounds[j].origin - bounds[i].origin) / slope;
+            if (t > 0. && t < 1.)
+                cuts.push_back(t);
+        }
+    std::sort(cuts.begin(), cuts.end());
+    cuts.erase(std::unique(cuts.begin(), cuts.end()), cuts.end());
+    std::vector<std::pair<double, double>> intervals;
+    for (size_t idx = 1; idx < cuts.size(); ++idx) {
+        double begin = cuts[idx - 1], end = cuts[idx];
+        const double middle = 0.5 * (begin + end);
+        const Affine lower = z_low.at(middle) > 0. ? z_low : zero;
+        const Affine upper = z_high.at(middle) < 1. ? z_high : one;
+        if (lower.at(middle) > upper.at(middle))
+            continue;
+        const Affine closest = nearest.at(middle) < lower.at(middle) ? lower :
+                               nearest.at(middle) > upper.at(middle) ? upper : nearest;
+        const Vec3d origin = a - c - s * closest.origin;
+        const Vec3d direction = r - s * closest.slope;
+        const double aa = direction.head<2>().squaredNorm();
+        const double bb = 2. * origin.head<2>().dot(direction.head<2>());
+        const double cc = origin.head<2>().squaredNorm() - xy_tolerance * xy_tolerance;
+        if (aa <= 1e-16) {
+            if (cc > 0.)
+                continue;
+        } else {
+            const double discriminant = bb * bb - 4. * aa * cc;
+            if (discriminant < 0.)
+                continue;
+            const double root = std::sqrt(discriminant);
+            begin = std::max(begin, (-bb - root) / (2. * aa));
+            end = std::min(end, (-bb + root) / (2. * aa));
+        }
+        if (!sloped_support) {
+            if (std::abs(r.z()) <= 1e-16) {
+                if (std::abs(a.z() - c.z()) > z_tolerance)
+                    continue;
+            } else {
+                const double t0 = (c.z() - a.z() - z_tolerance) / r.z();
+                const double t1 = (c.z() - a.z() + z_tolerance) / r.z();
+                begin = std::max(begin, std::min(t0, t1));
+                end = std::min(end, std::max(t0, t1));
+            }
+        }
+        if (end > begin + 1e-12) {
+            if (!intervals.empty() && begin <= intervals.back().second + 1e-12)
+                intervals.back().second = end;
+            else
+                intervals.emplace_back(begin, end);
+        }
+    }
+    return intervals;
+}
 
 namespace {
 
@@ -323,12 +512,16 @@ bool make_nonplanar_path(LayerRegion &region, const sla::IndexedMesh &mesh,
     path.polyline          = std::move(polyline);
     path.z_contoured       = true;
     path.nonplanar_surface = true;
-    if (path.polyline.points.front().z() < path.polyline.points.back().z())
-        path.reverse();
-    // Start beside the already deposited high edge, then descend away from it.
-    // Starting at the low edge would make the toolhead approach the previous
-    // raster's high end before the nozzle itself has climbed to that height.
-    path.set_reverse();
+    path.nonplanar_schedule_owned = false;
+    // A wall may be one directed part of a loop or multipath. Reversing that
+    // part independently disconnects it from both neighbors even though its
+    // unordered XY endpoints still appear to form a closed graph. Only free
+    // raster paths may choose their own high-to-low direction here.
+    if (!is_wall) {
+        if (path.polyline.points.front().z() < path.polyline.points.back().z())
+            path.reverse();
+        path.set_reverse();
+    }
     return true;
 }
 
@@ -403,6 +596,7 @@ void restore_candidate_path_as_planar(ExtrusionPath &path)
     path.polyline.fitting_result.clear();
     path.z_contoured = false;
     path.nonplanar_surface = false;
+    path.nonplanar_schedule_owned = false;
     path.nonplanar_transition = false;
     path.nonplanar_clearance_validated = false;
 }
@@ -413,28 +607,14 @@ bool projected_wall_loop_is_closed(const ExtrusionLoop &loop)
     const double join_tolerance_squared =
         std::pow(double(scale_(join_tolerance_mm)), 2.);
 
-    struct Endpoint {
-        Point point;
-        size_t path_index {0};
-    };
-    std::vector<Endpoint> endpoints;
-    for (size_t path_index = 0; path_index < loop.paths.size(); ++path_index) {
-        const ExtrusionPath &path = loop.paths[path_index];
-        if (!is_perimeter(path.role()) || path.polyline.points.size() < 2 ||
-            path.first_point() == path.last_point())
-            continue;
-        endpoints.push_back({path.first_point(), path_index});
-        endpoints.push_back({path.last_point(), path_index});
-    }
-    for (size_t endpoint_index = 0; endpoint_index < endpoints.size(); ++endpoint_index) {
-        const Endpoint &endpoint = endpoints[endpoint_index];
-        const bool joined = std::any_of(
-            endpoints.begin(), endpoints.end(), [&](const Endpoint &candidate) {
-                return candidate.path_index != endpoint.path_index &&
-                    (candidate.point - endpoint.point).squaredNorm() <=
-                        join_tolerance_squared;
-            });
-        if (!joined)
+    if (loop.paths.empty())
+        return false;
+    for (size_t i = 0; i < loop.paths.size(); ++i) {
+        const ExtrusionPath &path = loop.paths[i];
+        const ExtrusionPath &next = loop.paths[(i + 1) % loop.paths.size()];
+        if (path.polyline.points.size() < 2 || next.polyline.points.size() < 2 ||
+            (path.last_point3() - next.first_point3()).cast<double>().squaredNorm() >
+                join_tolerance_squared)
             return false;
     }
     return true;
@@ -447,6 +627,7 @@ void process_entity(LayerRegion &region, const sla::IndexedMesh &mesh,
     if (auto *path = dynamic_cast<ExtrusionPath *>(&entity)) {
         make_nonplanar_path(region, mesh, selected_facets, *path, allowed_area);
     } else if (auto *multipath = dynamic_cast<ExtrusionMultiPath *>(&entity)) {
+        const ExtrusionPaths original = multipath->paths;
         for (ExtrusionPath &path : multipath->paths) {
             path.inset_idx = multipath->inset_idx;
             make_nonplanar_path(region, mesh, selected_facets, path, allowed_area);
@@ -462,8 +643,7 @@ void process_entity(LayerRegion &region, const sla::IndexedMesh &mesh,
             // are the intended in-place transition representation.
             if (all_wall_paths_nonplanar &&
                 multipath->first_point() != multipath->last_point()) {
-                for (ExtrusionPath &path : multipath->paths)
-                    restore_candidate_path_as_planar(path);
+                multipath->paths = original;
                 return;
             }
             if (multipath->first_point3().z() > multipath->last_point3().z())
@@ -471,20 +651,24 @@ void process_entity(LayerRegion &region, const sla::IndexedMesh &mesh,
             multipath->set_reverse();
         }
     } else if (auto *loop = dynamic_cast<ExtrusionLoop *>(&entity)) {
+        const ExtrusionPaths original = loop->paths;
         for (ExtrusionPath &path : loop->paths) {
             path.inset_idx = loop->inset_idx;
             make_nonplanar_path(region, mesh, selected_facets, path, allowed_area);
         }
-        if (nonplanar_height(*loop) && !projected_wall_loop_is_closed(*loop)) {
-            for (ExtrusionPath &path : loop->paths)
-                if (path.nonplanar_surface && is_perimeter(path.role()))
-                    restore_candidate_path_as_planar(path);
-        }
+        // nonplanar_height() describes sortable free paths, not loops.
+        if (std::any_of(loop->paths.begin(), loop->paths.end(),
+                [](const ExtrusionPath &path) { return path.nonplanar_surface; }) &&
+            !projected_wall_loop_is_closed(*loop))
+            loop->paths = original;
     } else if (auto *collection = dynamic_cast<ExtrusionEntityCollection *>(&entity)) {
         ExtrusionEntitiesPtr rebuilt;
         rebuilt.reserve(collection->entities.size());
         for (ExtrusionEntity *child : collection->entities) {
             if (auto *path = dynamic_cast<ExtrusionPath *>(child)) {
+                std::optional<ExtrusionPath> original;
+                if (is_perimeter(path->role()))
+                    original = *path;
                 make_nonplanar_path(region, mesh, selected_facets, *path, allowed_area);
                 std::vector<ExtrusionPath> split =
                     split_planar_and_nonplanar(*path);
@@ -501,7 +685,7 @@ void process_entity(LayerRegion &region, const sla::IndexedMesh &mesh,
                 if (is_perimeter(path->role()) && split.size() == 1 &&
                     split.front().nonplanar_surface &&
                     split.front().first_point() != split.front().last_point()) {
-                    restore_candidate_path_as_planar(*path);
+                    *path = *original;
                     split = {*path};
                 }
                 if (is_perimeter(path->role()) && split.size() > 1) {
@@ -563,6 +747,7 @@ void contour_existing_perimeter_graph(
         }
     } else if (auto *loop = dynamic_cast<ExtrusionLoop *>(&entity)) {
         const size_t first_adjusted = adjusted_paths.size();
+        const ExtrusionPaths original = loop->paths;
         for (ExtrusionPath &path : loop->paths) {
             path.inset_idx = loop->inset_idx;
             contour_path(path);
@@ -572,9 +757,8 @@ void contour_existing_perimeter_graph(
         // turn their connected loop into detached raised fragments.
         if (adjusted_paths.size() != first_adjusted &&
             !projected_wall_loop_is_closed(*loop)) {
-            for (size_t idx = first_adjusted; idx < adjusted_paths.size(); ++idx)
-                restore_candidate_path_as_planar(*adjusted_paths[idx]);
             adjusted_paths.resize(first_adjusted);
+            loop->paths = original;
         }
     } else if (auto *collection =
                    dynamic_cast<ExtrusionEntityCollection *>(&entity)) {
@@ -645,11 +829,32 @@ void collect_nonplanar_outline_areas(const ExtrusionEntity &entity, Polygons &ar
 
 void append_without_nonplanar_top_overlap(const ExtrusionEntity &entity,
                                           const ExPolygons &top_coverage,
+                                          const BoundingBox &coverage_bounds,
                                           ExtrusionEntitiesPtr &out,
                                           bool bridges_and_sparse_only = false,
-                                          bool preserve_accepted_nonplanar = true)
+                                          bool preserve_accepted_nonplanar = true,
+                                          const std::function<ExPolygons(const ExtrusionPath &)> *coverage_at_path = nullptr,
+                                          const std::map<const ExtrusionPath *, ExtrusionPaths> *path_replacements = nullptr)
 {
     if (const auto *path = dynamic_cast<const ExtrusionPath *>(&entity)) {
+        if (path_replacements != nullptr) {
+            const auto replacement = path_replacements->find(path);
+            if (replacement != path_replacements->end()) {
+                for (const ExtrusionPath &fragment : replacement->second)
+                    out.emplace_back(fragment.clone());
+                return;
+            }
+        }
+        if (coverage_at_path != nullptr) {
+            const ExPolygons coverage = (*coverage_at_path)(*path);
+            if (coverage.empty())
+                out.emplace_back(path->clone());
+            else
+                append_without_nonplanar_top_overlap(entity, coverage,
+                    get_extents(coverage), out, bridges_and_sparse_only,
+                    preserve_accepted_nonplanar);
+            return;
+        }
         if (preserve_accepted_nonplanar && path->nonplanar_surface &&
             path->nonplanar_clearance_validated) {
             // This is an already accepted surface from an earlier, lower run.
@@ -659,6 +864,15 @@ void append_without_nonplanar_top_overlap(const ExtrusionEntity &entity,
         } else if (bridges_and_sparse_only &&
                    path->role() != erInternalInfill &&
                    !is_bridge_or_arc_fill(path->role())) {
+            out.emplace_back(path->clone());
+        } else if (path->polyline.points.empty() ||
+                   !path->polyline.to_polyline().bounding_box().overlap(
+                       coverage_bounds)) {
+            // Most replacement footprints are local while a layer may contain
+            // hundreds of unrelated wall and infill paths. Clipper still
+            // builds and sweeps a complete edge graph when two inputs have
+            // disjoint bounds. Reject those pairs here; the exact subtraction
+            // below remains authoritative for the small overlapping subset.
             out.emplace_back(path->clone());
         } else {
             // The replacement footprint owns every model extrusion in this
@@ -675,20 +889,44 @@ void append_without_nonplanar_top_overlap(const ExtrusionEntity &entity,
             // same-Z crossings seen on small curved Bunny surfaces.
             ExtrusionEntityCollection clipped;
             path->subtract_expolygons(top_coverage, &clipped);
+            for (auto fragment = clipped.entities.begin();
+                 fragment != clipped.entities.end();) {
+                if (auto *fragment_path = dynamic_cast<ExtrusionPath *>(*fragment)) {
+                    fragment_path->nonplanar_replacement_remainder = true;
+                    // Exact polygon subtraction may leave alternating
+                    // sub-bead tips of the old planar top raster along the
+                    // accepted skin boundary. They are neither a printable
+                    // planar surface nor useful buried support: hiding the
+                    // replacement exposes them as floating dashes. Buried
+                    // solid/sparse fill and perimeter fragments are retained
+                    // because they may be the validated foundation or lateral
+                    // anchor for the replacement.
+                    if (fragment_path->role() == erTopSolidInfill &&
+                        unscale<double>(fragment_path->length()) + EPSILON <
+                            std::max(0.05, double(fragment_path->width))) {
+                        delete *fragment;
+                        fragment = clipped.entities.erase(fragment);
+                        continue;
+                    }
+                }
+                ++fragment;
+            }
             out.insert(out.end(),
                        std::make_move_iterator(clipped.entities.begin()),
                        std::make_move_iterator(clipped.entities.end()));
             clipped.entities.clear();
         }
     } else if (const auto *multipath = dynamic_cast<const ExtrusionMultiPath *>(&entity)) {
-        const bool owns_accepted_wall = !multipath->paths.empty() && std::all_of(
+        const bool owns_accepted_surface = !multipath->paths.empty() && std::all_of(
             multipath->paths.begin(), multipath->paths.end(),
             [](const ExtrusionPath &path) {
                 return path.nonplanar_surface &&
-                       path.nonplanar_clearance_validated &&
-                       is_perimeter(path.role());
+                       path.nonplanar_clearance_validated;
             });
-        if (preserve_accepted_nonplanar && owns_accepted_wall)
+        // Variable-flow fill has the same continuity contract as walls.
+        // Keeping each child unchanged but putting it into a collection
+        // turns thickness samples into separate extrusion/retraction events.
+        if (preserve_accepted_nonplanar && owns_accepted_surface)
             out.emplace_back(multipath->clone());
         else {
             auto *rebuilt = new ExtrusionEntityCollection;
@@ -696,8 +934,39 @@ void append_without_nonplanar_top_overlap(const ExtrusionEntity &entity,
             rebuilt->inset_idx = multipath->inset_idx;
             for (const ExtrusionPath &path : multipath->paths)
                 append_without_nonplanar_top_overlap(
-                    path, top_coverage, rebuilt->entities,
-                    bridges_and_sparse_only, preserve_accepted_nonplanar);
+                    path, top_coverage, coverage_bounds, rebuilt->entities,
+                    bridges_and_sparse_only, preserve_accepted_nonplanar, coverage_at_path, path_replacements);
+            // Clipping may change only part of a connected path. Reassemble
+            // consecutive retained pieces at exact XYZ endpoints; only an
+            // actual removed interval should introduce a new print move.
+            ExtrusionEntitiesPtr connected;
+            ExtrusionPaths chain;
+            const auto flush = [&]() {
+                if (chain.empty())
+                    return;
+                if (chain.size() == 1)
+                    connected.emplace_back(new ExtrusionPath(std::move(chain.front())));
+                else {
+                    auto *joined = new ExtrusionMultiPath(std::move(chain));
+                    joined->inset_idx = multipath->inset_idx;
+                    connected.emplace_back(joined);
+                }
+                chain.clear();
+            };
+            for (ExtrusionEntity *child : rebuilt->entities) {
+                auto *path = dynamic_cast<ExtrusionPath *>(child);
+                if (path == nullptr || path->polyline.points.size() < 2) {
+                    flush();
+                    connected.emplace_back(child);
+                    continue;
+                }
+                if (!chain.empty() && chain.back().last_point3() != path->first_point3())
+                    flush();
+                chain.emplace_back(std::move(*path));
+                delete child;
+            }
+            flush();
+            rebuilt->entities = std::move(connected);
             if (rebuilt->empty())
                 delete rebuilt;
             else
@@ -723,9 +992,22 @@ void append_without_nonplanar_top_overlap(const ExtrusionEntity &entity,
             rebuilt->inset_idx = loop->inset_idx;
             for (const ExtrusionPath &path : loop->paths)
                 append_without_nonplanar_top_overlap(
-                    path, top_coverage, rebuilt->entities,
-                    bridges_and_sparse_only, preserve_accepted_nonplanar);
-            if (rebuilt->empty())
+                    path, top_coverage, coverage_bounds, rebuilt->entities,
+                    bridges_and_sparse_only, preserve_accepted_nonplanar, coverage_at_path, path_replacements);
+            // A layer-wide clipping pass also visits unaffected loops. Do
+            // not turn those into independently scheduled paths: retaining
+            // every original segment means the original closed wall and its
+            // seam policy still apply.
+            const bool unchanged = rebuilt->entities.size() == loop->paths.size() &&
+                std::equal(rebuilt->entities.begin(), rebuilt->entities.end(), loop->paths.begin(),
+                    [](const ExtrusionEntity *entity, const ExtrusionPath &original) {
+                        const auto *path = dynamic_cast<const ExtrusionPath *>(entity);
+                        return path != nullptr && path->polyline.points == original.polyline.points;
+                    });
+            if (unchanged) {
+                delete rebuilt;
+                out.emplace_back(loop->clone());
+            } else if (rebuilt->empty())
                 delete rebuilt;
             else
                 out.emplace_back(rebuilt);
@@ -736,8 +1018,8 @@ void append_without_nonplanar_top_overlap(const ExtrusionEntity &entity,
         rebuilt->inset_idx = collection->inset_idx;
         for (const ExtrusionEntity *child : collection->entities)
             append_without_nonplanar_top_overlap(
-                *child, top_coverage, rebuilt->entities,
-                bridges_and_sparse_only, preserve_accepted_nonplanar);
+                *child, top_coverage, coverage_bounds, rebuilt->entities,
+                bridges_and_sparse_only, preserve_accepted_nonplanar, coverage_at_path, path_replacements);
         if (rebuilt->empty())
             delete rebuilt;
         else
@@ -748,14 +1030,20 @@ void append_without_nonplanar_top_overlap(const ExtrusionEntity &entity,
 void remove_nonplanar_top_overlap(ExtrusionEntityCollection &collection,
                                   const ExPolygons &top_coverage,
                                   bool bridges_and_sparse_only = false,
-                                  bool preserve_accepted_nonplanar = true)
+                                  bool preserve_accepted_nonplanar = true,
+                                  const std::function<ExPolygons(const ExtrusionPath &)> *coverage_at_path = nullptr,
+                                  const std::map<const ExtrusionPath *, ExtrusionPaths> *path_replacements = nullptr)
 {
+    if (top_coverage.empty() && coverage_at_path == nullptr)
+        return;
+    const BoundingBox coverage_bounds = get_extents(top_coverage);
     ExtrusionEntitiesPtr rebuilt;
     rebuilt.reserve(collection.entities.size());
     for (const ExtrusionEntity *entity : collection.entities)
         append_without_nonplanar_top_overlap(
-            *entity, top_coverage, rebuilt, bridges_and_sparse_only,
-            preserve_accepted_nonplanar);
+            *entity, top_coverage, coverage_bounds, rebuilt,
+            bridges_and_sparse_only,
+            preserve_accepted_nonplanar, coverage_at_path, path_replacements);
     collection.clear();
     collection.entities = std::move(rebuilt);
 }
@@ -846,7 +1134,7 @@ void restore_nonplanar_wall_sequence(ExtrusionEntityCollection &collection,
 bool paths_have_proper_same_z_crossing(
     const ExtrusionPath &first, double first_owner_z,
     const ExtrusionPath &second, double second_owner_z,
-    double z_tolerance)
+    double z_tolerance, double xy_tolerance = 0.05)
 {
     // The writer rounds XY/Z to 0.001 mm. On steep, nearly tangent paths that
     // quantization changes the interpolated height at the intersection by
@@ -861,7 +1149,8 @@ bool paths_have_proper_same_z_crossing(
     // non-planar validation time.
     if (second_points.size() > first_points.size())
         return paths_have_proper_same_z_crossing(
-            second, second_owner_z, first, first_owner_z, z_tolerance);
+            second, second_owner_z, first, first_owner_z, z_tolerance,
+            xy_tolerance);
     struct SegmentBounds {
         size_t index;
         double min_x;
@@ -907,7 +1196,6 @@ bool paths_have_proper_same_z_crossing(
             // near-collinear test below: centerlines separated by only a few
             // microns may become the same emitted line and must not escape
             // collision arbitration at this early bounds check.
-            constexpr double xy_tolerance = 0.02;
             if (bounds.min_x > first_max_x + xy_tolerance)
                 break;
             if (bounds.max_x < first_min_x - xy_tolerance ||
@@ -1020,6 +1308,16 @@ bool paths_have_proper_same_z_crossing(
     return false;
 }
 
+bool bounds_overlap_with_tolerance(const BoundingBox &first,
+                                   const BoundingBox &second,
+                                   coord_t tolerance)
+{
+    return first.min.x() <= second.max.x() + tolerance &&
+           second.min.x() <= first.max.x() + tolerance &&
+           first.min.y() <= second.max.y() + tolerance &&
+           second.min.y() <= first.max.y() + tolerance;
+}
+
 bool path_has_proper_same_z_self_crossing(const ExtrusionPath &path,
                                           double owner_z,
                                           double z_tolerance)
@@ -1028,9 +1326,17 @@ bool path_has_proper_same_z_self_crossing(const ExtrusionPath &path,
     if (points.size() < 4)
         return false;
     const bool closed = points.front() == points.back();
+    const coord_t xy_tolerance = scale_(0.02);
+    const coord_t scaled_z_tolerance = scale_(z_tolerance + 0.01);
     for (size_t first_idx = 1; first_idx < points.size(); ++first_idx) {
-        ExtrusionPath first(path);
-        first.polyline.points = {points[first_idx - 1], points[first_idx]};
+        const Point3 &first_start = points[first_idx - 1];
+        const Point3 &first_end = points[first_idx];
+        const coord_t first_min_x = std::min(first_start.x(), first_end.x());
+        const coord_t first_max_x = std::max(first_start.x(), first_end.x());
+        const coord_t first_min_y = std::min(first_start.y(), first_end.y());
+        const coord_t first_max_y = std::max(first_start.y(), first_end.y());
+        const coord_t first_min_z = std::min(first_start.z(), first_end.z());
+        const coord_t first_max_z = std::max(first_start.z(), first_end.z());
         for (size_t second_idx = first_idx + 2;
              second_idx < points.size(); ++second_idx) {
             // The first and last segments of a closed loop share its seam and
@@ -1039,9 +1345,31 @@ bool path_has_proper_same_z_self_crossing(const ExtrusionPath &path,
             // bead and must be rejected before G-code ordering can hide it.
             if (closed && first_idx == 1 && second_idx + 1 == points.size())
                 continue;
+            const Point3 &second_start = points[second_idx - 1];
+            const Point3 &second_end = points[second_idx];
+            // Most pairs in a long raster or perimeter are remote. Avoid
+            // constructing two ExtrusionPath objects and rebuilding the
+            // generic segment index unless their emitted XY and Z envelopes
+            // can actually touch. This check uses the same tolerances as the
+            // exact routine below and therefore changes only cost, not the
+            // collision decision.
+            if (std::min(second_start.x(), second_end.x()) >
+                    first_max_x + xy_tolerance ||
+                std::max(second_start.x(), second_end.x()) <
+                    first_min_x - xy_tolerance ||
+                std::min(second_start.y(), second_end.y()) >
+                    first_max_y + xy_tolerance ||
+                std::max(second_start.y(), second_end.y()) <
+                    first_min_y - xy_tolerance ||
+                std::min(second_start.z(), second_end.z()) >
+                    first_max_z + scaled_z_tolerance ||
+                std::max(second_start.z(), second_end.z()) <
+                    first_min_z - scaled_z_tolerance)
+                continue;
+            ExtrusionPath first(path);
+            first.polyline.points = {first_start, first_end};
             ExtrusionPath second(path);
-            second.polyline.points = {
-                points[second_idx - 1], points[second_idx]};
+            second.polyline.points = {second_start, second_end};
             if (paths_have_proper_same_z_crossing(
                     first, owner_z, second, owner_z, z_tolerance))
                 return true;
@@ -1246,6 +1574,7 @@ bool path_has_proper_same_z_self_crossing(const ExtrusionPath &path,
                 connector.polyline.points = {from, to};
                 connector.polyline.fitting_result.clear();
                 connector.nonplanar_surface = true;
+                connector.nonplanar_schedule_owned = false;
                 connector.nonplanar_transition = true;
                 connector.nonplanar_clearance_validated = true;
                 combined->paths.emplace_back(std::move(connector));
@@ -1479,12 +1808,30 @@ void set_nonplanar_transition(ExtrusionEntity &entity, bool transition)
     }
 }
 
-void make_planar_solid_foundation(ExtrusionEntity &entity)
+void make_planar_solid_foundation(ExtrusionEntity &entity,
+                                  const ExPolygons &foundation_material)
 {
-    const auto make_path = [](ExtrusionPath &path) {
+    const auto make_path = [&foundation_material](ExtrusionPath &path) {
         for (Point3 &point : path.polyline.points)
             point.z() = 0;
         if (is_perimeter(path.role())) {
+            // The final-surface outline is morphed toward this real planar
+            // course, but a rounded corner may still finish a few hundredths
+            // beyond the supporting bead envelope. Clamp only unsupported
+            // points to that envelope; already valid dimensional centerlines
+            // remain untouched.
+            const ExPolygons bead_support = offset_ex(
+                foundation_material,
+                scale_(0.5 * double(path.width) + 0.02));
+            if (!bead_support.empty())
+                for (Point3 &point : path.polyline.points)
+                    if (!Geometry::contains(
+                            bead_support, point.to_point())) {
+                        const Point supported = projection_onto(
+                            bead_support, point.to_point());
+                        point.x() = supported.x();
+                        point.y() = supported.y();
+                    }
             // Course zero is the last fully horizontal perimeter below the
             // staircase. Preserve its structural role and inset, but keep it
             // conventional. Calling a fixed-Z copy a non-planar transition
@@ -1500,6 +1847,7 @@ void make_planar_solid_foundation(ExtrusionEntity &entity)
             // moved the foundation back into ordinary island ordering, after
             // the transition it was meant to support.
             path.nonplanar_surface = true;
+            path.nonplanar_schedule_owned = true;
             path.nonplanar_transition = false;
             path.nonplanar_clearance_validated = false;
             path.polyline.fitting_result.clear();
@@ -1508,6 +1856,7 @@ void make_planar_solid_foundation(ExtrusionEntity &entity)
         path.set_extrusion_role(erSolidInfill);
         path.z_contoured = false;
         path.nonplanar_surface = false;
+        path.nonplanar_schedule_owned = false;
         path.nonplanar_transition = false;
         path.nonplanar_clearance_validated = false;
         path.polyline.fitting_result.clear();
@@ -1522,7 +1871,7 @@ void make_planar_solid_foundation(ExtrusionEntity &entity)
             make_path(path);
     } else if (auto *collection = dynamic_cast<ExtrusionEntityCollection *>(&entity)) {
         for (ExtrusionEntity *child : collection->entities)
-            make_planar_solid_foundation(*child);
+            make_planar_solid_foundation(*child, foundation_material);
     }
 }
 
@@ -1671,19 +2020,23 @@ size_t planar_transition_anchor_layer_index(
 }
 
 struct NonplanarPatch;
+void destroy_entities(ExtrusionEntitiesPtr &entities);
 std::optional<double> patch_surface_z_at_xy(
     const NonplanarPatch &patch, const sla::IndexedMesh &mesh,
     const Point &point);
 std::optional<double> patch_surface_z_near_xy(
     const NonplanarPatch &patch, const sla::IndexedMesh &mesh,
     const Point &point, double maximum_distance);
+size_t owner_layer_for_z(const std::vector<Layer *> &layers, size_t first_layer,
+                         size_t last_layer, double required_z);
 
 bool blend_wall_z_from_planar_support(
     ExtrusionPath &path, const std::vector<Layer *> &layers,
     const NonplanarPatch &patch, const sla::IndexedMesh &mesh,
     coordf_t destination_owner_z, size_t transition_anchor_layer,
     double planar_layer_height, double minimum_course_height,
-    double blend_step, double surface_depth, double blend)
+    double blend_step, double surface_reference_z, double surface_depth,
+    double blend)
 {
     // Preserve the exact XY centerline, inset, width, role, brick offset and
     // perimeter ordering produced by the ordinary slicer. Only the height
@@ -1709,6 +2062,16 @@ bool blend_wall_z_from_planar_support(
         transitioned.front().to_point() == transitioned.back().to_point() &&
         std::all_of(sampled_surface_z.begin(), sampled_surface_z.end(),
                     [](const std::optional<double> &z) { return z.has_value(); });
+    // Arachne also represents a wholly selected wall as connected open width
+    // segments. If its projected surface happens to cross the owner plane,
+    // that zero offset is not a planar attachment. Recognize full projection
+    // from the complete path before resolving the ambiguous individual point.
+    const bool fully_selected_path = closed_surface_loop || std::equal(
+        transitioned.begin(), transitioned.end(), sampled_surface_z.begin(),
+        [&](const Point3 &point, const std::optional<double> &surface_z) {
+            return surface_z && std::abs(destination_owner_z + unscale_(point.z()) -
+                (*surface_z - mesh.ground_level())) <= 1e-5;
+        });
     for (size_t point_idx = 0; point_idx < transitioned.size(); ++point_idx) {
         Point3 &point = transitioned[point_idx];
         // The generic contouring pass eases a fully selected closed loop down
@@ -1732,9 +2095,15 @@ bool blend_wall_z_from_planar_support(
         // local course height is adjusted separately to match this blend;
         // retaining nominal-height flow here would overfill the low side of
         // a broad roof where the courses are intentionally closer together.
-        const double support_z = layers[transition_anchor_layer]->print_z;
-        const double fully_transitioned_z =
-            support_z + blend * (surface_z - support_z);
+        // Match the retained slicer wall to the same parallel surface course
+        // as the generated skin.  Interpolating from a single global anchor Z
+        // caused every nominal perimeter between the patch low and high points
+        // to become a separately raised closed ring.  `surface_depth` is the
+        // authoritative physical offset of this course from the mesh.
+        const double transition_plane_z =
+            surface_reference_z - surface_depth;
+        const double fully_transitioned_z = transition_plane_z +
+            blend * (surface_z - surface_reference_z);
         // contour_path_to_surface() already constructed the symmetric
         // planar<->surface entry profile along this exact perimeter. Preserve
         // that profile while moving its fully selected portion onto the
@@ -1742,7 +2111,6 @@ bool blend_wall_z_from_planar_support(
         // fully selected turned the first sample after a planar endpoint into
         // an abrupt Z jump and could exceed the safe cone despite a shallow
         // target surface.
-        const double full_surface_delta = surface_z - destination_owner_z;
         // A closed loop wholly owned by this patch is already connected to
         // itself and to the preceding wall course.  Its provisional seam dip
         // is an approach aid for a stand-alone contoured loop, not part of
@@ -1752,14 +2120,9 @@ bool blend_wall_z_from_planar_support(
         // blend over the complete closed loop.  Open/mixed fragments still
         // keep the symmetric in-path planar<->surface influence so their
         // endpoints join the untouched planar perimeter without a Z step.
-        const double influence = closed_surface_loop || point.z() == 0 ? 1. :
-            std::abs(full_surface_delta) <= EPSILON ? 1. :
-            std::clamp(
-                (original_absolute_z - destination_owner_z) /
-                    full_surface_delta,
-                0., 1.);
-        const double absolute_z = destination_owner_z + influence *
-            (fully_transitioned_z - destination_owner_z);
+        const double absolute_z = nonplanar_wall_course_z(
+            destination_owner_z, original_absolute_z, surface_z,
+            fully_transitioned_z, fully_selected_path);
         point.z() = scale_(absolute_z - destination_owner_z);
     }
     path.polyline.points = std::move(transitioned);
@@ -1780,27 +2143,14 @@ bool blend_wall_z_from_planar_support(
         path.nonplanar_interlocking_wall = false;
     }
 
-    double weighted_span = 0.;
-    double total_length = 0.;
-    const double support_z = layers[transition_anchor_layer]->print_z;
-    for (size_t idx = 1; idx < path.polyline.points.size(); ++idx) {
-        const double length = unscale_(
-            (path.polyline.points[idx].to_point() -
-             path.polyline.points[idx - 1].to_point()).cast<double>().norm());
-        if (length <= EPSILON)
-            continue;
-        weighted_span += length * 0.5 *
-            (std::max(0., *sampled_surface_z[idx - 1] -
-                              mesh.ground_level() - support_z) +
-             std::max(0., *sampled_surface_z[idx] -
-                              mesh.ground_level() - support_z));
-        total_length += length;
-    }
-    if (total_length > EPSILON)
-        set_nonplanar_local_course_height(
-            path, std::clamp(blend_step * weighted_span / total_length,
-                             minimum_course_height,
-                             planar_layer_height));
+    // Parallel courses retain the process layer height.  The XYZ segment
+    // length accounts for the extra material needed by sloped motion.
+    set_nonplanar_local_course_height(path, planar_layer_height);
+    (void) layers;
+    (void) transition_anchor_layer;
+    (void) minimum_course_height;
+    (void) blend_step;
+    (void) blend;
 
     // mm3_per_mm remains the original planar/brick value. G-code emission
     // measures each segment in XYZ, so extrusion rises naturally as the
@@ -1809,13 +2159,29 @@ bool blend_wall_z_from_planar_support(
     return true;
 }
 
-void blend_shell_from_planar_support(
+coord_t quantized_support_inset(coord_t inset)
+{
+    const coord_t quantum = scale_(0.02);
+    return inset <= 0 ? coord_t(0) :
+        coord_t(((inset + quantum - 1) / quantum) * quantum);
+}
+
+bool blend_shell_from_planar_support(
     ExtrusionEntity &entity, const std::vector<Layer *> &layers,
+    const NonplanarPatch &patch, const sla::IndexedMesh &mesh,
     coordf_t source_owner_z, coordf_t destination_owner_z,
     size_t transition_anchor_layer, double total_shell_depth,
-    coord_t fill_support_inset, double surface_depth, double blend,
-    std::map<std::pair<size_t, coord_t>, ExPolygons> &support_cache)
+    coord_t fill_support_inset, double surface_reference_z,
+    double surface_depth, double blend, bool use_local_support,
+    const std::map<std::pair<size_t, coord_t>, ExPolygons> &support_cache,
+    const std::map<std::pair<size_t, int>, Polylines> &wall_support_cache)
 {
+    // Variable-width Arachne paths may differ by only a few microns. Building
+    // a separate Clipper offset for every such width made the support cache
+    // scale with path count (hundreds of offsets on the Benchy roof). Round
+    // outward to a small conservative grid: sharing the next-larger inset can
+    // only shrink the accepted support, while reducing the cache to the small
+    // number of physically meaningful bead/inset combinations.
     const auto blend_path = [&](ExtrusionPath &path) {
         const bool perimeter = is_perimeter(path.role());
         const Flow path_flow(path.width, path.height, 0.f);
@@ -1825,14 +2191,34 @@ void blend_shell_from_planar_support(
         // wall clones on the final footprint, producing a vertical stack of
         // self-contained rings. Include the wall inset when constructing the
         // support contour so outer and inner walls retain their separation.
-        const coord_t support_inset = perimeter ?
+        const coord_t support_inset = quantized_support_inset(perimeter ?
             scale_(std::max(0., 0.5 * double(path.width) - 0.02)) +
                 coord_t(std::max(0, path.inset_idx)) *
                     path_flow.scaled_spacing() :
-            fill_support_inset;
+            fill_support_inset);
         for (Point3 &point : path.polyline.points) {
-            const double surface_z = source_owner_z + unscale_(point.z());
-            const size_t support_idx = transition_anchor_layer;
+            double surface_z = source_owner_z + unscale_(point.z());
+            const Point original_xy = point.to_point();
+            // A developable roof must originate from one real, horizontal
+            // source course. Selecting a support layer from the
+            // final surface height independently at each XY point reproduced
+            // the planar staircase inside course zero: a single generated
+            // perimeter could be pulled toward several unrelated slice
+            // contours and become a set of floating, laterally shifted rings.
+            // It also meant the advertised "flat foundation" was not flat in
+            // topology even though all of its points shared one Z value.
+            // Morph the complete path from the transition anchor selected for
+            // this patch.  Subsequent aligned courses release that one lateral
+            // correction with `blend`, so they remain bonded while converging
+            // continuously on the actual mesh contour. A genuinely doubly
+            // curved crown is different: there is no single corresponding
+            // lower contour, so its closed tracks retain local parallel-
+            // surface support selected from the buried surface offset.
+            const size_t support_idx = use_local_support ?
+                owner_layer_for_z(
+                    layers, transition_anchor_layer, layers.size() - 1,
+                    surface_z - total_shell_depth) :
+                transition_anchor_layer;
 
             // A Z-only blend leaves the complete transition stack on the
             // final surface's XY footprint. At a sloped outside edge that
@@ -1845,13 +2231,16 @@ void blend_shell_from_planar_support(
             if (blend < 1. - EPSILON) {
                 const auto key = std::make_pair(support_idx, support_inset);
                 auto cached = support_cache.find(key);
-                if (cached == support_cache.end()) {
-                    ExPolygons support = support_inset > 0 ?
-                        offset_ex(layers[support_idx]->lslices, -support_inset) :
-                        layers[support_idx]->lslices;
-                    if (support.empty())
-                        support = layers[support_idx]->lslices;
-                    cached = support_cache.emplace(key, std::move(support)).first;
+                assert(cached != support_cache.end());
+                bool inset_collapsed = cached->second.empty();
+                if (inset_collapsed && perimeter) {
+                    // Arachne can fill a narrow annulus with a widened medial
+                    // wall: inset_idx * spacing is no longer its distance from
+                    // the boundary. Preserve that centerline when its complete
+                    // bead fits; never project it onto the raw model edge.
+                    cached = support_cache.find({support_idx, quantized_support_inset(
+                        scale_(std::max(0., 0.5 * double(path.width) - 0.02)))});
+                    assert(cached != support_cache.end());
                 }
                 const Point surface_xy = point.to_point();
                 // Perimeters always morph from the actual lower contour,
@@ -1860,9 +2249,24 @@ void blend_shell_from_planar_support(
                 // extend beyond printable support. Limit the correction to a
                 // locally reachable boundary so interior raster lines do not
                 // collapse onto a remote contour.
-                if (!cached->second.empty()) {
-                    const Point support_xy = projection_onto(
-                        cached->second, surface_xy);
+                std::optional<Point> native_support_xy;
+                if (perimeter) {
+                    const auto walls = wall_support_cache.find({support_idx, std::max(0, path.inset_idx)});
+                    if (walls == wall_support_cache.end() || walls->second.empty())
+                        return false;
+                    double closest = std::numeric_limits<double>::infinity();
+                    for (const Polyline &line : walls->second) {
+                        const Point candidate = surface_xy.projection_onto(line);
+                        const double distance = (candidate - surface_xy).cast<double>().squaredNorm();
+                        if (distance < closest) {
+                            closest = distance;
+                            native_support_xy = candidate;
+                        }
+                    }
+                }
+                if (native_support_xy || !cached->second.empty()) {
+                    const Point support_xy = native_support_xy ? *native_support_xy :
+                        projection_onto(cached->second, surface_xy);
                     const bool outside_support =
                         !Geometry::contains(cached->second, surface_xy);
                     // A shallow roof moves its contour laterally by only the
@@ -1879,8 +2283,18 @@ void blend_shell_from_planar_support(
                         unscale_((support_xy - surface_xy).cast<double>().norm());
                     const double maximum_local_morph =
                         total_shell_depth + 0.5 * double(path.width);
+                    // An unsupported bottom-course point may never remain on
+                    // the exposed footprint merely because its nearest real
+                    // support contour is farther away than the preferred
+                    // morph distance. That was the source of the long random
+                    // floating scanline ends at the Benchy roof/eave. Anchor
+                    // every genuinely outside point; the aligned-path
+                    // crossing and clearance passes below reject a fold which
+                    // cannot be connected safely. Apply the distance cap only
+                    // to already-supported perimeter points, where moving to
+                    // a remote organic contour would be unnecessary.
                     if (outside_support ||
-                        (perimeter &&
+                        (perimeter && (native_support_xy || !inset_collapsed) &&
                          boundary_distance <= maximum_local_morph + EPSILON)) {
                         point.x() = coord_t(std::llround(
                             (1. - blend) * double(support_xy.x()) +
@@ -1891,51 +2305,108 @@ void blend_shell_from_planar_support(
                     }
                 }
             }
-            const double support_z = layers[transition_anchor_layer]->print_z;
-            const double transitioned_z =
-                support_z + blend * (surface_z - support_z);
+            // XY morphing changes the location at which the common height
+            // field must be evaluated. Reusing the height from the final
+            // contour at another XY tilts the roof differently from attached
+            // features, which already query the field at their actual XY.
+            if (blend > EPSILON && point.to_point() != original_xy) {
+                const auto projected_z = patch_surface_z_at_xy(patch, mesh, point.to_point());
+                if (!projected_z)
+                    return false;
+                surface_z = *projected_z - mesh.ground_level();
+            }
+            // Physical courses are parallel offsets from the selected mesh
+            // surface.  `surface_depth` used to be ignored here; all courses
+            // were instead interpolated from one global anchor plane.  That
+            // made the high side of a shallow roof climb through dozens of
+            // synthetic Z levels and left isolated wall rings in their wake.
+            const double transition_plane_z =
+                surface_reference_z - surface_depth;
+            const double transitioned_z = transition_plane_z +
+                blend * (surface_z - surface_reference_z);
             point.z() = scale_(transitioned_z - destination_owner_z);
         }
         path.polyline.remove_duplicate_points();
         path.polyline.fitting_result.clear();
+        return true;
     };
+    bool succeeded = true;
     if (auto *path = dynamic_cast<ExtrusionPath *>(&entity)) {
-        blend_path(*path);
+        succeeded = blend_path(*path);
     } else if (auto *multipath = dynamic_cast<ExtrusionMultiPath *>(&entity)) {
         for (ExtrusionPath &path : multipath->paths)
-            blend_path(path);
+            succeeded &= blend_path(path);
     } else if (auto *loop = dynamic_cast<ExtrusionLoop *>(&entity)) {
         for (ExtrusionPath &path : loop->paths)
-            blend_path(path);
+            succeeded &= blend_path(path);
     } else if (auto *collection = dynamic_cast<ExtrusionEntityCollection *>(&entity)) {
         for (ExtrusionEntity *child : collection->entities)
-            blend_shell_from_planar_support(
-                *child, layers, source_owner_z, destination_owner_z,
+            succeeded &= blend_shell_from_planar_support(
+                *child, layers, patch, mesh, source_owner_z, destination_owner_z,
                 transition_anchor_layer, total_shell_depth,
-                fill_support_inset, surface_depth, blend, support_cache);
+                fill_support_inset, surface_reference_z, surface_depth, blend,
+                use_local_support, support_cache, wall_support_cache);
     }
+    return succeeded;
 }
 
 ExtrusionEntitiesPtr clone_nonplanar_shell(
     const ExtrusionEntitiesPtr &source, const std::vector<Layer *> &layers,
+    const NonplanarPatch &patch, const sla::IndexedMesh &mesh,
     coordf_t source_owner_z, coordf_t destination_owner_z,
     size_t transition_anchor_layer, double total_shell_depth,
-    coord_t fill_support_inset, double surface_depth, double blend,
-    bool transition)
+    coord_t fill_support_inset, double surface_reference_z,
+    double surface_depth, double blend, bool use_local_support,
+    bool transition,
+    const std::map<std::pair<size_t, coord_t>, ExPolygons> &support_cache,
+    const std::map<std::pair<size_t, int>, Polylines> &wall_support_cache)
 {
     ExtrusionEntitiesPtr result;
     result.reserve(source.size());
-    std::map<std::pair<size_t, coord_t>, ExPolygons> support_cache;
     for (const ExtrusionEntity *entity : source) {
         ExtrusionEntity *copy = entity->clone();
-        blend_shell_from_planar_support(
-            *copy, layers, source_owner_z, destination_owner_z,
-            transition_anchor_layer, total_shell_depth,
-            fill_support_inset, surface_depth, blend, support_cache);
+        if (!blend_shell_from_planar_support(
+            *copy, layers, patch, mesh, source_owner_z, destination_owner_z,
+        transition_anchor_layer, total_shell_depth,
+        fill_support_inset, surface_reference_z, surface_depth, blend,
+        use_local_support, support_cache, wall_support_cache)) {
+            delete copy;
+            destroy_entities(result);
+            return {};
+        }
         set_nonplanar_transition(*copy, transition);
         result.emplace_back(copy);
     }
     return result;
+}
+
+void collect_shell_support_insets(const ExtrusionEntity &entity,
+                                  coord_t fill_support_inset,
+                                  std::set<coord_t> &insets)
+{
+    const auto collect_path = [&](const ExtrusionPath &path) {
+        if (!is_perimeter(path.role())) {
+            insets.insert(quantized_support_inset(fill_support_inset));
+            return;
+        }
+        const Flow path_flow(path.width, path.height, 0.f);
+        insets.insert(quantized_support_inset(
+            scale_(std::max(0., 0.5 * double(path.width) - 0.02))));
+        insets.insert(quantized_support_inset(
+            scale_(std::max(0., 0.5 * double(path.width) - 0.02)) +
+            coord_t(std::max(0, path.inset_idx)) * path_flow.scaled_spacing()));
+    };
+    if (const auto *path = dynamic_cast<const ExtrusionPath *>(&entity))
+        collect_path(*path);
+    else if (const auto *multipath = dynamic_cast<const ExtrusionMultiPath *>(&entity))
+        for (const ExtrusionPath &path : multipath->paths)
+            collect_path(path);
+    else if (const auto *loop = dynamic_cast<const ExtrusionLoop *>(&entity))
+        for (const ExtrusionPath &path : loop->paths)
+            collect_path(path);
+    else if (const auto *collection = dynamic_cast<const ExtrusionEntityCollection *>(&entity))
+        for (const ExtrusionEntity *child : collection->entities)
+            collect_shell_support_insets(*child, fill_support_inset, insets);
 }
 
 bool region_has_nonplanar_surface(const LayerRegion &region)
@@ -1980,6 +2451,7 @@ void restore_nonplanar_as_planar(ExtrusionEntity &entity)
             point.z() = 0;
         path.z_contoured = false;
         path.nonplanar_surface = false;
+        path.nonplanar_schedule_owned = false;
         path.nonplanar_transition = false;
         path.nonplanar_clearance_validated = false;
     };
@@ -2031,19 +2503,35 @@ struct NonplanarPatch {
 std::optional<double> patch_surface_z_at_xy(
     const NonplanarPatch &patch, const sla::IndexedMesh &mesh, const Point &point)
 {
+    return project_nonplanar_patch_height(mesh, patch.projection, patch.facets, point);
+}
+
+} // namespace
+
+std::optional<double> project_nonplanar_patch_height(
+    const sla::IndexedMesh &mesh, const ExPolygons &projection,
+    const std::vector<uint8_t> &facets, const Point &point)
+{
+    if (projection.empty())
+        return std::nullopt;
     // Clamp only samples outside the selected surface. projection_onto()
     // always returns a boundary point, including for a point already inside
     // the polygon. Applying it unconditionally made every interior raster
     // sample inherit the Z of its nearest roof edge or feature opening while
     // retaining the original emitted XY. The result was a set of false
     // plateaus which could sit several layer heights away from the mesh.
-    const Point sample = Geometry::contains(patch.projection, point) ?
-        point : projection_onto(patch.projection, point);
-    auto selected_patch_hit = [&patch, &mesh](const Point &candidate)
+    const bool on_surface = Geometry::contains(projection, point);
+    const Point sample = on_surface ? point : projection_onto(projection, point);
+    const bool in_opening = !on_surface && std::any_of(
+        projection.begin(), projection.end(), [&](const ExPolygon &polygon) {
+            return polygon.contour.contains(point);
+        });
+    const Point target = in_opening ? point : sample;
+    auto selected_patch_hit = [&facets, &mesh, &target](const Point &candidate)
         -> std::optional<double> {
         const std::vector<sla::IndexedMesh::hit_result> hits = mesh.query_ray_hits(
             Vec3d(unscale_(candidate.x()), unscale_(candidate.y()),
-                  patch.minimum_z - 0.02),
+                  mesh.ground_level() - mesh.ground_level_offset() - 0.02),
             Vec3d::UnitZ());
         // At a continuing boss/chimney, the nearest upward hit may belong to
         // the feature rather than the selected roof. Search the complete hit
@@ -2052,9 +2540,23 @@ std::optional<double> patch_surface_z_at_xy(
         // a distinct upper sheet may share this XY projection while the
         // printable surface for this patch is the lower selected sheet.
         for (const sla::IndexedMesh::hit_result &hit : hits)
-            if (hit.is_hit() && size_t(hit.face()) < patch.facets.size() &&
-                patch.facets[size_t(hit.face())])
-                return hit.position().z();
+            if (hit.is_hit() && size_t(hit.face()) < facets.size() &&
+                facets[size_t(hit.face())]) {
+                if (candidate == target)
+                    return hit.position().z();
+                // An attached feature removes roof triangles from its own
+                // footprint. Copying the nearest edge Z makes that feature's
+                // course a plateau rather than a continuation of the roof.
+                // Extend the selected facet plane to the actual sample XY;
+                // do not extend beyond the patch's exterior boundary.
+                const Vec3d normal = mesh.normal_by_face_id(hit.face());
+                if (normal.z() <= EPSILON)
+                    return std::nullopt;
+                const Vec3d position = hit.position();
+                return position.z() -
+                    (normal.x() * (unscale_(target.x()) - position.x()) +
+                     normal.y() * (unscale_(target.y()) - position.y())) / normal.z();
+            }
         return std::nullopt;
     };
     if (const std::optional<double> z = selected_patch_hit(sample))
@@ -2084,6 +2586,8 @@ std::optional<double> patch_surface_z_at_xy(
     return std::nullopt;
 }
 
+namespace {
+
 std::optional<double> patch_surface_z_near_xy(
     const NonplanarPatch &patch, const sla::IndexedMesh &mesh,
     const Point &point, double maximum_distance)
@@ -2112,9 +2616,12 @@ std::optional<double> patch_surface_z_near_xy(
 // a newly generated final-surface raster and cloning it downward cannot offer
 // that guarantee: the final footprint and phase may have no bead beneath them
 // at the flat transition foundation.
-ExtrusionEntitiesPtr project_source_solid_course(
-    LayerRegion &source_region, const NonplanarPatch &patch,
-    const sla::IndexedMesh &mesh, const ExPolygons &course_domain,
+} // namespace
+
+ExtrusionEntitiesPtr project_nonplanar_source_course(
+    LayerRegion &source_region, const sla::IndexedMesh &mesh,
+    const ExPolygons &surface_projection, const std::vector<uint8_t> &facets,
+    const ExPolygons &course_domain,
     coordf_t destination_owner_z, double maximum_drape_height)
 {
     ExtrusionEntitiesPtr result;
@@ -2141,6 +2648,7 @@ ExtrusionEntitiesPtr project_source_solid_course(
                 projected.set_extrusion_role(erTopSolidInfill);
                 projected.z_contoured = false;
                 projected.nonplanar_surface = false;
+                projected.nonplanar_schedule_owned = false;
                 projected.nonplanar_transition = false;
                 projected.nonplanar_clearance_validated = false;
 
@@ -2168,6 +2676,7 @@ ExtrusionEntitiesPtr project_source_solid_course(
                     if (section.polyline.points.size() >= 2) {
                         section.z_contoured = true;
                         section.nonplanar_surface = true;
+                        section.nonplanar_schedule_owned = false;
                         section.polyline.fitting_result.clear();
                         result.emplace_back(section.clone_move());
                     }
@@ -2188,10 +2697,15 @@ ExtrusionEntitiesPtr project_source_solid_course(
                             (double(sample_idx) / double(sample_count));
                         const Point sample(scale_(xy.x()), scale_(xy.y()));
                         const std::optional<double> surface_z =
-                            patch_surface_z_at_xy(patch, mesh, sample);
+                            project_nonplanar_patch_height(mesh, surface_projection, facets, sample);
+                        // Mesh coordinates are centered independently of the
+                        // printer's layer Z. Compare and emit in print space,
+                        // just as the wall and shell projection paths do.
+                        const double print_z = surface_z ?
+                            *surface_z - mesh.ground_level() : 0.;
                         if (!surface_z ||
-                            *surface_z < source_z - double(path->height) - EPSILON ||
-                            *surface_z > source_z + maximum_drape_height + EPSILON) {
+                            print_z < source_z - double(path->height) - EPSILON ||
+                            print_z > source_z + maximum_drape_height + EPSILON) {
                             // A boundary ray miss clips only this connected
                             // portion.  It must not discard every otherwise
                             // valid scanline in the source course and trigger
@@ -2201,7 +2715,7 @@ ExtrusionEntitiesPtr project_source_solid_course(
                         }
                         draped.emplace_back(
                             sample.x(), sample.y(),
-                            coord_t(scale_(*surface_z - destination_owner_z)));
+                            coord_t(scale_(print_z - destination_owner_z)));
                     }
                 }
                 emit_draped();
@@ -2223,6 +2737,42 @@ ExtrusionEntitiesPtr project_source_solid_course(
     collect(collect, source_region.fills);
     return result;
 }
+
+// Remove sub-bead fill remnants, not dimensional wall fragments. At this
+// stage Arachne's variable-width walls are still a flat list of paths; their
+// owning loops/multipaths are assembled later. A short wall here is therefore
+// not evidence of an isolated extrusion and deleting it opens the wall.
+//
+// Remnants are removed and the later deposited-coverage calculation leaves
+// the corresponding conventional material in place. This is preferable to
+// rejecting an otherwise broad printable surface because Arachne produced a
+// microscopic taper at one corner; only material covered by surviving paths
+// is removed from the ordinary slice during commit.
+void remove_short_nonplanar_fill_paths(ExtrusionEntitiesPtr &entities)
+{
+    entities.erase(
+        std::remove_if(entities.begin(), entities.end(),
+            [](ExtrusionEntity *entity) {
+                const auto *path = dynamic_cast<const ExtrusionPath *>(entity);
+                if (path == nullptr || is_perimeter(path->role()) ||
+                    path->polyline.points.size() < 2)
+                    return false;
+                const double minimum_run = std::max(
+                    0.40, double(path->width));
+                if (unscale<double>(path->length()) + EPSILON >= minimum_run)
+                    return false;
+                BOOST_LOG_TRIVIAL(debug)
+                    << "Dropping isolated nonplanar extrusion length="
+                    << unscale<double>(path->length())
+                    << " width=" << path->width
+                    << " role=" << int(path->role());
+                delete entity;
+                return true;
+            }),
+        entities.end());
+}
+
+namespace {
 
 ExPolygons continuing_feature_footprint(
     const std::vector<Layer *> &layers, size_t region_idx, size_t surface_owner,
@@ -2320,6 +2870,14 @@ bool warp_feature_path_to_surface(
         // adopting the roof slope.
         double target_z = base_z + blend *
             (absolute_surface_z - surface_reference_z);
+        // Transport the structural wall course as well as its nominal plane.
+        // Discarding the brick offset while keeping its role and flow lowers
+        // the first feature wall into the preceding raised course (notably
+        // the chimney at a 50% brick offset). These continuing feature walls
+        // are not the flat finishing cap: preserve their original interlock
+        // until the ordinary source course itself returns to nominal Z.
+        if (path.staggered_perimeter || path.staggered_transition)
+            target_z += unscale_(point.z());
         // Real continuing-feature courses pass transition_layers so their
         // caller supplies a different base_z for every extracted source
         // course. Keep that physical course offset and add the same blended
@@ -2335,9 +2893,24 @@ bool warp_feature_path_to_surface(
     path.polyline.points = std::move(warped);
     close_near_complete_wall_ring(path);
     path.polyline.fitting_result.clear();
-    path.z_contoured = true;
-    path.nonplanar_surface = true;
-    path.nonplanar_transition = true;
+    const auto [minimum_z, maximum_z] = std::minmax_element(
+        path.polyline.points.begin(), path.polyline.points.end(),
+        [](const Point3 &left, const Point3 &right) {
+            return left.z() < right.z();
+        });
+    const bool variable_z = minimum_z != path.polyline.points.end() &&
+        maximum_z != path.polyline.points.end() &&
+        maximum_z->z() - minimum_z->z() >= scale_(0.001);
+    // A locally horizontal part of a dependency course is still ordered with
+    // that course, but it is an ordinary wall rather than a non-planar
+    // transition. Keeping the transition flag on these fixed-Z bore rings
+    // produced the isolated loops visible in preview and falsely claimed a Z
+    // blend where none existed. Scheduler ownership preserves dependency
+    // order without changing its structural wall role.
+    path.z_contoured = variable_z;
+    path.nonplanar_surface = variable_z;
+    path.nonplanar_schedule_owned = !variable_z;
+    path.nonplanar_transition = variable_z;
     path.nonplanar_feature_transition = true;
     path.nonplanar_feature_course = feature_course;
     path.nonplanar_clearance_validated = false;
@@ -2360,18 +2933,24 @@ size_t warp_feature_entity_to_surface(
             feature_course, transition_layers, transition_anchor_layer) ? 1 : 0;
     size_t count = 0;
     if (auto *multipath = dynamic_cast<ExtrusionMultiPath *>(&entity)) {
-        for (ExtrusionPath &path : multipath->paths)
+        for (ExtrusionPath &path : multipath->paths) {
+            if (multipath->inset_idx >= 0 && is_perimeter(path.role()))
+                path.inset_idx = multipath->inset_idx;
             count += warp_feature_path_to_surface(
                 path, feature_footprint, patch, mesh, owner_z, base_z,
                 surface_reference_z, blend, before_current_layer,
                 feature_course, transition_layers, transition_anchor_layer);
+        }
         close_near_complete_wall_ring(multipath->paths);
     } else if (auto *loop = dynamic_cast<ExtrusionLoop *>(&entity)) {
-        for (ExtrusionPath &path : loop->paths)
+        for (ExtrusionPath &path : loop->paths) {
+            if (loop->inset_idx >= 0 && is_perimeter(path.role()))
+                path.inset_idx = loop->inset_idx;
             count += warp_feature_path_to_surface(
                 path, feature_footprint, patch, mesh, owner_z, base_z,
                 surface_reference_z, blend, before_current_layer,
                 feature_course, transition_layers, transition_anchor_layer);
+        }
         close_near_complete_wall_ring(loop->paths);
     } else if (auto *collection = dynamic_cast<ExtrusionEntityCollection *>(&entity)) {
         for (ExtrusionEntity *child : collection->entities)
@@ -2400,6 +2979,46 @@ size_t count_warpable_feature_paths(const ExtrusionEntity &entity)
             count += count_warpable_feature_paths(*child);
     }
     return count;
+}
+
+void normalize_fixed_feature_transition(ExtrusionEntity &entity)
+{
+    const auto normalize_path = [](ExtrusionPath &path) {
+        if (!path.nonplanar_feature_transition ||
+            path.nonplanar_leveling_transition ||
+            path.polyline.points.empty())
+            return;
+        const auto [minimum_z, maximum_z] = std::minmax_element(
+            path.polyline.points.begin(), path.polyline.points.end(),
+            [](const Point3 &left, const Point3 &right) {
+                return left.z() < right.z();
+            });
+        if (maximum_z->z() - minimum_z->z() >= scale_(0.001))
+            return;
+        // A ring may be horizontal while intentionally owned by a later
+        // nominal layer for dependency scheduling. Its constant point Z is
+        // then a real physical offset, not disposable transition metadata.
+        // Clearing z_contoured made the writer ignore that offset and emit
+        // the ring at m_nominal_z, where it collided with a later course.
+        const bool offset_from_owner =
+            std::abs(minimum_z->z()) >= scale_(0.001);
+        path.z_contoured = offset_from_owner;
+        path.nonplanar_surface = offset_from_owner;
+        path.nonplanar_schedule_owned = true;
+        path.nonplanar_transition = false;
+    };
+    if (auto *path = dynamic_cast<ExtrusionPath *>(&entity)) {
+        normalize_path(*path);
+    } else if (auto *multipath = dynamic_cast<ExtrusionMultiPath *>(&entity)) {
+        for (ExtrusionPath &path : multipath->paths)
+            normalize_path(path);
+    } else if (auto *loop = dynamic_cast<ExtrusionLoop *>(&entity)) {
+        for (ExtrusionPath &path : loop->paths)
+            normalize_path(path);
+    } else if (auto *collection = dynamic_cast<ExtrusionEntityCollection *>(&entity)) {
+        for (ExtrusionEntity *child : collection->entities)
+            normalize_fixed_feature_transition(*child);
+    }
 }
 
 bool feature_path_touches(const ExtrusionPath &path,
@@ -2616,6 +3235,7 @@ void restore_deferred_feature(ExtrusionEntity &entity)
             point.z() = 0;
         path.z_contoured = false;
         path.nonplanar_surface = false;
+        path.nonplanar_schedule_owned = false;
         path.nonplanar_transition = false;
         path.nonplanar_clearance_validated = false;
         path.nonplanar_before_current_layer = false;
@@ -2759,7 +3379,8 @@ std::vector<NonplanarPatch> active_nonplanar_patches(
     const std::vector<NonplanarPatch> &candidates,
     const sla::IndexedMesh &mesh,
     const ExPolygons &seed_coverage, const std::vector<uint8_t> &emitted_facets,
-    double active_minimum_z, double active_maximum_z)
+    double active_minimum_z, double active_maximum_z,
+    double first_layer_height, double last_layer_height)
 {
     std::vector<NonplanarPatch> result;
     for (const NonplanarPatch &patch : candidates) {
@@ -2767,10 +3388,17 @@ std::vector<NonplanarPatch> active_nonplanar_patches(
             patch.minimum_z - EPSILON > active_maximum_z)
             continue;
 
-        // A cached facet component may span a long organic slope while the
-        // currently active top paths cover only its high cap. Clip it to this
-        // run's actual height band; lower geometry remains the foundation.
-        NonplanarPatch active = clip_patch_to_z_range(
+        // Seeds are inset extrusion centerlines, not the mesh boundary. On
+        // a shallow roof their Z extrema omit the first/last bead of the
+        // surface. Clipping there creates an artificial wall inside the roof
+        // which has no matching wall on the flat foundation. Use the complete
+        // connected component when it fits within the seed courses' height
+        // envelope. Longer organic slopes still use a local band. This only
+        // selects a candidate; support and toolhead checks remain mandatory.
+        const bool complete_component =
+            patch.minimum_z >= active_minimum_z - first_layer_height - EPSILON &&
+            patch.maximum_z <= active_maximum_z + last_layer_height + EPSILON;
+        NonplanarPatch active = complete_component ? patch : clip_patch_to_z_range(
             patch, mesh, std::max(patch.minimum_z, active_minimum_z),
             std::min(patch.maximum_z, active_maximum_z));
         if (active.projection.empty())
@@ -2959,6 +3587,7 @@ struct PatchRasterCache {
     ExPolygons reachable_projection;
     std::vector<WeightedPatchGradient> reachable_gradients;
     bool domain_ready {false};
+    bool doubly_curved {false};
 };
 
 ExtrusionEntitiesPtr make_patch_raster(
@@ -2987,6 +3616,7 @@ ExtrusionEntitiesPtr make_patch_raster(
         cache.reachable_projection.clear();
         cache.reachable_gradients.clear();
         cache.domain_ready = false;
+        cache.doubly_curved = false;
     }
     std::vector<int8_t> &facet_clearance = cache.facet_clearance;
     // Include the boundary in the physical occupancy test.  Clipper's point
@@ -3273,6 +3903,7 @@ ExtrusionEntitiesPtr make_patch_raster(
         path->inset_idx = source.inset_idx;
         path->z_contoured = true;
         path->nonplanar_surface = true;
+        path->nonplanar_schedule_owned = false;
         path->nonplanar_transition = surface_depth > EPSILON;
         path->set_reverse();
         return path;
@@ -3526,6 +4157,7 @@ ExtrusionEntitiesPtr make_patch_raster(
     constexpr double minimum_two_axis_variance = 0.0025;
     const bool doubly_curved = gradient_variance.x() > minimum_two_axis_variance &&
         gradient_variance.x() > 0.35 * gradient_variance.y();
+    cache.doubly_curved = doubly_curved;
     BOOST_LOG_TRIVIAL(debug)
         << "Nonplanar surface pattern eigenvalues=" << gradient_variance.transpose()
         << " mean_gradient=" << mean_gradient.transpose()
@@ -3676,6 +4308,7 @@ ExtrusionEntitiesPtr make_patch_raster(
         ExtrusionPath path(std::move(projected), path_template);
         path.z_contoured = true;
         path.nonplanar_surface = true;
+        path.nonplanar_schedule_owned = false;
         path.nonplanar_transition = surface_depth > EPSILON;
         path.set_reverse();
         // Alternate neighboring scanlines so short boundary connectors can be
@@ -3868,38 +4501,10 @@ ExPolygons patch_shell_band_at_layer(const NonplanarPatch &patch,
     return union_ex(polygons);
 }
 
-ExPolygons first_shell_collision_band_at_layer(
-    const NonplanarPatch &patch, const sla::IndexedMesh &mesh,
-    const std::vector<Layer *> &layers, double layer_z,
-    size_t transition_anchor_layer, double first_shell_blend)
-{
-    if (layers.empty() || first_shell_blend <= EPSILON)
-        return {};
-
-    const double ground = mesh.ground_level();
-    // A conventional course is replacement material only where its center is
-    // at or above the first generated transition course.  A band expressed as
-    // `surface_z - shell_depth` cannot make that distinction because it
-    // reproduces the original staircase below the finishing surface. The
-    // complete patch now starts at one flat anchor layer, so solve the first
-    // shell interpolation against that same plane. This removes stair courses
-    // above the generated blend while preserving the flat foundation below.
-    constexpr double centerline_tolerance = 0.05;
-    const double conventional_z = layer_z + centerline_tolerance;
-    const double support_z = layers[transition_anchor_layer]->print_z;
-    // first_z = support_z + blend * (surface_z - ground - support_z)
-    const double collision_maximum = ground + support_z +
-        (conventional_z - support_z) / first_shell_blend;
-    const double maximum_z = std::min(patch.maximum_z, collision_maximum);
-    if (maximum_z <= patch.minimum_z + EPSILON)
-        return {};
-    return clip_patch_to_z_range(
-        patch, mesh, patch.minimum_z, maximum_z).projection;
-}
-
 void collect_generated_material_at_z(
     const ExtrusionEntity &entity, double owner_z, double layer_z,
-    double z_tolerance, bool include_planar_foundation, Polygons &coverage)
+    double z_tolerance, bool include_planar_foundation, Polygons &coverage,
+    bool round_caps = false)
 {
     const auto collect_path = [&](const ExtrusionPath &path) {
         if ((!path.nonplanar_surface &&
@@ -3939,8 +4544,14 @@ void collect_generated_material_at_z(
             };
             ExtrusionPath clipped(path);
             clipped.polyline.points = {interpolate(begin), interpolate(end)};
-            if (clipped.polyline.length() > SCALED_EPSILON)
-                clipped.polygons_covered_by_width(coverage, 0.f);
+            if (clipped.polyline.length() > SCALED_EPSILON) {
+                if (round_caps)
+                    polygons_append(coverage, offset(clipped.polyline.to_polyline(),
+                        float(scale_(path.width / 2.)), ClipperLib::jtRound,
+                        scale_(0.005), ClipperLib::etOpenRound));
+                else
+                    clipped.polygons_covered_by_width(coverage, 0.f);
+            }
         }
     };
 
@@ -3958,7 +4569,7 @@ void collect_generated_material_at_z(
         for (const ExtrusionEntity *child : collection->entities)
             collect_generated_material_at_z(
                 *child, owner_z, layer_z, z_tolerance,
-                include_planar_foundation, coverage);
+                include_planar_foundation, coverage, round_caps);
     }
 }
 
@@ -4024,6 +4635,232 @@ bool path_has_supported_run(const ExtrusionPath &path,
     return true;
 }
 
+void collect_extrusion_path_references(
+    const ExtrusionEntity &entity,
+    std::vector<const ExtrusionPath *> &paths)
+{
+    if (const auto *path = dynamic_cast<const ExtrusionPath *>(&entity)) {
+        if (path->polyline.points.size() >= 2)
+            paths.emplace_back(path);
+    } else if (const auto *multipath =
+                   dynamic_cast<const ExtrusionMultiPath *>(&entity)) {
+        for (const ExtrusionPath &path : multipath->paths)
+            collect_extrusion_path_references(path, paths);
+    } else if (const auto *loop = dynamic_cast<const ExtrusionLoop *>(&entity)) {
+        for (const ExtrusionPath &path : loop->paths)
+            collect_extrusion_path_references(path, paths);
+    } else if (const auto *collection =
+                   dynamic_cast<const ExtrusionEntityCollection *>(&entity)) {
+        for (const ExtrusionEntity *child : collection->entities)
+            collect_extrusion_path_references(*child, paths);
+    }
+}
+
+} // namespace
+
+static bool nonplanar_paths_are_supported(
+    const ExtrusionEntity &entity,
+    const std::vector<const ExtrusionPath *> &support_paths,
+    double entity_owner_z, double support_owner_z,
+    bool allow_short_unsupported_runs, bool walls_only)
+{
+    double unsupported_run = 0.;
+    std::optional<Point3> previous_endpoint;
+    const auto path_is_supported = [
+        &support_paths, entity_owner_z,
+        support_owner_z,
+        allow_short_unsupported_runs, walls_only, &unsupported_run,
+        &previous_endpoint](const ExtrusionPath &path) {
+        // Solid foundation raster may bridge ordinary sparse infill just like
+        // conventional internal-solid/top fill. The failure being guarded
+        // here is a generated structural wall with no wall or solid material
+        // under it; applying bead-by-bead support to raster fill would reject
+        // every legitimate roof over sparse infill.
+        if (walls_only && !is_perimeter(path.role()))
+            return true;
+        if (path.polyline.points.size() < 2 || support_paths.empty())
+            return false;
+        if (!previous_endpoint || *previous_endpoint != path.first_point3())
+            unsupported_run = 0.;
+        previous_endpoint = path.last_point3();
+        // This is the foundation of a generated replacement stack, not an
+        // ordinary overhang wall. Require every deposited segment to contact
+        // the preceding course. Arachne represents one loop as many short
+        // paths; applying the normal short-overhang allowance independently
+        // to each fragment allowed all of them to pass and routing later
+        // joined them into a several-millimetre floating ring. Validate the
+        // actual bead envelope here, before fragments can be chained.
+        const double maximum_unsupported_run =
+            std::max(0.8, 2. * double(path.width));
+        for (size_t idx = 1; idx < path.polyline.points.size(); ++idx) {
+            const Point3 &first = path.polyline.points[idx - 1];
+            const Point3 &last = path.polyline.points[idx];
+            // Test the entire segment, not only its midpoint. A short support
+            // crossing the middle of a long wall must not support both ends.
+            // Shift the query into the middle of the permitted vertical gap
+            // so the shared interval solver can enforce asymmetric Z bounds.
+            const double minimum_gap = 0.04;
+            const double maximum_gap = double(path.height) + 0.06;
+            const double gap_center = 0.5 * (minimum_gap + maximum_gap);
+            const double gap_tolerance = 0.5 * (maximum_gap - minimum_gap);
+            Vec3d a(unscale_(first.x()), unscale_(first.y()),
+                    entity_owner_z + unscale_(first.z()) - gap_center);
+            Vec3d b(unscale_(last.x()), unscale_(last.y()),
+                    entity_owner_z + unscale_(last.z()) - gap_center);
+            std::vector<std::pair<double, double>> contact;
+            bool complete_contact = false;
+            for (const ExtrusionPath *support : support_paths) {
+                const double contact_distance = 0.5 *
+                    (double(path.width) + double(support->width)) + 0.02;
+                const Points3 &points = support->polyline.points;
+                for (size_t support_idx = 1; support_idx < points.size(); ++support_idx) {
+                    const Point3 &start = points[support_idx - 1];
+                    const Point3 &end = points[support_idx];
+                    auto intervals = nonplanar_segment_overlap(a, b,
+                        Vec3d(unscale_(start.x()), unscale_(start.y()),
+                              support_owner_z + unscale_(start.z())),
+                        Vec3d(unscale_(end.x()), unscale_(end.y()),
+                              support_owner_z + unscale_(end.z())),
+                        contact_distance, gap_tolerance);
+                    complete_contact = intervals.size() == 1 &&
+                        intervals.front().first == 0. && intervals.front().second == 1.;
+                    if (complete_contact)
+                        break;
+                    append(contact, intervals);
+                }
+                if (complete_contact)
+                    break;
+            }
+            if (complete_contact) {
+                unsupported_run = 0.;
+                continue;
+            }
+            std::sort(contact.begin(), contact.end());
+            const double length = (b.head<2>() - a.head<2>()).norm();
+            double covered_until = 0.;
+            const auto gap_is_allowed = [&](double fraction) {
+                unsupported_run += fraction * length;
+                return allow_short_unsupported_runs ?
+                    unsupported_run <= maximum_unsupported_run + EPSILON :
+                    unsupported_run <= EPSILON;
+            };
+            for (const auto &[begin, end] : contact) {
+                if (end <= covered_until)
+                    continue;
+                if (begin > covered_until && !gap_is_allowed(begin - covered_until))
+                    return false;
+                unsupported_run = 0.;
+                covered_until = end;
+            }
+            if (!gap_is_allowed(1. - covered_until))
+                return false;
+        }
+        return true;
+    };
+
+    if (const auto *path = dynamic_cast<const ExtrusionPath *>(&entity))
+        return path_is_supported(*path);
+    if (const auto *multipath =
+            dynamic_cast<const ExtrusionMultiPath *>(&entity))
+        return std::all_of(
+            multipath->paths.begin(), multipath->paths.end(),
+            path_is_supported);
+    if (const auto *loop = dynamic_cast<const ExtrusionLoop *>(&entity))
+        return std::all_of(loop->paths.begin(), loop->paths.end(),
+                           path_is_supported);
+    if (const auto *collection =
+            dynamic_cast<const ExtrusionEntityCollection *>(&entity))
+        return std::all_of(
+            collection->entities.begin(), collection->entities.end(),
+            [&support_paths, entity_owner_z,
+             support_owner_z,
+             allow_short_unsupported_runs, walls_only](const ExtrusionEntity *child) {
+                return child != nullptr &&
+                    nonplanar_paths_are_supported(
+                        *child, support_paths,
+                        entity_owner_z, support_owner_z,
+                        allow_short_unsupported_runs, walls_only);
+            });
+    return false;
+}
+
+bool nonplanar_walls_are_supported(
+    const ExtrusionEntity &entity,
+    const std::vector<const ExtrusionPath *> &support_paths,
+    double entity_owner_z, double support_owner_z,
+    bool allow_short_unsupported_runs)
+{
+    return nonplanar_paths_are_supported(entity, support_paths,
+        entity_owner_z, support_owner_z, allow_short_unsupported_runs, true);
+}
+
+bool nonplanar_course_is_supported(
+    const ExtrusionEntity &entity,
+    const std::vector<const ExtrusionPath *> &support_paths,
+    double entity_owner_z, double support_owner_z)
+{
+    return nonplanar_paths_are_supported(entity, support_paths,
+        entity_owner_z, support_owner_z, false, false);
+}
+
+bool native_foundation_supports_course(
+    const ExtrusionEntitiesPtr &course, const LayerRegion &foundation,
+    double owner_z, double foundation_z, double minimum_height, double maximum_height)
+{
+    std::vector<const ExtrusionPath *> support_paths;
+    collect_extrusion_path_references(foundation.perimeters, support_paths);
+    collect_extrusion_path_references(foundation.fills, support_paths);
+    // A raised brick/interlocking path is an obstacle, not simply a path to
+    // omit from the support list. Reuse requires a genuinely flat native
+    // course; mixed-height courses need an explicit realignment first.
+    if (std::any_of(support_paths.begin(), support_paths.end(),
+        [](const ExtrusionPath *path) {
+            return path->nonplanar_surface || std::any_of(
+                path->polyline.points.begin(), path->polyline.points.end(),
+                [](const Point3 &point) { return point.z() != 0; });
+        }))
+        return false;
+    if (course.empty() || support_paths.empty())
+        return false;
+    for (const ExtrusionEntity *entity : course) {
+        if (entity == nullptr)
+            return false;
+        std::vector<const ExtrusionPath *> paths;
+        collect_extrusion_path_references(*entity, paths);
+        if (paths.empty())
+            return false;
+        for (const ExtrusionPath *path : paths) {
+            if (path->polyline.points.size() < 2)
+                return false;
+            ExtrusionPath segment(*path);
+            for (size_t i = 1; i < path->polyline.points.size(); ++i) {
+                const Point3 &a = path->polyline.points[i - 1];
+                const Point3 &b = path->polyline.points[i];
+                const double low = owner_z + unscale_(std::min(a.z(), b.z())) - foundation_z;
+                const double high = owner_z + unscale_(std::max(a.z(), b.z())) - foundation_z;
+                if (low < minimum_height - EPSILON || high > maximum_height + EPSILON)
+                    return false;
+                segment.polyline.points = {a, b};
+                segment.height = low;
+                // The foundation was verified flat above. The first course's
+                // local thickness is therefore z(s) - foundation_z, not the
+                // minimum thickness held constant along the whole segment.
+                // Check its contact footprint on that plane after bounding
+                // both endpoint heights. This changes only the validation
+                // probe; course_flow emits the actual varying thickness.
+                for (Point3 &point : segment.polyline.points)
+                    point.z() = 0;
+                if (!nonplanar_course_is_supported(segment, support_paths,
+                        foundation_z + low, foundation_z))
+                    return false;
+            }
+        }
+    }
+    return true;
+}
+
+namespace {
+
 ExPolygons retained_nonplanar_wall_material_at_z(
     const std::vector<Layer *> &layers, size_t region_idx, double layer_z,
     double z_tolerance)
@@ -4070,7 +4907,8 @@ bool generated_path_is_clear(
     ExtrusionPath &path, coordf_t owner_z,
     const SequentialGantryGeometry &gantry,
     const ToolheadClearanceFallback &fallback,
-    const Obstacles &remote_obstacles)
+    const Obstacles &remote_obstacles,
+    std::string *failure = nullptr)
 {
     std::vector<Vec3d> points;
     points.reserve(path.polyline.points.size());
@@ -4101,10 +4939,21 @@ bool generated_path_is_clear(
         // expensive segment/obstacle query and may reject paths that the
         // printer-specific geometry explicitly permits.  An empty geometry
         // still selects the conservative fallback inside the shared checker.
-        if (check_toolhead_clearance(
+        const ToolheadCollision collision = check_toolhead_clearance(
                 points[idx - 1], points[idx], gantry, remote_obstacles,
-                fallback, support_contact))
+                fallback, support_contact);
+        if (collision) {
+            if (failure != nullptr) {
+                std::ostringstream message;
+                message << "segment=[" << points[idx - 1].transpose()
+                        << "]-[" << points[idx].transpose()
+                        << "] obstacle=" << collision.obstacle_index
+                        << " gantry_slice=" << collision.slice_index
+                        << " contact_allowance=" << support_contact;
+                *failure = message.str();
+            }
             return false;
+        }
     }
     path.nonplanar_clearance_validated = true;
     return true;
@@ -4173,7 +5022,7 @@ bool validate_deferred_feature(
                 if (collision) {
                     const PrintedToolpathObstacle &obstacle =
                         obstacle_at(remote_obstacles, collision.obstacle_index);
-                    BOOST_LOG_TRIVIAL(warning)
+                    BOOST_LOG_TRIVIAL(debug)
                         << "Deferred feature nozzle obstacle "
                         << collision.obstacle_index << " top_z="
                         << obstacle.top_z
@@ -4221,6 +5070,60 @@ bool validate_deferred_feature(
 }
 
 } // namespace
+
+std::vector<NonplanarCourseProfile> plan_nonplanar_courses(
+    double anchor_z, double minimum_surface_z, double maximum_surface_z,
+    size_t minimum_courses, double minimum_height, double maximum_height)
+{
+    const double rise = minimum_surface_z - anchor_z;
+    const double span = maximum_surface_z - minimum_surface_z;
+    if (!std::isfinite(rise) || !std::isfinite(span) || rise <= 0. || span < 0. ||
+        !std::isfinite(minimum_height) || !std::isfinite(maximum_height) ||
+        minimum_height <= 0. || maximum_height < minimum_height)
+        return {};
+    // smoothstep's maximum derivative is 1.5. This conservative bound
+    // covers every XY height in the patch, not just its highest point.
+    const double required_steps = std::ceil((rise + 1.5 * span) / maximum_height);
+    const double available_steps = std::floor(rise / minimum_height);
+    if (required_steps > available_steps ||
+        double(minimum_courses) > available_steps ||
+        required_steps >= double(std::numeric_limits<size_t>::max()))
+        return {};
+    const size_t count = std::max<size_t>({1, minimum_courses, size_t(required_steps)});
+    std::vector<NonplanarCourseProfile> result;
+    if (count >= result.max_size())
+        return {};
+    result.reserve(count + 1);
+    for (size_t idx = 0; idx <= count; ++idx) {
+        const double t = double(idx) / double(count);
+        const double blend = t * t * (3. - 2. * t);
+        result.push_back({anchor_z + t * rise + blend * span, blend});
+    }
+    return result;
+}
+
+std::vector<ExtrusionPath> split_nonplanar_path_by_height(
+    const ExtrusionPath &path, const std::vector<double> &segment_heights)
+{
+    assert(path.polyline.points.size() == segment_heights.size() + 1);
+    ExtrusionPaths result;
+    for (size_t idx = 0; idx < segment_heights.size(); ++idx) {
+        const double height = segment_heights[idx];
+        assert(std::isfinite(height) && height > 0.);
+        if (!result.empty() && std::abs(double(result.back().height) - height) < 1e-6) {
+            result.back().polyline.points.push_back(path.polyline.points[idx + 1]);
+            continue;
+        }
+        // Copy metadata, not the entire source polyline for every thickness
+        // change. The latter makes finely sampled variable-flow paths quadratic.
+        result.emplace_back(Polyline3(Points3{path.polyline.points[idx], path.polyline.points[idx + 1]}), path);
+        ExtrusionPath &part = result.back();
+        set_nonplanar_local_course_height(part, height);
+    }
+    for (ExtrusionPath &part : result)
+        normalize_fixed_feature_transition(part);
+    return result;
+}
 
 void consolidate_nonplanar_top_surfaces(
     const std::vector<Layer *> &layers, const sla::IndexedMesh &mesh,
@@ -4354,10 +5257,10 @@ void consolidate_nonplanar_top_surfaces(
             const bool top_template_from_outline =
                 !top_template && outline_template.has_value();
             if (top_template_from_outline) {
-                // The template is needed to calculate flow and transition
-                // depth for compact wall-only surfaces, but it must never
-                // fabricate a filled top skin. Such a skin promoted narrowing
-                // rims and the Benchy bow into unsupported non-planar fill.
+                // Supply flow for the complete wall/skin generator even when
+                // ordinary slicing fills a narrow rim entirely with walls.
+                // Its projected domain retains holes; buried courses still
+                // come from real source geometry and require support below.
                 top_template = *outline_template;
                 top_template->set_extrusion_role(erTopSolidInfill);
                 top_template->inset_idx = 0;
@@ -4368,7 +5271,8 @@ void consolidate_nonplanar_top_surfaces(
             std::vector<NonplanarPatch> patches = active_nonplanar_patches(
                 region_patches, mesh, seed_coverage, emitted_facets,
                 unscale_(minimum_z) + mesh.ground_level(),
-                unscale_(maximum_z) + mesh.ground_level());
+                unscale_(maximum_z) + mesh.ground_level(),
+                layers[run_begin]->height, layers[run_end]->height);
             BOOST_LOG_TRIVIAL(debug) << "Nonplanar candidate run has " << patches.size()
                                      << " connected surface patches";
             const PrintRegionConfig &region_config =
@@ -4396,8 +5300,17 @@ void consolidate_nonplanar_top_surfaces(
             // the mesh itself is solid there.  Unlike the former global flat
             // foundation, this support course is a parallel surface offset,
             // so every adjacent course keeps the configured physical height.
-            const double total_shell_depth =
-                shell_layer_height * double(shell_count);
+            // `nonplanar_top_surface_layers` is the number of physical surface
+            // courses, including the exposed course.  The former reconstruction
+            // treated it as a minimum and added one course for every nominal Z
+            // plane crossed by the complete patch.  A five-layer Benchy roof
+            // consequently became 28--33 generated courses and replaced deep
+            // structural geometry with repeated projected rings.  A non-planar
+            // skin is instead a bounded stack of parallel surface offsets; the
+            // conventional slice below it remains its support.
+            const size_t physical_shell_count = std::max<size_t>(1, shell_count);
+            const double total_shell_depth = shell_layer_height *
+                double(physical_shell_count);
 
             // A complete connected organic surface is always attempted first.
             // If it cannot pass dependency, support or clearance validation,
@@ -4439,6 +5352,7 @@ void consolidate_nonplanar_top_surfaces(
             };
             struct FeatureCourse {
                 size_t owner_layer {0};
+                double surface_reference_z {0.};
                 double surface_depth {0.};
                 double blend {1.};
             };
@@ -4451,7 +5365,9 @@ void consolidate_nonplanar_top_surfaces(
                 size_t transition_anchor_layer {0};
                 size_t feature_source_begin {0};
                 double first_shell_blend {1.};
+                bool owns_generated_boundary {false};
                 bool before_current_layer {false};
+                bool native_foundation {false};
             };
             std::vector<ExtrusionEntitiesPtr> generated_by_layer(layers.size());
             std::vector<AcceptedPatch> accepted_patches;
@@ -4488,7 +5404,7 @@ void consolidate_nonplanar_top_surfaces(
                             0.25 * std::min(projected_patch_area, emitted_area);
                     });
                 if (projection_already_owned) {
-                    BOOST_LOG_TRIVIAL(warning)
+                    BOOST_LOG_TRIVIAL(debug)
                         << "Skipping nonplanar patch " << patch_idx
                         << ": its projected surface is already owned by an accepted patch";
                     continue;
@@ -4507,22 +5423,41 @@ void consolidate_nonplanar_top_surfaces(
 
                 const double minimum_surface_z =
                     patch.minimum_z - mesh.ground_level();
-                const size_t transition_anchor_layer =
+                size_t transition_anchor_layer =
                     planar_transition_anchor_layer_index(
                         layers, minimum_surface_z, total_shell_depth);
-                const double transition_anchor_z =
-                    layers[transition_anchor_layer]->print_z;
                 const double maximum_surface_z =
                     patch.maximum_z - mesh.ground_level();
-                // Limit every local transition step to one nominal course.
-                // The low side may use a thinner (variable-flow) course, but
-                // the high side must never float more than one layer above
-                // its predecessor.
-                const size_t transition_shell_count = std::max(
-                    shell_count,
-                    size_t(std::ceil(std::max(
-                        0., maximum_surface_z - transition_anchor_z) /
-                        shell_layer_height)));
+                double minimum_course_height = 0.01;
+                double maximum_course_height = 0.8 * nozzle_diameter;
+                for (double height : print_config.min_layer_height.values)
+                    if (height > 0.)
+                        minimum_course_height = std::max(minimum_course_height, height);
+                for (double height : print_config.max_layer_height.values)
+                    if (height > 0.)
+                        maximum_course_height = std::min(maximum_course_height, height);
+                for (double diameter : print_config.nozzle_diameter.values)
+                    if (diameter > 0.)
+                        maximum_course_height = std::min(maximum_course_height, 0.8 * diameter);
+                std::vector<NonplanarCourseProfile> course_plan;
+                // Start earlier when the low side cannot hold the courses
+                // required by the high side. Foundation geometry/support is
+                // still validated before any original material is removed.
+                for (;;) {
+                    course_plan = plan_nonplanar_courses(
+                        layers[transition_anchor_layer]->print_z,
+                        minimum_surface_z, maximum_surface_z, physical_shell_count,
+                        minimum_course_height, maximum_course_height);
+                    if (!course_plan.empty() || transition_anchor_layer == 0)
+                        break;
+                    --transition_anchor_layer;
+                }
+                if (course_plan.empty()) {
+                    enqueue_top_cap(patch, patch_idx, "no printable transition course spacing");
+                    continue;
+                }
+                const double transition_anchor_z = layers[transition_anchor_layer]->print_z;
+                const size_t transition_shell_count = course_plan.size() - 1;
                 BOOST_LOG_TRIVIAL(debug)
                     << "Nonplanar patch " << patch_idx
                     << " transition anchor layer=" << transition_anchor_layer
@@ -4537,19 +5472,31 @@ void consolidate_nonplanar_top_surfaces(
                     patch_idx + 1, patches.size());
 
                 std::vector<GeneratedShell> shells;
-                // Course zero is a real, flat solid foundation. The remaining
-                // courses interpolate from that exact path to the surface.
-                // Keeping it in the aligned path graph guarantees that the
-                // first variable-Z course has deposited support at every
-                // endpoint instead of relying on unrelated infill geometry.
+                bool native_foundation = false;
+                // Occupancy is fixed before support/clearance planning. Keep
+                // the aligned wall/raster indices for projection, but never
+                // let a row omitted from printing act as deposited support.
+                std::map<const ExtrusionEntity *, bool> course_occupancy;
+                const auto is_emitted = [&](const ExtrusionEntity *entity) {
+                    const auto found = course_occupancy.find(entity);
+                    return found == course_occupancy.end() || found->second;
+                };
+                // Course zero is a real flat foundation. The remaining
+                // courses interpolate from that course to the surface.
                 shells.reserve(transition_shell_count + 1);
+                const size_t surface_support_begin = nonplanar_solid_course_begin(
+                    course_plan, minimum_surface_z, maximum_surface_z,
+                    size_t(std::max(1, region_config.top_shell_layers.value)),
+                    region_config.top_shell_thickness.value);
                 for (size_t shell_idx = 0;
                      shell_idx <= transition_shell_count; ++shell_idx) {
-                    const double blend = double(shell_idx) /
-                        double(transition_shell_count);
-                    const double surface_depth = total_shell_depth * (1. - blend);
-                    const double required_z = transition_anchor_z +
-                        blend * (maximum_surface_z - transition_anchor_z);
+                    const double blend = course_plan[shell_idx].blend;
+                    const double surface_depth = maximum_surface_z - course_plan[shell_idx].plane_z;
+                    // Solid versus sparse fill does not change the height
+                    // field. Switching here to parallel offsets can put the
+                    // first solid course below an already deposited course.
+                    const double required_z =
+                        maximum_surface_z - surface_depth;
                     const size_t owner_layer = owner_layer_for_z(
                         layers,
                         shell_idx == 0 ? transition_anchor_layer :
@@ -4587,31 +5534,16 @@ void consolidate_nonplanar_top_surfaces(
                     if (!feature_footprint.empty())
                         BOOST_LOG_TRIVIAL(debug)
                             << "Nonplanar patch " << patch_idx
-                            << " rejected: connected continuation is too large to defer (area ratio "
+                            << " ignores non-compact continuation (area ratio "
                             << feature_area / std::max(patch_area, 1.) << ')';
-                    if (!patch.top_cap) {
-                        // Keeping a large continuation planar while replacing
-                        // a narrow ring around it creates exactly the partial,
-                        // perimeter-only skins this atomic check is intended
-                        // to prevent. Retry the component's highest coherent
-                        // cap instead; this targets the crown where stair
-                        // stepping is most visible without converting the
-                        // complete organic flank.
-                        enqueue_top_cap(
-                            patch, patch_idx,
-                            "continuation dependency rejection");
-                        continue;
-                    }
-
-                    // At a local crown, a broad slice component often only
-                    // grazes the expanded contact band outside the selected
-                    // facets. It is the ordinary continuation of the organic
-                    // body, not a compact chimney/boss that should be deferred
-                    // and warped. Keep it in its normal schedule and let the
-                    // full support/toolhead checks below decide whether the
-                    // cap itself is printable. A real compact feature remains
-                    // below the area-ratio limit and still takes the explicit
-                    // dependency-aware deferral path.
+                    // A footprint larger than the surface is the surrounding
+                    // hull/cabin continuing normally through adjacent layers,
+                    // not an attached chimney or boss.  Treating it as a
+                    // dependency falsely rejected the Benchy stern (ratios of
+                    // 1.0--10.5 were observed) and could enqueue a smaller,
+                    // disconnected cap.  Leave ordinary continuation in the
+                    // normal schedule; clearance validation below remains the
+                    // authority for whether the complete patch is printable.
                     feature_footprint.clear();
                 }
 
@@ -4642,83 +5574,43 @@ void consolidate_nonplanar_top_surfaces(
                         ApplySafetyOffset::No);
                 }
                 ExtrusionEntitiesPtr projected_source_course =
-                    project_source_solid_course(
+                    project_nonplanar_source_course(
                         *layers[transition_anchor_layer]->regions()[region_idx],
-                        patch, mesh, source_course_domain,
+                        mesh, patch.projection, patch.facets, source_course_domain,
                         layers[surface_shell.owner_layer]->print_z,
                         maximum_surface_z - transition_anchor_z +
                             shell_layer_height);
                 const bool has_real_source_course =
                     !projected_source_course.empty();
                 constexpr size_t minimum_coherent_surface_paths = 4;
-                // A broad, fully reachable top needs an aligned boundary on
-                // every generated physical course; an ordinary planar graph
-                // may not contain a wall on each of those owners. Compact
-                // patches retain the original sliced wall graph. The flat
-                // foundation of either form remains conventional geometry;
-                // only nonzero blend courses are classified as transitions.
-                const Vec2d patch_size = unscale(patch_bounds.size());
-                const double patch_area_mm2 = std::abs(area(patch.projection)) *
-                    SCALING_FACTOR * SCALING_FACTOR;
+                // Reusing an ordinary solid course also requires retaining
+                // its native wall graph. Otherwise the generated Arachne
+                // boundary owns the replacement, subject to support and
+                // clearance validation of the complete stack.
                 const bool surface_owns_boundary =
-                    outline_template.has_value() &&
-                    (patch.top_cap ||
-                     (patch_area_mm2 >= 100. &&
-                      std::min(patch_size.x(), patch_size.y()) >= 10.));
-                surface_shell.paths = make_patch_raster(
-                    patch, mesh, *top_template,
-                    layers[surface_shell.owner_layer]->print_z, resolution,
-                    gantry, region_config.top_surface_pattern.value, 0.,
-                    feature_footprint.empty() ? nullptr : &feature_footprint,
-                    outline_template ? &*outline_template : nullptr,
-                    &raster_cache,
-                    inner_outline_template ? &*inner_outline_template : nullptr,
-                    outline_count,
-                    arachne_params ? &*arachne_params : nullptr,
-                    surface_owns_boundary);
-                if (!surface_shell.paths.empty() &&
-                    surface_shell.paths.size() < minimum_coherent_surface_paths) {
-                    // A sparse source course may be a good directional
-                    // template on a roof, but two isolated scanlines cannot
-                    // represent a broad doubly-curved cap. Let the adaptive
-                    // surface generator try the complete patch before the
-                    // atomic coherence check rejects it.
-                    destroy_entities(surface_shell.paths);
-                    surface_shell.paths.clear();
-                }
-                if (!surface_shell.paths.empty()) {
-                    // The adaptive raster owns the final course.  The source
-                    // course is a pointer-owning fallback, so explicitly
-                    // destroy it instead of leaking it when the preferred
-                    // construction succeeds.
-                    destroy_entities(projected_source_course);
-                    projected_source_course.clear();
-                    BOOST_LOG_TRIVIAL(debug)
-                        << "Nonplanar patch " << patch_idx << " uses "
-                        << surface_shell.paths.size()
-                        << " coherent surface paths";
-                } else {
-                    surface_shell.paths =
-                        std::move(projected_source_course);
-                }
-                if (top_template_from_outline && !has_real_source_course &&
-                    feature_footprint.empty()) {
-                    BOOST_LOG_TRIVIAL(debug)
-                        << "Rejecting nonplanar patch " << patch_idx
-                        << ": wall-only surface has no real source course "
-                           "at its transition anchor";
-                    destroy_entities(surface_shell.paths);
-                    surface_shell.paths.clear();
-                    enqueue_top_cap(
-                        patch, patch_idx, "missing source solid course");
-                    continue;
-                }
-                if (surface_shell.paths.empty()) {
-                    // A profile may provide no solid course at the requested
-                    // transition foundation (for example a very thin roof or
-                    // zero top shells). Retain the existing generated-raster
-                    // fallback, which is still rejected atomically by the
-                    // support and clearance checks below if it cannot bond.
+                    outline_template.has_value() && !has_real_source_course;
+                // Preserve the ordinary slicer's raster phase, clipping and
+                // wall anchoring.  The Ahlers pipeline first creates a normal
+                // coherent fill/perimeter graph and only then projects that
+                // graph pointwise onto the mesh.  Preferring a newly generated
+                // final-surface raster here inverted those stages: its contour
+                // was subsequently cloned down to the anchor and manufactured
+                // flat loops where no planar extrusion existed (the isolated
+                // Benchy stern and corrupted roof regression).
+                //
+                // A generated raster remains a fallback only when this patch
+                // truly has no ordinary solid source course.  Such a fallback
+                // must still pass the complete deposited-support validation
+                // below; it is never allowed to stand in for a missing source
+                // on a normal top surface.
+                if (surface_owns_boundary) {
+                    // An exposed surface needs one topology owner for its
+                    // final walls and skin.  Reusing only clipped solid-infill
+                    // source paths leaves the finishing course without any
+                    // perimeter, while separately contouring nominal stair
+                    // walls creates the detached rings this pass is replacing.
+                    // Generate the complete Arachne course once and use its
+                    // exact indexed clones for the bounded stack below.
                     surface_shell.paths = make_patch_raster(
                         patch, mesh, *top_template,
                         layers[surface_shell.owner_layer]->print_z, resolution,
@@ -4729,15 +5621,80 @@ void consolidate_nonplanar_top_surfaces(
                         inner_outline_template ? &*inner_outline_template : nullptr,
                         outline_count,
                         arachne_params ? &*arachne_params : nullptr,
-                        surface_owns_boundary);
+                        true);
+                } else if (has_real_source_course) {
+                    surface_shell.paths = std::move(projected_source_course);
+                    BOOST_LOG_TRIVIAL(debug)
+                        << "Nonplanar patch " << patch_idx << " reuses "
+                        << surface_shell.paths.size()
+                        << " ordinary-slicer source paths";
+                } else if (!top_template_from_outline) {
+                    surface_shell.paths = make_patch_raster(
+                        patch, mesh, *top_template,
+                        layers[surface_shell.owner_layer]->print_z, resolution,
+                        gantry, region_config.top_surface_pattern.value, 0.,
+                        feature_footprint.empty() ? nullptr : &feature_footprint,
+                        outline_template ? &*outline_template : nullptr,
+                        &raster_cache,
+                        inner_outline_template ? &*inner_outline_template : nullptr,
+                        outline_count,
+                        arachne_params ? &*arachne_params : nullptr,
+                        false);
                 }
-                if (top_template_from_outline) {
-                    // Continue through the compact perimeter-only path below.
-                    // Larger wall-only projections fail that deliberately
-                    // strict size check and retain their conventional slice.
+                // A complete generated boundary does not consume the optional
+                // solid source projection. Release those temporary entities.
+                destroy_entities(projected_source_course);
+                if (surface_owns_boundary && raster_cache.doubly_curved) {
+                    // A dome has no single perimeter direction or matching
+                    // flat lower contour. Its concentric top tracks should
+                    // meet the ordinary curved walls, while cloning a newly
+                    // generated final crown outline down to one planar anchor
+                    // creates self-intersecting rings. Keep complete generated
+                    // boundaries for developable roofs and narrow slopes, but
+                    // let a genuinely two-axis crown use its existing sliced
+                    // wall graph and regenerate only the adaptive skin.
+                    destroy_entities(surface_shell.paths);
+                    surface_shell.paths = make_patch_raster(
+                        patch, mesh, *top_template,
+                        layers[surface_shell.owner_layer]->print_z, resolution,
+                        gantry, region_config.top_surface_pattern.value, 0.,
+                        feature_footprint.empty() ? nullptr : &feature_footprint,
+                        outline_template ? &*outline_template : nullptr,
+                        &raster_cache,
+                        inner_outline_template ? &*inner_outline_template : nullptr,
+                        outline_count,
+                        arachne_params ? &*arachne_params : nullptr,
+                        false);
+                }
+                if (!surface_owns_boundary && !surface_shell.paths.empty() &&
+                    surface_shell.paths.size() < minimum_coherent_surface_paths) {
                     destroy_entities(surface_shell.paths);
                     surface_shell.paths.clear();
+                    // A sparse ordinary source course is useful evidence that
+                    // the patch is a real top surface, but two isolated rows
+                    // cannot describe a coherent dome/crown. Fall back to the
+                    // complete adaptive raster instead of falling through
+                    // with an empty course. The resulting full patch still
+                    // has to pass the same atomic support, crossing and
+                    // toolhead-clearance validation below; no sparse fragment
+                    // is retained merely because it happened to be clear.
+                    if (!top_template_from_outline)
+                        surface_shell.paths = make_patch_raster(
+                            patch, mesh, *top_template,
+                            layers[surface_shell.owner_layer]->print_z,
+                            resolution, gantry,
+                            region_config.top_surface_pattern.value, 0.,
+                            feature_footprint.empty() ? nullptr :
+                                &feature_footprint,
+                            outline_template ? &*outline_template : nullptr,
+                            &raster_cache,
+                            inner_outline_template ?
+                                &*inner_outline_template : nullptr,
+                            outline_count,
+                            arachne_params ? &*arachne_params : nullptr,
+                            surface_owns_boundary);
                 }
+                remove_short_nonplanar_fill_paths(surface_shell.paths);
                 const bool generated_surface_owns_boundary = std::any_of(
                     surface_shell.paths.begin(), surface_shell.paths.end(),
                     [](const ExtrusionEntity *entity) {
@@ -4758,12 +5715,23 @@ void consolidate_nonplanar_top_surfaces(
                 // perimeters until a complete surrounding surface can be
                 // generated atomically.
                 if (path_count > 0 && path_count < minimum_coherent_surface_paths) {
-                    BOOST_LOG_TRIVIAL(debug)
-                        << "Rejecting nonplanar patch " << patch_idx << ": only "
-                        << path_count << " raster paths; a coherent finishing skin needs "
-                        << minimum_coherent_surface_paths;
-                    destroy_entities(surface_shell.paths);
-                    continue;
+                    // A narrow rim can be completely covered by fewer than
+                    // four variable-width walls. Count alone is not a coverage
+                    // test. Admit a complete generated graph, preserving mesh
+                    // holes, but still reject sparse isolated raster fragments.
+                    // All support/clearance/topology checks below still apply.
+                    Polygons beads;
+                    for (const ExtrusionEntity *entity : surface_shell.paths)
+                        entity->polygons_covered_by_width(beads, 0.f);
+                    const ExPolygons missing = diff_ex(source_course_domain,
+                        offset_ex(union_ex(beads), scale_(0.05)));
+                    if (area(missing) > 0.05 * area(source_course_domain)) {
+                        BOOST_LOG_TRIVIAL(warning)
+                            << "Rejecting nonplanar patch " << patch_idx << ": "
+                            << path_count << " paths leave more than 5% of the finishing domain uncovered";
+                        destroy_entities(surface_shell.paths);
+                        continue;
+                    }
                 }
                 const Flow top_flow(
                     top_template->width, top_template->height, 0.f);
@@ -4789,43 +5757,199 @@ void consolidate_nonplanar_top_surfaces(
                         inner_flow.scaled_spacing() +
                     (inner_flow.scaled_spacing() + top_flow.scaled_spacing()) / 2;
                 if (path_count != 0) {
-                    // Build the coincident flat foundation before changing
-                    // the finishing paths to their local variable height.
-                    // It remains an ordinary full-height solid course.
-                    GeneratedShell &foundation = shells.front();
-                    foundation.paths = clone_nonplanar_shell(
-                        surface_shell.paths, layers,
-                        layers[surface_shell.owner_layer]->print_z,
-                        layers[foundation.owner_layer]->print_z,
-                        transition_anchor_layer, total_shell_depth,
-                        fill_support_inset, foundation.surface_depth,
-                        foundation.blend, true);
-                    for (ExtrusionEntity *entity : foundation.paths)
-                        make_planar_solid_foundation(*entity);
-
-                    const double blend_step =
-                        1. / double(transition_shell_count);
-                    const double minimum_course_height = std::clamp(
-                        region_config.nonplanar_top_surface_min_height.value,
-                        0.01, shell_layer_height);
-                    for (ExtrusionEntity *entity : surface_shell.paths)
-                        adjust_nonplanar_stack_flow(
-                            *entity,
-                            layers[surface_shell.owner_layer]->print_z,
-                            transition_anchor_z, blend_step,
-                            minimum_course_height, shell_layer_height);
-
-                    for (size_t shell_idx = 1;
-                         shell_idx + 1 < shells.size(); ++shell_idx) {
-                        GeneratedShell &shell = shells[shell_idx];
-                        shell.paths = clone_nonplanar_shell(
-                            surface_shell.paths, layers,
-                            layers[surface_shell.owner_layer]->print_z,
-                            layers[shell.owner_layer]->print_z,
-                            transition_anchor_layer, total_shell_depth,
-                            fill_support_inset,
-                            shell.surface_depth, shell.blend, true);
+                    // The buried course is generated from the transition
+                    // anchor, not by copying the exposed boundary downward.
+                    // Features such as holes and chimney walls may not exist
+                    // at every buried depth, so cloning the final perimeter
+                    // creates unsupported rings.  The source-course morph
+                    // preserves the ordinary slicer's topology while the
+                    // following courses progressively adopt the surface.
+                    // Each course owns independent path copies and reads only
+                    // immutable slice geometry, so build them concurrently.
+                    // The prior serial loop repeated the same expensive
+                    // polygon projection 10--20 times on a shallow roof and
+                    // dominated the multi-minute Benchy slice.
+                    // Every course uses the same anchor slice and only a
+                    // small set of line-width/inset combinations. Build those
+                    // expensive Clipper offsets once. Previously each parallel
+                    // clone rebuilt them, multiplying the roof cost by the
+                    // 10--20 transition courses visible in a shallow slope.
+                    std::set<coord_t> support_insets;
+                    std::set<int> wall_insets;
+                    for (const ExtrusionEntity *entity : surface_shell.paths)
+                        if (is_perimeter(entity->role()))
+                            wall_insets.insert(std::max(0, entity->inset_idx));
+                    std::map<std::pair<size_t, int>, Polylines> wall_support_cache;
+                    for (const ExtrusionEntity *entity : surface_shell.paths)
+                        collect_shell_support_insets(
+                            *entity, fill_support_inset, support_insets);
+                    std::map<std::pair<size_t, coord_t>, ExPolygons>
+                        support_cache;
+                    // Support projection is queried only near this patch, but
+                    // offsetting the complete object slice makes a local roof
+                    // pay for every hull, cabin, text and multicolour contour.
+                    // On the Benchy this single cache-building loop dominated
+                    // minutes of CPU time. Crop before offsetting, with enough
+                    // margin that the artificial window edge is farther away
+                    // than any permitted transition morph.
+                    const coord_t maximum_support_inset = support_insets.empty() ?
+                        0 : *support_insets.rbegin();
+                    BoundingBox support_bounds = patch_bounds;
+                    support_bounds.offset(scale_(
+                        total_shell_depth +
+                        unscale_(maximum_support_inset) +
+                        std::max(double(top_template->width), resolution) + 1.));
+                    const ExPolygons support_window{
+                        ExPolygon(support_bounds.polygon())};
+                    for (size_t support_idx = transition_anchor_layer;
+                         support_idx <= surface_owner; ++support_idx) {
+                        for (const int inset : wall_insets)
+                            wall_support_cache.emplace(std::make_pair(support_idx, inset),
+                                nonplanar_wall_centerlines(
+                                    layers[support_idx]->regions()[region_idx]->perimeters, inset));
+                        const ExPolygons local_slices = intersection_ex(
+                            layers[support_idx]->lslices, support_window);
+                        for (const coord_t inset : support_insets) {
+                            ExPolygons support = inset > 0 ?
+                                offset_ex(local_slices, -inset) : local_slices;
+                            support_cache.emplace(
+                                std::make_pair(support_idx, inset),
+                                std::move(support));
+                        }
                     }
+                    tbb::parallel_for(
+                        tbb::blocked_range<size_t>(0, shells.size() - 1),
+                        [&](const tbb::blocked_range<size_t> &range) {
+                            for (size_t shell_idx = range.begin();
+                                 shell_idx < range.end(); ++shell_idx) {
+                                GeneratedShell &shell = shells[shell_idx];
+                                shell.paths = clone_nonplanar_shell(
+                                    surface_shell.paths, layers, patch, mesh,
+                                    layers[surface_shell.owner_layer]->print_z,
+                                    layers[shell.owner_layer]->print_z,
+                                    transition_anchor_layer, total_shell_depth,
+                                    fill_support_inset, maximum_surface_z,
+                                    shell.surface_depth, shell.blend,
+                                    raster_cache.doubly_curved, true,
+                                    support_cache, wall_support_cache);
+                            }
+                        });
+
+                    if (std::any_of(shells.begin(), shells.end(),
+                            [](const GeneratedShell &shell) { return shell.paths.empty(); })) {
+                        for (GeneratedShell &shell : shells)
+                            destroy_entities(shell.paths);
+                        enqueue_top_cap(patch, patch_idx, "incomplete transition surface projection");
+                        continue;
+                    }
+
+                    // This legacy raster selection is only an occupancy
+                    // proposal, not a bridge plan. Validate the actual sparse
+                    // proposal below; native per-course fill/bridge generation
+                    // must replace it when a dense handoff lacks support.
+                    const double density = std::clamp(
+                        double(region_config.sparse_infill_density.value), 0., 100.);
+                    const size_t stride = density <= EPSILON ?
+                        std::numeric_limits<size_t>::max() :
+                        std::max<size_t>(1, size_t(std::ceil(100. / density)));
+                    size_t fill_rank = 0;
+                    for (size_t idx = 0; idx < surface_shell.paths.size(); ++idx) {
+                        const auto *path = dynamic_cast<const ExtrusionPath *>(surface_shell.paths[idx]);
+                        const bool wall = path != nullptr && is_perimeter(path->role());
+                        const bool structural = path != nullptr && !wall &&
+                            unscale<double>(path->length()) + EPSILON >=
+                                std::max(1.0, 2.5 * double(path->width));
+                        const bool sparse = structural &&
+                            stride != std::numeric_limits<size_t>::max() && fill_rank % stride == 0;
+                        if (structural)
+                            ++fill_rank;
+                        for (size_t course = 0; course < shells.size(); ++course)
+                            course_occupancy.emplace(shells[course].paths[idx],
+                                wall || course >= surface_support_begin || sparse);
+                    }
+
+                    // Course zero is the last fully horizontal structural
+                    // course. Keep its fill in the ordinary planar schedule
+                    // and preserve only scheduler ownership needed by its
+                    // generated wall graph. The first path advertised as a
+                    // non-planar transition is therefore shells[1], which is
+                    // both supported by this complete course and actually
+                    // changes Z along the surface.
+                    for (ExtrusionEntity *entity : shells.front().paths)
+                        make_planar_solid_foundation(
+                            *entity,
+                            layers[shells.front().owner_layer]->lslices);
+
+                    // Course zero is useful only if it is a real foundation,
+                    // not merely a final-surface contour flattened onto an
+                    // earlier owner layer. Validate it against material that
+                    // will already have been deposited on the immediately
+                    // preceding planar course. The broad Benchy stern exposed
+                    // this distinction: its generated ring was collision-free
+                    // in empty space but the nearest matching wall was 2--8 mm
+                    // below, so every later transition course floated as an
+                    // isolated shell. Reject the complete patch before any
+                    // conventional geometry is carved; never salvage a few
+                    // individually supported fragments.
+                    bool foundation_supported = transition_anchor_layer > 0;
+                    if (foundation_supported) {
+                        const LayerRegion &support_region =
+                            *layers[transition_anchor_layer - 1]
+                                 ->regions()[region_idx];
+                        std::vector<const ExtrusionPath *> support_paths;
+                        collect_extrusion_path_references(
+                            support_region.perimeters, support_paths);
+                        collect_extrusion_path_references(
+                            support_region.fills, support_paths);
+                        foundation_supported = std::all_of(
+                            shells.front().paths.begin(),
+                            shells.front().paths.end(),
+                            [&support_paths, &layers, &raster_cache,
+                             transition_anchor_layer](
+                                const ExtrusionEntity *entity) {
+                                return entity != nullptr &&
+                                    nonplanar_walls_are_supported(
+                                        *entity, support_paths,
+                                        layers[transition_anchor_layer]->print_z,
+                                        layers[transition_anchor_layer - 1]
+                                            ->print_z,
+                                        raster_cache.doubly_curved);
+                            });
+                    }
+                    if (!foundation_supported && shells.size() > 1) {
+                        // A native bridge course can be a valid foundation
+                        // even when a copied finishing outline has no wall
+                        // directly underneath it. Reuse the native course
+                        // only when every first angled bead contacts it.
+                        const LayerRegion &anchor =
+                            *layers[transition_anchor_layer]->regions()[region_idx];
+                        const double owner_z = layers[shells[1].owner_layer]->print_z;
+                        const double anchor_z = layers[transition_anchor_layer]->print_z;
+                        native_foundation = native_foundation_supports_course(
+                            shells[1].paths, anchor, owner_z, anchor_z,
+                            minimum_course_height, maximum_course_height);
+                        foundation_supported = native_foundation;
+                        if (native_foundation)
+                            BOOST_LOG_TRIVIAL(debug) << "Nonplanar patch " << patch_idx
+                                << " reuses native foundation at z=" << anchor_z;
+                    }
+                    if (!foundation_supported) {
+                        BOOST_LOG_TRIVIAL(debug)
+                            << "Rejecting nonplanar patch " << patch_idx
+                            << ": its flat foundation is not continuously "
+                               "bonded to the preceding planar course";
+                        for (GeneratedShell &shell : shells)
+                            destroy_entities(shell.paths);
+                        enqueue_top_cap(
+                            patch, patch_idx,
+                            "unsupported flat transition foundation");
+                        continue;
+                    }
+
+                    // Local course thickness is assigned when the connected
+                    // paths are assembled below. XYZ length alone does not
+                    // account for changing separation between the courses.
+
                     // XY morphing is evaluated independently for each
                     // Arachne fragment. Near a variable-width edge, two
                     // neighboring fragments may reach the same XY at
@@ -4852,6 +5976,8 @@ void consolidate_nonplanar_top_surfaces(
                         std::map<std::pair<int64_t, int64_t>,
                                  std::vector<ShellSupportSegment>> support_buckets;
                         for (const ExtrusionEntity *entity : previous.paths) {
+                            if (!is_emitted(entity))
+                                continue;
                             const auto *path =
                                 dynamic_cast<const ExtrusionPath *>(entity);
                             if (path == nullptr)
@@ -4894,6 +6020,8 @@ void consolidate_nonplanar_top_surfaces(
                         const double current_owner_z =
                             layers[current.owner_layer]->print_z;
                         for (ExtrusionEntity *entity : current.paths) {
+                            if (!is_emitted(entity))
+                                continue;
                             auto *path = dynamic_cast<ExtrusionPath *>(entity);
                             if (path == nullptr)
                                 continue;
@@ -4944,7 +6072,7 @@ void consolidate_nonplanar_top_surfaces(
                                 const double current_z = current_owner_z +
                                     unscale_(point.z());
                                 const double maximum_z =
-                                    support_z + shell_layer_height;
+                                    support_z + maximum_course_height;
                                 if (current_z > maximum_z + EPSILON) {
                                     point.z() = scale_(maximum_z -
                                                        current_owner_z);
@@ -5090,6 +6218,8 @@ void consolidate_nonplanar_top_surfaces(
                             for (size_t shell_idx = 0;
                                  shell_idx < shells.size(); ++shell_idx) {
                                 const GeneratedShell &shell = shells[shell_idx];
+                                if (!is_emitted(shell.paths[left]) || !is_emitted(shell.paths[right]))
+                                    continue;
                                 if (!shell_path_bounds[shell_idx][left].overlap(
                                         shell_path_bounds[shell_idx][right]))
                                     continue;
@@ -5219,16 +6349,21 @@ void consolidate_nonplanar_top_surfaces(
                         break;
                     }
                 }
-                std::vector<size_t> redundant_raster_paths;
-                for (size_t path_idx = 0; path_idx < path_count; ++path_idx)
-                    if (!retained_raster[path_idx])
-                        redundant_raster_paths.emplace_back(path_idx);
-                for (auto index = redundant_raster_paths.rbegin();
-                     index != redundant_raster_paths.rend(); ++index)
-                    for (GeneratedShell &shell : shells) {
-                        delete shell.paths[*index];
-                        shell.paths.erase(shell.paths.begin() + *index);
+                bool wall_graph_preserved = true;
+                for (GeneratedShell &shell : shells)
+                    if (!filter_nonplanar_course_paths(shell.paths, retained_raster)) {
+                        wall_graph_preserved = false;
+                        break;
                     }
+                if (!wall_graph_preserved) {
+                    // These are still temporary courses. No ordinary wall or
+                    // fill may be carved for a candidate missing an inset.
+                    for (GeneratedShell &shell : shells)
+                        destroy_entities(shell.paths);
+                    enqueue_top_cap(patch, patch_idx,
+                        "surface projection would remove a required perimeter");
+                    continue;
+                }
                 path_count = surface_shell.paths.size();
                 std::map<unsigned int, size_t> retained_outlines_by_inset;
                 for (const ExtrusionEntity *entity : surface_shell.paths)
@@ -5242,21 +6377,17 @@ void consolidate_nonplanar_top_surfaces(
                 BOOST_LOG_TRIVIAL(debug)
                     << "Retained nonplanar Arachne outlines paths_by_inset="
                     << retained_outline_summary.str();
-                const BoundingBox printable_patch_bounds =
-                    get_extents(patch.projection);
-                const double printable_patch_area =
-                    std::abs(area(patch.projection)) *
-                    SCALING_FACTOR * SCALING_FACTOR;
-                const bool perimeter_only_patch = path_count == 0 &&
-                    printable_patch_area <= 10. &&
-                    unscale_(printable_patch_bounds.size().x()) <= 5. &&
-                    unscale_(printable_patch_bounds.size().y()) <= 5.;
+                // Narrow wall-dominated candidates now use the same complete
+                // generated graph and support stack as broad skins above.
+                // Do not revive the legacy independently projected-loop route:
+                // it emitted isolated rings without a connected foundation.
+                const bool perimeter_only_patch = false;
                 for (size_t shell_idx = 0; shell_idx < shells.size(); ++shell_idx)
                     BOOST_LOG_TRIVIAL(debug)
                         << "Nonplanar patch " << patch_idx << " shell "
                         << shell_idx << " owner_layer=" << shells[shell_idx].owner_layer
                         << " raster_paths=" << shells[shell_idx].paths.size();
-                if (path_count == 0 && !perimeter_only_patch) {
+                if (path_count == 0) {
                     BOOST_LOG_TRIVIAL(debug) << "Rejecting nonplanar patch " << patch_idx
                                              << ": no printable raster paths";
                     for (GeneratedShell &shell : shells)
@@ -5266,16 +6397,6 @@ void consolidate_nonplanar_top_surfaces(
                     enqueue_top_cap(patch, patch_idx, "surface reachability rejection");
                     continue;
                 }
-                if (perimeter_only_patch) {
-                    BOOST_LOG_TRIVIAL(debug)
-                        << "Rejecting nonplanar patch " << patch_idx
-                        << ": a perimeter-only surface has no coherent skin "
-                           "or bonded source course";
-                    for (GeneratedShell &shell : shells)
-                        destroy_entities(shell.paths);
-                    continue;
-                }
-
                 // Connected geometry above the skin (a chimney, boss, rib,
                 // etc.) is printed as a dependent sloped course after the
                 // skin. It must therefore be removed from the obstacle field
@@ -5360,7 +6481,7 @@ void consolidate_nonplanar_top_surfaces(
                         tbb::blocked_range<size_t>(0, shell.paths.size()),
                         [&](const tbb::blocked_range<size_t> &range) {
                             for (size_t path_idx = range.begin(); path_idx < range.end(); ++path_idx) {
-                                if (!clear_at_every_depth[path_idx])
+                                if (!clear_at_every_depth[path_idx] || !is_emitted(shell.paths[path_idx]))
                                     continue;
                                 auto *path = dynamic_cast<ExtrusionPath *>(shell.paths[path_idx]);
                                 if (path == nullptr) {
@@ -5461,9 +6582,99 @@ void consolidate_nonplanar_top_surfaces(
                     continue;
                 }
 
-                BOOST_LOG_TRIVIAL(debug) << "Nonplanar patch " << patch_idx
-                                         << " has " << clear_path_count
-                                         << " paths supported and clear at every shell depth";
+                const auto course_flow = [&](size_t shell_idx, const ExtrusionPath &source) {
+                    if (shell_idx == 0)
+                        return ExtrusionPaths{source};
+                    ExtrusionPath sampled(source);
+                    sampled.polyline.points = {source.first_point3()};
+                    std::vector<double> heights;
+                    const auto &current = course_plan[shell_idx];
+                    const auto &previous = course_plan[shell_idx - 1];
+                    for (size_t idx = 1; idx < source.polyline.points.size(); ++idx) {
+                        const Point3 &a = source.polyline.points[idx - 1];
+                        const Point3 &b = source.polyline.points[idx];
+                        const double length = unscale_((b - a).cast<double>().norm());
+                        const size_t steps = std::max<size_t>(1, size_t(std::ceil(length / resolution)));
+                        for (size_t step = 1; step <= steps; ++step) {
+                            const Vec3d midpoint = a.cast<double>() +
+                                ((double(step) - 0.5) / double(steps)) * (b - a).cast<double>();
+                            const Point xy(coord_t(std::llround(midpoint.x())),
+                                           coord_t(std::llround(midpoint.y())));
+                            const auto mesh_z = patch_surface_z_at_xy(patch, mesh, xy);
+                            if (!mesh_z)
+                                throw SlicingError("Could not determine non-planar course thickness");
+                            const double surface_z = *mesh_z - mesh.ground_level();
+                            const double height = current.plane_z - previous.plane_z +
+                                (current.blend - previous.blend) * (surface_z - maximum_surface_z);
+                            if (height < minimum_course_height - 1e-4 ||
+                                height > maximum_course_height + 1e-4)
+                                throw SlicingError("Non-planar course thickness exceeds its planned bounds");
+                            const Vec3d endpoint = a.cast<double>() +
+                                (double(step) / double(steps)) * (b - a).cast<double>();
+                            const Point3 point(coord_t(std::llround(endpoint.x())),
+                                               coord_t(std::llround(endpoint.y())),
+                                               coord_t(std::llround(endpoint.z())));
+                            if (point == sampled.polyline.points.back())
+                                continue;
+                            sampled.polyline.points.push_back(point);
+                            heights.push_back(height);
+                        }
+                    }
+                    return split_nonplanar_path_by_height(sampled, heights);
+                };
+
+                // This is the last gate before touching the native wall
+                // graph. Test the emitted occupancy with the same local
+                // thickness used by the writer, not the unthinned finishing
+                // raster or its provisional nominal layer height. A missing
+                // support row requires bridge planning; relabeling it as a
+                // bridge here would not establish physical anchors.
+                bool courses_supported = true;
+                std::vector<std::vector<const ExtrusionPath *>> course_supports(shells.size());
+                std::vector<double> support_owner_z(shells.size(), 0.);
+                for (size_t course = 1; course < shells.size() && courses_supported; ++course) {
+                    auto &support = course_supports[course];
+                    double &support_z = support_owner_z[course];
+                    support_z = layers[shells[course - 1].owner_layer]->print_z;
+                    if (native_foundation && course == 1) {
+                        const LayerRegion &anchor = *layers[transition_anchor_layer]->regions()[region_idx];
+                        collect_extrusion_path_references(anchor.perimeters, support);
+                        collect_extrusion_path_references(anchor.fills, support);
+                        support_z = layers[transition_anchor_layer]->print_z;
+                    } else {
+                        for (const ExtrusionEntity *entity : shells[course - 1].paths)
+                            if (is_emitted(entity))
+                                collect_extrusion_path_references(*entity, support);
+                    }
+                    for (const ExtrusionEntity *entity : shells[course].paths) {
+                        if (!is_emitted(entity))
+                            continue;
+                        const auto *path = dynamic_cast<const ExtrusionPath *>(entity);
+                        if (path == nullptr) {
+                            courses_supported = false;
+                            break;
+                        }
+                        const ExtrusionPaths parts = course_flow(course, *path);
+                        courses_supported = !parts.empty() && std::all_of(parts.begin(), parts.end(),
+                            [&](const ExtrusionPath &part) {
+                                return nonplanar_course_is_supported(part, support,
+                                    layers[shells[course].owner_layer]->print_z, support_z);
+                            });
+                        if (!courses_supported) {
+                            BOOST_LOG_TRIVIAL(debug) << "Rejecting nonplanar patch " << patch_idx
+                                << ": emitted course " << course << " has no deposited support for "
+                                << ExtrusionEntity::role_to_string(path->role())
+                                << "; a native fill/bridge plan is required";
+                            break;
+                        }
+                    }
+                }
+                if (!courses_supported) {
+                    for (GeneratedShell &shell : shells)
+                        destroy_entities(shell.paths);
+                    enqueue_top_cap(patch, patch_idx, "unsupported emitted course occupancy");
+                    continue;
+                }
 
                 // The wall is not regenerated from the patch outline. Keep
                 // the original perimeter graph that was contoured during the
@@ -5477,8 +6688,27 @@ void consolidate_nonplanar_top_surfaces(
                     outline_template ? double(outline_template->width) : 0.,
                     inner_outline_template ?
                         double(inner_outline_template->width) : 0.});
-                ExPolygons wall_selection = offset_ex(
-                    patch.projection, scale_(0.5 * retained_wall_width + 0.05));
+                // Only the perimeter band of an exposed surface belongs to
+                // its non-planar wall graph.  Selecting the complete patch
+                // interior also picked up ordinary stair boundaries and
+                // feature chords which merely crossed the same XY domain;
+                // those paths were then elevated as stand-alone loops.  The
+                // band is deep enough for every configured wall inset while
+                // preserving the exact Arachne centerlines and their normal
+                // ordering.  A path which enters the band remains one mixed
+                // planar/non-planar entity, so make_nonplanar_path() supplies
+                // its symmetric in-path transition instead of appending a
+                // second contour.
+                const coord_t wall_selection_outer =
+                    scale_(0.5 * retained_wall_width + 0.05);
+                const coord_t wall_selection_inner = scale_(
+                    (std::max(1, region_config.wall_loops.value) + 0.75) *
+                        retained_wall_width +
+                    0.05);
+                ExPolygons wall_selection = diff_ex(
+                    offset_ex(patch.projection, wall_selection_outer),
+                    offset_ex(patch.projection, -wall_selection_inner),
+                    ApplySafetyOffset::No);
                 if (!feature_footprint.empty()) {
                     // The dependency scheduler below owns continuing
                     // chimney/boss/post walls. Contouring those paths here as
@@ -5506,6 +6736,8 @@ void consolidate_nonplanar_top_surfaces(
                 // generated skin supplies any intermediate support course.
                 std::map<size_t, std::pair<double, double>> wall_course_by_owner;
                 for (const GeneratedShell &shell : shells) {
+                    if (native_foundation && shell.owner_layer == transition_anchor_layer)
+                        continue;
                     auto [position, inserted] = wall_course_by_owner.emplace(
                         shell.owner_layer,
                         std::pair<double, double>{shell.surface_depth, shell.blend});
@@ -5530,6 +6762,21 @@ void consolidate_nonplanar_top_surfaces(
                 std::vector<ExtrusionPath *> added_transition_walls;
                 const size_t first_wall_owner = wall_course_by_owner.begin()->first;
                 const size_t last_wall_owner = wall_course_by_owner.rbegin()->first;
+                // A rejected attempt must restore the complete original wall
+                // entities, not merely zero their Z offsets. Blending changes
+                // flow, role and brick metadata, and contouring may split loops.
+                // Leaving those changes behind corrupts the planar fallback
+                // and the next patch attempted on the same owner.
+                std::vector<std::pair<ExtrusionEntityCollection *, ExtrusionEntityCollection>> wall_backups;
+                if (!generated_surface_owns_boundary)
+                    for (const auto &[owner, course] : wall_course_by_owner) {
+                        auto &perimeters = layers[owner]->regions()[region_idx]->perimeters;
+                        wall_backups.emplace_back(&perimeters, perimeters);
+                    }
+                ScopeGuard restore_wall_graph([&wall_backups]() {
+                    for (auto &[perimeters, original] : wall_backups)
+                        *perimeters = std::move(original);
+                });
                 const double maximum_drape_height = std::max(
                     shell_layer_height,
                     maximum_surface_z - transition_anchor_z +
@@ -5563,6 +6810,26 @@ void consolidate_nonplanar_top_surfaces(
                             !is_perimeter(path->role()) ||
                             path->nonplanar_clearance_validated)
                             return;
+                        const auto [minimum_z, maximum_z] = std::minmax_element(
+                            path->polyline.points.begin(),
+                            path->polyline.points.end(),
+                            [](const Point3 &left, const Point3 &right) {
+                                return left.z() < right.z();
+                            });
+                        // A wall which rounds to one fixed emitted Z is not a
+                        // surface-following transition.  Such candidates were
+                        // skipped by belongs_to_patch below (all relative Z
+                        // values were zero), retained their provisional
+                        // nonplanar metadata, and leaked out as detached
+                        // closed loops several millimetres above their last
+                        // real support. Preserve the slicer's authoritative
+                        // owner course and classification instead.
+                        if (minimum_z == path->polyline.points.end() ||
+                            maximum_z == path->polyline.points.end() ||
+                            maximum_z->z() - minimum_z->z() < scale_(0.001)) {
+                            restore_candidate_path_as_planar(*path);
+                            return;
+                        }
                         const bool belongs_to_patch = std::any_of(
                             path->polyline.points.begin(),
                             path->polyline.points.end(),
@@ -5582,8 +6849,14 @@ void consolidate_nonplanar_top_surfaces(
                                             .nonplanar_top_surface_min_height.value,
                                         0.01, double(layers[source_idx]->height)),
                                     1. / double(transition_shell_count),
+                                    maximum_surface_z,
                                     course->second.first,
                                     course->second.second)) {
+                                BOOST_LOG_TRIVIAL(debug)
+                                    << "Nonplanar patch " << patch_idx
+                                    << " wall projection failed: owner=" << source_idx
+                                    << " inset=" << path->inset_idx
+                                    << " role=" << int(path->role());
                                 retained_wall_projection_valid = false;
                                 return;
                             }
@@ -5956,32 +7229,69 @@ void consolidate_nonplanar_top_surfaces(
                 for (const auto &[path, source_idx] : retained_walls) {
                     if (!remote_obstacle_cache[source_idx])
                         remote_obstacle_cache[source_idx] = obstacle_prefix(source_idx);
+                    std::string clearance_failure;
                     if (generated_path_is_clear(
                             *path, layers[source_idx]->print_z,
-                            gantry, fallback, *remote_obstacle_cache[source_idx]))
+                            gantry, fallback, *remote_obstacle_cache[source_idx],
+                            &clearance_failure))
                         continue;
+                    BOOST_LOG_TRIVIAL(debug)
+                        << "Nonplanar patch " << patch_idx
+                        << " wall clearance failed: owner=" << source_idx
+                        << " inset=" << path->inset_idx
+                        << " role=" << int(path->role())
+                        << ' ' << clearance_failure;
                     retained_walls_clear = false;
                     break;
                 }
                 if (perimeter_only_patch && retained_walls_clear) {
-                    if (transition_anchor_layer == 0) {
-                        retained_walls_clear = false;
-                    } else {
-                        Polygons support_polygons;
-                        const LayerRegion &support_region =
-                            *layers[transition_anchor_layer - 1]
-                                 ->regions()[region_idx];
-                        collect_deposited_coverage(
-                            support_region.perimeters, support_polygons);
-                        collect_deposited_coverage(
-                            support_region.fills, support_polygons);
-                        const ExPolygons support = union_ex(support_polygons);
-                        for (const auto &[path, owner_idx] : retained_walls) {
-                            (void) owner_idx;
-                            if (!path_has_supported_run(*path, support)) {
-                                retained_walls_clear = false;
-                                break;
-                            }
+                    // A compact crown may span many nominal owners.  Testing
+                    // every projected ring against the single flat anchor
+                    // footprint made a much later ring look supported merely
+                    // because its XY happened to overlap the old hull.  The
+                    // resulting path could start several millimetres above
+                    // the most recently deposited material (the detached
+                    // Benchy stern loops were the real-world example).
+                    //
+                    // Validate each retained slicer course against the course
+                    // which will actually precede its owner.  This is still
+                    // the normal perimeter overhang policy -- short runs may
+                    // cantilever -- but an entire closed post-process ring can
+                    // no longer borrow support from an unrelated old layer.
+                    std::map<size_t, std::vector<const ExtrusionPath *>>
+                        support_by_owner;
+                    for (const auto &[path, owner_idx] : retained_walls) {
+                        if (owner_idx == 0) {
+                            retained_walls_clear = false;
+                            break;
+                        }
+                        auto found = support_by_owner.find(owner_idx);
+                        if (found == support_by_owner.end()) {
+                            const LayerRegion &support_region =
+                                *layers[owner_idx - 1]->regions()[region_idx];
+                            std::vector<const ExtrusionPath *> support_paths;
+                            collect_extrusion_path_references(
+                                support_region.perimeters, support_paths);
+                            collect_extrusion_path_references(
+                                support_region.fills, support_paths);
+                            found = support_by_owner.emplace(
+                                owner_idx, std::move(support_paths)).first;
+                        }
+                        // A compact feature is not exempt from the physical
+                        // support rule.  Coverage polygons discard the
+                        // relative Z of a previously contoured support path,
+                        // so a ring at the same XY could be accepted even
+                        // when the closest deposited bead was millimetres
+                        // below it.  This was the source of the detached
+                        // Benchy flag-hole/chimney rings. Validate against
+                        // the real 3D centerlines just like a surface patch.
+                        if (!nonplanar_walls_are_supported(
+                                *path, found->second,
+                                layers[owner_idx]->print_z,
+                                layers[owner_idx - 1]->print_z,
+                                raster_cache.doubly_curved)) {
+                            retained_walls_clear = false;
+                            break;
                         }
                     }
                     for (size_t path_idx = 0;
@@ -6028,33 +7338,41 @@ void consolidate_nonplanar_top_surfaces(
                 // footprint before replacing any conventional geometry.  A
                 // short unsupported run remains governed by normal overhang
                 // behavior; a long run rejects the patch atomically.
-                if (!perimeter_only_patch && retained_walls_clear) {
-                    if (transition_anchor_layer == 0) {
-                        retained_walls_clear = false;
-                    } else {
-                        Polygons support_polygons;
-                        const LayerRegion &support_region =
-                            *layers[transition_anchor_layer - 1]
-                                 ->regions()[region_idx];
-                        collect_deposited_coverage(
-                            support_region.perimeters, support_polygons);
-                        collect_deposited_coverage(
-                            support_region.fills, support_polygons);
-                        const ExPolygons support = union_ex(support_polygons);
-                        for (const auto &[path, owner_idx] : retained_walls) {
-                            if (owner_idx != transition_anchor_layer)
-                                continue;
-                            if (!path_has_supported_run(*path, support)) {
-                                retained_walls_clear = false;
-                                break;
-                            }
+                if (!perimeter_only_patch && retained_walls_clear &&
+                    !raster_cache.doubly_curved) {
+                    std::map<size_t, std::vector<const ExtrusionPath *>>
+                        support_by_owner;
+                    for (const auto &[path, owner_idx] : retained_walls) {
+                        if (owner_idx == 0) {
+                            retained_walls_clear = false;
+                            break;
+                        }
+                        auto found = support_by_owner.find(owner_idx);
+                        if (found == support_by_owner.end()) {
+                            const LayerRegion &support_region =
+                                *layers[owner_idx - 1]->regions()[region_idx];
+                            std::vector<const ExtrusionPath *> support_paths;
+                            collect_extrusion_path_references(
+                                support_region.perimeters, support_paths);
+                            collect_extrusion_path_references(
+                                support_region.fills, support_paths);
+                            found = support_by_owner.emplace(
+                                owner_idx, std::move(support_paths)).first;
+                        }
+                        if (!nonplanar_walls_are_supported(
+                                *path, found->second,
+                                layers[owner_idx]->print_z,
+                                layers[owner_idx - 1]->print_z,
+                                raster_cache.doubly_curved)) {
+                            retained_walls_clear = false;
+                            break;
                         }
                     }
                     if (!retained_walls_clear)
                         BOOST_LOG_TRIVIAL(debug)
                             << "Rejecting nonplanar patch " << patch_idx
-                            << ": its flat anchor wall has no continuous "
-                               "deposited support on the preceding course";
+                            << ": a connected wall course has no continuous "
+                               "deposited support on its preceding owner";
                 }
                 if (!retained_walls_clear) {
                     BOOST_LOG_TRIVIAL(debug)
@@ -6088,6 +7406,7 @@ void consolidate_nonplanar_top_surfaces(
                 // the commit pass clips them from the replacement volume.
                 std::vector<uint8_t> retained_wall_crosses_raster(
                     retained_walls.size(), 0);
+                bool retained_wall_topology_conflict = false;
                 std::vector<BoundingBox> retained_wall_bounds;
                 std::vector<std::pair<double, double>> retained_wall_z_bounds;
                 retained_wall_bounds.reserve(retained_walls.size());
@@ -6138,14 +7457,10 @@ void consolidate_nonplanar_top_surfaces(
                         if (!paths_have_proper_same_z_crossing(
                                 *wall, layers[source_idx]->print_z,
                                 *other, layers[other_source_idx]->print_z,
-                                0.05))
+                                0.05, 0.02))
                             continue;
                         retained_wall_crosses_raster[later_idx] = 1;
-                        ExtrusionPath *replaced =
-                            retained_walls[later_idx].first;
-                        replaced->nonplanar_clearance_validated = false;
-                        replaced->nonplanar_feature_transition = false;
-                        restore_candidate_path_as_planar(*replaced);
+                        retained_wall_topology_conflict = true;
                     }
                 for (size_t wall_idx = 0; wall_idx < retained_walls.size(); ++wall_idx) {
                     const auto &[wall, source_idx] = retained_walls[wall_idx];
@@ -6159,15 +7474,40 @@ void consolidate_nonplanar_top_surfaces(
                             if (paths_have_proper_same_z_crossing(
                                     *wall, layers[source_idx]->print_z,
                                     *raster, layers[shell.owner_layer]->print_z,
-                                    0.05)) {
+                                    0.05, 0.02)) {
                                 retained_wall_crosses_raster[wall_idx] = 1;
-                                wall->nonplanar_clearance_validated = false;
-                                wall->nonplanar_feature_transition = false;
-                                restore_candidate_path_as_planar(*wall);
+                                retained_wall_topology_conflict = true;
                                 break;
                             }
                         }
                     }
+                }
+                // The retained paths are the slicer's complete dimensional
+                // wall graph.  A crossing is not repairable by dropping one
+                // wall or relabeling it as planar: either choice commits a
+                // hybrid patch with a missing perimeter or an unchanged
+                // collision.  Keep patch replacement atomic and restore the
+                // conventional slice when its entire wall graph cannot be
+                // connected to the finishing skin without an overlap.
+                if (retained_wall_topology_conflict) {
+                    BOOST_LOG_TRIVIAL(debug)
+                        << "Rejecting nonplanar patch " << patch_idx
+                        << ": projected wall topology intersects another "
+                           "wall course or finishing raster";
+                    for (GeneratedShell &shell : shells)
+                        destroy_entities(shell.paths);
+                    for (const auto &[path, source_idx] : retained_walls) {
+                        (void) source_idx;
+                        path->nonplanar_clearance_validated = false;
+                        restore_candidate_path_as_planar(*path);
+                    }
+                    for (ExtrusionPath *path : added_transition_walls) {
+                        path->nonplanar_clearance_validated = false;
+                        restore_candidate_path_as_planar(*path);
+                    }
+                    enqueue_top_cap(
+                        patch, patch_idx, "connected wall topology rejection");
+                    continue;
                 }
                 // A continuing feature receives its matching sloped course
                 // immediately after the finishing skin. Dependency-aware
@@ -6183,6 +7523,36 @@ void consolidate_nonplanar_top_surfaces(
                 // aligned through the complete non-planar skin.
                 std::vector<size_t> ordered_path_indices;
                 ordered_path_indices.reserve(clear_path_count);
+                if (native_foundation) {
+                    // Course corrections and wall routing run after the
+                    // initial support test. Recheck the geometry we will emit
+                    // and ensure its planned thickness still matches the
+                    // native flat foundation before committing replacement.
+                    const GeneratedShell &first = shells[1];
+                    const double owner_z = layers[first.owner_layer]->print_z;
+                    bool supported = native_foundation_supports_course(
+                        first.paths, *layers[transition_anchor_layer]->regions()[region_idx],
+                        owner_z, layers[transition_anchor_layer]->print_z,
+                        minimum_course_height, maximum_course_height);
+                    for (const ExtrusionEntity *entity : first.paths) {
+                        std::vector<const ExtrusionPath *> paths;
+                        collect_extrusion_path_references(*entity, paths);
+                        for (const ExtrusionPath *path : paths)
+                            for (const Point3 &point : path->polyline.points) {
+                                const auto mesh_z = patch_surface_z_at_xy(patch, mesh, point.to_point());
+                                if (!mesh_z || std::abs(owner_z + unscale_(point.z()) -
+                                    (course_plan[1].plane_z + course_plan[1].blend *
+                                     (*mesh_z - mesh.ground_level() - maximum_surface_z))) > 0.001)
+                                    supported = false;
+                            }
+                    }
+                    if (!supported) {
+                        for (GeneratedShell &shell : shells)
+                            destroy_entities(shell.paths);
+                        enqueue_top_cap(patch, patch_idx, "native foundation does not support the corrected first course");
+                        continue;
+                    }
+                }
                 std::vector<uint8_t> path_unvisited = clear_at_every_depth;
                 Point current_endpoint;
                 bool have_current_endpoint = false;
@@ -6277,6 +7647,19 @@ void consolidate_nonplanar_top_surfaces(
                         return path_order_key(left) < path_order_key(right);
                     });
 
+                // Only the exposed course is a top skin. Every lower generated
+                // course is a geometric transition and must retain the normal
+                // structural density. Repeating the final top raster for the
+                // configured transition count turns the whole transition into
+                // solid plastic, consumes excessive material and carves away
+                // ordinary infill which should remain between its sparse rows.
+                // The same row phase is used on every deep course so each
+                // retained bead has direct support. Conventional material is
+                // carved from the model only after these actual emitted paths
+                // are known, so omitted rows leave the ordinary sliced infill
+                // in place rather than creating holes.
+                const size_t solid_shell_begin = surface_support_begin;
+
                 // Join neighboring, collision-safe scanlines into continuous
                 // serpentine paths. The connector is accepted only when it
                 // remains inside the same surface patch and clears unrelated
@@ -6290,20 +7673,23 @@ void consolidate_nonplanar_top_surfaces(
                     1.5 * std::max(double(top_template->width), resolution));
                 const double maximum_connector_squared =
                     double(maximum_connector) * double(maximum_connector);
+                const double maximum_connector_slope = std::tan(
+                    std::clamp(double(region_config.nonplanar_top_surface_max_angle.value),
+                               0., 89.) * M_PI / 180.);
                 for (size_t order_idx = 0;
                      order_idx + 1 < ordered_path_indices.size(); ++order_idx) {
                     const size_t path_idx = ordered_path_indices[order_idx];
                     const size_t next_path_idx = ordered_path_indices[order_idx + 1];
                     bool connector_is_clear = true;
                     for (GeneratedShell &shell : shells) {
+                        if (!is_emitted(shell.paths[path_idx]) || !is_emitted(shell.paths[next_path_idx]))
+                            continue;
                         auto *before = dynamic_cast<ExtrusionPath *>(shell.paths[path_idx]);
                         auto *after = dynamic_cast<ExtrusionPath *>(shell.paths[next_path_idx]);
                         if (before == nullptr || after == nullptr ||
                             before->role() != after->role() ||
                             before->inset_idx != after->inset_idx ||
-                            std::abs(before->width - after->width) > EPSILON ||
                             std::abs(before->height - after->height) > EPSILON ||
-                            std::abs(before->mm3_per_mm - after->mm3_per_mm) > EPSILON ||
                             before->first_point3() == before->last_point3() ||
                             after->first_point3() == after->last_point3() ||
                             (before->last_point3().to_point() -
@@ -6311,6 +7697,19 @@ void consolidate_nonplanar_top_surfaces(
                                 maximum_connector_squared) {
                             connector_is_clear = false;
                             break;
+                        }
+                        // Variable-width Arachne pieces still form one wall.
+                        // Preserve their individual flow in a multipath, but
+                        // only bridge endpoint-scale gaps, not separate walls.
+                        if (std::abs(before->width - after->width) > EPSILON ||
+                            std::abs(before->mm3_per_mm - after->mm3_per_mm) > EPSILON) {
+                            const Vec3d gap = (after->first_point3() - before->last_point3())
+                                .cast<double>() * SCALING_FACTOR;
+                            if (!is_perimeter(before->role()) || gap.norm() > 0.05 ||
+                                std::abs(gap.z()) > maximum_connector_slope * gap.head<2>().norm() + EPSILON) {
+                                connector_is_clear = false;
+                                break;
+                            }
                         }
                         const Line connector(
                             before->last_point3().to_point(),
@@ -6327,6 +7726,27 @@ void consolidate_nonplanar_top_surfaces(
                         connector_path.polyline.points = {
                             before->last_point3(), after->first_point3()};
                         connector_path.nonplanar_clearance_validated = false;
+                        const size_t course = size_t(&shell - shells.data());
+                        if (course > 0 && is_emitted(before) && is_emitted(after)) {
+                            const ExtrusionPaths parts = course_flow(course, connector_path);
+                            if (!std::all_of(parts.begin(), parts.end(), [&](const ExtrusionPath &part) {
+                                    return nonplanar_course_is_supported(part, course_supports[course],
+                                        layers[shell.owner_layer]->print_z, support_owner_z[course]);
+                                })) {
+                                connector_is_clear = false;
+                                break;
+                            }
+                        }
+                        if (native_foundation && &shell == &shells[1] &&
+                            !native_foundation_supports_course(
+                                ExtrusionEntitiesPtr{&connector_path},
+                                *layers[transition_anchor_layer]->regions()[region_idx],
+                                layers[shell.owner_layer]->print_z,
+                                layers[transition_anchor_layer]->print_z,
+                                minimum_course_height, maximum_course_height)) {
+                            connector_is_clear = false;
+                            break;
+                        }
                         // The connector is an extrusion, not a travel.  A
                         // short connector can remain inside the patch and
                         // clear the toolhead while still cutting across one
@@ -6401,21 +7821,37 @@ void consolidate_nonplanar_top_surfaces(
                     connector.polygons_covered_by_spacing(
                         patch_coverage_polygons, float(scale_(0.02)));
                 }
-                for (GeneratedShell &shell : shells) {
+                for (size_t shell_idx = 0; shell_idx < shells.size(); ++shell_idx) {
+                    GeneratedShell &shell = shells[shell_idx];
+                    if (native_foundation && shell_idx == 0)
+                        continue;
                     ExtrusionPath *chain = nullptr;
+                    ExtrusionPaths wall_parts;
+                    std::optional<size_t> previous_order_idx;
                     const auto flush_chain = [&]() {
                         if (chain == nullptr)
                             return;
                         chain->nonplanar_clearance_validated = true;
-                        if (is_perimeter(chain->role()) &&
-                            chain->first_point3() == chain->last_point3()) {
-                            const unsigned int inset_idx = chain->inset_idx;
-                            auto *loop = new ExtrusionLoop(std::move(*chain));
-                            loop->inset_idx = inset_idx;
+                        wall_parts.emplace_back(std::move(*chain));
+                        delete chain;
+                        ExtrusionPaths parts;
+                        for (const ExtrusionPath &part : wall_parts)
+                            append(parts, course_flow(shell_idx, part));
+                        wall_parts.clear();
+                        if (parts.empty())
+                            throw SlicingError("Non-planar course has no printable path");
+                        const int inset = parts.front().inset_idx;
+                        if (is_perimeter(parts.front().role()) &&
+                            parts.front().first_point3() == parts.back().last_point3()) {
+                            auto *loop = new ExtrusionLoop(std::move(parts));
+                            loop->inset_idx = inset;
                             generated_by_layer[shell.owner_layer].emplace_back(loop);
-                            delete chain;
+                        } else if (parts.size() > 1) {
+                            auto *multipath = new ExtrusionMultiPath(std::move(parts));
+                            multipath->inset_idx = inset;
+                            generated_by_layer[shell.owner_layer].emplace_back(multipath);
                         } else {
-                            generated_by_layer[shell.owner_layer].emplace_back(chain);
+                            generated_by_layer[shell.owner_layer].emplace_back(new ExtrusionPath(std::move(parts.front())));
                         }
                         chain = nullptr;
                         first_operation_layer = std::min(
@@ -6428,7 +7864,20 @@ void consolidate_nonplanar_top_surfaces(
                         const size_t path_idx = ordered_path_indices[order_idx];
                         auto *path = dynamic_cast<ExtrusionPath *>(shell.paths[path_idx]);
                         shell.paths[path_idx] = nullptr;
-                        if (chain != nullptr && merge_after[order_idx - 1]) {
+                        if (!is_emitted(path)) {
+                            flush_chain();
+                            previous_order_idx.reset();
+                            delete path;
+                            continue;
+                        }
+                        if (shell_idx + 1 < shells.size() &&
+                            !is_perimeter(path->role()))
+                            path->set_extrusion_role(
+                                shell_idx < solid_shell_begin ?
+                                    erInternalInfill : erSolidInfill);
+                        if (chain != nullptr && previous_order_idx &&
+                            *previous_order_idx + 1 == order_idx &&
+                            merge_after[*previous_order_idx]) {
                             const size_t original_point_count =
                                 chain->polyline.points.size();
                             chain->polyline.points.insert(
@@ -6444,14 +7893,37 @@ void consolidate_nonplanar_top_surfaces(
                             // extrusion by splitting the chain at this point;
                             // routing will insert a travel between the two
                             // genuinely disconnected paths.
+                            ExtrusionPath whole_wall;
+                            const ExtrusionPath *validation_path = chain;
+                            if (!wall_parts.empty()) {
+                                whole_wall = wall_parts.front();
+                                for (size_t part = 1; part < wall_parts.size(); ++part)
+                                    whole_wall.polyline.points.insert(whole_wall.polyline.points.end(),
+                                        wall_parts[part].polyline.points.begin() + 1,
+                                        wall_parts[part].polyline.points.end());
+                                whole_wall.polyline.points.insert(whole_wall.polyline.points.end(),
+                                    chain->polyline.points.begin() + 1, chain->polyline.points.end());
+                                validation_path = &whole_wall;
+                            }
                             if (path_has_proper_same_z_self_crossing(
-                                    *chain,
+                                    *validation_path,
                                     layers[shell.owner_layer]->print_z,
                                     0.05)) {
                                 chain->polyline.points.resize(
                                     original_point_count);
                                 flush_chain();
                                 chain = path;
+                            } else if (std::abs(chain->width - path->width) > EPSILON ||
+                                       std::abs(chain->mm3_per_mm - path->mm3_per_mm) > EPSILON) {
+                                chain->polyline.points.resize(original_point_count);
+                                const Point3 endpoint = chain->last_point3();
+                                chain->nonplanar_clearance_validated = true;
+                                wall_parts.emplace_back(std::move(*chain));
+                                delete chain;
+                                chain = path;
+                                if (endpoint != chain->first_point3())
+                                    chain->polyline.points.insert(chain->polyline.points.begin(), endpoint);
+                                chain->polyline.fitting_result.clear();
                             } else {
                                 delete path;
                             }
@@ -6459,6 +7931,7 @@ void consolidate_nonplanar_top_surfaces(
                             flush_chain();
                             chain = path;
                         }
+                        previous_order_idx = order_idx;
                     }
                     flush_chain();
                 }
@@ -6481,6 +7954,7 @@ void consolidate_nonplanar_top_surfaces(
                     }
                 ExPolygons patch_coverage = union_ex(patch_coverage_polygons);
                 if (!patch_coverage.empty()) {
+                    restore_wall_graph.reset();
                     if (!perimeter_only_patch) {
                         for (size_t wall_idx = 0;
                              wall_idx < retained_walls.size(); ++wall_idx) {
@@ -6541,7 +8015,7 @@ void consolidate_nonplanar_top_surfaces(
                             scale_(0.5 * std::max({
                                 nozzle_diameter, double(top_template->width),
                                 resolution}) + 0.05));
-                        for (size_t source_idx = transition_anchor_layer;
+                        for (size_t source_idx = transition_anchor_layer + size_t(native_foundation);
                              source_idx <= surface_owner; ++source_idx) {
                             const ExtrusionEntityCollection &perimeters =
                                 layers[source_idx]->regions()[region_idx]->perimeters;
@@ -6558,17 +8032,16 @@ void consolidate_nonplanar_top_surfaces(
                             break;
                         }
                     }
-                    // An attached chimney/boss participates in the same
-                    // physical course stack as the roof beneath it. Limiting
-                    // it to the configured top-shell count while the roof
-                    // adds more courses to respect the maximum local height
-                    // made the feature climb the complete height field in
-                    // much larger steps (0.3 mm on the Benchy roof above a
-                    // 0.2 mm process). Those rings cleared the toolhead but
-                    // had no deposited course underneath. Generate one
-                    // feature course for every non-foundation roof course;
-                    // the later leveling run still fades the slope before
-                    // handing back to the untouched planar feature.
+                    // An attached chimney/boss participates in the exact same
+                    // physical course stack as the roof beneath it. A separate
+                    // interpolation from the patch's global low/high Z range
+                    // assigned the feature rings to later owner layers than
+                    // the roof boundary they were meant to meet. The roof was
+                    // consequently emitted first, unsupported beside the
+                    // still-planar feature, and the delayed ring then crossed
+                    // it. Reuse each generated shell's authoritative owner,
+                    // depth and blend so both sides of the interface are
+                    // deposited together at the same physical height.
                     // A mesh contact may begin part-way through the roof's
                     // transition stack. Starting before its first real sliced
                     // perimeter makes the extracted course empty and causes
@@ -6582,30 +8055,18 @@ void consolidate_nonplanar_top_surfaces(
                     const size_t feature_shell_count = std::min(
                         shells.size() - 1, available_feature_courses);
                     feature_courses.reserve(feature_shell_count);
+                    const size_t first_feature_shell = std::max<size_t>(
+                        1, shells.size() - feature_shell_count);
                     for (size_t feature_idx = 0;
                          feature_idx < feature_shell_count; ++feature_idx) {
-                        // The conventional feature course on the flat anchor
-                        // remains as interval zero. Spread the sourced
-                        // transformed courses over the same number of
-                        // intervals as the complete roof stack; the first
-                        // synthetic leveling course then supplies the final
-                        // surface-to-planar handoff. Using the sourced-course
-                        // count as the denominator made the last few local
-                        // steps exceed one printable layer at the high side.
-                        const double feature_blend =
-                            double(feature_idx + 1) /
-                            double(feature_shell_count + 1);
-                        const double required_z = transition_anchor_z +
-                            feature_blend *
-                                (maximum_surface_z - transition_anchor_z);
+                        const GeneratedShell &shell =
+                            shells[first_feature_shell + feature_idx];
                         feature_courses.push_back({
-                            owner_layer_for_z(
-                                layers, run_begin, layers.size() - 1,
-                                required_z),
-                            total_shell_depth * (1. - feature_blend),
-                            feature_blend});
+                            shell.owner_layer, maximum_surface_z,
+                            shell.surface_depth,
+                            shell.blend});
                     }
-                    if (transition_anchor_layer > 0)
+                    if (!native_foundation && transition_anchor_layer > 0)
                         flatten_interlocking_wall_foundation(
                             layers[transition_anchor_layer - 1]
                                 ->regions()[region_idx]->perimeters,
@@ -6615,8 +8076,9 @@ void consolidate_nonplanar_top_surfaces(
                         std::move(feature_footprint), std::move(feature_courses),
                         surface_owner, transition_anchor_layer,
                         feature_source_begin,
-                        1. / double(transition_shell_count),
-                        patch_requires_early_emission});
+                        course_plan[1].blend,
+                        generated_surface_owns_boundary,
+                        patch_requires_early_emission, native_foundation});
                     emitted_patch_projections.push_back({
                         patch.projection, patch.minimum_z, patch.maximum_z});
                     for (const size_t face : patch.face_indices)
@@ -6735,6 +8197,17 @@ void consolidate_nonplanar_top_surfaces(
                         feature_course_snapshots[accepted_idx][source_idx]);
                 }
             }
+            std::vector<std::pair<const ExtrusionPath *, double>> finishing_paths;
+            for (size_t owner = 0; owner < generated_by_layer.size(); ++owner)
+                for (const ExtrusionEntity *entity : generated_by_layer[owner]) {
+                    std::vector<const ExtrusionPath *> paths;
+                    collect_extrusion_path_references(*entity, paths);
+                    for (const ExtrusionPath *path : paths)
+                        if (path->nonplanar_surface && !path->nonplanar_transition &&
+                            !path->nonplanar_feature_transition &&
+                            (path->role() == erTopSolidInfill || is_perimeter(path->role())))
+                            finishing_paths.emplace_back(path, layers[owner]->print_z);
+                }
             // Material replacement follows the exact height of the first
             // generated blend.  Clearance retains the wider physical shell
             // band used by the gantry checks, but it must never be reused to
@@ -6742,6 +8215,14 @@ void consolidate_nonplanar_top_surfaces(
             for (size_t source_idx = 1;
                  source_idx <= last_operation_layer; ++source_idx) {
                 LayerRegion &source = *layers[source_idx]->regions()[region_idx];
+                const bool is_transition_support_layer = std::any_of(
+                    accepted_patches.begin(), accepted_patches.end(),
+                    [source_idx](const AcceptedPatch &accepted) {
+                        return (accepted.transition_anchor_layer > 0 &&
+                                accepted.transition_anchor_layer - 1 == source_idx) ||
+                               (accepted.native_foundation &&
+                                accepted.transition_anchor_layer == source_idx);
+                    });
                 ExPolygons replacement_fill_area;
                 ExPolygons replacement_wall_area;
                 ExPolygons replacement_clearance_area;
@@ -6762,6 +8243,15 @@ void consolidate_nonplanar_top_surfaces(
                                    clearance_band,
                                    accepted_bead_clearance[accepted_idx]));
                     }
+                    // Do not remove every conventional wall throughout the
+                    // patch's global low-to-high owner range.  A sloped course
+                    // crosses many nominal Z planes, but most of those planar
+                    // walls are its staircase support rather than duplicate
+                    // boundary material.  The exact 3D bead-at-Z calculation
+                    // below removes only centerlines which physically share a
+                    // generated course.  The former broad subtraction deleted
+                    // all three wall insets below the bounded roof stack and
+                    // left its first course floating by several millimetres.
                 }
                 // Material replacement must be driven by the paths that will
                 // actually be deposited, not by the complete mesh projection
@@ -6802,11 +8292,39 @@ void consolidate_nonplanar_top_surfaces(
                     retained_wall_material, replacement_bead_margin));
                 append(replacement_wall_area, offset_ex(
                     retained_wall_material, replacement_bead_margin));
+                // The final mesh-following skin replaces the rounded-up
+                // planar cap above it, too. A symmetric center-Z comparison
+                // misses that cap when its nozzle plane lies more than the
+                // join tolerance above the true surface. Hybrid contouring
+                // subsequently lowers the leftover cap into the finished
+                // wall. Use a one-sided layer interval for finishing paths
+                // only; never remove the supporting course below the skin.
+                Polygons superseded_cap;
+                const double half_height = 0.5 * layers[source_idx]->height;
+                for (const auto &[path, owner_z] : finishing_paths)
+                    collect_generated_material_at_z(*path, owner_z,
+                        layers[source_idx]->print_z - half_height,
+                        half_height, false, superseded_cap);
+                const ExPolygons cap_coverage = offset_ex(
+                    union_ex(superseded_cap), replacement_bead_margin);
+                append(replacement_wall_area, cap_coverage);
+                append(replacement_fill_area, cap_coverage);
                 replacement_fill_area = union_ex(replacement_fill_area);
                 replacement_wall_area = union_ex(replacement_wall_area);
                 replacement_clearance_area =
                     union_ex(replacement_clearance_area);
-                if (!replacement_fill_area.empty())
+                // The course immediately below a patch's flat anchor is the
+                // support that was used by its bead-to-bead acceptance test.
+                // Never carve it after acceptance. Generated-material-at-Z
+                // may include a retained provisional wall descending into
+                // this nominal plane; using that later path as a replacement
+                // mask deleted the already validated support and turned an
+                // initially sound foundation into a floating G-code ring.
+                // It is one normal layer below the generated foundation, so
+                // preserving the complete conventional course is the same
+                // dependency rule used by ordinary top-solid printing.
+                if (!is_transition_support_layer &&
+                    !replacement_fill_area.empty())
                     remove_nonplanar_top_overlap(
                         source.fills, replacement_fill_area);
                 if (!replacement_clearance_area.empty()) {
@@ -6842,7 +8360,8 @@ void consolidate_nonplanar_top_surfaces(
                     // The exact first-shell footprint keeps the immediately
                     // preceding wall course while still removing stair walls
                     // that share or overlie the generated shell's physical Z.
-                    if (!replacement_wall_area.empty())
+                    if (!is_transition_support_layer &&
+                        !replacement_wall_area.empty())
                         remove_nonplanar_top_overlap(
                             source.perimeters, replacement_wall_area);
                 }
@@ -6871,6 +8390,10 @@ void consolidate_nonplanar_top_surfaces(
                     bool wall = false;
                     if (const auto *path = dynamic_cast<const ExtrusionPath *>(entity))
                         wall = is_perimeter(path->role());
+                    else if (const auto *multipath = dynamic_cast<const ExtrusionMultiPath *>(entity))
+                        wall = !multipath->paths.empty() && std::all_of(
+                            multipath->paths.begin(), multipath->paths.end(),
+                            [](const ExtrusionPath &path) { return is_perimeter(path.role()); });
                     else if (const auto *loop = dynamic_cast<const ExtrusionLoop *>(entity))
                         wall = !loop->paths.empty() && std::all_of(
                             loop->paths.begin(), loop->paths.end(),
@@ -7113,8 +8636,6 @@ void consolidate_nonplanar_top_surfaces(
 
                 size_t warped_count = 0;
                 bool projection_succeeded = true;
-                const double planar_feature_support_z =
-                    layers[first_source - 1]->print_z;
                 for (size_t course_idx = 0;
                      course_idx < surface_course_count; ++course_idx) {
                     DeferredCourse &source = courses[course_idx];
@@ -7129,9 +8650,10 @@ void consolidate_nonplanar_top_surfaces(
                         course_warped += warp_feature_entity_to_surface(
                             *entity, accepted.feature_footprint, patch, mesh,
                             owner_z,
-                            planar_feature_support_z +
-                                double(course_idx) * shell_layer_height,
-                            local_surface_z, destination.blend,
+                            destination.surface_reference_z -
+                                destination.surface_depth,
+                            destination.surface_reference_z,
+                            destination.blend,
                             accepted.before_current_layer, course_idx + 1,
                             &layers, accepted.transition_anchor_layer);
                     }
@@ -7140,9 +8662,10 @@ void consolidate_nonplanar_top_surfaces(
                         course_warped += warp_feature_entity_to_surface(
                             *entity, accepted.feature_footprint, patch, mesh,
                             owner_z,
-                            planar_feature_support_z +
-                                double(course_idx) * shell_layer_height,
-                            local_surface_z, destination.blend,
+                            destination.surface_reference_z -
+                                destination.surface_depth,
+                            destination.surface_reference_z,
+                            destination.blend,
                             accepted.before_current_layer, course_idx + 1,
                             &layers, accepted.transition_anchor_layer);
                     }
@@ -7539,6 +9062,18 @@ void consolidate_nonplanar_top_surfaces(
                     }
                 }
 
+                // Boundary-contact corrections above may flatten a locally
+                // horizontal bore or boss ring after its initial projection.
+                // Normalize metadata only after those corrections so preview
+                // and scheduling never advertise a fixed-Z closed loop as a
+                // non-planar transition.
+                for (DeferredCourse &course : courses) {
+                    for (ExtrusionEntity *entity : course.perimeters)
+                        normalize_fixed_feature_transition(*entity);
+                    for (ExtrusionEntity *entity : course.fills)
+                        normalize_fixed_feature_transition(*entity);
+                }
+
                 // Validate the transformed courses against the same generic
                 // gantry model used for the skin. The local patch is excluded
                 // from the obstacle set because it supports these courses;
@@ -7713,6 +9248,7 @@ void consolidate_nonplanar_top_surfaces(
                                     for (Point3 &point : path->polyline.points)
                                         point.z() -= scale_(0.01);
                                     path->polyline.fitting_result.clear();
+                                    normalize_fixed_feature_transition(*path);
                                     return true;
                                 }
                                 if (auto *multipath =
@@ -7780,6 +9316,12 @@ void consolidate_nonplanar_top_surfaces(
                     // owner, terminate accepted top paths at the validated
                     // wall bead. Perimeters and lower support courses are not
                     // touched here.
+                    // These masks describe conventional fill at its owner Z,
+                    // not the varying height of an accepted surface chain.
+                    // Cutting that chain by XY alone removes unrelated height
+                    // samples and leaves isolated variable-flow fragments.
+                    // Preserve accepted courses; feature-to-skin clearance
+                    // must be resolved by the preceding 3D validation.
                     for (const DeferredCourse &course : courses) {
                         Polygons course_wall_material;
                         for (const ExtrusionEntity *entity : course.perimeters)
@@ -7797,7 +9339,7 @@ void consolidate_nonplanar_top_surfaces(
                                 layers[course.destination_layer]
                                     ->regions()[region_idx]
                                     ->fills,
-                                course_wall_coverage, false, false);
+                                course_wall_coverage);
                     }
 
                     // Dependency deferral happens after the main replacement
@@ -7841,7 +9383,7 @@ void consolidate_nonplanar_top_surfaces(
                                 layers[source_idx]
                                     ->regions()[region_idx]
                                     ->fills,
-                                wall_coverage, false, false);
+                                wall_coverage);
                             // The initial marking/roof pass may leave a
                             // conventional stair-wall fragment in the same
                             // physical band even when the complete feature
@@ -7852,12 +9394,38 @@ void consolidate_nonplanar_top_surfaces(
                             // emitting a second planar chimney ring beside or
                             // through the deferred wall while preserving all
                             // perimeter material outside the local handoff.
-                            remove_nonplanar_top_overlap(
-                                layers[source_idx]
-                                    ->regions()[region_idx]
-                                    ->perimeters,
-                                wall_coverage);
                         }
+                        // A raised brick wall does not occupy source_z. Query
+                        // replacement ownership at its actual course height,
+                        // separately from nominal walls/fill; using the nominal
+                        // band left duplicate chimney arcs at a 50% offset.
+                        std::map<coord_t, ExPolygons> coverage_by_offset{{0, wall_coverage}};
+                        const std::function<ExPolygons(const ExtrusionPath &)> coverage_at_path =
+                            [&](const ExtrusionPath &path) {
+                                coord_t offset = 0;
+                                if (path.z_contoured && !path.polyline.points.empty() &&
+                                    std::all_of(path.polyline.points.begin(), path.polyline.points.end(),
+                                        [&](const Point3 &point) {
+                                            return point.z() == path.polyline.points.front().z();
+                                        }))
+                                    offset = path.polyline.points.front().z();
+                                auto found = coverage_by_offset.find(offset);
+                                if (found == coverage_by_offset.end()) {
+                                    Polygons physical_material;
+                                    for (const DeferredCourse &course : courses)
+                                        for (const ExtrusionEntity *entity : course.perimeters)
+                                            collect_generated_material_at_z(*entity,
+                                                layers[course.destination_layer]->print_z,
+                                                source_z + unscale_(offset),
+                                                feature_fill_z_tolerance, false, physical_material);
+                                    found = coverage_by_offset.emplace(offset,
+                                        offset_ex(union_ex(physical_material), scale_(0.05))).first;
+                                }
+                                return found->second;
+                            };
+                        remove_nonplanar_top_overlap(
+                            layers[source_idx]->regions()[region_idx]->perimeters,
+                            wall_coverage, false, true, &coverage_at_path);
                     }
                 }
 
@@ -7894,15 +9462,36 @@ void consolidate_nonplanar_top_surfaces(
                             restore_deferred_feature(*entity);
                         for (ExtrusionEntity *entity : course.fills)
                             restore_deferred_feature(*entity);
+                    } else {
+                        // Boundary adoption and overlap cleanup above are the
+                        // last operations allowed to alter Z. They may flatten
+                        // a locally horizontal bore/boss ring after the first
+                        // normalization pass. Normalize again at commit time
+                        // so fixed-Z feature walls retain dependency ordering
+                        // without being mislabeled as non-planar transitions.
+                        for (ExtrusionEntity *entity : course.perimeters)
+                            normalize_fixed_feature_transition(*entity);
+                        for (ExtrusionEntity *entity : course.fills)
+                            normalize_fixed_feature_transition(*entity);
                     }
                     LayerRegion &region = *layers[owner]->regions()[region_idx];
                     append_ordered_entities(
                         region.perimeters, std::move(course.perimeters), 0);
                     append_ordered_entities(
                         region.fills, std::move(course.fills), 0);
-                    if (clearance_valid)
+                    if (clearance_valid) {
+                        // An adopted boundary lives in the destination
+                        // region, not necessarily in course.perimeters.
+                        // Normalize the committed graph as well so every
+                        // fixed-Z feature ring is classified consistently
+                        // regardless of which side owned the splice.
+                        for (ExtrusionEntity *entity : region.perimeters.entities)
+                            normalize_fixed_feature_transition(*entity);
+                        for (ExtrusionEntity *entity : region.fills.entities)
+                            normalize_fixed_feature_transition(*entity);
                         last_operation_layer = std::max(
                             last_operation_layer, course.destination_layer);
+                    }
                 }
                 BOOST_LOG_TRIVIAL(debug) << "Nonplanar patch "
                                          << accepted.patch_index << " deferred "
@@ -7960,6 +9549,7 @@ void consolidate_nonplanar_top_surfaces(
         BoundingBox bounds;
         double minimum_z;
         double maximum_z;
+        ExtrusionEntity *continuous_wall = nullptr;
     };
     for (size_t region_idx = 0; region_idx < region_count; ++region_idx) {
         std::vector<FinalNonplanarWall> walls;
@@ -7968,11 +9558,17 @@ void consolidate_nonplanar_top_surfaces(
         size_t final_crossing_count = 0;
         const auto collect_walls = [&](auto &&self, ExtrusionEntity &entity,
                                        size_t owner,
-                                       bool scheduled_nonplanar) -> void {
+                                       bool scheduled_nonplanar,
+                                       ExtrusionEntity *continuous_wall) -> void {
             if (auto *path = dynamic_cast<ExtrusionPath *>(&entity)) {
                 if (!is_perimeter(path->role()) ||
                     path->polyline.points.size() < 2)
                     return;
+                // Native Arachne paths may keep their inset only on the
+                // parent. All final support/collision comparisons below use
+                // the child field, including comparisons with unwarped walls.
+                if (continuous_wall != nullptr && continuous_wall->inset_idx >= 0)
+                    path->inset_idx = continuous_wall->inset_idx;
                 double minimum_z = std::numeric_limits<double>::max();
                 double maximum_z = std::numeric_limits<double>::lowest();
                 for (const Point3 &point : path->polyline.points) {
@@ -7980,10 +9576,23 @@ void consolidate_nonplanar_top_surfaces(
                     minimum_z = std::min(minimum_z, z);
                     maximum_z = std::max(maximum_z, z);
                 }
+                // Recheck this invariant on the final graph.  A candidate may
+                // have had a real Z span when it was selected, then collapse
+                // onto one owner height while blending from planar support or
+                // separating dependency courses.  Keeping the provisional
+                // non-planar flag in that state schedules an otherwise
+                // ordinary closed wall after the layer, with a retract and a
+                // clearance travel.  That is the detached fixed-Z loop seen
+                // around the Benchy stern.  A perimeter with no emitted Z
+                // variation belongs to its normal owner-layer wall graph.
+                if (path->nonplanar_surface &&
+                    maximum_z - minimum_z < 0.001)
+                    normalize_fixed_feature_transition(*path);
                 const BoundingBox bounds =
                     path->polyline.to_polyline().bounding_box();
                 if (path->nonplanar_surface || scheduled_nonplanar)
-                    walls.push_back({path, owner, bounds, minimum_z, maximum_z});
+                    walls.push_back({path, owner, bounds, minimum_z, maximum_z,
+                                     continuous_wall ? continuous_wall : path});
                 if (!path->nonplanar_surface)
                     conventional_walls.push_back(
                         {path, owner, bounds, minimum_z, maximum_z});
@@ -7996,7 +9605,7 @@ void consolidate_nonplanar_top_surfaces(
                             return path.nonplanar_surface;
                         });
                 for (ExtrusionPath &path : multipath->paths)
-                    self(self, path, owner, emitted_nonplanar);
+                    self(self, path, owner, emitted_nonplanar, &entity);
             } else if (auto *loop = dynamic_cast<ExtrusionLoop *>(&entity)) {
                 const bool emitted_nonplanar = scheduled_nonplanar ||
                     std::any_of(
@@ -8005,17 +9614,39 @@ void consolidate_nonplanar_top_surfaces(
                             return path.nonplanar_surface;
                         });
                 for (ExtrusionPath &path : loop->paths)
-                    self(self, path, owner, emitted_nonplanar);
+                    self(self, path, owner, emitted_nonplanar, &entity);
             } else if (auto *collection =
                            dynamic_cast<ExtrusionEntityCollection *>(&entity)) {
                 for (ExtrusionEntity *child : collection->entities)
-                    self(self, *child, owner, scheduled_nonplanar);
+                    self(self, *child, owner, scheduled_nonplanar, nullptr);
             }
         };
-        for (size_t owner = 0; owner < layers.size(); ++owner)
+        for (size_t owner = 0; owner < layers.size(); ++owner) {
             collect_walls(
                 collect_walls,
-                layers[owner]->regions()[region_idx]->perimeters, owner, false);
+                layers[owner]->regions()[region_idx]->perimeters, owner, false, nullptr);
+            // Arachne outlines generated with the finishing skin are stored
+            // in fills while retaining perimeter roles. They participate in
+            // the same physical wall graph and must be visible to duplicate
+            // and crossing arbitration.
+            collect_walls(
+                collect_walls,
+                layers[owner]->regions()[region_idx]->fills, owner, false, nullptr);
+        }
+        // Arachne changes width by splitting one continuous wall into paths.
+        // Clearance translations must move that wall atomically: lifting just
+        // one child creates a vertical travel at its formerly shared endpoint.
+        const auto shift_wall = [&](FinalNonplanarWall &wall, double distance) {
+            const coord_t delta = coord_t(std::ceil(scale_(distance)));
+            offset_entity_z(*wall.continuous_wall, delta);
+            normalize_fixed_feature_transition(*wall.continuous_wall);
+            for (FinalNonplanarWall &part : walls)
+                if (part.continuous_wall == wall.continuous_wall) {
+                    part.path->polyline.fitting_result.clear();
+                    part.minimum_z += unscale_(delta);
+                    part.maximum_z += unscale_(delta);
+                }
+        };
         const auto collect_top_paths = [&](auto &&self,
                                            ExtrusionEntity &entity,
                                            size_t owner) -> void {
@@ -8725,11 +10356,7 @@ void consolidate_nonplanar_top_surfaces(
                             *top.path, layers[top.owner]->print_z, 0.05))
                         continue;
                     constexpr double feature_skin_clearance = 0.061;
-                    for (Point3 &point : feature.path->polyline.points)
-                        point.z() += scale_(feature_skin_clearance);
-                    feature.path->polyline.fitting_result.clear();
-                    feature.minimum_z += feature_skin_clearance;
-                    feature.maximum_z += feature_skin_clearance;
+                    shift_wall(feature, feature_skin_clearance);
                     repaired = true;
                     break;
                 }
@@ -8796,14 +10423,23 @@ void consolidate_nonplanar_top_surfaces(
         // count bounds convergence without turning malformed input into an
         // unbounded repair loop.
         const size_t maximum_repairs = std::max<size_t>(32, 4 * walls.size());
+        // Repairs below only change Z or clear a path; XY bounds and vector
+        // indices remain fixed. Cache the broad-phase pairs once, in exactly
+        // the original scan order, instead of repeating the same XY tests
+        // after every contact. Z and exact crossings must still be rechecked.
+        std::vector<std::vector<size_t>> wall_candidates(walls.size());
+        for (size_t left = 0; left < walls.size(); ++left)
+            for (size_t right = left + 1; right < walls.size(); ++right)
+                if (bounds_overlap_with_tolerance(
+                        walls[left].bounds, walls[right].bounds, scale_(0.05)))
+                    wall_candidates[left].push_back(right);
         for (size_t repair = 0; repair < maximum_repairs; ++repair) {
             bool repaired = false;
             for (size_t left = 0; left < walls.size() && !repaired; ++left) {
                 if (walls[left].path->polyline.points.size() < 2)
                     continue;
-                for (size_t right = left + 1; right < walls.size(); ++right) {
+                for (size_t right : wall_candidates[left]) {
                     if (walls[right].path->polyline.points.size() < 2 ||
-                        !walls[left].bounds.overlap(walls[right].bounds) ||
                         walls[left].minimum_z > walls[right].maximum_z + 0.05 ||
                         walls[right].minimum_z > walls[left].maximum_z + 0.05 ||
                         !paths_have_proper_same_z_crossing(
@@ -8839,11 +10475,7 @@ void consolidate_nonplanar_top_surfaces(
                                          walls[right].path->nonplanar_feature_course ?
                             left : right;
                         constexpr double repair_clearance = 0.061;
-                        for (Point3 &point : walls[victim].path->polyline.points)
-                            point.z() += scale_(repair_clearance);
-                        walls[victim].path->polyline.fitting_result.clear();
-                        walls[victim].minimum_z += repair_clearance;
-                        walls[victim].maximum_z += repair_clearance;
+                        shift_wall(walls[victim], repair_clearance);
                     } else {
                         // Two unrelated paths are not an ordered feature
                         // stack. A proper centerline crossing is a duplicate
@@ -8960,11 +10592,53 @@ void consolidate_nonplanar_top_surfaces(
             }
             if (required_shift <= EPSILON)
                 continue;
-            for (Point3 &point : higher.path->polyline.points)
-                point.z() += scale_(required_shift);
-            higher.path->polyline.fitting_result.clear();
-            higher.minimum_z += required_shift;
-            higher.maximum_z += required_shift;
+            shift_wall(higher, required_shift);
+        }
+        // The dependency propagation above enforces bead support against the
+        // immediately preceding course, but that upward translation can make
+        // the settled course cross a non-adjacent course on a curved feature.
+        // Re-run same-inset arbitration after propagation. Always move the
+        // later dependency course upward, preserving the already deposited
+        // support and converging monotonically instead of deleting a real
+        // chimney/boss wall.
+        const size_t maximum_settled_repairs =
+            std::max<size_t>(32, 4 * walls.size());
+        for (size_t repair = 0; repair < maximum_settled_repairs; ++repair) {
+            bool repaired = false;
+            for (size_t left = 0; left < walls.size() && !repaired; ++left) {
+                if (walls[left].path->polyline.points.size() < 2)
+                    continue;
+                for (size_t right = left + 1; right < walls.size(); ++right) {
+                    if (walls[right].path->polyline.points.size() < 2 ||
+                        walls[left].path->inset_idx !=
+                            walls[right].path->inset_idx ||
+                        !bounds_overlap_with_tolerance(
+                            walls[left].bounds, walls[right].bounds,
+                            scale_(0.05)) ||
+                        walls[left].minimum_z > walls[right].maximum_z + 0.05 ||
+                        walls[right].minimum_z > walls[left].maximum_z + 0.05 ||
+                        !paths_have_proper_same_z_crossing(
+                            *walls[left].path, layers[walls[left].owner]->print_z,
+                            *walls[right].path, layers[walls[right].owner]->print_z,
+                            0.05))
+                        continue;
+                    FinalNonplanarWall &later =
+                        walls[left].path->nonplanar_feature_transition !=
+                                walls[right].path->nonplanar_feature_transition ?
+                            (walls[left].path->nonplanar_feature_transition ?
+                                walls[left] : walls[right]) :
+                            (walls[left].path->nonplanar_feature_course >
+                                    walls[right].path->nonplanar_feature_course ?
+                                walls[left] : walls[right]);
+                    constexpr double settled_repair_clearance = 0.061;
+                    shift_wall(later, settled_repair_clearance);
+                    ++final_crossing_count;
+                    repaired = true;
+                    break;
+                }
+            }
+            if (!repaired)
+                break;
         }
         // Brick/interlocking metadata can give neighboring insets different
         // height profiles. The upward dependency propagation above may make
@@ -9029,7 +10703,6 @@ void consolidate_nonplanar_top_surfaces(
                 break;
             }
         }
-        conventional_walls.clear();
         // Z corrections may bring a transformed feature boundary into a
         // conventional stair fragment after the patch-local handoff clipping
         // has run. Reapply that same physical-Z material subtraction to the
@@ -9037,30 +10710,190 @@ void consolidate_nonplanar_top_surfaces(
         // clipping helper; only conventional centerline portions occupying a
         // transformed bead envelope are removed, so a partial planar wall is
         // joined to the feature instead of deleting its complete loop.
-        std::vector<ExPolygons> settled_feature_coverage(layers.size());
-        for (size_t owner = 0; owner < layers.size(); ++owner) {
-            Polygons material;
-            const double source_z = layers[owner]->print_z;
-            for (const FinalNonplanarWall &feature : walls) {
-                if (!feature.path->nonplanar_feature_transition ||
-                    feature.path->polyline.points.size() < 2)
-                    continue;
-                collect_generated_material_at_z(
-                    *feature.path, layers[feature.owner]->print_z, source_z,
-                    0.05, false, material);
+        // Build every mask before clipping: `walls` points into collections
+        // which clipping replaces. Brick courses occupy their raised physical
+        // plane, not the nominal owner plane used by ordinary perimeters.
+        std::vector<std::map<coord_t, ExPolygons>> settled_feature_coverage(layers.size());
+        // A 2D mask at one Z cannot represent an interlocking wall. Subtract
+        // its actual contact intervals instead, retaining XYZ and extrusion
+        // metadata and joining consecutive untouched pieces back together.
+        std::map<const ExtrusionPath *, ExtrusionPaths> variable_wall_replacements;
+        std::vector<bool> variable_wall_changed(layers.size(), false);
+        for (const FinalNonplanarWall &wall : conventional_walls) {
+            const ExtrusionPath &path = *wall.path;
+            if (!path.z_contoured || path.polyline.points.size() < 2 ||
+                std::all_of(path.polyline.points.begin(), path.polyline.points.end(),
+                    [&](const Point3 &point) { return point.z() == path.polyline.points.front().z(); }))
+                continue;
+            ExtrusionPaths fragments;
+            bool changed = false;
+            for (size_t idx = 1; idx < path.polyline.points.size(); ++idx) {
+                const Point3 &first = path.polyline.points[idx - 1];
+                const Point3 &last = path.polyline.points[idx];
+                Vec3d a = first.cast<double>() * SCALING_FACTOR;
+                Vec3d b = last.cast<double>() * SCALING_FACTOR;
+                a.z() += layers[wall.owner]->print_z;
+                b.z() += layers[wall.owner]->print_z;
+                std::vector<std::pair<double, double>> covered;
+                for (const FinalNonplanarWall &feature : walls) {
+                    const bool coincident = feature.path->nonplanar_feature_transition ||
+                        (feature.path->nonplanar_surface &&
+                         (path.staggered_perimeter || path.staggered_transition || path.nonplanar_interlocking_wall));
+                    const bool underpass = feature.path->nonplanar_surface &&
+                        (feature.owner > wall.owner ||
+                         (feature.owner == wall.owner && !feature.path->nonplanar_before_current_layer));
+                    const double maximum_underpass = layers[wall.owner]->height - 0.02;
+                    if ((!coincident && !underpass) ||
+                        feature.maximum_z < wall.minimum_z -
+                            (underpass ? std::max(0.05, maximum_underpass) : 0.05) ||
+                        feature.minimum_z > wall.maximum_z + 0.05 ||
+                        !feature.bounds.inflated(scale_(0.5 * feature.path->width + 0.05)).overlap(wall.bounds))
+                        continue;
+                    const Points3 &points = feature.path->polyline.points;
+                    for (size_t j = 1; j < points.size(); ++j) {
+                        Vec3d c = points[j - 1].cast<double>() * SCALING_FACTOR;
+                        Vec3d d = points[j].cast<double>() * SCALING_FACTOR;
+                        c.z() += layers[feature.owner]->print_z;
+                        d.z() += layers[feature.owner]->print_z;
+                        const double xy_tolerance = 0.5 * feature.path->width + 0.05;
+                        if (coincident) {
+                            const auto intervals = nonplanar_segment_overlap(a, b, c, d,
+                                xy_tolerance, 0.05);
+                            covered.insert(covered.end(), intervals.begin(), intervals.end());
+                        }
+                        if (underpass && maximum_underpass > 0.05) {
+                            Vec3d lower_a = a, lower_b = b;
+                            lower_a.z() -= 0.5 * (maximum_underpass + 0.05);
+                            lower_b.z() -= 0.5 * (maximum_underpass + 0.05);
+                            const auto intervals = nonplanar_segment_overlap(lower_a, lower_b, c, d,
+                                xy_tolerance, 0.5 * (maximum_underpass - 0.05));
+                            covered.insert(covered.end(), intervals.begin(), intervals.end());
+                        }
+                    }
+                }
+                std::sort(covered.begin(), covered.end());
+                const auto append_interval = [&](double begin, double end) {
+                    if (end <= begin + 1e-12)
+                        return;
+                    const auto point_at = [&](double t) -> Point3 {
+                        const Vec3d point = first.cast<double>() + t * (last - first).cast<double>();
+                        return Point3(coord_t(std::llround(point.x())),
+                                      coord_t(std::llround(point.y())),
+                                      coord_t(std::llround(point.z())));
+                    };
+                    const Point3 start = point_at(begin), finish = point_at(end);
+                    if (start == finish)
+                        return;
+                    if (!fragments.empty() && fragments.back().polyline.points.back() == start)
+                        fragments.back().polyline.points.push_back(finish);
+                    else {
+                        fragments.emplace_back(path);
+                        fragments.back().polyline.points = {start, finish};
+                        fragments.back().polyline.fitting_result.clear();
+                    }
+                };
+                double cursor = 0.;
+                for (const auto &[begin, end] : covered) {
+                    append_interval(cursor, begin);
+                    cursor = std::max(cursor, end);
+                    changed = true;
+                }
+                append_interval(cursor, 1.);
             }
-            if (!material.empty())
-                settled_feature_coverage[owner] = offset_ex(
-                    union_ex(material), scale_(0.05));
+            if (changed) {
+                // A cut away from the old seam leaves one surviving arc
+                // across that seam, not two disconnected extrusion paths.
+                if (fragments.size() > 1 &&
+                    fragments.back().polyline.points.back() == fragments.front().polyline.points.front()) {
+                    Points3 joined = std::move(fragments.back().polyline.points);
+                    const Points3 &head = fragments.front().polyline.points;
+                    joined.insert(joined.end(), std::next(head.begin()), head.end());
+                    fragments.front().polyline.points = std::move(joined);
+                    fragments.pop_back();
+                }
+                for (ExtrusionPath &fragment : fragments)
+                    fragment.nonplanar_replacement_remainder = true;
+                variable_wall_replacements.emplace(&path, std::move(fragments));
+                variable_wall_changed[wall.owner] = true;
+            }
         }
-        for (size_t owner = 0; owner < layers.size(); ++owner)
-            if (!settled_feature_coverage[owner].empty())
+        const auto course_offset = [](const ExtrusionPath &path) -> coord_t {
+            if (!path.z_contoured || path.polyline.points.empty())
+                return 0;
+            const coord_t offset = path.polyline.points.front().z();
+            return std::all_of(path.polyline.points.begin(), path.polyline.points.end(),
+                [offset](const Point3 &point) { return point.z() == offset; }) ? offset : 0;
+        };
+        for (const FinalNonplanarWall &wall : conventional_walls)
+            settled_feature_coverage[wall.owner].try_emplace(course_offset(*wall.path));
+        conventional_walls.clear();
+        for (size_t owner = 0; owner < layers.size(); ++owner) {
+            for (auto &[offset, coverage] : settled_feature_coverage[owner]) {
+                Polygons material;
+                const double source_z = layers[owner]->print_z + unscale_(offset);
+                for (const FinalNonplanarWall &feature : walls) {
+                    if ((!feature.path->nonplanar_feature_transition &&
+                         !(offset != 0 && feature.path->nonplanar_surface)) ||
+                        feature.path->polyline.points.size() < 2)
+                        continue;
+                    collect_generated_material_at_z(
+                        *feature.path, layers[feature.owner]->print_z, source_z,
+                        0.05, false, material);
+                }
+                if (!material.empty())
+                    coverage = offset_ex(union_ex(material), scale_(0.05));
+                // Test the settled graph, after feature extraction and wall
+                // adoption. A conventional stair wall printed before a lower
+                // draped wall must not remain inside its bead footprint. Do
+                // not apply this subtraction to a normal supporting course
+                // below the draped path or to a later, correctly stacked wall.
+                Polygons underpass_material;
+                const double maximum_underpass = layers[owner]->height - 0.02;
+                if (maximum_underpass > 0.05)
+                    for (const FinalNonplanarWall &surface : walls) {
+                        if (!surface.path->nonplanar_surface ||
+                            surface.owner < owner ||
+                            (surface.owner == owner && surface.path->nonplanar_before_current_layer))
+                            continue;
+                        // Match the finite-endpoint radius of the XYZ overlap
+                        // test. Butt caps leave stair-wall tips just beyond a
+                        // draped segment's endpoint inside the nozzle footprint.
+                        collect_generated_material_at_z(*surface.path,
+                            layers[surface.owner]->print_z,
+                            source_z - 0.5 * (maximum_underpass + 0.05),
+                            0.5 * (maximum_underpass - 0.05), false,
+                            underpass_material, true);
+                    }
+                if (!underpass_material.empty()) {
+                    append(coverage, offset_ex(union_ex(underpass_material), scale_(0.05)));
+                    coverage = union_ex(coverage);
+                }
+            }
+        }
+        for (size_t owner = 0; owner < layers.size(); ++owner) {
+            const std::function<ExPolygons(const ExtrusionPath &)> coverage_at_path =
+                [&](const ExtrusionPath &path) {
+                    if (path.z_contoured && !path.polyline.points.empty() &&
+                        std::any_of(path.polyline.points.begin(), path.polyline.points.end(),
+                            [&](const Point3 &point) { return point.z() != path.polyline.points.front().z(); }))
+                        return ExPolygons{}; // Already checked against the physical 3D segments.
+                    const auto found = settled_feature_coverage[owner].find(course_offset(path));
+                    return found == settled_feature_coverage[owner].end() ? ExPolygons{} : found->second;
+                };
+            if (variable_wall_changed[owner] || std::any_of(settled_feature_coverage[owner].begin(),
+                            settled_feature_coverage[owner].end(),
+                            [](const auto &entry) { return !entry.second.empty(); }))
                 remove_nonplanar_top_overlap(
                     layers[owner]->regions()[region_idx]->perimeters,
-                    settled_feature_coverage[owner]);
-        for (size_t owner = 0; owner < layers.size(); ++owner)
+                    {}, false, true, &coverage_at_path, &variable_wall_replacements);
+        }
+
+        for (size_t owner = 0; owner < layers.size(); ++owner) {
             prune_empty_extrusion_paths(
                 layers[owner]->regions()[region_idx]->perimeters);
+            prune_empty_extrusion_paths(
+                layers[owner]->regions()[region_idx]->fills);
+        }
         (void) final_crossing_count;
     }
     // Runs and continuing features may span different nominal owner ranges.
@@ -9077,7 +10910,261 @@ void consolidate_nonplanar_top_surfaces(
             restore_nonplanar_wall_sequence(
                 region->perimeters, wall_sequence,
                 config.wall_loops.value, owner > 0);
+            // Wall-order reconstruction is the final graph mutation and may
+            // split/copy a mixed loop after the collision pass normalized it.
+            // Reassert the fixed-Z feature invariant on the reconstructed
+            // entities before G-code scheduling and preview consume them.
+            for (ExtrusionEntity *entity : region->perimeters.entities)
+                normalize_fixed_feature_transition(*entity);
         }
+    // Wall ordering is intentionally the last structural graph operation.
+    // Revalidate feature-to-surface contacts afterwards so no late grouping
+    // can reintroduce an emitted-precision collision between an attached
+    // feature course and the retained opening boundary.
+    for (size_t region_idx = 0; region_idx < region_count; ++region_idx) {
+        struct OwnedWallPath {
+            ExtrusionPath *path;
+            size_t owner;
+            BoundingBox bounds;
+            ExtrusionEntity *continuous_wall;
+        };
+        std::vector<OwnedWallPath> feature_walls;
+        std::vector<OwnedWallPath> surface_walls;
+        std::vector<OwnedWallPath> foundation_walls;
+        const auto collect = [&](auto &&self, ExtrusionEntity &entity,
+                                 size_t owner, ExtrusionEntity *continuous_wall) -> void {
+            if (auto *path = dynamic_cast<ExtrusionPath *>(&entity)) {
+                // A horizontal portion of a deferred feature is displayed as
+                // an ordinary wall, but still belongs to the same physical
+                // course stack and must participate in clearance validation.
+                if (!is_perimeter(path->role()) ||
+                    path->polyline.points.size() < 2)
+                    return;
+                OwnedWallPath owned{
+                    path, owner, path->polyline.to_polyline().bounding_box(),
+                    continuous_wall ? continuous_wall : path};
+                if (path->nonplanar_feature_transition)
+                    feature_walls.emplace_back(std::move(owned));
+                else if (path->nonplanar_surface)
+                    surface_walls.emplace_back(std::move(owned));
+                else if (!path->nonplanar_schedule_owned)
+                    foundation_walls.emplace_back(std::move(owned));
+            } else if (auto *multipath =
+                           dynamic_cast<ExtrusionMultiPath *>(&entity)) {
+                for (ExtrusionPath &path : multipath->paths)
+                    self(self, path, owner, &entity);
+            } else if (auto *loop = dynamic_cast<ExtrusionLoop *>(&entity)) {
+                for (ExtrusionPath &path : loop->paths)
+                    self(self, path, owner, &entity);
+            } else if (auto *collection =
+                           dynamic_cast<ExtrusionEntityCollection *>(&entity)) {
+                for (ExtrusionEntity *child : collection->entities)
+                    self(self, *child, owner, nullptr);
+            }
+        };
+        for (size_t owner = 0; owner < layers.size(); ++owner) {
+            LayerRegion &region = *layers[owner]->regions()[region_idx];
+            collect(collect, region.perimeters, owner, nullptr);
+            collect(collect, region.fills, owner, nullptr);
+        }
+        for (OwnedWallPath &feature : feature_walls) {
+            for (size_t repair = 0; repair < 8; ++repair) {
+                bool collision = false;
+                for (const OwnedWallPath &surface : surface_walls) {
+                    if (feature.path->inset_idx != surface.path->inset_idx ||
+                        !bounds_overlap_with_tolerance(
+                            feature.bounds, surface.bounds, scale_(0.05)) ||
+                        !paths_have_proper_same_z_crossing(
+                            *feature.path, layers[feature.owner]->print_z,
+                            *surface.path, layers[surface.owner]->print_z,
+                            0.05))
+                        continue;
+                    collision = true;
+                    break;
+                }
+                if (!collision)
+                    break;
+                offset_entity_z(*feature.continuous_wall, scale_(0.061));
+                normalize_fixed_feature_transition(*feature.continuous_wall);
+            }
+        }
+        std::stable_sort(feature_walls.begin(), feature_walls.end(),
+            [](const OwnedWallPath &left, const OwnedWallPath &right) {
+                return left.path->nonplanar_feature_course <
+                       right.path->nonplanar_feature_course;
+            });
+        for (OwnedWallPath &higher : feature_walls) {
+            size_t previous_course = 0;
+            for (const OwnedWallPath &candidate : feature_walls)
+                if (candidate.path->inset_idx == higher.path->inset_idx &&
+                    candidate.path->nonplanar_feature_course <
+                        higher.path->nonplanar_feature_course)
+                    previous_course = std::max(
+                        previous_course,
+                        candidate.path->nonplanar_feature_course);
+            if (previous_course == 0)
+                continue;
+            const double higher_owner_z = layers[higher.owner]->print_z;
+            double required_shift = 0.;
+            for (size_t point_idx = 1;
+                 point_idx < higher.path->polyline.points.size(); ++point_idx) {
+                const Point3 &first = higher.path->polyline.points[point_idx - 1];
+                const Point3 &last = higher.path->polyline.points[point_idx];
+                const Vec2d sample = 0.5 * (
+                    unscale(first.to_point()).cast<double>() +
+                    unscale(last.to_point()).cast<double>());
+                const double higher_z = higher_owner_z + 0.5 * (
+                    unscale_(first.z()) + unscale_(last.z()));
+                for (const OwnedWallPath &lower : feature_walls) {
+                    if (lower.path->inset_idx != higher.path->inset_idx ||
+                        lower.path->nonplanar_feature_course != previous_course)
+                        continue;
+                    const double lower_owner_z = layers[lower.owner]->print_z;
+                    for (size_t lower_idx = 1;
+                         lower_idx < lower.path->polyline.points.size();
+                         ++lower_idx) {
+                        const Point3 &a3 =
+                            lower.path->polyline.points[lower_idx - 1];
+                        const Point3 &b3 =
+                            lower.path->polyline.points[lower_idx];
+                        const Vec2d a =
+                            unscale(a3.to_point()).cast<double>();
+                        const Vec2d delta =
+                            unscale(b3.to_point()).cast<double>() - a;
+                        const double squared = delta.squaredNorm();
+                        const double ratio = squared <= EPSILON ? 0. :
+                            std::clamp((sample - a).dot(delta) / squared,
+                                       0., 1.);
+                        if ((sample - (a + ratio * delta)).norm() > 0.05)
+                            continue;
+                        const double lower_z = lower_owner_z +
+                            unscale_(a3.z()) + ratio *
+                                unscale_(b3.z() - a3.z());
+                        const double clearance = 0.5 * std::max(
+                            double(lower.path->height),
+                            double(higher.path->height));
+                        required_shift = std::max(
+                            required_shift,
+                            lower_z + clearance - higher_z);
+                    }
+                }
+            }
+            if (required_shift <= EPSILON)
+                continue;
+            offset_entity_z(*higher.continuous_wall, coord_t(std::ceil(scale_(required_shift))));
+            normalize_fixed_feature_transition(*higher.continuous_wall);
+        }
+        // Clearance edits may leave a supported feature wall with a larger
+        // local bead height than its original planar flow describes. Recover
+        // only small, measured gaps directly over preceding feature walls.
+        // Do not bridge lateral gaps, move the geometry, or exceed the nozzle
+        // and profile height limits. Build all replacements before modifying
+        // containers so support pointers remain valid throughout measurement.
+        double maximum_height = 0.8 * nozzle_diameter;
+        for (double diameter : print_config.nozzle_diameter.values)
+            if (diameter > 0.)
+                maximum_height = std::min(maximum_height, 0.8 * diameter);
+        for (double height : print_config.max_layer_height.values)
+            if (height > 0.)
+                maximum_height = std::min(maximum_height, height);
+        std::map<const ExtrusionPath *, ExtrusionPaths> height_replacements;
+        for (const OwnedWallPath &wall : feature_walls) {
+            const Points3 &points = wall.path->polyline.points;
+            std::vector<const OwnedWallPath *> supports;
+            for (const OwnedWallPath &lower : feature_walls)
+                if (lower.path->nonplanar_feature_course < wall.path->nonplanar_feature_course &&
+                    lower.path->inset_idx == wall.path->inset_idx &&
+                    bounds_overlap_with_tolerance(lower.bounds, wall.bounds, scale_(0.05)))
+                    supports.push_back(&lower);
+            // The first deformed course rests on ordinary sliced walls, not
+            // another feature course. Only already printed owners may support
+            // it; a future planar wall must never justify extra material here.
+            if (wall.path->nonplanar_feature_course == 1)
+                for (const OwnedWallPath &lower : foundation_walls)
+                    // Ordinary wall generators store the inset on the parent
+                    // loop/multipath; its child path may still have inset 0.
+                    if (lower.owner < wall.owner &&
+                        lower.continuous_wall->inset_idx == wall.path->inset_idx &&
+                        bounds_overlap_with_tolerance(lower.bounds, wall.bounds, scale_(0.05)))
+                        supports.push_back(&lower);
+            std::vector<double> heights(points.size() - 1, wall.path->height);
+            bool changed = false;
+            for (size_t idx = 1; idx < points.size(); ++idx) {
+                double minimum_gap = std::numeric_limits<double>::infinity();
+                double maximum_gap = 0.;
+                for (double t : {0., 0.5, 1.}) {
+                    const Vec3d position = ((1. - t) * points[idx - 1].cast<double>() +
+                                           t * points[idx].cast<double>()) * SCALING_FACTOR;
+                    const double z = layers[wall.owner]->print_z + position.z();
+                    double support_z = -std::numeric_limits<double>::infinity();
+                    for (const OwnedWallPath *support : supports) {
+                        const OwnedWallPath &lower = *support;
+                        const Points3 &below = lower.path->polyline.points;
+                        for (size_t j = 1; j < below.size(); ++j) {
+                            const Vec2d start = unscale(below[j - 1].to_point());
+                            const Vec2d delta = unscale(below[j].to_point()) - start;
+                            const double ratio = delta.squaredNorm() <= EPSILON ? 0. :
+                                std::clamp((position.head<2>() - start).dot(delta) / delta.squaredNorm(), 0., 1.);
+                            if ((position.head<2>() - start - ratio * delta).norm() > 0.05)
+                                continue;
+                            const double candidate_z = layers[lower.owner]->print_z + unscale_(below[j - 1].z()) +
+                                ratio * unscale_(below[j].z() - below[j - 1].z());
+                            if (candidate_z < z - EPSILON)
+                                support_z = std::max(support_z, candidate_z);
+                        }
+                    }
+                    const double gap = z - support_z;
+                    minimum_gap = std::min(minimum_gap, gap);
+                    maximum_gap = std::max(maximum_gap, gap);
+                }
+                if (minimum_gap > double(wall.path->height) + 0.01 &&
+                    maximum_gap <= std::min(maximum_height, double(wall.path->width)) &&
+                    maximum_gap - minimum_gap <= 0.01) {
+                    heights[idx - 1] = 0.5 * (minimum_gap + maximum_gap);
+                    changed = true;
+                }
+            }
+            if (changed)
+                height_replacements.emplace(wall.path, split_nonplanar_path_by_height(*wall.path, heights));
+        }
+        const auto replace_paths = [&](ExtrusionPaths &paths) {
+            ExtrusionPaths replaced;
+            for (ExtrusionPath &path : paths) {
+                auto found = height_replacements.find(&path);
+                if (found == height_replacements.end())
+                    replaced.emplace_back(std::move(path));
+                else
+                    append(replaced, std::move(found->second));
+            }
+            paths = std::move(replaced);
+        };
+        const auto replace_heights = [&](auto &&self, ExtrusionEntity *&entity) -> void {
+            if (auto *path = dynamic_cast<ExtrusionPath *>(entity)) {
+                auto found = height_replacements.find(path);
+                if (found == height_replacements.end())
+                    return;
+                auto *replacement = new ExtrusionMultiPath(*path);
+                replacement->inset_idx = path->inset_idx;
+                replacement->paths = std::move(found->second);
+                delete entity;
+                entity = replacement;
+            } else if (auto *loop = dynamic_cast<ExtrusionLoop *>(entity))
+                replace_paths(loop->paths);
+            else if (auto *multipath = dynamic_cast<ExtrusionMultiPath *>(entity))
+                replace_paths(multipath->paths);
+            else if (auto *collection = dynamic_cast<ExtrusionEntityCollection *>(entity))
+                for (ExtrusionEntity *&child : collection->entities)
+                    self(self, child);
+        };
+        if (!height_replacements.empty())
+            for (Layer *layer : layers) {
+                LayerRegion &region = *layer->regions()[region_idx];
+                for (ExtrusionEntity *&entity : region.perimeters.entities)
+                    replace_heights(replace_heights, entity);
+                for (ExtrusionEntity *&entity : region.fills.entities)
+                    replace_heights(replace_heights, entity);
+            }
+    }
     if (progress)
         progress({1., NonplanarProgressStage::Commit, 1, 1});
 }
@@ -9412,6 +11499,7 @@ bool project_support_contact_path(
     path.polyline.fitting_result.clear();
     path.z_contoured = true;
     path.nonplanar_surface = true;
+    path.nonplanar_schedule_owned = false;
     path.nonplanar_clearance_validated = false;
     return true;
 }

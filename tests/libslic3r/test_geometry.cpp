@@ -4,6 +4,7 @@
 #include "libslic3r/BoundingBox.hpp"
 #include "libslic3r/Polygon.hpp"
 #include "libslic3r/Polyline.hpp"
+#include "libslic3r/ExtrusionEntity.hpp"
 #include "libslic3r/Line.hpp"
 #include "libslic3r/Geometry.hpp"
 #include "libslic3r/Geometry/Circle.hpp"
@@ -20,6 +21,52 @@
 #include <unordered_set>
 
 using namespace Slic3r;
+
+TEST_CASE("Splitting a multi-part wall preserves brick and flow metadata", "[Geometry][StaggeredPerimeters][Regression]")
+{
+    ExtrusionPath brick(erPerimeter, 0.09, 0.45, 0.2);
+    brick.polyline = Polyline3(Points3{Point3(Point::new_scale(0., 0.), scale_(0.1)),
+        Point3(Point::new_scale(10., 0.), scale_(0.1)), Point3(Point::new_scale(10., 10.), scale_(0.1))});
+    brick.z_contoured = brick.staggered_perimeter = brick.staggered_transition = true;
+    brick.shrinkage_compensation = true;
+    brick.inset_idx = 1;
+    ExtrusionPath plain(erPerimeter, 0.08, 0.42, 0.2);
+    plain.polyline = Polyline3(Points3{brick.last_point3(),
+        Point3(Point::new_scale(0., 10.), scale_(0.1)), brick.first_point3()});
+    ExtrusionLoop loop(ExtrusionPaths{brick, plain});
+    const double expected_length = brick.length();
+    loop.split_at(Point::new_scale(5., 0.), false);
+    double brick_length = 0.;
+    for (const auto &path : loop.paths) {
+        if (path.mm3_per_mm == brick.mm3_per_mm) {
+            CHECK(path.staggered_perimeter);
+            CHECK(path.staggered_transition);
+            CHECK(path.shrinkage_compensation);
+            CHECK(path.z_contoured);
+            CHECK(path.inset_idx == 1);
+            brick_length += path.staggered_perimeter ? path.length() : 0.;
+        } else
+            CHECK_FALSE(path.staggered_perimeter);
+    }
+    CHECK_THAT(brick_length, Catch::Matchers::WithinAbs(expected_length, 1.));
+}
+
+TEST_CASE("Splitting a contoured path projects the seam without creating spurs", "[Geometry][ContourZ][Regression]")
+{
+    const double length = GENERATE(0.15, 2.0);
+    Polyline3 path(Points3{Point3(0., 0., scale_(0.1)),
+                          Point3(scale_(length), 0., scale_(0.3))});
+    Point candidate = Point::new_scale(length * 0.4, 0.04);
+    Polyline3 before, after;
+    path.split_at(candidate, &before, &after);
+    REQUIRE(before.is_valid());
+    REQUIRE(after.is_valid());
+    CHECK(before.last_point() == after.first_point());
+    CHECK(candidate == Point::new_scale(length * 0.4, 0.));
+    CHECK_THAT(unscale<double>(before.last_point().z()), Catch::Matchers::WithinAbs(0.18, 1e-6));
+    CHECK(before.first_point() == path.first_point());
+    CHECK(after.last_point() == path.last_point());
+}
 
 TEST_CASE("Line::parallel_to", "[Geometry]"){
     Line l{ { 100000, 0 }, { 0, 0 } };

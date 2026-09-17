@@ -207,12 +207,15 @@ TEST_CASE("Three raft layers are created", "[SupportMaterial]")
 TEST_CASE("Surface-following support ironing projects the supported interface",
           "[SupportMaterial][Nonplanar]")
 {
+    const size_t copies = GENERATE(1, 8);
     TriangleMesh sloped_plate = make_cube(20., 12., 1.2);
     sloped_plate.rotate_y(float(10. * M_PI / 180.));
     sloped_plate.translate(Vec3f(0.f, 0.f, 8.f));
 
     Print print;
-    init_and_process_print({sloped_plate}, print, {
+    Model model;
+    DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+    config.set_deserialize_strict({
         {"enable_support", true},
         {"support_type", std::string("normal(auto)")},
         {"support_ironing", true},
@@ -224,6 +227,16 @@ TEST_CASE("Surface-following support ironing projects the supported interface",
         {"dont_support_bridges", false},
         {"layer_height", 0.2}
     });
+    init_print({sloped_plate}, print, model, config);
+    ModelObject *model_object = model.objects.front();
+    const ModelInstance &source = *model_object->instances.front();
+    for (size_t i = 1; i < copies; ++i)
+        model_object->add_instance(source)->set_offset(
+            source.get_offset() + Vec3d(30. * (i % 4), 30. * (i / 4), 0.));
+    model_object->invalidate_bounding_box();
+    print.apply(model, config);
+    REQUIRE_NOTHROW(print.process());
+    REQUIRE(print.objects().front()->instances().size() == copies);
 
     const PrintObject &object = *print.objects().front();
     size_t contact_layers = 0;

@@ -24,6 +24,30 @@
 #include <iterator>
 
 using namespace Slic3r;
+
+TEST_CASE("Per-print area slots reach sliced wall and infill regions",
+          "[Print][ProjectFilamentBindings][Regression]")
+{
+    DynamicPrintConfig config = Test::multifilament_config(3, {
+        {"outer_wall_filament_id", -1}, {"inner_wall_filament_id", -1},
+        {"sparse_infill_filament_id", -1}, {"top_surface_filament_id", -1},
+        {"support_filament", -1}, {"support_interface_filament", -1}});
+    config.set_key_value("project_filament_bindings", new ConfigOptionInts{2, 3, 3, 2, 1, 0, 2, 0});
+    Print print;
+    Test::init_and_process_print({make_cube(5., 5., 1.)}, print, config);
+    REQUIRE_FALSE(print.objects().empty());
+    const PrintObject *object = print.objects().front();
+    CHECK(object->config().support_filament.value == 2);
+    CHECK(object->config().support_interface_filament.value == 3);
+    REQUIRE_FALSE(object->layers().empty());
+    REQUIRE_FALSE(object->layers().front()->regions().empty());
+    const auto &region = object->layers().front()->regions().front()->region().config();
+    CHECK(region.outer_wall_filament_id.value == 3);
+    CHECK(region.inner_wall_filament_id.value == 2);
+    CHECK(region.sparse_infill_filament_id.value == 1);
+    CHECK(region.top_surface_filament_id.value == 2);
+    CHECK(config.opt_int("outer_wall_filament_id") == -1);
+}
 using namespace Slic3r::Test;
 
 namespace {
@@ -99,7 +123,7 @@ TEST_CASE("Disabled inner wall seam start preserves the selected wall order", "[
     CHECK(order[0] == 0);
 }
 
-TEST_CASE("Inner wall seam preparation is a non-extruding outer-wall approach", "[Print][Seam]")
+TEST_CASE("Internal seam entries and returns preserve the original wall material", "[Print][Seam]")
 {
     const std::string wall_generator = GENERATE("classic", "arachne");
     CAPTURE(wall_generator);
@@ -124,13 +148,15 @@ TEST_CASE("Inner wall seam preparation is a non-extruding outer-wall approach", 
     double enabled_extrusion_length = 0.0;
     GCodeReader reader;
     reader.parse_buffer(generated_gcode, [&](GCodeReader &self, const GCodeReader::GCodeLine &line) {
-        if (line.extruding(self))
-            enabled_extrusion_length += line.dist_XY(self);
         const std::string comment(line.comment());
-        if (line.travel() && line.dist_XY(self) > 0.0 &&
+        const bool connector = comment.find("outer wall seam transition") != std::string::npos ||
+                               comment.find("outer wall seam return") != std::string::npos;
+        if (line.extruding(self) && !connector)
+            enabled_extrusion_length += line.dist_XY(self);
+        if (line.dist_XY(self) > 0.0 &&
             comment.find("outer wall seam transition") != std::string::npos) {
             ++transitions;
-            CHECK_FALSE(line.extruding(self));
+            CHECK(line.extruding(self));
         }
         if (line.has_e() && line.dist_XY(self) > 0.0 &&
             comment.find("outer wall seam prime") != std::string::npos) {
@@ -150,6 +176,93 @@ TEST_CASE("Inner wall seam preparation is a non-extruding outer-wall approach", 
                 baseline_extrusion_length += line.dist_XY(self);
         });
     CHECK(enabled_extrusion_length == Catch::Approx(baseline_extrusion_length).epsilon(0.005));
+}
+
+TEST_CASE("Internal seam starts and finishes inside without retracing the reserved wall",
+          "[Print][Seam][Regression]")
+{
+    const std::string generator = GENERATE("classic", "arachne");
+    const std::string sequence = GENERATE("outer wall/inner wall", "inner wall/outer wall");
+    const double gap = GENERATE(0., 0.06);
+    const bool curved = GENERATE(false, true);
+    const std::string layering = GENERATE("standard", "brick");
+    CAPTURE(generator, sequence, gap, curved, layering);
+    const std::string output = slice({curved ? make_cylinder(6., 1., PI / 60.) : make_cube(12., 12., 1.)}, {
+        {"wall_generator", generator}, {"wall_sequence", sequence}, {"wall_loops", 3},
+        {"perimeter_layering", layering}, {"staggered_perimeters_inner_only", true},
+        {"seam_start_on_inner_wall", true}, {"seam_slope_type", "none"}, {"seam_gap", gap},
+        {"enable_arc_fitting", false}, {"gcode_comments", true}, {"skirt_loops", 0},
+        {"brim_type", "no_brim"}, {"layer_height", 0.2}, {"initial_layer_print_height", 0.2},
+        {"sparse_infill_density", "0%"}, {"top_shell_layers", 0}, {"bottom_shell_layers", 0}});
+    struct Segment { Vec2d a, b; double z; };
+    std::vector<Segment> segments;
+    bool in_seam = false;
+    Vec2d inside_start = Vec2d::Zero();
+    size_t entries = 0, returns = 0, finishes = 0;
+    GCodeReader reader;
+    reader.parse_buffer(output, [&](GCodeReader &self, const GCodeReader::GCodeLine &line) {
+        const std::string comment(line.comment());
+        const bool prime = comment.find("outer wall seam prime") != std::string::npos;
+        const bool finish = comment.find("outer wall seam finish") != std::string::npos;
+        if (prime && !in_seam && line.extruding(self)) {
+            inside_start = Vec2d(self.x(), self.y());
+            in_seam = true;
+        }
+        if (in_seam && line.dist_XY(self) > 0.001)
+            CHECK(line.extruding(self));
+        if (in_seam && std::abs(line.new_Z(self) - self.z()) > 0.001)
+            CHECK(line.extruding(self));
+        if (in_seam && line.has_e()) CHECK(line.dist_E(self) >= 0.);
+        if (comment.find("outer wall seam transition") != std::string::npos) {
+            CHECK(line.extruding(self));
+            ++entries;
+        }
+        if (comment.find("outer wall seam return") != std::string::npos) {
+            CHECK(line.extruding(self));
+            ++returns;
+        }
+        if (finish && line.extruding(self) &&
+            (Vec2d(line.new_X(self), line.new_Y(self)) - inside_start).norm() < 0.002) {
+            in_seam = false;
+            ++finishes;
+        }
+        if (line.extruding(self) && line.dist_XY(self) > 0.001)
+            segments.push_back({Vec2d(self.x(), self.y()), Vec2d(line.new_X(self), line.new_Y(self)), self.z()});
+    });
+    CHECK_FALSE(in_seam);
+    REQUIRE(entries > 0);
+    CHECK(returns == entries);
+    CHECK(finishes == entries);
+    // Include later inner walls, not just the entry itself: reserving a tail
+    // is only correct if that wall never extrudes over it again.
+    for (size_t i = 0; i < segments.size(); ++i) {
+        const auto &a = segments[i];
+        const Vec2d direction = (a.b - a.a).normalized();
+        const auto cross = [&](const Vec2d &v) { return direction.x() * v.y() - direction.y() * v.x(); };
+        for (size_t j = i + 1; j < segments.size(); ++j) {
+            const auto &b = segments[j];
+            if (std::abs(a.z - b.z) > 0.001)
+                continue;
+            const Vec2d other = b.b - b.a;
+            const double determinant = cross(other);
+            if (std::abs(determinant) > 1e-6) {
+                const double u = -cross(b.a - a.a) / determinant;
+                const double distance = (b.a + u * other - a.a).dot(direction);
+                const bool interior_crossing =
+                    u * other.norm() > 0.005 && (1. - u) * other.norm() > 0.005 &&
+                    distance > 0.005 && distance < (a.b - a.a).norm() - 0.005;
+                CAPTURE(i, j, distance, u);
+                CHECK_FALSE(interior_crossing);
+                continue;
+            }
+            if (std::abs(cross(b.a - a.a)) > 0.001 || std::abs(cross(b.b - a.a)) > 0.001)
+                continue;
+            const double p = (b.a - a.a).dot(direction), q = (b.b - a.a).dot(direction);
+            const double overlap = std::min((a.b - a.a).norm(), std::max(p, q)) - std::max(0., std::min(p, q));
+            CAPTURE(i, j, overlap);
+            CHECK(overlap < 0.005);
+        }
+    }
 }
 
 TEST_CASE("Inner wall seam preparation follows the configured seam position", "[Print][Seam]")
@@ -177,7 +290,7 @@ TEST_CASE("Inner wall seam preparation follows the configured seam position", "[
     GCodeReader reader;
     reader.parse_buffer(generated_gcode, [&](GCodeReader &self, const GCodeReader::GCodeLine &line) {
         const std::string comment(line.comment());
-        if (line.travel() &&
+        if (line.dist_XY(self) > 0. &&
             comment.find("outer wall seam transition") != std::string::npos) {
             transition_end = Vec2f(line.new_X(self), line.new_Y(self));
             awaiting_outer_wall = true;
@@ -193,6 +306,166 @@ TEST_CASE("Inner wall seam preparation follows the configured seam position", "[
     });
     CHECK(aligned_transitions > 0);
     CHECK_FALSE(awaiting_outer_wall);
+}
+
+TEST_CASE("Qualified scarf seams replace internal entries without removing inner wall material", "[Print][Seam][ScarfFallback][Regression]")
+{
+    const bool smooth = GENERATE(false, true);
+    const bool scarf_inner = GENERATE(false, true);
+    const std::string sequence = GENERATE("outer wall/inner wall", "inner wall/outer wall");
+    const std::string generator = GENERATE("classic", "arachne");
+    CAPTURE(smooth, scarf_inner, sequence, generator);
+    const auto output = [&](bool internal) {
+        return slice({smooth ? make_cylinder(8., 1., PI / 120.) : make_cube(16., 16., 1.)}, {
+            {"wall_generator", generator}, {"wall_loops", 3},
+            {"wall_sequence", sequence}, {"seam_start_on_inner_wall", internal},
+            {"seam_slope_type", "all"}, {"seam_slope_conditional", true},
+            {"scarf_angle_threshold", 155.}, {"scarf_overhang_threshold", 40.},
+            {"seam_slope_inner_walls", scarf_inner}, {"seam_gap", 0.},
+            {"layer_height", 0.2}, {"initial_layer_print_height", 0.2},
+            {"enable_arc_fitting", false}, {"gcode_comments", true},
+            {"skirt_loops", 0}, {"brim_type", "no_brim"}
+        });
+    };
+    size_t entries = 0;
+    size_t first_layer_entries = 0;
+    size_t slopes = 0;
+    const auto deposited = [&](const std::string &gcode, bool inspect) {
+        std::pair<double, double> result{0., 0.};
+        GCodeReader reader;
+        reader.parse_buffer(gcode, [&](GCodeReader &self, const GCodeReader::GCodeLine &line) {
+            const std::string comment(line.comment());
+            const bool connector = comment.find("outer wall seam transition") != std::string::npos ||
+                                   comment.find("outer wall seam return") != std::string::npos;
+            if (line.extruding(self) && line.dist_XY(self) > 0. && !connector) {
+                result.first += line.dist_XY(self);
+                result.second += line.dist_E(self);
+            }
+            if (inspect && self.z() <= 0.21 &&
+                comment.find("outer wall seam transition") != std::string::npos)
+                ++first_layer_entries;
+            // The first layer deliberately cannot scarf and must still use
+            // the internal fallback. Check subsequent layers separately.
+            if (inspect && self.z() > 0.21) {
+                if (comment.find("outer wall seam transition") != std::string::npos)
+                    ++entries;
+                if (line.extruding(self) && line.dist_XY(self) > 0. &&
+                    std::abs(line.new_Z(self) - self.z()) > 0.0001)
+                    ++slopes;
+            }
+        });
+        return result;
+    };
+    const auto baseline = deposited(output(false), false);
+    const auto combined = deposited(output(true), true);
+    CHECK(first_layer_entries > 0);
+    CHECK_THAT(combined.first, Catch::Matchers::WithinAbs(baseline.first, 0.05));
+    CHECK_THAT(combined.second, Catch::Matchers::WithinAbs(baseline.second, 0.01));
+    if (smooth) {
+        CHECK(slopes > 0);
+        CHECK(entries == 0);
+    } else {
+        CHECK(slopes == 0);
+        CHECK(entries > 0);
+    }
+}
+
+TEST_CASE("Internal seam preparation preserves wall material with variable height modes", "[Print][Seam][Regression]")
+{
+    const std::string mode = GENERATE("interlocking_walls", "nonplanar_top_surface", "z_contouring");
+    const bool wall_mode = mode == "brick" || mode == "interlocking_walls";
+    const std::string sequence = GENERATE("outer wall/inner wall", "inner wall/outer wall");
+    CAPTURE(mode, sequence);
+    const auto perimeter_length = [&](bool inner_seam) {
+        const std::string output = slice({cube(5.0)}, {
+            {"wall_loops", 3},
+            {"wall_sequence", sequence},
+            {"perimeter_layering", wall_mode ? mode : "standard"},
+            {"top_surface_z_mode", wall_mode ? "disabled" : mode},
+            {"seam_start_on_inner_wall", inner_seam},
+            {"seam_gap", 0.0},
+            {"seam_slope_type", "none"},
+            {"gcode_comments", true},
+            {"skirt_loops", 0},
+            {"brim_type", "no_brim"},
+            {"layer_height", 0.2},
+            {"initial_layer_print_height", 0.2}
+        });
+        double length = 0.;
+        GCodeReader reader;
+        reader.parse_buffer(output, [&](GCodeReader &self, const GCodeReader::GCodeLine &line) {
+            const std::string comment(line.comment());
+            const bool original_wall = comment.find("perimeter") != std::string::npos ||
+                comment.find("outer wall seam prime") != std::string::npos ||
+                comment.find("outer wall seam finish") != std::string::npos;
+            if (line.extruding(self) && original_wall)
+                length += std::hypot(line.dist_XY(self), line.new_Z(self) - self.z());
+        });
+        return length;
+    };
+    const double baseline = perimeter_length(false);
+    REQUIRE(baseline > 0.);
+    CHECK_THAT(perimeter_length(true), Catch::Matchers::WithinAbs(baseline, 0.05));
+}
+
+TEST_CASE("Brick courses use continuous internal seams across corner height offsets",
+          "[Print][Seam][StaggeredPerimeters][Regression]")
+{
+    const std::string generator = GENERATE("classic", "arachne");
+    const std::string sequence = GENERATE("outer wall/inner wall", "inner wall/outer wall");
+    const bool inner_only = GENERATE(false, true);
+    const std::string seam_position = GENERATE("aligned", "back");
+    const std::string surface_mode = GENERATE("disabled", "nonplanar_with_z_contouring_fallback");
+    CAPTURE(generator, sequence, inner_only, surface_mode, seam_position);
+    const auto output = [&](bool internal) {
+        return slice({make_cube(12., 12., 2.)}, {
+            {"wall_generator", generator}, {"wall_sequence", sequence}, {"wall_loops", 3},
+            {"perimeter_layering", "brick"}, {"staggered_perimeters_inner_only", inner_only},
+            {"top_surface_z_mode", surface_mode},
+            {"seam_position", seam_position},
+            {"staggered_perimeter_offset", "50%"}, {"seam_start_on_inner_wall", internal},
+            {"seam_slope_type", "none"}, {"seam_gap", 0.}, {"enable_arc_fitting", false},
+            {"gcode_comments", true}, {"skirt_loops", 0}, {"brim_type", "no_brim"},
+            {"layer_height", 0.2}, {"initial_layer_print_height", 0.2},
+            {"sparse_infill_density", "0%"}, {"top_shell_layers", 0}, {"bottom_shell_layers", 0}});
+    };
+    size_t raised_entries = 0, returns = 0, entries = 0;
+    const auto volume = [&](const std::string &text, bool inspect) {
+        double deposited = 0.;
+        bool brick = false, inside = false;
+        double seam_z = 0., inner_z = 0.;
+        GCodeReader reader;
+        reader.parse_buffer(text, [&](GCodeReader &self, const GCodeReader::GCodeLine &line) {
+            const std::string comment(line.comment());
+            if (comment.find("TYPE:") != std::string::npos)
+                brick = comment.find("Brick wall") != std::string::npos;
+            const bool entry = comment.find("outer wall seam transition") != std::string::npos;
+            const bool finish = comment.find("outer wall seam return") != std::string::npos;
+            if (line.extruding(self) && line.dist_XY(self) > 0. && !entry && !finish)
+                deposited += line.dist_E(self);
+            if (!inspect) return;
+            if (entry) {
+                ++entries;
+                if (brick) ++raised_entries;
+                CHECK(line.extruding(self));
+                inner_z = self.z();
+                seam_z = line.new_Z(self);
+                inside = true;
+            }
+            if (inside && (line.has_x() || line.has_y() || line.has_z())) {
+                CHECK_THAT(double(line.new_Z(self)), Catch::Matchers::WithinAbs(finish ? inner_z : seam_z, 0.001));
+                if (line.dist_XY(self) > 0.001) CHECK(line.extruding(self));
+            }
+            if (finish) { ++returns; inside = false; }
+        });
+        CHECK_FALSE(inside);
+        return deposited;
+    };
+    const double expected = volume(output(false), false);
+    CHECK_THAT(volume(output(true), true), Catch::Matchers::WithinAbs(expected, 0.015));
+    CHECK(entries > 0);
+    CHECK(returns == entries);
+    CHECK(raised_entries > 0);
 }
 
 SCENARIO("Changing the number of solid shell layers does not make all surfaces internal", "[Print]") {
@@ -239,6 +512,42 @@ SCENARIO("Changing the number of solid shell layers does not make all surfaces i
 }
 
 // ---------------------------------------------------------------------------
+TEST_CASE("Imported nonplanar settings are rejected before slicing", "[Print][Nonplanar]")
+{
+    const auto [key, value] = GENERATE(table<const char *, const char *>({
+        {"top_surface_z_mode", "nonplanar_top_surface"},
+        {"perimeter_layering", "interlocking_walls"},
+        {"nonplanar_infill", "1"},
+        {"support_ironing_nonplanar", "1"}
+    }));
+    CAPTURE(key);
+    Model model;
+    Print print;
+    DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+    config.set_deserialize_strict(key, value);
+    Slic3r::Test::init_print({make_cube(20., 20., 20.)}, print, model, config);
+    const auto error = print.validate();
+    CHECK(error.opt_key == key);
+    CHECK_FALSE(error.string.empty());
+}
+
+TEST_CASE("Nonplanar quarantine leaves standard brick and Z contouring available", "[Print][Nonplanar]")
+{
+    const auto [key, value] = GENERATE(table<const char *, const char *>({
+        {"perimeter_layering", "standard"},
+        {"perimeter_layering", "brick"},
+        {"top_surface_z_mode", "z_contouring"}
+    }));
+    CAPTURE(key, value);
+    Model model;
+    Print print;
+    DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+    config.set_deserialize_strict(key, value);
+    config.set_key_value("layer_change_gcode", new ConfigOptionString("G92 E0\n"));
+    Slic3r::Test::init_print({make_cube(20., 20., 20.)}, print, model, config);
+    CHECK(print.validate().string.empty());
+}
+
 // Print::validate() warning collection
 //
 // validate() returns its warnings in a vector. The warning paths deliberately

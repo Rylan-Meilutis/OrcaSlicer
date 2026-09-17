@@ -36,7 +36,8 @@ static bool contour_extrusion_path(LayerRegion *region, const sla::IndexedMesh &
     // paths already contain the validated mesh-following XYZ geometry and
     // must never be contoured a second time. Conventional paths that remain
     // are precisely the safe fallback ownership left by rejected patches.
-    if (path.nonplanar_surface || path.z_contoured)
+    if (path.nonplanar_surface || path.z_contoured ||
+        path.nonplanar_replacement_remainder)
         return false;
     if (path.role() != erTopSolidInfill && path.role() != erIroning && path.role() != erExternalPerimeter && path.role() != erPerimeter) {
 		return false;
@@ -128,6 +129,17 @@ static bool contour_extrusion_path(LayerRegion *region, const sla::IndexedMesh &
                 // fallback for a non-planar patch rejected by the toolhead.
                 d = 0;
             }
+
+            // A flat cap over brick courses must share the nominal plane of
+            // their half-height return walls. Those walls are already tagged
+            // z_contoured and intentionally skipped above; lowering only the
+            // neighboring ordinary walls/skin leaves raised ridges and can
+            // descend into the previous brick bead. Horizontal surfaces have
+            // no staircase to smooth. Keep their complete cap flat, while
+            // retaining mesh-following fallback on genuinely sloping faces.
+            if (brick_perimeters_enabled(region->region().config()) &&
+                hit_up.is_hit() && hit_up.normal().head<2>().squaredNorm() < 1e-12)
+                d = 0;
 
             if (std::abs(d) > EPSILON) {
 				was_contoured = true;

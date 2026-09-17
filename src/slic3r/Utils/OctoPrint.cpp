@@ -271,6 +271,21 @@ wxString OctoPrint::get_test_failed_msg (wxString &msg) const
 bool OctoPrint::get_selected_filament_spools(
     std::vector<SpoolManagerMetadata::Filament> &slots, wxString &error) const
 {
+    std::vector<SpoolManagerMetadata::Filament> inventory;
+    if (!get_filament_spools(slots, inventory, error))
+        return false;
+    if (slots.empty()) {
+        error = _L("The OctoPrint filament provider has no spools assigned to its tools or slots.");
+        return false;
+    }
+    return true;
+}
+
+bool OctoPrint::get_filament_spools(
+    std::vector<SpoolManagerMetadata::Filament> &slots,
+    std::vector<SpoolManagerMetadata::Filament> &inventory,
+    wxString &error) const
+{
     const auto fetch = [this](const std::string &path, std::string &body, wxString &request_error,
                               int attempts = 1) {
         for (int attempt = 1; attempt <= attempts; ++attempt) {
@@ -308,13 +323,19 @@ bool OctoPrint::get_selected_filament_spools(
                 error = std::move(request_error);
             return false;
         }
-        std::string parse_error;
-        if (SpoolManagerMetadata::parse_selected_spools(
-                body, slots, parse_error, fallback_provider))
+        std::string selected_error;
+        const bool selected_ok = SpoolManagerMetadata::parse_selected_spools(
+            body, slots, selected_error, fallback_provider);
+        std::string inventory_error;
+        const bool inventory_ok = SpoolManagerMetadata::parse_spool_inventory(
+            body, inventory, inventory_error, fallback_provider);
+        if (!inventory_ok && selected_ok)
+            inventory.assign(slots.begin(), slots.end());
+        if (selected_ok || inventory_ok)
             return true;
         BOOST_LOG_TRIVIAL(debug) << "OctoPrint filament provider response was not usable at " << path
-                                 << ": " << parse_error;
-        error = GUI::from_u8(parse_error);
+                                 << ": " << selected_error << "; " << inventory_error;
+        error = GUI::from_u8(selected_error);
         return false;
     };
 
@@ -347,7 +368,7 @@ bool OctoPrint::get_selected_filament_spools(
         fetch("plugin/Spoolman/spoolman/spools", inventory_body, inventory_error, 2)) {
         try {
             const nlohmann::json settings = nlohmann::json::parse(settings_body);
-            const nlohmann::json inventory = nlohmann::json::parse(inventory_body);
+            const nlohmann::json inventory_json = nlohmann::json::parse(inventory_body);
             const nlohmann::json *plugin = nullptr;
             if (const auto plugins = settings.find("plugins"); plugins != settings.end() && plugins->is_object()) {
                 for (const char *key : {"Spoolman", "spoolman"}) {
@@ -358,15 +379,19 @@ bool OctoPrint::get_selected_filament_spools(
                     }
                 }
             }
-            const nlohmann::json *inventory_data = &inventory;
-            if (const auto data = inventory.find("data"); data != inventory.end() && data->is_object())
+            const nlohmann::json *inventory_data = &inventory_json;
+            if (const auto data = inventory_json.find("data"); data != inventory_json.end() && data->is_object())
                 inventory_data = &*data;
             if (plugin != nullptr) {
                 nlohmann::json combined;
                 combined["selectedSpoolIds"] = plugin->value("selectedSpoolIds", nlohmann::json::object());
                 combined["spools"] = inventory_data->value("spools", nlohmann::json::array());
                 std::string parse_error;
-                if (SpoolManagerMetadata::parse_selected_spools(combined.dump(), slots, parse_error))
+                const std::string combined_text = combined.dump();
+                std::string inventory_parse_error;
+                const bool inventory_ok = SpoolManagerMetadata::parse_spool_inventory(
+                    combined_text, inventory, inventory_parse_error, "Spoolman");
+                if (SpoolManagerMetadata::parse_selected_spools(combined_text, slots, parse_error) || inventory_ok)
                     return true;
                 error = GUI::from_u8(parse_error);
             }

@@ -52,6 +52,8 @@ namespace Slic3r {
 // s_project_options_published additionally carries wipe_tower_rotation_angle, which normal
 // loads do not import (it is not listed here): published-only plate geometry.
 static std::vector<std::string> s_project_options {
+    "project_filament_bindings",
+    "project_filament_roles",
     "flush_volumes_vector",
     "flush_volumes_matrix",
     // BBS
@@ -654,6 +656,7 @@ PresetBundle& PresetBundle::operator=(const PresetBundle &rhs)
 
     filament_presets    = rhs.filament_presets;
     project_config      = rhs.project_config;
+    project_default_filament_id = rhs.project_default_filament_id;
     vendors             = rhs.vendors;
     obsolete_presets    = rhs.obsolete_presets;
     m_errors    = rhs.m_errors;
@@ -3450,21 +3453,6 @@ static std::string fixed_filament_slot_color(size_t index)
     return colors[index % std::size(colors)];
 }
 
-void PresetBundle::set_num_filaments(unsigned int n, std::vector<std::string> new_colors) {
-    ConfigOptionStrings* filament_color = project_config.option<ConfigOptionStrings>("filament_colour");
-    const size_t old_slot_count = filament_color->values.size();
-    // Keep every parallel per-filament array, including mixed-color metadata,
-    // synchronized through the common resize implementation.
-    set_num_filaments(n, std::string{});
-    ConfigOptionStrings *filament_multi_color = project_config.option<ConfigOptionStrings>("filament_multi_colour");
-    for (size_t i = old_slot_count; i < filament_color->values.size(); ++i) {
-        const size_t color_index = i - old_slot_count;
-        if (color_index < new_colors.size()) {
-            filament_color->values[i] = new_colors[color_index];
-            filament_multi_color->values[i] = new_colors[color_index];
-        }
-    }
-}
 void PresetBundle::set_num_filaments(unsigned int n, std::string new_color)
 {
     const bool fixed_slots = has_fixed_filament_slots();
@@ -4191,10 +4179,10 @@ unsigned int PresetBundle::sync_ams_list(std::vector<std::pair<DynamicPrintConfi
         auto& print_config = this->prints.get_edited_preset().config;
         auto  support_filament_opt = print_config.option<ConfigOptionInt>("support_filament");
         auto support_interface_filament_opt = print_config.option<ConfigOptionInt>("support_interface_filament");
-        if (support_filament_opt->value > filament_color_type->values.size())
+        if (support_filament_opt->value > int(filament_color_type->values.size()))
             support_filament_opt->value = 0;
 
-        if (support_interface_filament_opt->value > filament_color_type->values.size())
+        if (support_interface_filament_opt->value > int(filament_color_type->values.size()))
             support_interface_filament_opt->value = 0;
     }
     // Re-append mixed filament slots that were stripped before AMS sync
@@ -4898,6 +4886,8 @@ DynamicPrintConfig PresetBundle::full_fff_config(bool apply_extruder, std::optio
     //BBS: add logic for settings check between different system presets
     out.erase("different_settings_to_system");
 
+    capture_project_filament_roles(out);
+    resolve_project_filament_bindings(out, project_default_filament_id);
     static const char* keys[] = {"support_filament", "support_interface_filament", "wipe_tower_filament"};
     for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); ++ i) {
         std::string key = std::string(keys[i]);
@@ -5188,6 +5178,7 @@ static void convert_filament_preset_name(std::string& machine_name, std::string&
 // is_external == false on if called from ConfigWizard
 void PresetBundle::load_config_file_config(const std::string &name_or_path, bool is_external, DynamicPrintConfig &&config, Semver file_version, bool selected, PublishedConfig *published_config)
 {
+    restore_project_filament_roles(config);
     PrinterTechnology printer_technology = Preset::printer_technology(config);
 
     // A "published" 3MF project keeps the user's currently-selected presets and overlays only

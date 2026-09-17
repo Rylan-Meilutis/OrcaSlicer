@@ -12,6 +12,8 @@ public:
     bool  no_sort() const override { return true; }
 
 protected:
+    unsigned int m_refinement_depth = 0;
+
     void _fill_surface_single(const FillParams              &params,
                               unsigned int                   thickness_layers,
                               const std::pair<float, Point> &direction,

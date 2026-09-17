@@ -14,6 +14,9 @@
 #include <vector>
 #include <string>
 #include <regex>
+#include <future>
+#include <thread>
+#include <tuple>
 #include <atomic>
 #include <mutex>
 #include <boost/algorithm/string.hpp>
@@ -37,6 +40,7 @@
 #include <wx/statbmp.h>
 #include <wx/filedlg.h>
 #include <wx/choicdlg.h>
+#include <wx/choice.h>
 #include <wx/dnd.h>
 #include <wx/progdlg.h>
 #include <wx/string.h>
@@ -48,6 +52,7 @@
 #include <wx/evtloop.h>
 #include <wx/timer.h>
 #include <wx/wrapsizer.h>
+#include <wx/scrolwin.h>
 #ifdef _WIN32
 #include <wx/richtooltip.h>
 #include <wx/custombgwin.h>
@@ -229,6 +234,344 @@ wxDEFINE_EVENT(EVT_PUBLISH,                         wxCommandEvent);
 wxDEFINE_EVENT(EVT_OPEN_PLATESETTINGSDIALOG,        wxCommandEvent);
 wxDEFINE_EVENT(EVT_OPEN_FILAMENT_MAP_SETTINGS_DIALOG, wxCommandEvent);
 // BBS: backup & restore
+
+namespace {
+
+constexpr const char *SPOOL_PROFILE_MAPPINGS_KEY = "octoprint_spool_profile_mappings";
+constexpr const char *MATERIAL_PROFILE_MAPPINGS_KEY = "octoprint_material_profile_mappings";
+constexpr const char *DEFAULT_FILAMENT_PROFILE_KEY = "octoprint_default_filament_profile";
+
+std::string normalized_mapping_key(std::string value)
+{
+    boost::algorithm::to_lower(value);
+    value.erase(std::remove_if(value.begin(), value.end(), [](unsigned char ch) {
+        return std::isspace(ch) != 0;
+    }), value.end());
+    return value;
+}
+
+std::vector<std::string> load_filament_mapping_lines(const AppConfig &config, const char *key)
+{
+    const std::string serialized = config.get(key);
+    if (serialized.empty())
+        return {};
+    try {
+        const json parsed = json::parse(serialized);
+        if (parsed.is_array())
+            return parsed.get<std::vector<std::string>>();
+    } catch (...) {
+        // Preserve mappings written by early builds that used newline text.
+    }
+    std::vector<std::string> lines;
+    boost::split(lines, serialized, boost::is_any_of("\r\n"), boost::token_compress_on);
+    lines.erase(std::remove_if(lines.begin(), lines.end(), [](std::string line) {
+        boost::trim(line);
+        return line.empty();
+    }), lines.end());
+    return lines;
+}
+
+std::string mapped_value(const std::vector<std::string> &lines, const std::string &wanted_key)
+{
+    const std::string normalized_wanted = normalized_mapping_key(wanted_key);
+    for (const std::string &line : lines) {
+        const size_t separator = line.find('=');
+        if (separator == std::string::npos ||
+            normalized_mapping_key(line.substr(0, separator)) != normalized_wanted)
+            continue;
+        std::string value = line.substr(separator + 1);
+        boost::trim(value);
+        return value;
+    }
+    return {};
+}
+
+void set_mapped_value(std::vector<std::string> &lines, const std::string &key,
+                      const std::string &value)
+{
+    const std::string normalized_wanted = normalized_mapping_key(key);
+    lines.erase(std::remove_if(lines.begin(), lines.end(), [&](const std::string &line) {
+        const size_t separator = line.find('=');
+        return separator != std::string::npos &&
+               normalized_mapping_key(line.substr(0, separator)) == normalized_wanted;
+    }), lines.end());
+    if (!value.empty())
+        lines.emplace_back(key + '=' + value);
+}
+
+wxColour spool_colour(const std::string &value)
+{
+    std::string color = value;
+    boost::trim(color);
+    if (color.size() == 6 && color.front() != '#')
+        color.insert(color.begin(), '#');
+    if (color.size() == 7 && color.front() == '#' &&
+        std::all_of(color.begin() + 1, color.end(), [](unsigned char ch) { return std::isxdigit(ch) != 0; }))
+        return wxColour(from_u8(color));
+    return wxColour("#808080");
+}
+
+// Connection credentials belong to the selected physical printer, not its
+// reusable machine preset. Keep profile settings as the fallback for old setups.
+DynamicPrintConfig filament_sync_host_config()
+{
+    auto &bundle = *wxGetApp().preset_bundle;
+    DynamicPrintConfig config = bundle.printers.get_edited_preset().config;
+    if (const auto *physical = bundle.physical_printers.get_selected_printer_config())
+        config.apply(*physical);
+    return config;
+}
+
+class OctoPrintFilamentMappingsDialog final : public DPIDialog
+{
+public:
+    OctoPrintFilamentMappingsDialog(
+        wxWindow *parent, AppConfig &config,
+        std::vector<SpoolManagerMetadata::Filament> inventory)
+        : DPIDialog(parent, wxID_ANY, _L("OctoPrint filament profile mappings"),
+                    wxDefaultPosition, wxDefaultSize,
+                    wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER)
+        , m_config(config)
+        , m_spool_lines(load_filament_mapping_lines(config, SPOOL_PROFILE_MAPPINGS_KEY))
+        , m_material_lines(load_filament_mapping_lines(config, MATERIAL_PROFILE_MAPPINGS_KEY))
+    {
+        build_profile_choices();
+        deduplicate_inventory(inventory);
+
+        auto *root = new wxBoxSizer(wxVERTICAL);
+        auto *intro = new wxStaticText(
+            this, wxID_ANY,
+            _L("Map rolls reported by the selected OctoPrint printer to compatible Orca filament profiles. "
+               "Exact-roll mappings win, followed by manufacturer/material, unknown-manufacturer material, "
+               "and finally the default all-rounder."));
+        intro->Wrap(FromDIP(850));
+        root->Add(intro, 0, wxEXPAND | wxALL, FromDIP(12));
+
+        auto *scrolled = new wxScrolledWindow(this, wxID_ANY, wxDefaultPosition,
+                                               wxSize(FromDIP(880), FromDIP(520)),
+                                               wxVSCROLL | wxBORDER_NONE);
+        scrolled->SetScrollRate(0, FromDIP(12));
+        auto *content = new wxBoxSizer(wxVERTICAL);
+        add_roll_mappings(scrolled, content, inventory);
+        add_material_mappings(scrolled, content, inventory);
+        scrolled->SetSizer(content);
+        content->FitInside(scrolled);
+        root->Add(scrolled, 1, wxEXPAND | wxLEFT | wxRIGHT, FromDIP(12));
+
+        auto *default_box = new wxStaticBoxSizer(wxHORIZONTAL, this, _L("Default all-rounder"));
+        auto *default_help = new wxStaticText(
+            this, wxID_ANY,
+            _L("Used only when no roll or material mapping exists. Automatic lets Orca choose its best compatible material profile."));
+        default_help->Wrap(FromDIP(480));
+        default_box->Add(default_help, 1, wxALIGN_CENTER_VERTICAL | wxALL, FromDIP(8));
+        m_default_choice = make_profile_choice(this, m_config.get(DEFAULT_FILAMENT_PROFILE_KEY));
+        default_box->Add(m_default_choice, 1, wxALIGN_CENTER_VERTICAL | wxALL, FromDIP(8));
+        root->Add(default_box, 0, wxEXPAND | wxALL, FromDIP(12));
+
+        auto *buttons = new wxBoxSizer(wxHORIZONTAL);
+        auto *cancel = new Button(this, _L("Cancel"));
+        cancel->SetStyle(ButtonStyle::Regular, ButtonType::Choice);
+        auto *save_button = new Button(this, _L("Save"));
+        save_button->SetStyle(ButtonStyle::Confirm, ButtonType::Choice);
+        buttons->AddStretchSpacer();
+        buttons->Add(cancel, 0, wxRIGHT, FromDIP(8));
+        buttons->Add(save_button);
+        root->Add(buttons, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, FromDIP(12));
+        cancel->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { EndModal(wxID_CANCEL); });
+        save_button->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { save(); EndModal(wxID_OK); });
+        SetSizerAndFit(root);
+        SetMinSize(wxSize(FromDIP(760), FromDIP(560)));
+        SetSize(wxSize(FromDIP(920), FromDIP(700)));
+        wxGetApp().UpdateDlgDarkUI(this);
+        CenterOnParent();
+    }
+
+private:
+    struct MappingChoice {
+        std::string key;
+        ComboBox   *choice {nullptr};
+    };
+
+    AppConfig &m_config;
+    wxArrayString m_profile_choices;
+    std::vector<std::string> m_spool_lines;
+    std::vector<std::string> m_material_lines;
+    std::vector<MappingChoice> m_roll_choices;
+    std::vector<MappingChoice> m_vendor_material_choices;
+    std::vector<MappingChoice> m_material_choices;
+    ComboBox *m_default_choice {nullptr};
+
+    void on_dpi_changed(const wxRect &suggested_rect) override
+    {
+        SetSize(suggested_rect);
+        Layout();
+    }
+
+    void build_profile_choices()
+    {
+        m_profile_choices.Add(_L("Automatic (Orca best match)"));
+        if (wxGetApp().preset_bundle == nullptr)
+            return;
+        for (const Preset &preset : wxGetApp().preset_bundle->filaments.get_presets())
+            if (!preset.is_default && preset.is_visible && preset.is_compatible)
+                m_profile_choices.Add(from_u8(preset.name));
+    }
+
+    static void deduplicate_inventory(std::vector<SpoolManagerMetadata::Filament> &inventory)
+    {
+        std::vector<std::string> seen;
+        inventory.erase(std::remove_if(inventory.begin(), inventory.end(), [&](const auto &spool) {
+            const std::string key = normalized_mapping_key(spool.provider + ':' + spool.spool_id);
+            if (spool.spool_id.empty() || std::find(seen.begin(), seen.end(), key) != seen.end())
+                return true;
+            seen.push_back(key);
+            return false;
+        }), inventory.end());
+        std::sort(inventory.begin(), inventory.end(), [](const auto &left, const auto &right) {
+            return std::tie(left.vendor, left.material, left.name) <
+                   std::tie(right.vendor, right.material, right.name);
+        });
+    }
+
+    ComboBox *make_profile_choice(wxWindow *parent, const std::string &selected)
+    {
+        auto *choice = new ComboBox(parent, wxID_ANY, wxEmptyString, wxDefaultPosition,
+                                    wxSize(FromDIP(280), -1), 0, nullptr, wxCB_READONLY);
+        for (const wxString &profile : m_profile_choices)
+            choice->Append(profile);
+        int index = m_profile_choices.Index(from_u8(selected));
+        if (index == wxNOT_FOUND && !selected.empty()) {
+            // Opening and saving the editor must not erase a rule just because
+            // its profile is unavailable for the currently selected printer.
+            index = choice->Append(from_u8(selected));
+            choice->SetToolTip(_L("This saved profile is currently unavailable or incompatible. Select another profile to change the mapping."));
+        }
+        choice->SetSelection(index == wxNOT_FOUND ? 0 : index);
+        return choice;
+    }
+
+    void add_heading(wxWindow *parent, wxBoxSizer *content, const wxString &title,
+                     const wxString &description)
+    {
+        auto *label = new wxStaticText(parent, wxID_ANY, title);
+        label->SetFont(label->GetFont().Bold());
+        content->Add(label, 0, wxEXPAND | wxTOP | wxBOTTOM, FromDIP(8));
+        auto *help = new wxStaticText(parent, wxID_ANY, description);
+        help->Wrap(FromDIP(820));
+        content->Add(help, 0, wxEXPAND | wxBOTTOM, FromDIP(8));
+    }
+
+    void add_roll_mappings(wxWindow *parent, wxBoxSizer *content,
+                           const std::vector<SpoolManagerMetadata::Filament> &inventory)
+    {
+        add_heading(parent, content, _L("Upstream OctoPrint rolls"),
+                    _L("Every roll reported by the filament inventory provider is shown here. Choose the Orca profile that should be selected when that exact roll is loaded."));
+        auto *grid = new wxFlexGridSizer(3, FromDIP(6), FromDIP(10));
+        grid->AddGrowableCol(1, 1);
+        grid->AddGrowableCol(2, 1);
+        grid->Add(new wxStaticText(parent, wxID_ANY, _L("Color")), 0, wxALIGN_CENTER_VERTICAL);
+        grid->Add(new wxStaticText(parent, wxID_ANY, _L("OctoPrint filament")), 0, wxALIGN_CENTER_VERTICAL);
+        grid->Add(new wxStaticText(parent, wxID_ANY, _L("Orca filament profile")), 0, wxALIGN_CENTER_VERTICAL);
+        for (const auto &spool : inventory) {
+            auto *color = new wxPanel(parent, wxID_ANY, wxDefaultPosition,
+                                      wxSize(FromDIP(22), FromDIP(22)));
+            color->SetBackgroundColour(spool_colour(spool.color));
+            grid->Add(color, 0, wxALIGN_CENTER_VERTICAL);
+            wxString description = from_u8(spool.name);
+            if (!spool.vendor.empty() || !spool.material.empty())
+                description += "\n" + from_u8(spool.vendor) + " · " + from_u8(spool.material);
+            description += "\n" + from_u8(spool.provider) + ": " + from_u8(spool.spool_id);
+            grid->Add(new wxStaticText(parent, wxID_ANY, description), 1, wxEXPAND | wxALIGN_CENTER_VERTICAL);
+            const std::string key = spool.provider.empty() ? spool.spool_id :
+                                    spool.provider + ':' + spool.spool_id;
+            ComboBox *choice = make_profile_choice(parent, mapped_value(m_spool_lines, key));
+            grid->Add(choice, 1, wxEXPAND | wxALIGN_CENTER_VERTICAL);
+            m_roll_choices.push_back({key, choice});
+        }
+        if (inventory.empty()) {
+            grid->AddSpacer(1);
+            grid->Add(new wxStaticText(parent, wxID_ANY, _L("No upstream rolls were reported.")),
+                      0, wxEXPAND);
+            grid->AddSpacer(1);
+        }
+        content->Add(grid, 0, wxEXPAND | wxBOTTOM, FromDIP(14));
+    }
+
+    void add_material_mappings(wxWindow *parent, wxBoxSizer *content,
+                               const std::vector<SpoolManagerMetadata::Filament> &inventory)
+    {
+        add_heading(parent, content, _L("Material fallbacks"),
+                    _L("The manufacturer mapping is used for other rolls from that brand. The unknown-manufacturer mapping is used whenever only the material is known."));
+        auto *grid = new wxFlexGridSizer(3, FromDIP(6), FromDIP(10));
+        grid->AddGrowableCol(1, 1);
+        grid->AddGrowableCol(2, 1);
+        grid->Add(new wxStaticText(parent, wxID_ANY, _L("Upstream material")), 0, wxALIGN_CENTER_VERTICAL);
+        grid->Add(new wxStaticText(parent, wxID_ANY, _L("Same manufacturer + material")), 0, wxALIGN_CENTER_VERTICAL);
+        grid->Add(new wxStaticText(parent, wxID_ANY, _L("Unknown manufacturer, same material")), 0, wxALIGN_CENTER_VERTICAL);
+
+        std::vector<std::pair<std::string, std::string>> materials;
+        for (const auto &spool : inventory) {
+            if (spool.material.empty())
+                continue;
+            const auto key = std::make_pair(spool.vendor, spool.material);
+            const bool present = std::any_of(materials.begin(), materials.end(), [&](const auto &item) {
+                return normalized_mapping_key(item.first) == normalized_mapping_key(key.first) &&
+                       normalized_mapping_key(item.second) == normalized_mapping_key(key.second);
+            });
+            if (!present)
+                materials.push_back(key);
+        }
+        for (const auto &[vendor, material] : materials) {
+            const std::string vendor_key = vendor.empty() ? material : vendor + '|' + material;
+            grid->Add(new wxStaticText(parent, wxID_ANY,
+                                       vendor.empty() ? from_u8(material) :
+                                       from_u8(vendor) + " · " + from_u8(material)),
+                      0, wxALIGN_CENTER_VERTICAL);
+            ComboBox *vendor_choice = make_profile_choice(parent, mapped_value(m_material_lines, vendor_key));
+            grid->Add(vendor_choice, 1, wxEXPAND | wxALIGN_CENTER_VERTICAL);
+            m_vendor_material_choices.push_back({vendor_key, vendor_choice});
+
+            ComboBox *material_choice = make_profile_choice(parent, mapped_value(m_material_lines, material));
+            grid->Add(material_choice, 1, wxEXPAND | wxALIGN_CENTER_VERTICAL);
+            m_material_choices.push_back({material, material_choice});
+            material_choice->Bind(wxEVT_COMBOBOX, [this, material = material](wxCommandEvent &event) {
+                const wxString selection = static_cast<ComboBox *>(event.GetEventObject())->GetStringSelection();
+                for (const MappingChoice &mapping : m_material_choices)
+                    if (normalized_mapping_key(mapping.key) == normalized_mapping_key(material) &&
+                        mapping.choice != event.GetEventObject()) {
+                        if (mapping.choice->FindString(selection) == wxNOT_FOUND)
+                            mapping.choice->Append(selection);
+                        mapping.choice->SetStringSelection(selection);
+                    }
+                event.Skip();
+            });
+        }
+        content->Add(grid, 0, wxEXPAND | wxBOTTOM, FromDIP(14));
+    }
+
+    std::string selected_profile(const ComboBox *choice) const
+    {
+        return choice == nullptr || choice->GetSelection() <= 0 ? std::string() :
+               into_u8(choice->GetStringSelection());
+    }
+
+    void save()
+    {
+        for (const MappingChoice &mapping : m_roll_choices)
+            set_mapped_value(m_spool_lines, mapping.key, selected_profile(mapping.choice));
+        for (const MappingChoice &mapping : m_vendor_material_choices)
+            set_mapped_value(m_material_lines, mapping.key, selected_profile(mapping.choice));
+        for (const MappingChoice &mapping : m_material_choices)
+            set_mapped_value(m_material_lines, mapping.key, selected_profile(mapping.choice));
+        m_config.set(SPOOL_PROFILE_MAPPINGS_KEY, json(m_spool_lines).dump());
+        m_config.set(MATERIAL_PROFILE_MAPPINGS_KEY, json(m_material_lines).dump());
+        m_config.set(DEFAULT_FILAMENT_PROFILE_KEY, selected_profile(m_default_choice));
+        m_config.set("octoprint_profile_mappings_global", "1");
+        m_config.save();
+    }
+};
+
+} // namespace
 wxDEFINE_EVENT(EVT_RESTORE_PROJECT,                 wxCommandEvent);
 wxDEFINE_EVENT(EVT_PRINT_FINISHED,                  wxCommandEvent);
 wxDEFINE_EVENT(EVT_SEND_CALIBRATION_FINISHED,       wxCommandEvent);
@@ -714,6 +1057,11 @@ struct Sidebar::priv
     std::vector<PlaterPresetComboBox*> combos_filament;
     int editing_filament = -1;
     wxBoxSizer *sizer_filaments = nullptr;
+    wxPanel *area_bindings_panel = nullptr;
+    wxPanel *area_bindings_content = nullptr;
+    bool area_bindings_collapsed = false;
+    std::vector<wxPanel *> area_binding_rows;
+    std::vector<ComboBox *> area_binding_choices;
 
     //BBS Sidebar widgets
     wxPanel* m_panel_print_title;
@@ -730,6 +1078,7 @@ struct Sidebar::priv
     ScalableButton *  m_bpButton_add_filament;
     ScalableButton *  m_bpButton_del_filament;
     ScalableButton *  m_bpButton_ams_filament;
+    ScalableButton *  m_bpButton_octoprint_filament_mappings;
     ScalableButton *  m_bpButton_set_filament;
     int m_menu_filament_id = -1;
 
@@ -1100,6 +1449,7 @@ struct DynamicFilamentList : DynamicList
     // physical-only list for all of its keys.
     explicit DynamicFilamentList(bool physical_only = false) : physical_only(physical_only) {}
     bool physical_only;
+    bool allow_per_print = true;
     std::vector<std::pair<wxString, wxBitmap *>> items;
     std::vector<int> slot_map{0}; // combo index -> 1-based filament slot; slot_map[0] = 0 is "Default"
 
@@ -1122,6 +1472,13 @@ struct DynamicFilamentList : DynamicList
         for (auto i : items) {
             cb->Append(i.first, i.second ? *i.second : wxNullBitmap);
         }
+        if (allow_per_print) {
+            cb->Append(_L("Per print"));
+            if (old_selection == _L("Per print")) {
+                cb->SetSelection(int(items.size()) + 1);
+                return;
+            }
+        }
 
         int restored = index_of(wxString::Format("%d", old_slot));
         if (restored > 0 || old_slot == 0) {
@@ -1131,7 +1488,7 @@ struct DynamicFilamentList : DynamicList
 
         int new_index = cb->FindString(old_selection);
         if (old_index == cb->GetCount()) {
-            cb->SetSelection(old_index - 1);
+            cb->SetSelection(std::min(old_index - 1, int(items.size())));
         } else if (new_index != wxNOT_FOUND) {
             cb->SetSelection(new_index);
         } else {
@@ -1141,7 +1498,8 @@ struct DynamicFilamentList : DynamicList
     wxString get_value(int index) override
     {
         wxString str;
-        str << (index >= 0 && index < int(slot_map.size()) ? slot_map[index] : 0);
+        str << (allow_per_print && index == int(items.size()) + 1 ? -1 :
+                (index >= 0 && index < int(slot_map.size()) ? slot_map[index] : 0));
         return str;
     }
     int index_of(wxString value) override
@@ -1149,6 +1507,8 @@ struct DynamicFilamentList : DynamicList
         long n = 0;
         if (!value.ToLong(&n))
             return -1;
+        if (allow_per_print && n == -1)
+            return int(items.size()) + 1;
         for (int i = 0; i < int(slot_map.size()); ++i)
             if (slot_map[i] == int(n))
                 return i;
@@ -1193,6 +1553,7 @@ static bool has_junction_deviation(const DynamicPrintConfig* printer_config)
 
 static DynamicFilamentList dynamic_filament_list;                // every slot, mixed included (per-feature *_filament_id keys)
 static DynamicFilamentList dynamic_physical_filament_list(true); // physical slots only (support_*, wipe_tower_filament)
+static DynamicFilamentList dynamic_wipe_filament_list(true);
 
 class AMSCountPopupWindow : public PopupWindow
 {
@@ -2422,7 +2783,8 @@ Sidebar::Sidebar(Plater *parent)
     Choice::register_dynamic_list("internal_solid_filament_id", &dynamic_filament_list);
     Choice::register_dynamic_list("top_surface_filament_id", &dynamic_filament_list);
     Choice::register_dynamic_list("bottom_surface_filament_id", &dynamic_filament_list);
-    Choice::register_dynamic_list("wipe_tower_filament", &dynamic_physical_filament_list);
+    dynamic_wipe_filament_list.allow_per_print = false;
+    Choice::register_dynamic_list("wipe_tower_filament", &dynamic_wipe_filament_list);
 
     p->scrolled = new wxPanel(this);
     //    p->scrolled->SetScrollbars(0, 100, 1, 2); // ys_DELETE_after_testing. pixelsPerUnitY = 100
@@ -2998,7 +3360,7 @@ Sidebar::Sidebar(Plater *parent)
                                                  wxBU_EXACTFIT | wxNO_BORDER, false, 16); // ORCA match icon size with other icons as 16x16
     ams_btn->SetToolTip(_L("Synchronize filament list from AMS"));
     ams_btn->Bind(wxEVT_BUTTON, [this](wxCommandEvent &e) {
-        auto &printer_config = wxGetApp().preset_bundle->printers.get_edited_preset().config;
+        auto printer_config = filament_sync_host_config();
         const auto *host_type = printer_config.option<ConfigOptionEnum<PrintHostType>>("host_type");
         if (host_type != nullptr && host_type->value == htOctoPrint)
             sync_spool_manager_filaments(&printer_config);
@@ -3010,6 +3372,18 @@ Sidebar::Sidebar(Plater *parent)
     p->m_bpButton_ams_filament = ams_btn;
 
     bSizer39->Add(ams_btn, 0, wxALIGN_CENTER | wxLEFT, FromDIP(SidebarProps::WideSpacing()));
+
+    auto *mapping_btn = new ScalableButton(p->m_panel_filament_title, wxID_ANY,
+                                           "switch_filament_maps", wxEmptyString,
+                                           wxDefaultSize, wxDefaultPosition,
+                                           wxBU_EXACTFIT | wxNO_BORDER, false, 16);
+    mapping_btn->SetToolTip(_L("Map OctoPrint filaments to Orca profiles"));
+    mapping_btn->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
+        manage_octoprint_filament_mappings();
+    });
+    mapping_btn->Hide();
+    p->m_bpButton_octoprint_filament_mappings = mapping_btn;
+    bSizer39->Add(mapping_btn, 0, wxALIGN_CENTER | wxLEFT, FromDIP(SidebarProps::IconSpacing()));
     //bSizer39->Add(FromDIP(10), 0, 0, 0, 0 );
 
     ScalableButton* set_btn = new ScalableButton(p->m_panel_filament_title, wxID_ANY, "settings");
@@ -3184,6 +3558,72 @@ Sidebar::Sidebar(Plater *parent)
     // ---- End filament area ----
     }
 
+    {
+        p->area_bindings_panel = new wxPanel(p->scrolled);
+        auto *section_sizer = new wxBoxSizer(wxVERTICAL);
+        auto *header = new StaticBox(p->area_bindings_panel, wxID_ANY, wxDefaultPosition,
+                                     wxDefaultSize, wxTAB_TRAVERSAL | wxBORDER_NONE);
+        header->SetBackgroundColor(title_bg);
+        header->SetBackgroundColor2(0xF1F1F1);
+        auto *header_sizer = new wxBoxSizer(wxHORIZONTAL);
+        auto *icon = new ScalableButton(header, wxID_ANY, "filament");
+        auto *title = new Label(header, _L("Filament Bindings"), LB_PROPAGATE_MOUSE_EVENT);
+        auto *toggle = new ScalableButton(header, wxID_ANY,
+            p->area_bindings_collapsed ? "expand_btn" : "collapse_btn");
+        toggle->SetToolTip(_L("Expand or collapse Filament Bindings"));
+        header_sizer->Add(icon, 0, wxALIGN_CENTER | wxLEFT, FromDIP(SidebarProps::TitlebarMargin()));
+        header_sizer->Add(title, 1, wxALIGN_CENTER_VERTICAL | wxLEFT | wxRIGHT, FromDIP(SidebarProps::ElementSpacing()));
+        header_sizer->Add(toggle, 0, wxALIGN_CENTER | wxRIGHT, FromDIP(SidebarProps::TitlebarMargin()));
+        header_sizer->SetMinSize(-1, FromDIP(30));
+        header->SetSizerAndFit(header_sizer);
+        section_sizer->Add(header, 0, wxEXPAND);
+        p->area_bindings_content = new wxPanel(p->area_bindings_panel);
+        wxWindow *content = p->area_bindings_content;
+        auto *bindings_sizer = new wxBoxSizer(wxVERTICAL);
+        const auto &keys = project_filament_role_keys();
+        for (size_t i = 0; i < keys.size(); ++i) {
+            auto *row = new wxPanel(content);
+            auto *row_sizer = new wxBoxSizer(wxHORIZONTAL);
+            row_sizer->Add(new wxStaticText(row, wxID_ANY, _(print_config_def.get(keys[i])->label)),
+                           1, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(5));
+            auto *choice = new ComboBox(row, wxID_ANY, wxEmptyString, wxDefaultPosition, wxDefaultSize,
+                                       0, nullptr, wxCB_READONLY);
+            row_sizer->Add(choice, 1, wxEXPAND);
+            row->SetSizerAndFit(row_sizer);
+            bindings_sizer->Add(row, 0, wxEXPAND | wxTOP | wxBOTTOM, FromDIP(1));
+            p->area_binding_rows.push_back(row);
+            p->area_binding_choices.push_back(choice);
+            choice->Bind(wxEVT_COMBOBOX, [this, i, choice](wxCommandEvent &) {
+                auto *bundle = wxGetApp().preset_bundle;
+                auto *slots = bundle->project_config.option<ConfigOptionInts>("project_filament_bindings", true);
+                slots->values.resize(project_filament_role_keys().size(), 0);
+                slots->values[i] = std::max(0, choice->GetSelection());
+                p->plater->on_config_change(bundle->full_config());
+                p->plater->update_project_dirty_from_presets();
+                p->plater->update();
+            });
+        }
+        content->SetSizerAndFit(bindings_sizer);
+        content->SetMinSize(wxDefaultSize);
+        content->Show(!p->area_bindings_collapsed);
+        section_sizer->Add(content, 0, wxEXPAND | wxLEFT | wxRIGHT, FromDIP(5));
+        p->area_bindings_panel->SetSizerAndFit(section_sizer);
+        p->area_bindings_panel->SetMinSize(wxDefaultSize);
+        const auto toggle_bindings = [this, toggle] {
+            p->area_bindings_collapsed = !p->area_bindings_collapsed;
+            p->area_bindings_content->Show(!p->area_bindings_collapsed);
+            toggle->SetBitmap(create_scaled_bitmap(p->area_bindings_collapsed ? "expand_btn" : "collapse_btn", toggle));
+            p->area_bindings_panel->InvalidateBestSize();
+            p->area_bindings_panel->Layout();
+            p->scrolled->Layout();
+            p->scrolled->FitInside();
+        };
+        header->Bind(wxEVT_LEFT_UP, [toggle_bindings](wxMouseEvent &) { toggle_bindings(); });
+        toggle->Bind(wxEVT_BUTTON, [toggle_bindings](wxCommandEvent &) { toggle_bindings(); });
+        icon->Bind(wxEVT_BUTTON, [toggle_bindings](wxCommandEvent &) { toggle_bindings(); });
+        scrolled_sizer->Add(p->area_bindings_panel, 0, wxEXPAND);
+        p->area_bindings_panel->Hide();
+    }
     {
     //add project title
     auto params_panel = ((MainFrame*)parent->GetParent())->m_param_panel;
@@ -3446,6 +3886,7 @@ void Sidebar::update_all_preset_comboboxes()
         p->m_printer_connect->Hide();
         //only show sync-ams button for BBL printer
         p->m_bpButton_ams_filament->Show();
+        p->m_bpButton_octoprint_filament_mappings->Hide();
         p->m_bpButton_ams_filament->SetToolTip(_L("Synchronize filament list from AMS"));
         //update print button default value for bbl or third-party printer
         p_mainframe->set_print_button_to_default(MainFrame::PrintSelectType::ePrintPlate);
@@ -3457,11 +3898,13 @@ void Sidebar::update_all_preset_comboboxes()
         // ORCA: OctoPrint SpoolManager uses the same filament-title sync action as
         // AMS and other printer agents. Its host URL and API key are read from this
         // physical printer's connection settings.
-        const auto *host_type = cfg.option<ConfigOptionEnum<PrintHostType>>("host_type");
+        const auto sync_config = filament_sync_host_config();
+        const auto *host_type = sync_config.option<ConfigOptionEnum<PrintHostType>>("host_type");
         const bool is_octoprint = host_type != nullptr && host_type->value == htOctoPrint;
         auto agent = wxGetApp().getAgent();
         p->m_bpButton_ams_filament->Show(
             is_octoprint || (agent && agent->get_filament_sync_mode() != FilamentSyncMode::none));
+        p->m_bpButton_octoprint_filament_mappings->Show(is_octoprint);
         p->m_bpButton_ams_filament->SetToolTip(
             is_octoprint ? _L("Synchronize filament list from OctoPrint")
                          : _L("Synchronize filament list from AMS"));
@@ -5138,6 +5581,7 @@ void Sidebar::msw_rescale()
     p->m_bpButton_add_filament->msw_rescale();
     p->m_bpButton_del_filament->msw_rescale();
     p->m_bpButton_ams_filament->msw_rescale();
+    p->m_bpButton_octoprint_filament_mappings->msw_rescale();
     p->m_bpButton_set_filament->msw_rescale();
     p->m_purge_mode_btn->Rescale();
     p->m_flushing_volume_btn->Rescale();
@@ -5224,6 +5668,7 @@ void Sidebar::sys_color_changed()
     p->m_bpButton_add_filament->msw_rescale();
     p->m_bpButton_del_filament->msw_rescale();
     p->m_bpButton_ams_filament->msw_rescale();
+    p->m_bpButton_octoprint_filament_mappings->msw_rescale();
     p->m_bpButton_set_filament->msw_rescale();
     p->m_purge_mode_btn->Rescale();
     p->m_flushing_volume_btn->Rescale();
@@ -6122,17 +6567,11 @@ void Sidebar::sync_ams_list(bool is_from_big_sync_btn)
 void Sidebar::sync_spool_manager_filaments(DynamicPrintConfig *host_config)
 {
     auto &bundle = *wxGetApp().preset_bundle;
-    DynamicPrintConfig &printer_config =
-        host_config != nullptr ? *host_config : bundle.printers.get_edited_preset().config;
+    DynamicPrintConfig printer_config =
+        host_config != nullptr ? *host_config : filament_sync_host_config();
     const auto *host_type = printer_config.option<ConfigOptionEnum<PrintHostType>>("host_type");
     if (host_type == nullptr || host_type->value != htOctoPrint) {
         show_error(this, _L("Select OctoPrint as the print host before synchronizing filament spools."), false);
-        return;
-    }
-
-    const auto *enabled = printer_config.option<ConfigOptionBool>("sync_spool_manager_filament_names");
-    if (enabled == nullptr || !enabled->value) {
-        show_error(this, _L("Enable OctoPrint filament spool sync in the physical printer connection settings first."), false);
         return;
     }
 
@@ -6174,8 +6613,10 @@ void Sidebar::sync_spool_manager_filaments(DynamicPrintConfig *host_config)
 
     auto &filament_presets = bundle.filament_presets;
     const bool fixed_slots = bundle.has_fixed_filament_slots();
-    const size_t slot_count =
-        fixed_slots ? bundle.max_filament_colors() : std::min(slots.size(), bundle.max_filament_colors());
+    // A partial provider report must not delete project materials or invalidate
+    // painted regions and per-print role bindings.
+    const size_t slot_count = fixed_slots ? bundle.max_filament_colors() :
+        std::min(std::max(slots.size(), filament_presets.size()), bundle.max_filament_colors());
     bundle.set_num_filaments(static_cast<unsigned int>(slot_count));
 
     auto *colors = bundle.project_config.option<ConfigOptionStrings>("filament_colour");
@@ -6204,6 +6645,42 @@ void Sidebar::sync_spool_manager_filaments(DynamicPrintConfig *host_config)
     const auto *default_filament_profile =
         printer_config.option<ConfigOptionString>("octoprint_default_filament_profile");
     const std::vector<std::string> no_mappings;
+    const auto global_mapping_lines = [](const char *key) {
+        std::vector<std::string> values;
+        if (wxGetApp().app_config == nullptr)
+            return values;
+        const std::string serialized = wxGetApp().app_config->get(key);
+        if (serialized.empty())
+            return values;
+        try {
+            const json parsed = json::parse(serialized);
+            if (parsed.is_array())
+                values = parsed.get<std::vector<std::string>>();
+        } catch (...) {
+            boost::split(values, serialized, boost::is_any_of("\r\n"), boost::token_compress_on);
+        }
+        values.erase(std::remove_if(values.begin(), values.end(), [](std::string value) {
+            boost::trim(value);
+            return value.empty();
+        }), values.end());
+        return values;
+    };
+    const std::vector<std::string> global_spool_mappings =
+        global_mapping_lines("octoprint_spool_profile_mappings");
+    const std::vector<std::string> global_material_mappings =
+        global_mapping_lines("octoprint_material_profile_mappings");
+    const std::string global_default_profile = wxGetApp().app_config == nullptr ? std::string() :
+        wxGetApp().app_config->get("octoprint_default_filament_profile");
+    const bool global_mappings_configured = wxGetApp().app_config != nullptr &&
+        wxGetApp().app_config->get("octoprint_profile_mappings_global") == "1";
+    // Global mappings are printer-independent. The physical-printer values are
+    // retained only as a backward-compatible fallback for existing configs.
+    const std::vector<std::string> &effective_spool_mappings = global_mappings_configured ?
+        global_spool_mappings : (spool_profile_mappings != nullptr ? spool_profile_mappings->values : no_mappings);
+    const std::vector<std::string> &effective_material_mappings = global_mappings_configured ?
+        global_material_mappings : (material_profile_mappings != nullptr ? material_profile_mappings->values : no_mappings);
+    const std::string effective_default_profile = global_mappings_configured ? global_default_profile :
+        (default_filament_profile != nullptr ? default_filament_profile->value : std::string());
     size_t assigned_count = 0;
     const size_t synchronized_slots = std::min(filament_presets.size(), slots.size());
     for (size_t index = 0; index < synchronized_slots; ++index) {
@@ -6223,9 +6700,9 @@ void Sidebar::sync_spool_manager_filaments(DynamicPrintConfig *host_config)
 
         const std::string mapped_profile = SpoolManagerMetadata::mapped_profile_name(
             spool,
-            spool_profile_mappings != nullptr ? spool_profile_mappings->values : no_mappings,
-            material_profile_mappings != nullptr ? material_profile_mappings->values : no_mappings,
-            default_filament_profile != nullptr ? default_filament_profile->value : std::string());
+            effective_spool_mappings,
+            effective_material_mappings,
+            effective_default_profile);
         if (!mapped_profile.empty()) {
             const Preset *mapped = bundle.filaments.find_preset(mapped_profile);
             if (mapped != nullptr && mapped->is_visible && mapped->is_compatible) {
@@ -6334,6 +6811,34 @@ void Sidebar::sync_spool_manager_filaments(DynamicPrintConfig *host_config)
         _L("OctoPrint filament spools"), wxOK | wxICON_INFORMATION).ShowModal();
 }
 
+void Sidebar::manage_octoprint_filament_mappings()
+{
+    if (wxGetApp().preset_bundle == nullptr || wxGetApp().app_config == nullptr)
+        return;
+    DynamicPrintConfig printer_config = filament_sync_host_config();
+    const auto *host_type = printer_config.option<ConfigOptionEnum<PrintHostType>>("host_type");
+    if (host_type == nullptr || host_type->value != htOctoPrint) {
+        show_error(this, _L("Select OctoPrint as the print host before mapping filament spools."), false);
+        return;
+    }
+
+    std::vector<SpoolManagerMetadata::Filament> slots;
+    std::vector<SpoolManagerMetadata::Filament> inventory;
+    wxString error;
+    {
+        wxBusyCursor wait;
+        OctoPrint host(&printer_config);
+        if (!host.get_filament_spools(slots, inventory, error)) {
+            show_error(this, error, false);
+            return;
+        }
+    }
+    if (inventory.empty())
+        inventory = slots;
+    OctoPrintFilamentMappingsDialog dialog(this, *wxGetApp().app_config, std::move(inventory));
+    dialog.ShowModal();
+}
+
 
 bool Sidebar::should_show_SEMM_buttons()
 {
@@ -6410,6 +6915,48 @@ void Sidebar::update_dynamic_filament_list()
 {
     dynamic_filament_list.update();
     dynamic_physical_filament_list.update();
+    dynamic_wipe_filament_list.update();
+    update_area_bindings();
+}
+
+void Sidebar::update_area_bindings()
+{
+    if (p->area_bindings_panel == nullptr)
+        return;
+    auto *bundle = wxGetApp().preset_bundle;
+    const auto &config = bundle->prints.get_edited_preset().config;
+    const auto *slots = bundle->project_config.option<ConfigOptionInts>("project_filament_bindings");
+    const auto icons = get_extruder_color_icons(true);
+    const int automatic = project_default_filament(p->plater->model());
+    bundle->project_default_filament_id = automatic;
+    bool any = false;
+    const auto &keys = project_filament_role_keys();
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const auto *role = config.option<ConfigOptionInt>(keys[i]);
+        const bool visible = role != nullptr && role->value == -1;
+        p->area_binding_rows[i]->Show(visible);
+        any |= visible;
+        if (!visible)
+            continue;
+        ComboBox *choice = p->area_binding_choices[i];
+        choice->Clear();
+        choice->Append(wxString::Format(_L("Automatic (filament %d)"), automatic));
+        for (size_t slot = 0; slot < bundle->filament_presets.size(); ++slot) {
+            const wxString label = wxString::Format("%d: ", int(slot) + 1) + from_u8(bundle->filament_presets[slot]);
+            choice->Append(label, slot < icons.size() && icons[slot] != nullptr ? *icons[slot] : wxNullBitmap);
+        }
+        const int selected = slots != nullptr && i < slots->values.size() ? slots->values[i] : 0;
+        choice->SetSelection(selected >= 0 && selected <= int(bundle->filament_presets.size()) ? selected : 0);
+    }
+    p->area_bindings_panel->Show(any);
+    // Hidden roles must not reserve their initial expanded height. Preserve
+    // the user's folded state while updating the choices and visible rows.
+    p->area_bindings_content->InvalidateBestSize();
+    p->area_bindings_content->Layout();
+    p->area_bindings_panel->InvalidateBestSize();
+    p->area_bindings_panel->Layout();
+    p->scrolled->Layout();
+    p->scrolled->FitInside();
 }
 
 PlaterPresetComboBox* Sidebar::printer_combox()
@@ -17939,6 +18486,8 @@ void Plater::add_file()
 
 void Plater::update(bool conside_update_flag, bool force_background_processing_update)
 {
+    if (p->sidebar != nullptr)
+        p->sidebar->update_area_bindings();
     if (is_new_project_and_check_state()) {
         return;
     }
@@ -20267,6 +20816,11 @@ void Plater::on_filament_count_change(size_t num_filaments)
 
 void Plater::on_filaments_delete(size_t num_filaments, size_t filament_id, int replace_filament_id, const std::vector<unsigned char>& is_mixed_before_delete)
 {
+    // The UI has already renumbered the replacement; bindings still refer
+    // to the old slot list, so restore its pre-deletion index for remapping.
+    const int old_replacement = replace_filament_id >= int(filament_id) ? replace_filament_id + 1 : replace_filament_id;
+    remap_project_filament_bindings(wxGetApp().preset_bundle->project_config,
+                                    int(filament_id) + 1, old_replacement + 1);
     // only update elements in plater
     update_filament_colors_in_full_config();
 
@@ -20384,6 +20938,8 @@ void Plater::config_change_notification(const DynamicPrintConfig &config, const 
 
 void Plater::on_config_change(const DynamicPrintConfig &config)
 {
+    if (p->sidebar != nullptr)
+        p->sidebar->update_area_bindings();
     bool update_scheduled = false;
     bool bed_shape_changed = false;
     //bool print_sequence_changed = false;

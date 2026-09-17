@@ -379,6 +379,8 @@ struct SurfaceFill {
     ExPolygons          arc_anchor_regions;
     ExPolygons          arc_root_anchor_regions;
     Polylines           arc_obstacle_paths;
+    Polylines           arc_support_paths;
+    std::vector<coord_t> arc_support_widths;
     ExPolygons          arc_obstacle_regions;
 };
 
@@ -1339,7 +1341,12 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
                 arc_regions[region_id] = true;
     }
 
+    const bool has_arc_regions = std::any_of(arc_regions.begin(), arc_regions.end(),
+        [](bool enabled) { return enabled; });
     Polylines layer_arc_obstacle_paths;
+    Polylines layer_arc_support_paths;
+    std::vector<coord_t> layer_arc_support_widths;
+    Polygons layer_arc_support_coverage;
     Polygons layer_retained_perimeter_coverage;
     std::function<void(const ExtrusionEntity &, int)> collect_retained_perimeters;
     collect_retained_perimeters =
@@ -1363,9 +1370,17 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
                 entity.polygons_covered_by_width(
                     layer_retained_perimeter_coverage,
                     float(SCALED_EPSILON));
+                const auto *path = dynamic_cast<const ExtrusionPath *>(&entity);
+                if (path != nullptr && (!path->z_contoured || std::all_of(
+                        path->polyline.points.begin(), path->polyline.points.end(),
+                        [](const Point3 &point) { return std::abs(point.z()) <= SCALED_EPSILON; }))) {
+                    path->collect_polylines(layer_arc_support_paths);
+                    layer_arc_support_widths.resize(layer_arc_support_paths.size(), scale_(path->width));
+                    path->polygons_covered_by_width(layer_arc_support_coverage, float(SCALED_EPSILON));
+                }
             }
         };
-    for (size_t region_id = 0; region_id < layer.regions().size(); ++region_id) {
+    for (size_t region_id = 0; has_arc_regions && region_id < layer.regions().size(); ++region_id) {
         const LayerRegion &perimeter_region = *layer.regions()[region_id];
         const int wall_loops =
             std::max(0, int(perimeter_region.region().config().wall_loops));
@@ -1376,7 +1391,7 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
     }
 
     ExPolygons previous_layer_perimeter_beads;
-    if (layer.lower_layer != nullptr) {
+    if (has_arc_regions && layer.lower_layer != nullptr) {
         Polygons previous_layer_perimeter_coverage;
         for (const LayerRegion *lower_region : layer.lower_layer->regions())
             lower_region->perimeters.polygons_covered_by_width(
@@ -1440,6 +1455,8 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
         // before the arcs. Preserve every centerline that will actually be
         // emitted anywhere on this layer as a hard obstacle.
         fill.arc_obstacle_paths = layer_arc_obstacle_paths;
+        fill.arc_support_paths = layer_arc_support_paths;
+        fill.arc_support_widths = layer_arc_support_widths;
         if (!layer_retained_perimeter_coverage.empty()) {
             const ExPolygons perimeter_beads =
                 union_ex(layer_retained_perimeter_coverage);
@@ -1473,7 +1490,7 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
             perimeter_runways = intersection_ex(
                 perimeter_runways, to_expolygons(layerm.slices.surfaces));
             const ExPolygons perimeter_contact_extent = offset_ex(
-                perimeter_beads, 0.5f * float(arc_width));
+                union_ex(layer_arc_support_coverage), 0.5f * float(arc_width));
             const ExPolygons perimeter_anchor_rims =
                 diff_ex(perimeter_contact_extent, perimeter_cores);
             ExPolygons perimeter_anchors = intersection_ex(
@@ -1680,7 +1697,8 @@ void export_group_fills_to_svg(const char *path, const std::vector<SurfaceFill> 
 #endif
 
 // friend to Layer
-void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive::Octree* support_fill_octree, FillLightning::Generator* lightning_generator)
+void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive::Octree* support_fill_octree, FillLightning::Generator* lightning_generator,
+                       const FillProgressCallback* progress)
 {
     has_one_sided_arc_overhang = false;
 	for (LayerRegion *layerm : m_regions)
@@ -1691,6 +1709,8 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
 //	this->export_region_fill_surfaces_to_svg_debug("10_fill-initial");
 #endif /* SLIC3R_DEBUG_SLICE_PROCESSING */
     LockRegionParam lock_param;
+    if (progress != nullptr)
+        (*progress)(FillProgressStage::GroupSurfaces, 0, 1);
     std::vector<SurfaceFill>     surface_fills = group_fills(*this, lock_param);
     Polylines                    prior_arc_paths;
 	const Slic3r::BoundingBox bbox 			= this->object()->bounding_box();
@@ -1752,6 +1772,7 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
 
         // apply half spacing using this flow's own spacing and generate infill
         FillParams params;
+        params.progress          = progress;
         params.density 		     = float(0.01 * surface_fill.params.density);
         params.multiline         = surface_fill.params.multiline;
 		params.dont_adjust		 = false; //  surface_fill.params.dont_adjust;
@@ -1778,6 +1799,8 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
         params.arc_root_anchor_regions =
             &surface_fill.arc_root_anchor_regions;
         params.arc_obstacle_paths   = &surface_fill.arc_obstacle_paths;
+        params.arc_support_paths    = &surface_fill.arc_support_paths;
+        params.arc_support_widths   = &surface_fill.arc_support_widths;
         params.arc_prior_paths      = &prior_arc_paths;
         params.arc_obstacle_regions = &surface_fill.arc_obstacle_regions;
         params.pattern              = surface_fill.params.pattern;

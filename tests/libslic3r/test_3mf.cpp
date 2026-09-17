@@ -149,7 +149,7 @@ SCENARIO("Export+Import geometry to/from 3mf file cycle", "[3mf]") {
 //   * nozzle_volume_type    -> PlateData::nozzle_volume_types (previously write-only)
 // and pins the deliberately-lossy keys (enable_filament_dynamic_map) so a future change has to
 // consciously unpin them. Uses a store_bbs_3mf -> load_bbs_3mf cycle (no external fixture needed).
-SCENARIO("H2C multi-nozzle .3mf round-trip", "[3mf][MultiNozzle]") {
+SCENARIO("H2C multi-nozzle .3mf round-trip", "[3mf][MultiNozzle][ProjectFilamentBindings]") {
     GIVEN("a plate carrying multi-nozzle filament assignment metadata") {
         Model model;
         std::string src_file = std::string(TEST_DATA_DIR) + "/test_3mf/Prusa.stl";
@@ -166,6 +166,11 @@ SCENARIO("H2C multi-nozzle .3mf round-trip", "[3mf][MultiNozzle]") {
         DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
         config.set_key_value("nozzle_volume_type",
                              new ConfigOptionEnumsGeneric({ (int) NozzleVolumeType::nvtHighFlow }));
+        config.set_key_value("support_filament", new ConfigOptionInt(-1));
+        config.set_key_value("outer_wall_filament_id", new ConfigOptionInt(-1));
+        config.set_key_value("project_filament_bindings", new ConfigOptionInts{1, 0, 1, 0, 0, 0, 0, 0});
+        capture_project_filament_roles(config);
+        resolve_project_filament_bindings(config);
 
         PlateData* plate = new PlateData();
         plate->plate_index      = 0;
@@ -193,6 +198,8 @@ SCENARIO("H2C multi-nozzle .3mf round-trip", "[3mf][MultiNozzle]") {
             REQUIRE(store_bbs_3mf(store_params));
 
             Model dst_model;
+            ScopedTemporaryDir loaded_backup_dir("orca_mn_loaded");
+            dst_model.set_backup_path(loaded_backup_dir.string());
             DynamicPrintConfig dst_config;
             ConfigSubstitutionContext ctxt{ ForwardCompatibilitySubstitutionRule::Enable };
             PlateDataPtrs        dst_plates;
@@ -206,6 +213,13 @@ SCENARIO("H2C multi-nozzle .3mf round-trip", "[3mf][MultiNozzle]") {
                                        LoadStrategy::LoadModel | LoadStrategy::LoadConfig);
             THEN("every multi-nozzle key round-trips as expected") {
                 REQUIRE(loaded);
+                REQUIRE(dst_config.has("project_filament_bindings"));
+                CHECK(dst_config.option<ConfigOptionInts>("project_filament_bindings")->values ==
+                      config.option<ConfigOptionInts>("project_filament_bindings")->values);
+                CHECK(dst_config.opt_int("support_filament") == 1);
+                restore_project_filament_roles(dst_config);
+                CHECK(dst_config.opt_int("support_filament") == -1);
+                CHECK(dst_config.opt_int("outer_wall_filament_id") == -1);
                 REQUIRE(dst_plates.size() >= 1);
                 PlateData* rt = dst_plates.front();
 

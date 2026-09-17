@@ -3928,10 +3928,13 @@ void GCodeProcessor::process_gcode_line(const GCodeReader::GCodeLine& line, bool
         m_command_processor.process_comand(cmd, line);
     }
     else {
-        const std::string &comment = line.raw();
+        std::string_view comment = line.raw();
+        const size_t first = comment.find_first_not_of(" \t");
+        if (first != std::string_view::npos)
+            comment.remove_prefix(first);
         if (comment.length() > 2 && comment.front() == ';')
         {
-            std::string comment_content = comment.substr(1); // only format like ";V{cmd}" is valid
+            std::string comment_content(comment.substr(1)); // only format like ";V{cmd}" is valid
             if (comment_content[0] == 'V' || comment_content[0] == 'v') {
                 GCodeReader reader;
                 GCodeReader::GCodeLine new_line;
@@ -3941,8 +3944,7 @@ void GCodeProcessor::process_gcode_line(const GCodeReader::GCodeLine& line, bool
                 m_command_processor.process_comand(new_line.cmd(), new_line);
             }
             else {
-                // Process tags embedded into comments. Tag comments always start at the start of a line
-                // with a comment and continue with a tag without any whitespace separator.
+                // Process comment-only tag lines, including indented custom macros.
                 process_tags(comment_content, producers_enabled);
             }
         }
@@ -4209,14 +4211,24 @@ void GCodeProcessor::process_tags(const std::string_view comment, bool producers
         return;
     }
 
-    //BBS: flush start tag
-    if (boost::starts_with(comment, GCodeProcessor::Flush_Start_Tag)) {
+    // Custom cleaner macros also use ";FLUSH_START" and indented comments.
+    // Normalize these delimiters only; other producer tags have their own syntax.
+    std::string_view flush_tag = comment;
+    const size_t first_flush_char = flush_tag.find_first_not_of(" \t");
+    if (first_flush_char != std::string_view::npos)
+        flush_tag.remove_prefix(first_flush_char);
+    const size_t last_flush_char = flush_tag.find_last_not_of(" \t\r");
+    if (last_flush_char != std::string_view::npos)
+        flush_tag = flush_tag.substr(0, last_flush_char + 1);
+    if (boost::starts_with(comment, Flush_Start_Tag) ||
+        flush_tag == std::string_view(Flush_Start_Tag).substr(1)) {
         m_flushing = true;
         return;
     }
 
     //BBS: flush end tag
-    if (boost::starts_with(comment, GCodeProcessor::Flush_End_Tag)) {
+    if (boost::starts_with(comment, Flush_End_Tag) ||
+        flush_tag == std::string_view(Flush_End_Tag).substr(1)) {
         m_flushing = false;
         return;
     }
@@ -4952,6 +4964,13 @@ void GCodeProcessor::process_G1(const std::array<std::optional<double>, 4>& axes
     const float delta_xyz = std::sqrt(sqr(delta_pos[X]) + sqr(delta_pos[Y]) + sqr(delta_pos[Z]));
     m_travel_dist = delta_xyz;
 
+    // Purging can move XY inside a firmware-controlled cleaner whose position
+    // is unknown to the viewer. Do not render that motion as the previous model
+    // feature, or change its bead dimensions / last extruded Z. Keep motion
+    // timing and account for all positive E as flushed filament below.
+    if (m_flushing && type == EMoveType::Extrude)
+        type = EMoveType::Travel;
+
     if (type == EMoveType::Extrude) {
         float volume_extruded_filament = area_filament_cross_section * delta_pos[E];
         float area_toolpath_cross_section = volume_extruded_filament / delta_xyz;
@@ -5004,7 +5023,7 @@ void GCodeProcessor::process_G1(const std::array<std::optional<double>, 4>& axes
         // clamp width to avoid artifacts which may arise from wrong values of m_height
         m_width = std::min(m_width, std::max(2.0f, 4.0f * m_height));
     }
-    else if (type == EMoveType::Unretract && m_flushing) {
+    else if (m_flushing && delta_pos[E] > 0.0f) {
         int extruder_id = get_extruder_id();
         float volume_flushed_filament = area_filament_cross_section * delta_pos[E];
         if (m_remaining_volume[extruder_id] > volume_flushed_filament)

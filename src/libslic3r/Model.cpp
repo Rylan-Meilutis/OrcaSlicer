@@ -3879,8 +3879,15 @@ void remap_model_filament_slots(Model &model, const std::map<int, int> &slot_rel
     // Paint states and the object/volume "extruder" configs store one-based slot numbers
     // (see Sidebar::on_action_add_filament's insertion remap for the same encoding).
     std::map<int, int> one_based_slots;
-    for (const auto &[from, to] : slot_relocations)
-        one_based_slots.emplace(from + 1, to + 1);
+    for (const auto &[from, to] : slot_relocations) {
+        const int max_slots = int(EnforcerBlockerType::ExtruderMax);
+        if (from < 0 || from >= max_slots || to < 0 || to >= max_slots)
+            throw std::invalid_argument("Filament slot relocation is outside the supported range");
+        if (from != to)
+            one_based_slots.emplace(from + 1, to + 1);
+    }
+    if (one_based_slots.empty())
+        return;
 
     EnforcerBlockerStateMap paint_state_map;
     for (size_t state = 0; state < paint_state_map.size(); ++state)
@@ -3891,16 +3898,25 @@ void remap_model_filament_slots(Model &model, const std::map<int, int> &slot_rel
         paint_state_map[size_t(one_based_from)] = EnforcerBlockerType(one_based_to);
     }
 
-    auto remap_extruder_config = [&one_based_slots](ModelConfig &config) -> bool {
-        const auto it = config.has("extruder") ? one_based_slots.find(config.extruder()) : one_based_slots.end();
-        if (it == one_based_slots.end())
-            return false;
-        config.set("extruder", it->second);
-        return true;
+    auto remap_extruder_config = [&one_based_slots](ModelConfig &config) {
+        const auto remap_key = [&](const std::string &key) {
+            if (!config.has(key))
+                return;
+            const auto it = one_based_slots.find(config.opt_int(key));
+            if (it != one_based_slots.end() && it->first != it->second)
+                config.set(key, it->second);
+        };
+        remap_key("extruder");
+        // Material assignments also live on modifiers and height ranges, not
+        // just painted facets. Default (0) and Per print (-1) stay symbolic.
+        for (const std::string &key : project_filament_role_keys())
+            remap_key(key);
     };
 
     for (ModelObject *object : model.objects) {
         remap_extruder_config(object->config);
+        for (auto &[range, config] : object->layer_config_ranges)
+            remap_extruder_config(config);
         for (ModelVolume *volume : object->volumes) {
             remap_extruder_config(volume->config);
             volume->mmu_segmentation_facets.remap_states(*volume, paint_state_map);

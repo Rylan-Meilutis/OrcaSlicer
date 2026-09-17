@@ -47,6 +47,17 @@ bool path_is_stagger_candidate(const ExtrusionPath &path, int inset_idx,
            !path.z_contoured;
 }
 
+bool outer_brick_boundary_unchanged(const ExtrusionPath &path,
+                                  const ExPolygons &current_coverage,
+                                  const ExPolygons &upper_coverage)
+{
+    const Polygons footprint = path.polygons_covered_by_width(float(SCALED_EPSILON));
+    if (footprint.empty() || current_coverage.empty() || upper_coverage.empty())
+        return false;
+    const ExPolygons changed = xor_ex(current_coverage, upper_coverage, ApplySafetyOffset::No);
+    return changed.empty() || intersection_ex(footprint, changed, ApplySafetyOffset::No).empty();
+}
+
 bool path_can_be_staggered(const ExtrusionPath &path, int inset_idx,
                            bool inner_only,
                            const ExPolygons &current_coverage,
@@ -62,15 +73,7 @@ bool path_can_be_staggered(const ExtrusionPath &path, int inset_idx,
         // the complete bead corridor. This admits vertical structural walls
         // while rejecting top edges and sloped walls where either slice gains
         // or loses material beside the path.
-        const Polygons footprint = path.polygons_covered_by_width(
-            float(SCALED_EPSILON));
-        if (footprint.empty() || current_coverage.empty() ||
-            upper_coverage.empty())
-            return false;
-        const ExPolygons changed = xor_ex(
-            current_coverage, upper_coverage, ApplySafetyOffset::No);
-        return changed.empty() || intersection_ex(
-            footprint, changed, ApplySafetyOffset::No).empty();
+        return outer_brick_boundary_unchanged(path, current_coverage, upper_coverage);
     }
 
     // Raising an inner wall is safe only when its complete deposited bead is
@@ -109,9 +112,26 @@ void set_staggered_transition_height(ExtrusionPath &path, coord_t z_offset,
 
 ExtrusionPaths add_staggered_course_transitions(
     const ExtrusionPath &source, int inherited_inset_idx, coord_t z_offset,
-    bool inner_only, const ExPolygons &lower_staggered_coverage)
+    bool inner_only, const ExPolygons &lower_staggered_coverage,
+    const ExPolygons &lower_coverage, const ExPolygons &current_coverage)
 {
     const int inset_idx = source.inset_idx >= 0 ? source.inset_idx : inherited_inset_idx;
+    if (!inner_only && inset_idx == 0 && !source.nonplanar_surface &&
+        path_is_stagger_wall(source, inset_idx, inner_only)) {
+        ExtrusionPath result = source;
+        result.inset_idx = inset_idx;
+        // Outer beads straddle the slice boundary. Reuse the same boundary
+        // stability test that authorized the previous course, not the eroded
+        // interior used for inner walls. Otherwise every outer course gets
+        // entry flow and its final exposed course never gets half-height flow.
+        const bool lower_course_present = outer_brick_boundary_unchanged(
+            source, lower_coverage, current_coverage);
+        if (result.staggered_perimeter && !lower_course_present)
+            set_staggered_transition_height(result, z_offset, true);
+        else if (!result.z_contoured && lower_course_present)
+            set_staggered_transition_height(result, z_offset, false);
+        return {std::move(result)};
+    }
     if (!path_is_stagger_wall(source, inset_idx, inner_only) ||
         source.nonplanar_surface ||
         lower_staggered_coverage.empty()) {
@@ -150,6 +170,11 @@ ExtrusionPaths add_staggered_course_transitions(
         ExtrusionPath &path = result.back();
         path.inset_idx = inset_idx;
         const Point &sample = fragment.points[fragment.points.size() / 2];
+        // This split operates on a constant-height course, before endpoint
+        // ramps are added. Polyline3(fragment) otherwise resets a raised brick
+        // to Z=0 while leaving its brick role/flow intact.
+        for (Point3 &point : path.polyline.points)
+            point.z() = source.polyline.points.front().z();
         const bool lower_course_present = std::any_of(
             lower_staggered_coverage.begin(), lower_staggered_coverage.end(),
             [&sample](const ExPolygon &polygon) { return polygon.contains(sample); });
@@ -432,17 +457,28 @@ void apply_staggered_perimeters(ExtrusionEntity &entity, int inherited_inset_idx
                                 coord_t z_offset, bool inner_only,
                                 const ExPolygons &current_coverage,
                                 const ExPolygons &upper_coverage,
-                                const ExPolygons &lower_staggered_coverage)
+                                const ExPolygons &lower_staggered_coverage,
+                                const ExPolygons &lower_coverage)
 {
     const int inset_idx = entity.inset_idx >= 0 ? entity.inset_idx : inherited_inset_idx;
     if (auto *path = dynamic_cast<ExtrusionPath *>(&entity)) {
         if (path_can_be_staggered(
                 *path, inset_idx, inner_only, current_coverage, upper_coverage)) {
             stagger_path(*path, inset_idx, z_offset);
+            if (!inner_only && inset_idx == 0) {
+                *path = add_staggered_course_transitions(*path, inset_idx,
+                    z_offset, inner_only, lower_staggered_coverage,
+                    lower_coverage, current_coverage).front();
+                return;
+            }
             const bool continues_lower_course = !intersection_pl(
                 Polylines{path->polyline.to_polyline()}, lower_staggered_coverage).empty();
             if (!continues_lower_course)
                 set_staggered_transition_height(*path, z_offset, true);
+        } else if (!inner_only && inset_idx == 0) {
+            *path = add_staggered_course_transitions(*path, inset_idx,
+                z_offset, inner_only, lower_staggered_coverage,
+                lower_coverage, current_coverage).front();
         } else if (path_is_stagger_candidate(*path, inset_idx, inner_only) &&
                    !intersection_pl(Polylines{path->polyline.to_polyline()},
                                     lower_staggered_coverage).empty()) {
@@ -462,7 +498,7 @@ void apply_staggered_perimeters(ExtrusionEntity &entity, int inherited_inset_idx
             for (const ExtrusionPath &fragment : supported)
                 append(paths, add_staggered_course_transitions(
                     fragment, inset_idx, z_offset, inner_only,
-                    lower_staggered_coverage));
+                    lower_staggered_coverage, lower_coverage, current_coverage));
         }
         smooth_staggered_transitions(paths, z_offset, false);
         multipath->paths = std::move(paths);
@@ -478,7 +514,7 @@ void apply_staggered_perimeters(ExtrusionEntity &entity, int inherited_inset_idx
             for (const ExtrusionPath &fragment : supported)
                 append(paths, add_staggered_course_transitions(
                     fragment, inset_idx, z_offset, inner_only,
-                    lower_staggered_coverage));
+                    lower_staggered_coverage, lower_coverage, current_coverage));
         }
         // A closed course has no geometric beginning, so choose its lowest
         // supported fragment as the emission start. This retains one
@@ -492,7 +528,7 @@ void apply_staggered_perimeters(ExtrusionEntity &entity, int inherited_inset_idx
             apply_staggered_perimeters(
                 *child, inset_idx, z_offset, inner_only, current_coverage,
                 upper_coverage,
-                lower_staggered_coverage);
+                lower_staggered_coverage, lower_coverage);
         // Resolve the physical Z dependency before applying the configured
         // wall order: lower courses must exist before a neighboring raised
         // wall is deposited. Stable ordering preserves the user's inner /
@@ -752,11 +788,20 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
         const double offset_ratio = region_config.staggered_perimeter_offset.get_abs_value(1.);
         const coord_t z_offset = scale_(this->layer()->height * offset_ratio);
         if (z_offset > 0) {
-            // Aggregate object coverage is intentional: a wall is buried even
-            // when the next layer covering it belongs to another print region.
-            const ExPolygons upper_coverage = this->layer()->upper_layer == nullptr ?
-                ExPolygons{} : this->layer()->upper_layer->lslices;
+            // Brick ownership must stay inside this material/print region.
+            // Aggregate object coverage lets a neighboring colour authorize a
+            // raised inner-wall fragment on the other side of the region
+            // boundary. The fragment then crosses that region's outer wall
+            // even though it remains inside the aggregate model silhouette.
+            const ExPolygons current_region_coverage = union_ex(
+                to_polygons(this->slices.surfaces));
+            const ExPolygons upper_coverage =
+                this->layer()->upper_layer == nullptr ? ExPolygons{} :
+                union_ex(to_polygons(
+                    this->layer()->upper_layer->get_region(region_id)
+                        ->slices.surfaces));
             ExPolygons lower_staggered_coverage;
+            ExPolygons lower_region_coverage;
             // Perimeters are generated in parallel across layers, so course
             // continuity must be derived from slice geometry rather than from
             // whether the lower layer's path entities happen to be ready. A
@@ -766,16 +811,19 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
             if (this->layer()->lower_layer->lower_layer != nullptr) {
                 const coord_t clearance = scale_(0.5 * this->flow(frPerimeter).width()) +
                     coord_t(SCALED_EPSILON);
+                lower_region_coverage = union_ex(to_polygons(
+                    this->layer()->lower_layer->get_region(region_id)
+                        ->slices.surfaces));
                 lower_staggered_coverage = intersection_ex(
-                    shrink_ex(this->layer()->lslices, clearance),
-                    shrink_ex(this->layer()->lower_layer->lslices, clearance));
+                    shrink_ex(current_region_coverage, clearance),
+                    shrink_ex(lower_region_coverage, clearance));
             }
             apply_staggered_perimeters(
                 this->perimeters, -1, z_offset,
                 region_config.staggered_perimeters_inner_only.value,
-                this->layer()->lslices,
+                current_region_coverage,
                 upper_coverage,
-                lower_staggered_coverage);
+                lower_staggered_coverage, lower_region_coverage);
         }
     }
     if (region_config.perimeter_layering.value ==

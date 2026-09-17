@@ -1,6 +1,7 @@
 #include <catch2/catch_all.hpp>
 
 #include <cstdlib>
+#include <fstream>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -19,6 +20,234 @@
 
 using namespace Slic3r;
 using namespace Slic3r::Test;
+
+TEST_CASE("Unused configured tools stay unused in exported startup metadata",
+          "[GCodeWriter][INDX][Regression]")
+{
+    const bool two_tools = GENERATE(false, true);
+    auto config = multifilament_config(8, {{"enable_prime_tower", false},
+        {"single_extruder_multi_material", true}, {"skirt_loops", 0},
+        {"brim_type", "no_brim"}});
+    config.set_key_value("filament_density", new ConfigOptionFloats(std::vector<double>(8, 1.24)));
+    std::string start = "G90\nM83\n; USED_TOOLS = ";
+    for (unsigned int tool = 0; tool < 8; ++tool)
+        start += "{if is_extruder_used[" + std::to_string(tool) + "]}" +
+                 std::to_string(tool) + ",{endif}";
+    config.set_key_value("machine_start_gcode", new ConfigOptionString(start + "\n"));
+    const std::string output = slice_with_object_overrides({cube(3), cube(3)}, config,
+        {{{"extruder", two_tools ? 1 : 8}}, {{"extruder", 8}}});
+    REQUIRE(output.find(two_tools ? "; USED_TOOLS = 0,7,\n" : "; USED_TOOLS = 7,\n") != std::string::npos);
+    const std::string prefix = "; filament used [g] = ";
+    const size_t begin = output.find(prefix);
+    REQUIRE(begin != std::string::npos);
+    std::istringstream values(output.substr(begin + prefix.size()));
+    for (unsigned int tool = 0; tool < 8; ++tool) {
+        double grams = -1.;
+        REQUIRE(bool(values >> grams));
+        CAPTURE(tool, two_tools);
+        if (tool == 7 || (two_tools && tool == 0)) CHECK(grams > 0.);
+        else CHECK(grams == 0.);
+        if (tool < 7) {
+            char comma = 0;
+            values >> comma;
+            REQUIRE(comma == ',');
+        }
+    }
+}
+
+TEST_CASE("INDX startup primes in the bucket and ejects before printing", "[GCodeWriter][INDX][Regression]")
+{
+    const bool tower = GENERATE(false, true);
+    const bool heated_chamber = GENERATE(false, true);
+    const unsigned int tool_mask = GENERATE(1u, 128u, 129u, 18u, 255u);
+    std::vector<unsigned char> used(8, 0);
+    std::string tool_list;
+    int initial_tool = -1, tool_count = 0;
+    for (int tool = 0; tool < 8; ++tool) {
+        if ((tool_mask & (1u << tool)) == 0)
+            continue;
+        used[tool] = 1;
+        if (initial_tool < 0) initial_tool = tool;
+        if (tool_count++) tool_list += ',';
+        tool_list += std::to_string(tool);
+    }
+    CAPTURE(tool_mask, tower, heated_chamber);
+    auto config = multifilament_config(8, {{"enable_prime_tower", tower},
+        {"outer_wall_line_width", 0.45}, {"line_width", 0.45}, {"layer_height", 0.2}});
+    PlaceholderParser parser;
+    parser.apply_config(config);
+    parser.set("filament_type", new ConfigOptionStrings(std::vector<std::string>(8, heated_chamber ? "ABS" : "PLA")));
+    parser.set("chamber_temperature", new ConfigOptionInts(std::vector<int>(8, heated_chamber ? 45 : 0)));
+    parser.set("chamber_minimal_temperature", new ConfigOptionInts(std::vector<int>(8, heated_chamber ? 35 : 0)));
+    parser.set("initial_tool", initial_tool);
+    parser.set("is_extruder_used", new ConfigOptionBools(used));
+    parser.set("first_layer_print_min", new ConfigOptionFloats({100., 100.}));
+    parser.set("first_layer_print_max", new ConfigOptionFloats({120., 120.}));
+    parser.set("print_bed_max", new ConfigOptionFloats({250., 220.}));
+    parser.set("first_layer_bed_temperature", new ConfigOptionInts(std::vector<int>(8, 60)));
+    parser.set("filament_minimal_purge_on_wipe_tower", new ConfigOptionFloats(std::vector<double>(8, 15.)));
+    DynamicConfig outputs;
+    outputs.set_key_value("e_retracted", new ConfigOptionFloats(std::vector<double>(8, 0.)));
+    PlaceholderParser::ContextData context;
+    context.global_config = std::make_unique<DynamicConfig>();
+    std::ifstream input(std::string(TEST_DATA_DIR) + "/../../resources/gcode/indx_rme_start.gcode");
+    REQUIRE(input.good());
+    const std::string output = parser.process(std::string(std::istreambuf_iterator<char>(input), {}),
+                                             initial_tool, nullptr, &outputs, &context);
+    CHECK(output.find('{') == std::string::npos);
+    REQUIRE(output.find("\nG427 T" + tool_list + " R2 P3 ;") != std::string::npos);
+    bool inside = false, pellet = false, wiped = false;
+    size_t exits = 0, calibrations = 0, homes = 0, xy_homes = 0, z_homes = 0;
+    size_t pa_calibrations = 0, tool_selections = 0, bed_waits = 0;
+    bool bed_heating = false;
+    GCodeReader reader;
+    reader.parse_buffer(output, [&](GCodeReader &, const GCodeReader::GCodeLine &line) {
+        float sequence = 0.f;
+        if (line.cmd_is("M140") || line.cmd_is("M190")) {
+            float target = 0.f;
+            const bool has_target = line.has_value('S', target) || line.has_value('R', target);
+            REQUIRE(has_target);
+            CHECK(target > 0.f); // Never interrupt bed heating during startup.
+            bed_heating = true;
+            if (line.cmd_is("M190")) {
+                CHECK(pa_calibrations == 1);
+                ++bed_waits;
+            }
+        }
+        if (line.cmd_is("M976")) {
+            CHECK(z_homes == 1);
+            CHECK(calibrations == 0);
+            CHECK(bed_heating);
+            ++pa_calibrations;
+        }
+        if (line.cmd_is("G427")) {
+            CHECK(pa_calibrations == 1);
+            CHECK(bed_waits == 1);
+            ++calibrations;
+        }
+        if (!line.cmd().empty() && line.cmd().front() == 'T') {
+            // One pickup for Z homing, then one print-tool restoration after
+            // PA and offsets. No extra pickup between the calibration stages.
+            if (tool_selections > 0) {
+                CHECK(pa_calibrations == 1);
+                CHECK(calibrations == 1);
+                CHECK(line.cmd() == "T" + std::to_string(initial_tool));
+            }
+            ++tool_selections;
+        }
+        if (line.cmd_is("G28")) {
+            ++homes;
+            if (line.raw().rfind("G28 XY", 0) == 0) ++xy_homes;
+            if (line.raw().rfind("G28 Z", 0) == 0) {
+                CHECK(xy_homes == 1);
+                ++z_homes;
+            }
+        }
+        if (line.cmd_is("M870")) {
+            CHECK(xy_homes == 1);
+            CHECK(z_homes == 0);
+        }
+        if (line.cmd_is("G12") && line.has_value('S', sequence)) {
+            if (sequence == 90) inside = true;
+            if (sequence == 1) {
+                CHECK(inside);
+                wiped = true;
+            }
+            if (sequence == 30) {
+                CHECK(wiped);
+                wiped = false;
+                pellet = false;
+            }
+            if (sequence == 91) {
+                CHECK_FALSE(pellet);
+                inside = false;
+                ++exits;
+            }
+        }
+        if (line.cmd_is("G1") && line.has_e() && line.e() > 0) {
+            CHECK(inside); // No bed purge line or extrusion outside the cleaner.
+            pellet = true;
+            wiped = false;
+        }
+    });
+    CHECK(exits == size_t(tool_count == 1 || tower));
+    CHECK(calibrations == 1);
+    CHECK(pa_calibrations == 1);
+    CHECK(tool_selections == 2);
+    CHECK(homes == 2);
+    CHECK(xy_homes == 1);
+    CHECK(z_homes == 1);
+    CHECK_FALSE(inside);
+}
+
+TEST_CASE("INDX bucket templates eject pellets and emit evaluated filament commands", "[GCodeWriter][INDX][Regression]")
+{
+    const bool tower = GENERATE(false, true);
+    const auto read_template = [](const char *filename) {
+        std::ifstream input(std::string(TEST_DATA_DIR) + "/../../resources/gcode/" + filename);
+        REQUIRE(input.good());
+        return std::string(std::istreambuf_iterator<char>(input), {});
+    };
+    auto config = multifilament_config(2, {
+        {"enable_prime_tower", tower}, {"single_extruder_multi_material", true},
+        {"wipe_tower_x", "20"}, {"wipe_tower_y", "20"},
+        {"layer_height", 0.2}, {"initial_layer_print_height", 0.2},
+        {"skirt_loops", 0}, {"brim_type", "no_brim"}, {"enable_pressure_advance", "0,0"}
+    });
+    config.set_key_value("machine_start_gcode", new ConfigOptionString("{global retract_toolchange = 8}\nG90\nM83\n"));
+    config.set_key_value("change_filament_gcode", new ConfigOptionString(read_template("indx_rme_toolchange.gcode")));
+    config.set_key_value("filament_start_gcode", new ConfigOptionStrings({
+        "M572 S{if nozzle_diameter[0]==0.4}0.036{else}0{endif} ; evaluated filament zero\n",
+        "M572 S{if nozzle_diameter[0]==0.4}0.026{else}0{endif} ; evaluated filament one\n"
+    }));
+    const std::string output = slice_with_object_overrides(
+        {cube(5), cube(5)}, config, {{{"extruder", 1}}, {{"extruder", 2}}});
+    bool inside_cleaner = false;
+    bool positive_e_since_eject = false;
+    bool wiped = false;
+    size_t cleaner_exits = 0, filament_commands = 0;
+    GCodeReader reader;
+    reader.parse_buffer(output, [&](GCodeReader &r, const GCodeReader::GCodeLine &line) {
+        if (line.cmd().empty())
+            return; // The footer intentionally stores unevaluated profile templates.
+        CHECK(line.raw().find('{') == std::string::npos);
+        CHECK(line.raw().find('[') == std::string::npos);
+        if (line.cmd_is("M572")) {
+            ++filament_commands;
+            float pressure = 0.f;
+            REQUIRE(line.has_value('S', pressure));
+            CHECK((std::abs(pressure - 0.036) < 1e-5 || std::abs(pressure - 0.026) < 1e-5));
+        }
+        if (line.cmd_is("G12")) {
+            float sequence = 0.f;
+            REQUIRE(line.has_value('S', sequence));
+            if (sequence == 90) inside_cleaner = true;
+            if (sequence == 1) {
+                CHECK(inside_cleaner);
+                wiped = true;
+            }
+            if (sequence == 30) {
+                CHECK(inside_cleaner);
+                CHECK(wiped);
+                wiped = false;
+                positive_e_since_eject = false;
+            }
+            if (sequence == 91) {
+                CHECK(inside_cleaner);
+                CHECK_FALSE(positive_e_since_eject);
+                inside_cleaner = false;
+                ++cleaner_exits;
+            }
+        }
+        if (inside_cleaner && line.cmd_is("G1") && line.has_e() && line.e() > 0) {
+            positive_e_since_eject = true;
+            wiped = false;
+        }
+    });
+    CHECK(cleaner_exits > 0);
+    CHECK(filament_commands >= 2);
+    CHECK_FALSE(inside_cleaner);
+}
 
 TEST_CASE("SpoolManager metadata updates marked filament notes", "[GCodeWriter][SpoolManager]")
 {
@@ -192,6 +421,48 @@ TEST_CASE("Spoolman tool assignments resolve against its spool inventory", "[GCo
     CHECK(slots[0].provider == "Spoolman");
     CHECK(slots[1].name.empty());
     CHECK(slots[2].name == "Signal Orange");
+}
+
+TEST_CASE("OctoPrint spool inventory exposes every upstream roll for profile mapping",
+          "[GCodeWriter][SpoolManager]")
+{
+    const std::string response = R"({
+        "selectedSpoolIds":{"0":{"spoolId":"42"}},
+        "spools":[
+            {"id":42,"filament":{"name":"Galaxy Black","material":"PLA",
+             "vendor":{"name":"Prusament"}}},
+            {"id":73,"filament":{"name":"Signal Orange","material":"PETG",
+             "vendor":{"name":"Polymaker"}}}
+        ]
+    })";
+    std::vector<SpoolManagerMetadata::Filament> inventory;
+    std::string error;
+
+    REQUIRE(SpoolManagerMetadata::parse_spool_inventory(
+        response, inventory, error, "Spoolman"));
+    REQUIRE(inventory.size() == 2);
+    CHECK(inventory[0].spool_id == "42");
+    CHECK(inventory[0].provider == "Spoolman");
+    CHECK(inventory[1].spool_id == "73");
+    CHECK(inventory[1].material == "PETG");
+}
+
+TEST_CASE("legacy SpoolManager inventory is available without a tool assignment",
+          "[GCodeWriter][SpoolManager]")
+{
+    const std::string response = R"({
+        "allSpools":[
+            {"spoolId":"9","displayName":"Workshop Black","vendor":"Generic","material":"ABS"}
+        ],
+        "selectedSpools":[null]
+    })";
+    std::vector<SpoolManagerMetadata::Filament> inventory;
+    std::string error;
+
+    REQUIRE(SpoolManagerMetadata::parse_spool_inventory(response, inventory, error));
+    REQUIRE(inventory.size() == 1);
+    CHECK(inventory.front().name == "Workshop Black");
+    CHECK(inventory.front().provider == "SpoolManager");
 }
 
 TEST_CASE("generic OctoPrint filament providers preserve tool indices", "[GCodeWriter][SpoolManager]")

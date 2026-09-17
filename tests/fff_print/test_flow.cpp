@@ -106,7 +106,7 @@ TEST_CASE("Staggered perimeters raise only supported odd inner walls", "[Flow][S
             {"top_shell_layers", 0},
             {"bottom_shell_layers", 0},
             {"sparse_infill_density", "0%"},
-            {"staggered_perimeters", 1},
+            {"perimeter_layering", "brick"},
             {"staggered_perimeter_offset", "50%"}
         });
 
@@ -158,7 +158,7 @@ TEST_CASE("Staggered perimeters can include buried outer walls",
         {"top_shell_layers", 0},
         {"bottom_shell_layers", 0},
         {"sparse_infill_density", "0%"},
-        {"staggered_perimeters", 1},
+        {"perimeter_layering", "brick"},
         {"staggered_perimeters_inner_only", 0},
         {"staggered_perimeter_offset", "50%"}
     });
@@ -200,7 +200,7 @@ TEST_CASE("Staggered wall entities are emitted from lower to higher Z",
         {"top_shell_layers", 0},
         {"bottom_shell_layers", 0},
         {"sparse_infill_density", "0%"},
-        {"staggered_perimeters", 1},
+        {"perimeter_layering", "brick"},
         {"staggered_perimeters_inner_only", 0},
         {"staggered_perimeter_offset", "50%"}
     });
@@ -259,12 +259,32 @@ TEST_CASE("Brick transition beads do not activate non-planar travel clearance",
         {"top_shell_layers", 0},
         {"bottom_shell_layers", 0},
         {"sparse_infill_density", "15%"},
-        {"staggered_perimeters", 1},
+        {"perimeter_layering", "brick"},
         {"staggered_perimeter_offset", "50%"}
     });
 
     CHECK(gcode.find(";TYPE:Brick wall") != std::string::npos);
     CHECK(gcode.find("raise for non-planar toolhead clearance") == std::string::npos);
+}
+
+TEST_CASE("Standard perimeter layering ignores a stale legacy brick flag",
+          "[Flow][StaggeredPerimeters][GCode][Regression]")
+{
+    const std::string gcode = slice({cube(10.)}, {
+        {"layer_height", 0.2},
+        {"initial_layer_print_height", 0.2},
+        {"wall_loops", 4},
+        {"top_shell_layers", 0},
+        {"bottom_shell_layers", 0},
+        {"sparse_infill_density", "15%"},
+        {"perimeter_layering", "standard"},
+        // Profiles saved by an older build may retain this compatibility key.
+        // The visible selector is authoritative once it is present.
+        {"staggered_perimeters", 1},
+        {"staggered_perimeter_offset", "50%"}
+    });
+
+    CHECK(gcode.find(";TYPE:Brick wall") == std::string::npos);
 }
 
 TEST_CASE("Staggered inner walls continue through shrinking outlines", "[Flow][StaggeredPerimeters][Regression]")
@@ -278,7 +298,7 @@ TEST_CASE("Staggered inner walls continue through shrinking outlines", "[Flow][S
         {"top_shell_layers", 0},
         {"bottom_shell_layers", 0},
         {"sparse_infill_density", "0%"},
-        {"staggered_perimeters", 1},
+        {"perimeter_layering", "brick"},
         {"staggered_perimeter_offset", "50%"}
     });
 
@@ -308,7 +328,7 @@ TEST_CASE("Staggered perimeters split partially covered wall paths", "[Flow][Sta
         {"top_shell_layers", 0},
         {"bottom_shell_layers", 0},
         {"sparse_infill_density", "0%"},
-        {"staggered_perimeters", 1},
+        {"perimeter_layering", "brick"},
         {"staggered_perimeter_offset", "50%"}
     });
 
@@ -392,6 +412,145 @@ TEST_CASE("Staggered perimeters split partially covered wall paths", "[Flow][Sta
     CHECK(found_low_course_first);
 }
 
+TEST_CASE("Brick walls retain their height and connectivity at changing material boundaries", "[Flow][StaggeredPerimeters][MultiMaterial][Regression]")
+{
+    const std::string generator = GENERATE("classic", "arachne");
+    CAPTURE(generator);
+    auto config = multifilament_config(2, {
+        {"wall_generator", generator}, {"wall_loops", 3},
+        {"layer_height", 0.2}, {"initial_layer_print_height", 0.2},
+        {"top_shell_layers", 0}, {"bottom_shell_layers", 0},
+        {"sparse_infill_density", "0%"},
+        {"perimeter_layering", "brick"},
+        {"staggered_perimeter_offset", "50%"},
+        {"staggered_perimeters_inner_only", true},
+        {"seam_gap", 0.}, {"seam_slope_type", "none"},
+        {"seam_start_on_inner_wall", true}, {"enable_arc_fitting", false},
+        {"skirt_loops", 0}, {"brim_type", "no_brim"},
+        {"gcode_comments", true}
+    });
+    // Two complementary volumes form a solid block, while the colour boundary
+    // moves at Z2. Aggregate object coverage cannot detect this interface.
+    TriangleMesh first = make_cube(10., 12., 2.);
+    TriangleMesh upper_first = make_cube(6., 12., 2.);
+    upper_first.translate(0., 0., 2.);
+    first.merge(upper_first);
+    TriangleMesh second = make_cube(2., 12., 2.);
+    second.translate(10., 0., 0.);
+    TriangleMesh upper_second = make_cube(6., 12., 2.);
+    upper_second.translate(6., 0., 2.);
+    second.merge(upper_second);
+    Print print;
+    Model model;
+    init_print(std::vector<TriangleMesh>{first}, print, model, config, nullptr, false);
+    auto *object = model.objects.front();
+    object->volumes.front()->config.set_key_value("extruder", new ConfigOptionInt(1));
+    object->add_volume(second)->config.set_key_value("extruder", new ConfigOptionInt(2));
+    print.apply(model, config);
+    print.process();
+    size_t raised_paths = 0;
+    size_t checked_joins = 0;
+    double planned_length = 0.;
+    std::vector<std::pair<Vec3d, Vec3d>> planned_segments;
+    const Vec2d origin = unscale(print.objects().front()->instances().front().shift);
+    for (const Layer *layer : print.objects().front()->layers()) {
+        REQUIRE(layer->regions().size() == 2);
+        for (const LayerRegion *region : layer->regions()) {
+            const auto inspect_paths = [&](const ExtrusionPaths &paths, bool closed) {
+                for (size_t i = 0; i < paths.size(); ++i) {
+                    const auto &path = paths[i];
+                    for (const Line3 &segment : path.polyline.lines()) {
+                        planned_length += (segment.b - segment.a).cast<double>().norm() * SCALING_FACTOR;
+                        const Vec3d offset(origin.x(), origin.y(), layer->print_z);
+                        planned_segments.emplace_back(segment.a.cast<double>() * SCALING_FACTOR + offset,
+                                                      segment.b.cast<double>() * SCALING_FACTOR + offset);
+                    }
+                    if (i + 1 < paths.size() || closed) {
+                        const auto &next = paths[(i + 1) % paths.size()];
+                        CHECK_THAT(unscale<double>((path.last_point() - next.first_point()).cast<double>().norm()),
+                                   Catch::Matchers::WithinAbs(0., 0.002));
+                        ++checked_joins;
+                    }
+                    if (!path.staggered_perimeter)
+                        continue;
+                    ++raised_paths;
+                    // A raised fragment must not silently lose its Z when a
+                    // second clipping pass inserts course-transition points.
+                    REQUIRE_FALSE(path.polyline.points.empty());
+                    const auto highest = std::max_element(path.polyline.points.begin(), path.polyline.points.end(),
+                        [](const Point3 &a, const Point3 &b) { return a.z() < b.z(); });
+                    CHECK(highest->z() > 0);
+                    REQUIRE(layer->upper_layer != nullptr);
+                    const auto upper = offset_ex(to_expolygons(layer->upper_layer
+                        ->get_region(region->region().print_object_region_id())->slices.surfaces), scale_(0.002));
+                    const auto outside = diff_ex(path.polygons_covered_by_width(), upper);
+                    double outside_area = 0.;
+                    for (const auto &polygon : outside)
+                        outside_area += polygon.area() * SCALING_FACTOR * SCALING_FACTOR;
+                    CHECK(outside_area < 0.001);
+                }
+            };
+            const auto visit = [&](const auto &self, const ExtrusionEntity &entity) -> void {
+                if (const auto *loop = dynamic_cast<const ExtrusionLoop *>(&entity))
+                    inspect_paths(loop->paths, true);
+                else if (const auto *multi = dynamic_cast<const ExtrusionMultiPath *>(&entity))
+                    inspect_paths(multi->paths, false);
+                else if (const auto *collection = dynamic_cast<const ExtrusionEntityCollection *>(&entity))
+                    for (const auto *child : collection->entities) self(self, *child);
+                else if (const auto *path = dynamic_cast<const ExtrusionPath *>(&entity))
+                    inspect_paths(ExtrusionPaths{*path}, false);
+            };
+            visit(visit, region->perimeters);
+        }
+    }
+    CHECK(raised_paths > 0);
+    CHECK(checked_joins > 0);
+    // Export as well: extra connectors or seam-primer holes can be introduced
+    // after the in-memory geometry passes all its checks.
+    const std::string output = gcode(print);
+    double emitted_length = 0.;
+    double maximum_deviation = 0.;
+    size_t emitted_segments = 0;
+    int active_tool = 0;
+    std::set<int> perimeter_tools;
+    GCodeReader reader;
+    reader.parse_buffer(output, [&](GCodeReader &self, const GCodeReader::GCodeLine &line) {
+        if (line.cmd_is("T0")) active_tool = 0;
+        if (line.cmd_is("T1")) active_tool = 1;
+        const std::string comment(line.comment());
+        // Internal entry/finish now own disjoint pieces of the original wall.
+        // Count those pieces, but not the added cross-wall connectors, when
+        // checking conservation against the pre-seam perimeter geometry.
+        const bool original_wall = comment.find("perimeter") != std::string::npos ||
+            comment.find("outer wall seam prime") != std::string::npos ||
+            comment.find("outer wall seam finish") != std::string::npos;
+        if (line.extruding(self) && original_wall) {
+            perimeter_tools.insert(active_tool);
+            ++emitted_segments;
+            emitted_length += std::hypot(line.dist_XY(self), line.new_Z(self) - self.z());
+            const Vec3d start(self.x(), self.y(), self.z());
+            const Vec3d end(line.new_X(self), line.new_Y(self), line.new_Z(self));
+            for (double t : {0.25, 0.5, 0.75}) {
+                const Vec3d sample = start + t * (end - start);
+                double closest = std::numeric_limits<double>::max();
+                for (const auto &[a, b] : planned_segments) {
+                    const Vec3d delta = b - a;
+                    const double u = delta.squaredNorm() > 0. ?
+                        std::clamp((sample - a).dot(delta) / delta.squaredNorm(), 0., 1.) : 0.;
+                    closest = std::min(closest, (sample - a - u * delta).norm());
+                }
+                maximum_deviation = std::max(maximum_deviation, closest);
+            }
+        }
+    });
+    REQUIRE(emitted_segments > 0);
+    CHECK(perimeter_tools == std::set<int>{0, 1});
+    CHECK(maximum_deviation < 0.003);
+    // Endpoint rounding to 0.001 mm can change each segment's length by up
+    // to sqrt(3)*0.001 mm; accumulate that bound instead of a fixed tolerance.
+    CHECK_THAT(emitted_length, Catch::Matchers::WithinAbs(planned_length, emitted_segments * std::sqrt(3.) * 0.001));
+}
+
 TEST_CASE("Staggered perimeters use the existing intermediate inner wall flow", "[Flow][StaggeredPerimeters]")
 {
     const auto extrusion_for = [](bool enabled, double flow) {
@@ -402,7 +561,7 @@ TEST_CASE("Staggered perimeters use the existing intermediate inner wall flow", 
             {"top_shell_layers", 0},
             {"bottom_shell_layers", 0},
             {"sparse_infill_density", "0%"},
-            {"staggered_perimeters", enabled ? "1" : "0"},
+            {"perimeter_layering", enabled ? "brick" : "standard"},
             {"inner_walls_flow_ratio", std::to_string(flow * 100.) + "%"}
         }));
     };

@@ -1326,7 +1326,8 @@ void GCodeViewer::SequentialView::render(const bool has_render_path, float legen
 {
     if (has_render_path && m_show_marker) {
         // marker.set_world_offset(current_offset);
-        marker.render(canvas_width, canvas_height, view_type);
+        if (get_app_config()->get("preview_show_tool_model") != "0")
+            marker.render(canvas_width, canvas_height, view_type);
         marker.render_position_window(viewer, canvas_width, canvas_height, view_type);
     }
 
@@ -3958,6 +3959,17 @@ void GCodeViewer::render_legend(float &legend_height, int canvas_width, int canv
         return;
     }
 
+    // Visibility is independent of the selected nozzle/gantry asset and of
+    // the position readout. Missing preferences preserve the existing default.
+    bool show_tool_model = get_app_config()->get("preview_show_tool_model") != "0";
+    ImGui::Dummy({ window_padding, 0.0f });
+    ImGui::SameLine();
+    if (imgui.checkbox(_L("Show nozzle/toolhead"), show_tool_model)) {
+        get_app_config()->set("preview_show_tool_model", show_tool_model ? "1" : "0");
+        wxGetApp().plater()->get_current_canvas3D()->set_as_dirty();
+        wxGetApp().plater()->get_current_canvas3D()->request_extra_frame();
+    }
+
     // data used to properly align items in columns when showing time
     std::vector<float> offsets;
     std::vector<std::string> labels;
@@ -5003,6 +5015,7 @@ void GCodeViewer::render_legend(float &legend_height, int canvas_width, int canv
         switch (time_mode_id)
         {
         case libvgcode::ETimeMode::Normal: { time_title += " [" + _u8L("Normal mode") + "]"; break; }
+        case libvgcode::ETimeMode::Stealth: { time_title += " [" + _u8L("Stealth mode") + "]"; break; }
         default: { assert(false); break; }
         }
     }
@@ -5016,6 +5029,11 @@ void GCodeViewer::render_legend(float &legend_height, int canvas_width, int canv
     std::string prepare_str = _u8L("Prepare time");
     std::string print_str = _u8L("Model printing time");
     std::string total_str = _u8L("Total time");
+    const auto &normal_estimate = m_print_statistics.modes[static_cast<size_t>(PrintEstimatedStatistics::ETimeMode::Normal)];
+    const auto &stealth_estimate = m_print_statistics.modes[static_cast<size_t>(PrintEstimatedStatistics::ETimeMode::Stealth)];
+    const bool show_both_estimates = normal_estimate.time > 0.0f && stealth_estimate.time > 0.0f;
+    const std::string normal_total_str = total_str + " [" + _u8L("Normal mode") + "]";
+    const std::string stealth_total_str = total_str + " [" + _u8L("Stealth mode") + "]";
     float max_len = window_padding + 2 * ImGui::GetStyle().ItemSpacing.x;
     if (m_viewer.get_layers_estimated_times().empty())
         max_len += ImGui::CalcTextSize(total_str.c_str()).x;
@@ -5029,6 +5047,10 @@ void GCodeViewer::render_legend(float &legend_height, int canvas_width, int canv
             max_len += std::max(ImGui::CalcTextSize(print_str.c_str()).x,
                 (std::max(ImGui::CalcTextSize(prepare_str.c_str()).x, ImGui::CalcTextSize(total_str.c_str()).x)));
     }
+    if (show_both_estimates)
+        max_len = std::max(max_len, window_padding + 2 * ImGui::GetStyle().ItemSpacing.x +
+            std::max(ImGui::CalcTextSize(normal_total_str.c_str()).x,
+                     ImGui::CalcTextSize(stealth_total_str.c_str()).x));
     if (m_viewer.get_view_type() == libvgcode::EViewType::FeatureType) {
         //BBS display filament cost
         ImGui::Dummy({ window_padding, window_padding });
@@ -5075,9 +5097,18 @@ void GCodeViewer::render_legend(float &legend_height, int canvas_width, int canv
     imgui.text(short_time(get_time_dhms(time_mode.time - time_mode.prepare_time)));
     ImGui::Dummy({ window_padding, window_padding });
     ImGui::SameLine();
-    imgui.text(total_str + ":");
+    imgui.text((show_both_estimates ? normal_total_str : total_str) + ":");
     ImGui::SameLine(max_len);
-    imgui.text(short_time(get_time_dhms(time_mode.time)));
+    imgui.text(short_time(get_time_dhms(show_both_estimates ? normal_estimate.time : time_mode.time)));
+    // Show both totals even when rounding makes them identical. Switching the
+    // feature-time view should not be necessary to compare the two estimates.
+    if (show_both_estimates) {
+        ImGui::Dummy({ window_padding, window_padding });
+        ImGui::SameLine();
+        imgui.text(stealth_total_str + ":");
+        ImGui::SameLine(max_len);
+        imgui.text(short_time(get_time_dhms(stealth_estimate.time)));
+    }
 
     auto show_mode_button = [this, &imgui, can_show_mode_button](const std::string& label, libvgcode::ETimeMode mode) {
         if (can_show_mode_button(mode)) {

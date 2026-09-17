@@ -212,6 +212,15 @@ public:
     // The path follows the model's actual top surface. It shares the variable-Z
     // transport machinery with Z contouring, but keeps normal bead volume.
     bool nonplanar_surface = false;
+    // A geometrically planar foundation that belongs to the non-planar
+    // dependency graph. The graph still uses nonplanar_surface to preserve
+    // replacement ownership, while this explicit marker lets G-code and
+    // preview retain the path's ordinary structural role.
+    bool nonplanar_schedule_owned = false;
+    // Conventional material left after an accepted non-planar bead envelope
+    // clips its source course. It remains a planar anchor/remainder and must
+    // not be transformed again by the hybrid Z-contouring fallback.
+    bool nonplanar_replacement_remainder = false;
     // A buried member of a multi-layer non-planar top shell. It follows the
     // same model surface as the finishing skin, offset downward by one or more
     // layer heights, and receives a separate preview role.
@@ -272,6 +281,8 @@ public:
         , smooth_speed(rhs.smooth_speed)
         , z_contoured(rhs.z_contoured)
         , nonplanar_surface(rhs.nonplanar_surface)
+        , nonplanar_schedule_owned(rhs.nonplanar_schedule_owned)
+        , nonplanar_replacement_remainder(rhs.nonplanar_replacement_remainder)
         , nonplanar_transition(rhs.nonplanar_transition)
         , nonplanar_clearance_validated(rhs.nonplanar_clearance_validated)
         , nonplanar_before_current_layer(rhs.nonplanar_before_current_layer)
@@ -298,6 +309,8 @@ public:
         , smooth_speed(rhs.smooth_speed)
         , z_contoured(rhs.z_contoured)
         , nonplanar_surface(rhs.nonplanar_surface)
+        , nonplanar_schedule_owned(rhs.nonplanar_schedule_owned)
+        , nonplanar_replacement_remainder(rhs.nonplanar_replacement_remainder)
         , nonplanar_transition(rhs.nonplanar_transition)
         , nonplanar_clearance_validated(rhs.nonplanar_clearance_validated)
         , nonplanar_before_current_layer(rhs.nonplanar_before_current_layer)
@@ -324,6 +337,8 @@ public:
         , smooth_speed(rhs.smooth_speed)
         , z_contoured(rhs.z_contoured)
         , nonplanar_surface(rhs.nonplanar_surface)
+        , nonplanar_schedule_owned(rhs.nonplanar_schedule_owned)
+        , nonplanar_replacement_remainder(rhs.nonplanar_replacement_remainder)
         , nonplanar_transition(rhs.nonplanar_transition)
         , nonplanar_clearance_validated(rhs.nonplanar_clearance_validated)
         , nonplanar_before_current_layer(rhs.nonplanar_before_current_layer)
@@ -350,6 +365,8 @@ public:
         , smooth_speed(rhs.smooth_speed)
         , z_contoured(rhs.z_contoured)
         , nonplanar_surface(rhs.nonplanar_surface)
+        , nonplanar_schedule_owned(rhs.nonplanar_schedule_owned)
+        , nonplanar_replacement_remainder(rhs.nonplanar_replacement_remainder)
         , nonplanar_transition(rhs.nonplanar_transition)
         , nonplanar_clearance_validated(rhs.nonplanar_clearance_validated)
         , nonplanar_before_current_layer(rhs.nonplanar_before_current_layer)
@@ -377,6 +394,8 @@ public:
         this->smooth_speed = rhs.smooth_speed;
         this->z_contoured = rhs.z_contoured;
         this->nonplanar_surface = rhs.nonplanar_surface;
+        this->nonplanar_schedule_owned = rhs.nonplanar_schedule_owned;
+        this->nonplanar_replacement_remainder = rhs.nonplanar_replacement_remainder;
         this->nonplanar_transition = rhs.nonplanar_transition;
         this->nonplanar_clearance_validated = rhs.nonplanar_clearance_validated;
         this->nonplanar_before_current_layer = rhs.nonplanar_before_current_layer;
@@ -405,6 +424,8 @@ public:
         this->smooth_speed = rhs.smooth_speed;
         this->z_contoured = rhs.z_contoured;
         this->nonplanar_surface = rhs.nonplanar_surface;
+        this->nonplanar_schedule_owned = rhs.nonplanar_schedule_owned;
+        this->nonplanar_replacement_remainder = rhs.nonplanar_replacement_remainder;
         this->nonplanar_transition = rhs.nonplanar_transition;
         this->nonplanar_clearance_validated = rhs.nonplanar_clearance_validated;
         this->nonplanar_before_current_layer = rhs.nonplanar_before_current_layer;
@@ -553,19 +574,21 @@ public:
     ExtrusionPaths paths;
 
     ExtrusionMultiPath() {}
-    ExtrusionMultiPath(const ExtrusionMultiPath &rhs) : paths(rhs.paths), m_can_reverse(rhs.m_can_reverse) {}
-    ExtrusionMultiPath(ExtrusionMultiPath &&rhs) : paths(std::move(rhs.paths)), m_can_reverse(rhs.m_can_reverse) {}
+    ExtrusionMultiPath(const ExtrusionMultiPath &rhs) : ExtrusionEntity(rhs), paths(rhs.paths), m_can_reverse(rhs.m_can_reverse) {}
+    ExtrusionMultiPath(ExtrusionMultiPath &&rhs) : ExtrusionEntity(rhs), paths(std::move(rhs.paths)), m_can_reverse(rhs.m_can_reverse) {}
     ExtrusionMultiPath(const ExtrusionPaths &paths) : paths(paths) {}
     ExtrusionMultiPath(const ExtrusionPath &path) {this->paths.push_back(path); m_can_reverse = path.can_reverse(); }
 
     ExtrusionMultiPath &operator=(const ExtrusionMultiPath &rhs)
     {
+        this->inset_idx = rhs.inset_idx;
         this->paths   = rhs.paths;
         m_can_reverse = rhs.m_can_reverse;
         return *this;
     }
     ExtrusionMultiPath &operator=(ExtrusionMultiPath &&rhs)
     {
+        this->inset_idx = rhs.inset_idx;
         this->paths   = std::move(rhs.paths);
         m_can_reverse = rhs.m_can_reverse;
         return *this;
