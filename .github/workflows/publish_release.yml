@@ -23,6 +23,10 @@ on:
         description: 'Tag of the release to upload to (e.g. v2.4.0-beta)'
         required: true
         type: string
+      publish_stable:
+        description: 'Wait for a successful build, verify the tag, then publish the draft as stable'
+        type: boolean
+        default: false
 
 permissions:
   contents: write   # upload release assets
@@ -36,6 +40,7 @@ jobs:
       (github.event.workflow_run.event == 'workflow_dispatch' &&
        github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-latest
+    timeout-minutes: 240
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       RUN_ID: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.id || inputs.run_id }}
@@ -105,6 +110,29 @@ jobs:
             echo "::warning::Source run did not conclude 'success' ($conclusion). Some assets may be missing."
           fi
 
+      - name: Wait for and verify stable release build
+        if: env.TAG != '' && github.event_name == 'workflow_dispatch' && inputs.publish_stable
+        run: |
+          set -euo pipefail
+          info=$(gh run view "$RUN_ID" --repo "$GITHUB_REPOSITORY" --json workflowName,status,conclusion,headSha)
+          test "$(jq -r '.workflowName' <<< "$info")" = 'Build all'
+          while [ "$(jq -r '.status' <<< "$info")" != 'completed' ]; do
+            sleep 30
+            info=$(gh run view "$RUN_ID" --repo "$GITHUB_REPOSITORY" --json workflowName,status,conclusion,headSha)
+          done
+          if [ "$(jq -r '.conclusion' <<< "$info")" != 'success' ]; then
+            echo "::error::Release build did not pass. Leaving the release unpublished."
+            exit 1
+          fi
+          ref=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG")
+          sha=$(jq -r '.object.sha' <<< "$ref")
+          if [ "$(jq -r '.object.type' <<< "$ref")" = 'tag' ]; then
+            sha=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$sha" --jq '.object.sha')
+          fi
+          test "$sha" = "$(jq -r '.headSha' <<< "$info")"
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease |
+            jq -e '.isDraft and (.isPrerelease | not)'
+
       - name: Download release artifacts from build run
         if: env.TAG != ''
         run: |
@@ -166,3 +194,16 @@ jobs:
           gh release upload "$TAG" upload/* --repo "$GITHUB_REPOSITORY" --clobber
           echo "Uploaded to release: $TAG"
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name'
+
+      - name: Publish verified stable release
+        if: env.TAG != '' && github.event_name == 'workflow_dispatch' && inputs.publish_stable
+        run: |
+          set -euo pipefail
+          # Do not expose an empty or single-platform draft as the latest release.
+          for extension in exe dmg AppImage; do
+            if ! find upload -type f -name "*.$extension" -print -quit | grep -q .; then
+              echo "::error::Missing $extension installer; leaving the release in draft."
+              exit 1
+            fi
+          done
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease=false --latest
