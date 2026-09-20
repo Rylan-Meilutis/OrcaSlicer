@@ -28,18 +28,30 @@ void remove_short_nonplanar_fill_paths(std::vector<ExtrusionEntity *> &paths);
 // Native centerlines at a wall inset, retaining parent loop/multipath ownership.
 Polylines nonplanar_wall_centerlines(const ExtrusionEntity &entity, int inset);
 
-// Caller owns the returned projected solid-fill entities. Layer heights are
-// in print space; the selected mesh may have a different ground level.
-std::vector<ExtrusionEntity *> project_nonplanar_source_course(
-    LayerRegion &source_region, const sla::IndexedMesh &mesh,
-    const ExPolygons &surface_projection, const std::vector<uint8_t> &facets,
-    const ExPolygons &course_domain, coordf_t destination_owner_z,
-    double maximum_drape_height);
-
 struct NonplanarCourseProfile {
     double plane_z;
     double blend;
 };
+
+// A native course follows the same height field as its walls, independently
+// of the finishing raster's path count, pattern, or density. Projection does
+// not establish bridge anchoring or toolhead clearance.
+struct NonplanarCourseProjection {
+    NonplanarCourseProfile profile;
+    double maximum_surface_z;
+};
+
+// Caller owns the returned projected fill entities. Layer heights are
+// in print space; the selected mesh may have a different ground level.
+// Supplying a course retains native infill roles instead of creating top skin.
+// Flow remains the source template; local bead thickness must be assigned
+// after planning the adjacent course and validating actual deposited support.
+std::vector<ExtrusionEntity *> project_nonplanar_source_course(
+    LayerRegion &source_region, const sla::IndexedMesh &mesh,
+    const ExPolygons &surface_projection, const std::vector<uint8_t> &facets,
+    const ExPolygons &course_domain, coordf_t destination_owner_z,
+    double maximum_drape_height,
+    const NonplanarCourseProjection *course = nullptr);
 
 // Index of the first solid course required by layer count and physical shell
 // thickness. Zero uses the whole available stack; any additional required

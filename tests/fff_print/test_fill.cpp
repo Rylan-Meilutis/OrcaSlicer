@@ -41,6 +41,39 @@
 
 using namespace Slic3r;
 
+TEST_CASE("External bridge overlap replaces density without changing strand flow", "[Fill][BridgeOverlap]")
+{
+    auto bridge_paths = [](double overlap, double density) {
+        Print print;
+        Test::init_and_process_print({Test::TestMesh::bridge}, print, {
+            {"bridge_line_overlap", overlap}, {"bridge_density", density},
+            {"arc_overhang_enabled", false}, {"thick_bridges", true},
+            {"bridge_flow", 1.}, {"enable_support", false}
+        });
+        double length = 0., volume = 0.;
+        for (const Layer *layer : print.objects().front()->layers())
+            for (const LayerRegion *region : layer->regions()) {
+                const auto paths = region->fills.flatten();
+                for (const ExtrusionEntity *entity : paths.entities)
+                    if (entity->role() == erBridgeInfill) {
+                        length += entity->length();
+                        volume += entity->total_volume();
+                    }
+            }
+        return std::make_pair(length, volume);
+    };
+    const auto normal = bridge_paths(0., 100.);
+    const auto overlap = bridge_paths(20., 100.);
+    const auto density = bridge_paths(0., 125.);
+    const auto override_density = bridge_paths(20., 50.);
+    REQUIRE(normal.first > 0.);
+    CHECK(overlap.first > normal.first);
+    CHECK_THAT(overlap.first, Catch::Matchers::WithinAbs(density.first, 1e-6));
+    CHECK_THAT(overlap.first, Catch::Matchers::WithinAbs(override_density.first, 1e-6));
+    CHECK_THAT(overlap.second / overlap.first,
+               Catch::Matchers::WithinRel(normal.second / normal.first, 1e-5));
+}
+
 TEST_CASE("Non-planar candidate marking preserves wall direction and rejected brick geometry",
           "[Fill][NonplanarSurface][CandidateWallGraph][Regression]")
 {
@@ -172,6 +205,168 @@ TEST_CASE("Source-course projection uses print-space heights for translated mesh
     out_of_reach.entities = project_nonplanar_source_course(
         region, indexed, domain, {1, 1}, domain, destination_z, 0.1);
     CHECK(out_of_reach.empty());
+}
+
+TEST_CASE("Source-course projection does not turn failed scanlines into isolated fragments",
+          "[Fill][NonplanarSurface][SourceCourseProjection][Regression]")
+{
+    const bool reverse = GENERATE(false, true);
+    Print print;
+    Test::init_and_process_print({make_cube(2., 2., 1.)}, print, {
+        {"layer_height", 0.2}, {"initial_layer_print_height", 0.2},
+        {"top_surface_z_mode", "disabled"}, {"nonplanar_top_surface_resolution", 0.2}
+    });
+    LayerRegion &region = *print.objects().front()->layers().front()->regions().front();
+    region.fills.clear();
+    const Flow flow(0.45f, 0.2f, 0.4f);
+    ExtrusionPath source(erSolidInfill, flow.mm3_per_mm(), flow.width(), flow.height());
+    // Both ends are reachable but the connected scanline leaves the reach
+    // envelope in the middle. Neither surviving end may become a new path.
+    source.polyline = Polyline3(Points3{
+        Point3(scale_(1.), scale_(1.), scale_(0.)), Point3(scale_(9.), scale_(1.), scale_(0.)),
+        Point3(scale_(9.), scale_(2.), scale_(0.)), Point3(scale_(1.), scale_(2.), scale_(0.))});
+    if (reverse)
+        source.polyline.reverse();
+    region.fills.entities.push_back(source.clone());
+
+    indexed_triangle_set triangles;
+    triangles.vertices = {Vec3f(0, 0, 2), Vec3f(10, 0, 3),
+                          Vec3f(10, 10, 3), Vec3f(0, 10, 2)};
+    triangles.indices = {Vec3i32(0, 1, 2), Vec3i32(0, 2, 3)};
+    TriangleMesh surface(triangles);
+    sla::IndexedMesh mesh(surface);
+    mesh.ground_level_offset(-mesh.ground_level());
+    const ExPolygons domain{ExPolygon(Polygon(Points{
+        Point(scale_(0.), scale_(0.)), Point(scale_(10.), scale_(0.)),
+        Point(scale_(10.), scale_(10.)), Point(scale_(0.), scale_(10.))}))};
+    ExtrusionEntityCollection rejected;
+    rejected.entities = project_nonplanar_source_course(
+        region, mesh, domain, {1, 1}, domain, 3., 2.3);
+    CHECK(rejected.empty());
+    REQUIRE(region.fills.entities.size() == 1);
+    CHECK(region.fills.entities.front()->first_point() == source.first_point());
+    CHECK(region.fills.entities.front()->last_point() == source.last_point());
+
+    // The same line is retained whole when every sample is reachable.
+    ExtrusionEntityCollection accepted;
+    accepted.entities = project_nonplanar_source_course(
+        region, mesh, domain, {1, 1}, domain, 3., 4.);
+    REQUIRE(accepted.entities.size() == 1);
+    CHECK(accepted.entities.front()->first_point() == source.first_point());
+    CHECK(accepted.entities.front()->last_point() == source.last_point());
+
+    ExtrusionPath neighbor(source);
+    neighbor.polyline = Polyline3(Points3{
+        Point3(scale_(1.), scale_(3.), scale_(0.)),
+        Point3(scale_(2.), scale_(3.), scale_(0.))});
+    region.fills.entities.push_back(neighbor.clone());
+    ExtrusionEntityCollection mixed;
+    mixed.entities = project_nonplanar_source_course(
+        region, mesh, domain, {1, 1}, domain, 3., 2.3);
+    REQUIRE(mixed.entities.size() == 1);
+    CHECK(mixed.entities.front()->first_point() == neighbor.first_point());
+    CHECK(mixed.entities.front()->last_point() == neighbor.last_point());
+}
+
+TEST_CASE("Native course projection preserves infill roles and follows its own height field",
+          "[Fill][NonplanarSurface][SourceCourseProjection][Regression]")
+{
+    const ExtrusionRole role = GENERATE(erInternalInfill, erSolidInfill,
+        erInternalBridgeInfill, erTopSolidInfill);
+    const double blend = GENERATE(0., 0.25, 1.);
+    Print print;
+    Test::init_and_process_print({make_cube(2., 2., 1.)}, print, {
+        {"layer_height", 0.2}, {"initial_layer_print_height", 0.2},
+        {"top_surface_z_mode", "disabled"}, {"nonplanar_top_surface_resolution", 0.2}
+    });
+    LayerRegion &region = *print.objects().front()->layers().front()->regions().front();
+    region.fills.clear();
+    const Flow flow(0.45f, 0.2f, 0.4f);
+    ExtrusionPath source(role, flow.mm3_per_mm(), flow.width(), flow.height());
+    source.polyline = Polyline3(Points3{
+        Point3(scale_(1.), scale_(1.), scale_(0.)),
+        Point3(scale_(5.), scale_(1.), scale_(0.)),
+        Point3(scale_(5.), scale_(8.), scale_(0.))});
+    region.fills.entities.push_back(source.clone());
+    indexed_triangle_set triangles;
+    triangles.vertices = {Vec3f(0, 0, 2), Vec3f(10, 0, 3),
+                          Vec3f(10, 10, 3), Vec3f(0, 10, 2)};
+    triangles.indices = {Vec3i32(0, 1, 2), Vec3i32(0, 2, 3)};
+    TriangleMesh surface(triangles);
+    sla::IndexedMesh mesh(surface);
+    mesh.ground_level_offset(-mesh.ground_level());
+    const ExPolygons domain{ExPolygon(Polygon(Points{
+        Point(scale_(0.), scale_(0.)), Point(scale_(10.), scale_(0.)),
+        Point(scale_(10.), scale_(10.)), Point(scale_(0.), scale_(10.))}))};
+    const NonplanarCourseProjection course{{0.2 + blend * 2.8, blend}, 3.};
+    ExtrusionEntityCollection projected;
+    projected.entities = project_nonplanar_source_course(
+        region, mesh, domain, {1, 1}, domain, 3., 3., &course);
+    REQUIRE(projected.entities.size() == 1);
+    const auto *path = dynamic_cast<const ExtrusionPath *>(projected.entities.front());
+    REQUIRE(path != nullptr);
+    CHECK(path->role() == role);
+    CHECK(path->first_point() == source.first_point());
+    CHECK(path->last_point() == source.last_point());
+    CHECK_THAT(path->polyline.to_polyline().length(),
+        Catch::Matchers::WithinAbs(source.polyline.to_polyline().length(), scale_(0.00001)));
+    CHECK_THAT(path->mm3_per_mm, Catch::Matchers::WithinAbs(source.mm3_per_mm, 1e-9));
+    CHECK_FALSE(path->nonplanar_clearance_validated);
+    CHECK(path->nonplanar_transition == (blend < 1.));
+    for (const Point3 &point : path->polyline.points)
+        CHECK_THAT(3. + unscale_(point.z()), Catch::Matchers::WithinAbs(
+            0.2 + blend * (2. + 0.1 * unscale_(point.x()) - 0.2), 1e-5));
+}
+
+TEST_CASE("Native course projection retains sparse patterns instead of repeating the top raster",
+          "[Fill][NonplanarSurface][SourceCourseProjection][Regression]")
+{
+    const std::string pattern = GENERATE(std::string("rectilinear"), std::string("gyroid"));
+    Print print;
+    Test::init_and_process_print({make_cube(20., 20., 6.)}, print, {
+        {"layer_height", 0.2}, {"initial_layer_print_height", 0.2},
+        {"top_surface_z_mode", "disabled"}, {"nonplanar_top_surface_resolution", 0.2},
+        {"sparse_infill_pattern", pattern}, {"sparse_infill_density", "15%"},
+        {"top_shell_layers", 3}, {"bottom_shell_layers", 3},
+        {"top_shell_thickness", 0.6}, {"bottom_shell_thickness", 0.6},
+        {"wall_loops", 2}
+    });
+    const Layer &layer = *print.objects().front()->layers()[10];
+    LayerRegion &region = *layer.regions().front();
+    const Polylines source = region.fills.as_polylines();
+    REQUIRE_FALSE(source.empty());
+    BoundingBox bounds = get_extents(layer.lslices);
+    bounds.offset(scale_(1.));
+    const Vec2d lo = unscale(bounds.min), hi = unscale(bounds.max);
+    const double z = layer.print_z;
+    indexed_triangle_set triangles;
+    triangles.vertices = {
+        Vec3f(lo.x(), lo.y(), z + 0.6), Vec3f(hi.x(), lo.y(), z + 1.),
+        Vec3f(hi.x(), hi.y(), z + 1.), Vec3f(lo.x(), hi.y(), z + 0.6)};
+    triangles.indices = {Vec3i32(0, 1, 2), Vec3i32(0, 2, 3)};
+    TriangleMesh surface(triangles);
+    sla::IndexedMesh mesh(surface);
+    mesh.ground_level_offset(-mesh.ground_level());
+    const ExPolygons domain{ExPolygon(bounds.polygon())};
+    const NonplanarCourseProjection course{{z + 0.5, 0.5}, z + 1.};
+    ExtrusionEntityCollection projected;
+    projected.entities = project_nonplanar_source_course(
+        region, mesh, domain, {1, 1}, domain, z, 1., &course);
+    REQUIRE_FALSE(projected.empty());
+    for (const ExtrusionEntity *entity : projected.entities) {
+        CHECK(entity->role() == erInternalInfill);
+        const auto *path = dynamic_cast<const ExtrusionPath *>(entity);
+        REQUIRE(path != nullptr);
+        CHECK_FALSE(path->nonplanar_clearance_validated);
+    }
+    double source_length = 0., projected_length = 0.;
+    for (const Polyline &line : source)
+        source_length += line.length();
+    for (const Polyline &line : projected.as_polylines())
+        projected_length += line.length();
+    CHECK_THAT(projected_length, Catch::Matchers::WithinRel(source_length, 0.001));
+    // The source fill is neither consumed nor replaced during candidate projection.
+    CHECK(region.fills.as_polylines() == source);
 }
 
 TEST_CASE("Native non-planar foundations reject raised neighboring brick paths",
@@ -975,12 +1170,17 @@ static bool arc_paths_track_obstacles(const Polylines &arcs,
 static bool arc_paths_have_sustained_endpoint_retrace(
     const Polylines &arcs, coord_t centerline_clearance,
     coord_t minimum_run, bool trailing,
-    std::string *details = nullptr)
+    std::string *details = nullptr, bool include_interior = false,
+    double maximum_path_length = std::numeric_limits<double>::max())
 {
     Lines printed;
     const double sample_step = scale_(0.05);
     for (size_t arc_idx = 0; arc_idx < arcs.size(); ++arc_idx) {
         Polyline inspected = arcs[arc_idx];
+        if (inspected.length() > maximum_path_length) {
+            append(printed, to_lines(arcs[arc_idx]));
+            continue;
+        }
         if (trailing)
             inspected.reverse();
         double close_run = 0.;
@@ -1041,6 +1241,10 @@ static bool arc_paths_have_sustained_endpoint_retrace(
                         return true;
                     }
                 } else {
+                    if (include_interior) {
+                        close_run = 0.;
+                        continue;
+                    }
                     left_leading_contact = true;
                     break;
                 }
@@ -1100,11 +1304,15 @@ TEST_CASE("Arc overhang fill produces curved paths inside its bridge surface", "
 
 TEST_CASE("Arc overhangs keep consecutive starts on the current side", "[Fill][ArcOverhang][Travel]")
 {
+    const bool native_anchors = GENERATE(false, true);
+    const bool recursive = GENERATE(false, true);
+    const double height = GENERATE(10., 30.);
+    CAPTURE(native_anchors, recursive, height);
     const ExPolygon expolygon(Points{
         Point::new_scale(0., 0.),
         Point::new_scale(20., 0.),
-        Point::new_scale(20., 10.),
-        Point::new_scale(0., 10.)
+        Point::new_scale(20., height),
+        Point::new_scale(0., height)
     });
     Surface surface(stBottomBridge, expolygon);
     surface.bridge_angle = 0.;
@@ -1115,11 +1323,23 @@ TEST_CASE("Arc overhangs keep consecutive starts on the current side", "[Fill][A
     filler->bounding_box = get_extents(expolygon);
 
     PrintRegionConfig config;
-    config.arc_overhang_recursive_fill.value = false;
+    config.arc_overhang_recursive_fill.value = recursive;
     FillParams params;
     params.density = 1.f;
     params.resolution = 0.05f;
     params.config = &config;
+
+    // Both ends may be supported by the previous layer rather than by a
+    // current-layer wall centerline. This is the native slicing path, which
+    // must make the same short, alternating travels as standalone fill.
+    const ExPolygons anchors{expolygon};
+    const Polylines no_walls;
+    if (native_anchors) {
+        params.arc_root_anchor_regions = &anchors;
+        params.arc_anchor_regions = &anchors;
+        params.arc_support_paths = &no_walls;
+        params.arc_obstacle_paths = &no_walls;
+    }
 
     const Polylines paths = filler->fill_surface(&surface, params);
     REQUIRE(paths.size() > 1);
@@ -1185,6 +1405,63 @@ TEST_CASE("Primary arc overhangs cover the bottom and start on its perimeter", "
                 line.distance_to_squared(path.first_point()));
         CHECK(nearest_perimeter_distance_squared <= anchor_tolerance_squared);
     }
+}
+
+TEST_CASE("Supported open courses remain single arcs away from the original foundation",
+          "[Fill][ArcOverhang][Anchor][Regression]")
+{
+    const ExPolygon region(Points{Point::new_scale(0., 0.), Point::new_scale(30., 0.),
+                                  Point::new_scale(30., 20.), Point::new_scale(0., 20.)});
+    const ExPolygons foundation{ExPolygon(Points{
+        Point::new_scale(27., 0.), Point::new_scale(30., 0.),
+        Point::new_scale(30., 20.), Point::new_scale(27., 20.)})};
+    Surface surface(stBottomBridge, region);
+    surface.bridge_angle = 0.;
+    std::unique_ptr<Fill> fill(Fill::new_from_type("arc-overhang"));
+    fill->spacing = 0.45;
+    fill->bounding_box = get_extents(region);
+    PrintRegionConfig config;
+    config.arc_overhang_recursive_fill.value = false;
+    config.arc_overhang_overlap.value = 25.;
+    FillParams params;
+    params.config = &config;
+    params.density = 1.f;
+    params.resolution = 0.003f;
+    params.arc_anchor_regions = &foundation;
+    params.arc_root_anchor_regions = &foundation;
+    const Polylines paths = fill->fill_surface(&surface, params);
+    REQUIRE_FALSE(paths.empty());
+    REQUIRE(paths.front().points.size() >= 3);
+    const Points &first = paths.front().points;
+    const Vec2d a = first[0].cast<double>();
+    const Vec2d b = first[first.size() / 3].cast<double>();
+    const Vec2d c = first[2 * first.size() / 3].cast<double>();
+    const Vec2d center = Geometry::circle_center(a, b, c, 1e-10);
+    const double pitch = scale_(fill->spacing * 0.75);
+    std::map<long, size_t> courses;
+    size_t supported_open_courses = 0;
+    for (const Polyline &path : paths) {
+        const double radius = (path.first_point().cast<double>() - center).norm();
+        // Between the horizontal edges and the far vertical edge, clipping
+        // this circle leaves exactly one connected open course. At either
+        // corner transition multiple components are geometrically legitimate.
+        if (radius <= scale_(10. + fill->spacing) || radius >= center.x() - scale_(fill->spacing))
+            continue;
+        if (std::any_of(path.points.begin(), path.points.end(), [&](const Point &point) {
+                return std::abs((point.cast<double>() - center).norm() - radius) > scale_(0.01);
+            }))
+            continue; // Deliberately tightened shallow remnants have another center.
+        const long course = std::lround(radius / pitch);
+        CAPTURE(course, unscale<double>(path.length()));
+        CHECK(++courses[course] == 1);
+        if (!path.is_closed() && !foundation.front().contains(path.first_point()) &&
+            !foundation.front().contains(path.last_point()))
+            ++supported_open_courses;
+    }
+    // The test must reach courses supported by deposited arcs, not only the
+    // first closed rings embedded in the lower-layer foundation.
+    CHECK(supported_open_courses > 0);
+    CHECK_FALSE(arc_paths_have_proper_crossing(paths));
 }
 
 TEST_CASE("Primary arc overhang starts at lower-layer support", "[Fill][ArcOverhang][Anchor]")
@@ -1987,17 +2264,19 @@ TEST_CASE("Arc anchoring uses the retained wall width", "[Fill][ArcOverhang][Anc
 TEST_CASE("Recursive arc growth preserves coverage and coherent families", "[Fill][ArcOverhang][Recursive][Coverage]")
 {
     const bool narrow = GENERATE(false, true);
+    const double wide_span = narrow ? 40. : GENERATE(40., 80.);
     const double bridge_angle = narrow ? GENERATE(0., 0.5 * M_PI) : 0.;
     const bool both_ends = narrow ? GENERATE(false, true) : false;
     CAPTURE(narrow);
     CAPTURE(bridge_angle);
     CAPTURE(both_ends);
+    CAPTURE(wide_span);
     const ExPolygon region(narrow ? Points{
         Point::new_scale(0., 0.), Point::new_scale(4.5, 0.),
         Point::new_scale(4.5, 40.), Point::new_scale(0., 40.)} : Points{
         Point::new_scale(0., 0.), Point::new_scale(30., 0.),
-        Point::new_scale(30., 10.), Point::new_scale(40., 10.),
-        Point::new_scale(40., 40.), Point::new_scale(0., 40.)});
+        Point::new_scale(30., 10.), Point::new_scale(wide_span, 10.),
+        Point::new_scale(wide_span, 40.), Point::new_scale(0., 40.)});
     ExPolygons foundation{ExPolygon(narrow ? Points{
         Point::new_scale(0., 0.), Point::new_scale(4.5, 0.),
         Point::new_scale(4.5, 0.6), Point::new_scale(0., 0.6)} : Points{
@@ -2095,19 +2374,34 @@ TEST_CASE("Recursive arc growth preserves coverage and coherent families", "[Fil
     REQUIRE(recursive_length > 0.);
     CAPTURE(grouped_length, recursive_length);
     CHECK(grouped_length > 0.65 * recursive_length);
+    if (!narrow) {
+        std::string overlap_details;
+        const bool overlapping = arc_paths_have_sustained_endpoint_retrace(
+            paths, scale_(0.4 * fill->spacing), scale_(0.65 * fill->spacing),
+            false, &overlap_details, true, scale_(4. * fill->spacing));
+        INFO(overlap_details);
+        CHECK_FALSE(overlapping);
+    }
 }
 
 TEST_CASE("Arc bodies grow from previously deposited material", "[Fill][ArcOverhang][Recursive][Regression]")
 {
-    const ExPolygon region(Points{
+    const bool narrow = GENERATE(false, true);
+    const double rotation = narrow ? GENERATE(0., M_PI / 3.) : 0.;
+    CAPTURE(narrow, rotation);
+    ExPolygon region(narrow ? Points{
+        Point::new_scale(0., 0.), Point::new_scale(8., 0.),
+        Point::new_scale(8., 40.), Point::new_scale(0., 40.)} : Points{
         Point::new_scale(0., 0.), Point::new_scale(30., 0.),
         Point::new_scale(30., 10.), Point::new_scale(40., 10.),
         Point::new_scale(40., 40.), Point::new_scale(0., 40.)});
-    const ExPolygons foundation{ExPolygon(Points{
+    ExPolygons foundation{ExPolygon(Points{
         Point::new_scale(0., 0.), Point::new_scale(0.6, 0.),
         Point::new_scale(0.6, 40.), Point::new_scale(0., 40.)})};
+    region.rotate(rotation);
+    expolygons_rotate(foundation, rotation);
     Surface surface(stBottomBridge, region);
-    surface.bridge_angle = 0.;
+    surface.bridge_angle = rotation;
     std::unique_ptr<Fill> fill(Fill::new_from_type("arc-overhang"));
     fill->spacing = 0.45;
     fill->bounding_box = get_extents(region);
@@ -2122,6 +2416,19 @@ TEST_CASE("Arc bodies grow from previously deposited material", "[Fill][ArcOverh
     params.arc_root_anchor_regions = &foundation;
     const Polylines paths = fill->fill_surface(&surface, params);
     REQUIRE_FALSE(paths.empty());
+    CHECK_FALSE(arc_paths_have_proper_crossing(paths));
+    ExPolygons covered = union_ex(offset(paths, float(scale_(0.5 * fill->spacing))));
+    append(covered, foundation);
+    const ExPolygons holes = opening_ex(diff_ex(ExPolygons{region}, union_ex(covered)),
+                                       float(scale_(0.75 * fill->spacing)));
+    const double missing_mm2 = std::accumulate(holes.begin(), holes.end(), 0.,
+        [](double sum, const ExPolygon &hole) { return sum + std::abs(hole.area()); }) *
+        SCALING_FACTOR * SCALING_FACTOR;
+    CAPTURE(missing_mm2);
+    // Safety clipping can leave residuals in this arc-only fixture. Bound
+    // their area as well as validating the deposited prefix; this does not
+    // replace model-coverage checks on the complete sliced layer.
+    CHECK(missing_mm2 < 0.01 * std::abs(region.area()) * SCALING_FACTOR * SCALING_FACTOR);
     // Lower-layer footprint plus less than half of the new bead's width:
     // the first course must retain overlap, not be wholly inside the support.
     ExPolygons deposited = offset_ex(foundation, float(scale_(0.4 * fill->spacing)),
@@ -2271,6 +2578,49 @@ TEST_CASE("Narrow bridge grows tight arcs from available end foundations", "[Fil
     const double missing = std::accumulate(holes.begin(), holes.end(), 0.,
         [](double sum, const ExPolygon &hole) { return sum + std::abs(hole.area()); });
     CHECK(missing < 0.08 * std::abs(expolygon.area()));
+}
+
+TEST_CASE("Rotating a narrow bridge preserves its coherent arc layout", "[Fill][ArcOverhang][ArcPocketOrientation]")
+{
+    const auto generate = [](double angle) {
+        ExPolygon region(Points{Point::new_scale(0., 0.), Point::new_scale(4.5, 0.),
+            Point::new_scale(4.5, 24.), Point::new_scale(0., 24.)});
+        ExPolygons foundation{
+            ExPolygon(Points{Point::new_scale(0., 0.), Point::new_scale(4.5, 0.),
+                Point::new_scale(4.5, 0.6), Point::new_scale(0., 0.6)}),
+            ExPolygon(Points{Point::new_scale(0., 23.4), Point::new_scale(4.5, 23.4),
+                Point::new_scale(4.5, 24.), Point::new_scale(0., 24.)})};
+        region.rotate(angle);
+        expolygons_rotate(foundation, angle);
+        Surface surface(stBottomBridge, region);
+        surface.bridge_angle = angle;
+        std::unique_ptr<Fill> fill(Fill::new_from_type("arc-overhang"));
+        fill->spacing = 0.45;
+        fill->bounding_box = get_extents(region);
+        PrintRegionConfig config;
+        config.arc_overhang_recursive_fill.value = true;
+        config.arc_overhang_overlap.value = 25.;
+        FillParams params;
+        params.density = 1.f;
+        params.resolution = 0.003f;
+        params.config = &config;
+        params.arc_anchor_regions = &foundation;
+        params.arc_root_anchor_regions = &foundation;
+        return fill->fill_surface(&surface, params);
+    };
+    const double angle = GENERATE(M_PI / 6., M_PI / 3.);
+    const Polylines baseline = generate(0.);
+    const Polylines rotated = generate(angle);
+    REQUIRE_FALSE(baseline.empty());
+    REQUIRE_FALSE(rotated.empty());
+    CAPTURE(angle, baseline.size(), rotated.size());
+    CHECK(rotated.size() <= baseline.size() * 1.15 + 2);
+    const auto length = [](const Polylines &paths) {
+        return std::accumulate(paths.begin(), paths.end(), 0.,
+            [](double sum, const Polyline &path) { return sum + path.length(); });
+    };
+    CHECK(length(rotated) >= 0.98 * length(baseline));
+    CHECK_FALSE(arc_paths_have_proper_crossing(rotated));
 }
 
 TEST_CASE("Long narrow arc overhang retains complete primary coverage", "[Fill][ArcOverhang][Coverage][Performance]")
@@ -2567,7 +2917,8 @@ TEST_CASE("Recursive arc families cover a wide roof without unbounded root growt
             a.norm() * b.norm() * (b - a).norm() / (2. * cross) :
             std::numeric_limits<double>::infinity());
     }
-    // The root must obey the same 15 mm growth policy as recursive children.
+    // Keep the initial seed bounded even when supported children can grow
+    // beyond it; extending a child must not change root qualification.
     // Measure curvature, not chord length: a large circle clipped to a short
     // strip can have a small chord while being almost straight.
     CHECK(maximum_radius <= scale_(15.2));
@@ -2752,6 +3103,54 @@ TEST_CASE("Arc overhang keeps a distinct G-code feature role", "[Fill][ArcOverha
     CHECK(ExtrusionEntity::string_to_role("Arc overhang") == erArcOverhang);
     CHECK(ExtrusionEntity::role_to_string(erArcBridge) == "Arc bridge");
     CHECK(ExtrusionEntity::string_to_role("Arc bridge") == erArcBridge);
+}
+
+TEST_CASE("Short arc path time limits speed without changing deposited geometry", "[Fill][ArcOverhang][ArcCooling]")
+{
+    const double minimum_time = GENERATE(0., 2.);
+    const double radius = GENERATE(1., 4.);
+    const ExtrusionRole role = GENERATE(erArcOverhang, erArcBridge);
+    CAPTURE(minimum_time, radius, role);
+    Print print;
+    Test::init_and_process_print({make_cube(10., 10., 0.4)}, print, {
+        {"layer_height", 0.2}, {"initial_layer_print_height", 0.2},
+        {"arc_overhang_speed", 5.}, {"arc_overhang_min_path_time", minimum_time},
+        {"slow_down_for_layer_cooling", false}, {"enable_arc_fitting", false},
+        {"seam_slope_type", "none"}, {"seam_start_on_inner_wall", false}
+    });
+    const Layer &layer = *print.objects().front()->layers().back();
+    LayerRegion &region = *layer.regions().front();
+    const Vec2d center = unscale(get_extents(layer.lslices).center());
+    region.fills.clear();
+    // Inject one tessellated semicircle to isolate G-code speed handling from
+    // the recursive fill selector. Segments must not each get the time limit.
+    const Flow flow = Flow::bridging_flow(0.4f, 0.4f);
+    ExtrusionPath path(role, flow.mm3_per_mm(), flow.width(), flow.height());
+    for (int i = 0; i <= 20; ++i) {
+        const double angle = PI * i / 20.;
+        path.polyline.points.emplace_back(scale_(center.x() + radius * std::cos(angle)),
+                                         scale_(center.y() + radius * std::sin(angle)), 0.);
+    }
+    const double length = unscale<double>(path.length());
+    auto *collection = new ExtrusionEntityCollection;
+    collection->append(path);
+    region.fills.entities.push_back(collection);
+    ScopedTemporaryFile file(".gcode");
+    GCodeProcessorResult preview;
+    print.export_gcode(file.string(), &preview, nullptr);
+    size_t moves = 0;
+    double emitted_length = 0.;
+    const double expected_speed = minimum_time > 0. ? std::min(5., length / minimum_time) : 5.;
+    for (size_t i = 1; i < preview.moves.size(); ++i) {
+        const auto &move = preview.moves[i];
+        if (move.type != EMoveType::Extrude || move.extrusion_role != role)
+            continue;
+        ++moves;
+        emitted_length += (move.position - preview.moves[i - 1].position).norm();
+        CHECK_THAT(move.feedrate, Catch::Matchers::WithinAbs(expected_speed, 0.002));
+    }
+    REQUIRE(moves > 1);
+    CHECK_THAT(emitted_length, Catch::Matchers::WithinAbs(length, 0.01));
 }
 
 TEST_CASE("Wide unsupported roofs reach the preview as arc overhangs", "[Fill][ArcOverhang][GCode]")

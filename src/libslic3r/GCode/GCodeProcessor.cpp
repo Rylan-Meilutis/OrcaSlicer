@@ -2520,11 +2520,23 @@ void GCodeProcessor::UsedFilaments::process_caches(GCodeProcessor* processor)
     process_total_volume_cache(processor);
 }
 
+const GCodeProcessorResult::TemperatureTargets* GCodeProcessorResult::temperature_targets_at(unsigned int gcode_id) const
+{
+    auto it = std::upper_bound(moves.begin(), moves.end(), gcode_id,
+        [](unsigned int id, const MoveVertex &move) { return id < move.gcode_id; });
+    if (it == moves.begin())
+        return nullptr;
+    const size_t index = std::prev(it)->temperature_targets_id;
+    return index < temperature_targets.size() ? &temperature_targets[index] : nullptr;
+}
+
 void GCodeProcessorResult::reset() {
     //BBS: add mutex for protection of gcode result
     lock();
 
     moves.clear();
+    temperature_targets.clear();
+    temperature_targets.emplace_back(); // dummy move has no known targets
     lines_ends.clear();
     printable_area = Pointfs();
     //BBS: add bed exclude area
@@ -3553,6 +3565,8 @@ void GCodeProcessor::reset()
     m_has_filament_switcher = false;
 
     m_highest_bed_temp = 0;
+    m_temperature_targets = {};
+    m_temperature_targets_changed = true;
 
     m_extruded_last_z = 0.0f;
     m_zero_layer_height = 0.0f;
@@ -6122,10 +6136,29 @@ void GCodeProcessor::process_M83(const GCodeReader::GCodeLine& line)
 
 void GCodeProcessor::process_M104(const GCodeReader::GCodeLine& line)
 {
-    int filament_id = get_filament_id();
+    process_nozzle_temperature(line, false);
+}
+
+void GCodeProcessor::process_nozzle_temperature(const GCodeReader::GCodeLine& line, bool wait)
+{
     float new_temp;
-    if (line.has_value('S', new_temp))
-        m_extruder_temps[filament_id] = new_temp;
+    const bool has_temperature = (wait && line.has_value('R', new_temp)) || line.has_value('S', new_temp);
+    if (!has_temperature || !std::isfinite(new_temp) || new_temp < 0.f)
+        return;
+    float target;
+    const bool explicit_tool = line.has_value('T', target);
+    if (explicit_tool && (!std::isfinite(target) || target < 0.f || target >= 255.f || target != std::floor(target)))
+        return;
+    const unsigned int tool = explicit_tool ? static_cast<unsigned int>(target) :
+        (s_IsBBLPrinter ? get_extruder_id() : get_filament_id());
+    size_t filament = explicit_tool ? tool : get_filament_id();
+    if (explicit_tool && s_IsBBLPrinter && tool < m_filament_id.size() && m_filament_id[tool] != static_cast<unsigned char>(-1))
+        filament = m_filament_id[tool];
+    if (filament >= m_extruder_temps.size())
+        m_extruder_temps.resize(filament + 1, 0.f);
+    m_extruder_temps[filament] = new_temp;
+    m_temperature_targets.tools[tool] = new_temp;
+    m_temperature_targets_changed = true;
 }
 
 void GCodeProcessor::process_VM104(const GCodeReader::GCodeLine& line)
@@ -6199,20 +6232,9 @@ void GCodeProcessor::process_M108(const GCodeReader::GCodeLine& line)
 
 void GCodeProcessor::process_M109(const GCodeReader::GCodeLine& line)
 {
-    int filament_id = get_filament_id();
-    float new_temp;
-    if (line.has_value('R', new_temp)) {
-        float val;
-        if (line.has_value('T', val)) {
-            size_t eid = static_cast<size_t>(val);
-            if (eid < m_extruder_temps.size())
-                m_extruder_temps[eid] = new_temp;
-        }
-        else
-            m_extruder_temps[filament_id] = new_temp;
-    }
-    else if (line.has_value('S', new_temp))
-        m_extruder_temps[filament_id] = new_temp;
+    // Share addressed-tool handling for both wait forms, including inactive
+    // tools. M104 and M109 S previously attributed these to the active tool.
+    process_nozzle_temperature(line, true);
 }
 
 void GCodeProcessor::process_VM109(const GCodeReader::GCodeLine& line)
@@ -6255,15 +6277,21 @@ void GCodeProcessor::process_M135(const GCodeReader::GCodeLine& line)
 void GCodeProcessor::process_M140(const GCodeReader::GCodeLine& line)
 {
     float new_temp;
-    if (line.has_value('S', new_temp))
+    if (line.has_value('S', new_temp) && std::isfinite(new_temp) && new_temp >= 0.f) {
         m_highest_bed_temp = m_highest_bed_temp < (int)new_temp ? (int)new_temp : m_highest_bed_temp;
+        m_temperature_targets.bed = new_temp;
+        m_temperature_targets_changed = true;
+    }
 }
 
 void GCodeProcessor::process_M190(const GCodeReader::GCodeLine& line)
 {
     float new_temp;
-    if (line.has_value('S', new_temp))
+    if ((line.has_value('R', new_temp) || line.has_value('S', new_temp)) && std::isfinite(new_temp) && new_temp >= 0.f) {
         m_highest_bed_temp = m_highest_bed_temp < (int)new_temp ? (int)new_temp : m_highest_bed_temp;
+        m_temperature_targets.bed = new_temp;
+        m_temperature_targets_changed = true;
+    }
 }
 
 void GCodeProcessor::process_M191(const GCodeReader::GCodeLine& line)
@@ -7063,6 +7091,10 @@ void GCodeProcessor::store_move_vertex(EMoveType type, EMovePathType path_type, 
         m_result.print_statistics.total_travel_distance += m_travel_dist;
     }
 
+    if (m_temperature_targets_changed) {
+        m_result.temperature_targets.push_back(m_temperature_targets);
+        m_temperature_targets_changed = false;
+    }
     m_result.moves.push_back({
         m_last_line_id,
         type,
@@ -7091,7 +7123,8 @@ void GCodeProcessor::store_move_vertex(EMoveType type, EMovePathType path_type, 
         std::max<unsigned int>(1, m_layer_id) - 1,
         internal_only,
         m_object_label_id,
-        m_print_z
+        m_print_z,
+        static_cast<unsigned int>(m_result.temperature_targets.size() - 1)
     });
 
     if (type == EMoveType::Seam) {

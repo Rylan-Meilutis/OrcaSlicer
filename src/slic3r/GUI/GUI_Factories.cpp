@@ -1885,6 +1885,7 @@ wxMenu *MenuFactory::svg_part_menu()
 
 wxMenu* MenuFactory::instance_menu()
 {
+    append_menu_item_change_extruder(&m_instance_menu);
     return &m_instance_menu;
 }
 

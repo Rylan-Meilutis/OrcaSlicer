@@ -2622,19 +2622,26 @@ ExtrusionEntitiesPtr project_nonplanar_source_course(
     LayerRegion &source_region, const sla::IndexedMesh &mesh,
     const ExPolygons &surface_projection, const std::vector<uint8_t> &facets,
     const ExPolygons &course_domain,
-    coordf_t destination_owner_z, double maximum_drape_height)
+    coordf_t destination_owner_z, double maximum_drape_height,
+    const NonplanarCourseProjection *course)
 {
     ExtrusionEntitiesPtr result;
+    if (course != nullptr &&
+        (!std::isfinite(course->profile.plane_z) || !std::isfinite(course->maximum_surface_z) ||
+         !std::isfinite(course->profile.blend) || course->profile.blend < 0. || course->profile.blend > 1.))
+        return result;
     const double resolution = std::max(
         0.05, source_region.region().config().nonplanar_top_surface_resolution.value);
     const double source_z = source_region.layer()->print_z;
     const auto collect = [&](auto &&self, const ExtrusionEntity &entity) -> void {
         if (const auto *path = dynamic_cast<const ExtrusionPath *>(&entity)) {
-            if (path->role() != erTopSolidInfill &&
-                path->role() != erSolidInfill)
+            if (course != nullptr ?
+                (!is_infill(path->role()) || is_arc_fill(path->role()) || path->role() == erIroning) :
+                (path->role() != erTopSolidInfill && path->role() != erSolidInfill))
                 return;
-            const Polylines fragments = intersection_pl(
-                Polylines{path->polyline.to_polyline()}, course_domain);
+            const Polyline source = path->polyline.to_polyline();
+            Polylines fragments = intersection_pl(Polylines{source}, course_domain);
+            restore_source_path_order(source, fragments);
             for (const Polyline &fragment : fragments) {
                 if (fragment.points.size() < 2 ||
                     fragment.length() <= SCALED_EPSILON)
@@ -2645,11 +2652,12 @@ ExtrusionEntitiesPtr project_nonplanar_source_course(
                 for (const Point &point : fragment.points)
                     projected.polyline.points.emplace_back(
                         point.x(), point.y(), coord_t(0));
-                projected.set_extrusion_role(erTopSolidInfill);
+                if (course == nullptr)
+                    projected.set_extrusion_role(erTopSolidInfill);
                 projected.z_contoured = false;
                 projected.nonplanar_surface = false;
                 projected.nonplanar_schedule_owned = false;
-                projected.nonplanar_transition = false;
+                projected.nonplanar_transition = course != nullptr && course->profile.blend < 1.;
                 projected.nonplanar_clearance_validated = false;
 
                 // This is a complete solid course, not a perimeter entering
@@ -2664,6 +2672,7 @@ ExtrusionEntitiesPtr project_nonplanar_source_course(
                 // transition is between supported courses, while each course
                 // remains one coherent height field.
                 Points3 draped;
+                bool complete = true;
                 const auto emit_draped = [&]() {
                     if (draped.size() < 2) {
                         draped.clear();
@@ -2684,7 +2693,7 @@ ExtrusionEntitiesPtr project_nonplanar_source_course(
                 };
                 const Points &points = fragment.points;
                 for (size_t segment_idx = 0;
-                     segment_idx + 1 < points.size();
+                     complete && segment_idx + 1 < points.size();
                      ++segment_idx) {
                     const Vec2d a = unscale(points[segment_idx]);
                     const Vec2d b = unscale(points[segment_idx + 1]);
@@ -2701,24 +2710,29 @@ ExtrusionEntitiesPtr project_nonplanar_source_course(
                         // Mesh coordinates are centered independently of the
                         // printer's layer Z. Compare and emit in print space,
                         // just as the wall and shell projection paths do.
-                        const double print_z = surface_z ?
+                        const double target_surface_z = surface_z ?
                             *surface_z - mesh.ground_level() : 0.;
+                        const double print_z = course == nullptr ? target_surface_z :
+                            course->profile.plane_z + course->profile.blend *
+                                (target_surface_z - course->maximum_surface_z);
                         if (!surface_z ||
                             print_z < source_z - double(path->height) - EPSILON ||
                             print_z > source_z + maximum_drape_height + EPSILON) {
-                            // A boundary ray miss clips only this connected
-                            // portion.  It must not discard every otherwise
-                            // valid scanline in the source course and trigger
-                            // the legacy generated-raster fallback.
-                            emit_draped();
-                            continue;
+                            // Only domain clipping may create endpoints.
+                            // Keeping either side of a failed projection
+                            // creates unanchored scanline ends in the middle
+                            // of the patch. Leave this fragment conventional;
+                            // other complete scanlines remain candidates.
+                            complete = false;
+                            break;
                         }
                         draped.emplace_back(
                             sample.x(), sample.y(),
                             coord_t(scale_(print_z - destination_owner_z)));
                     }
                 }
-                emit_draped();
+                if (complete)
+                    emit_draped();
             }
         } else if (const auto *multipath =
                        dynamic_cast<const ExtrusionMultiPath *>(&entity)) {

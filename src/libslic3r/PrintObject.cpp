@@ -1616,6 +1616,12 @@ bool PrintObject::invalidate_state_by_config_options(
     std::vector<PrintObjectStep> steps;
     bool invalidated = false;
     for (const t_config_option_key &opt_key : opt_keys) {
+        if (m_config.rooting && (opt_key == "wall_loops" || opt_key == "top_shell_layers" ||
+            opt_key == "bottom_shell_layers" || opt_key == "outer_wall_filament_id" ||
+            opt_key == "inner_wall_filament_id" || opt_key == "sparse_infill_filament_id" ||
+            opt_key == "internal_solid_filament_id" || opt_key == "top_surface_filament_id" ||
+            opt_key == "bottom_surface_filament_id"))
+            steps.emplace_back(posSlice);
         if (   opt_key == "brim_width"
             || opt_key == "brim_object_gap"
             || opt_key == "brim_use_efc_outline"
@@ -1659,6 +1665,12 @@ bool PrintObject::invalidate_state_by_config_options(
             || opt_key == "min_width_top_surface"
             || opt_key == "only_one_wall_first_layer"
             || opt_key == "extra_perimeters_on_overhangs"
+            || opt_key == "arc_overhang_enabled"
+            || opt_key == "arc_overhang_bridges"
+            || opt_key == "arc_overhang_overhangs"
+            || opt_key == "arc_overhang_bridge_distance"
+            || opt_key == "arc_overhang_min_overhang_distance"
+            || opt_key == "overhang_wall_overlap"
             || opt_key == "detect_overhang_wall"
             || opt_key == "initial_layer_line_width"
             || opt_key == "inner_wall_line_width"
@@ -1707,6 +1719,11 @@ bool PrintObject::invalidate_state_by_config_options(
             || opt_key == "make_overhang_printable_angle"
             || opt_key == "make_overhang_printable_hole_size"
             || opt_key == "interlocking_beam"
+            || opt_key == "rooting"
+            || opt_key == "rooting_depth"
+            || opt_key == "rooting_width"
+            || opt_key == "rooting_spacing"
+            || opt_key == "rooting_skin"
             || opt_key == "interlocking_orientation"
             || opt_key == "interlocking_beam_layer_count"
             || opt_key == "interlocking_depth"
@@ -1847,6 +1864,7 @@ bool PrintObject::invalidate_state_by_config_options(
             //BBS
             || opt_key == "bridge_line_width"
             || opt_key == "bridge_density"
+            || opt_key == "bridge_line_overlap"
             || opt_key == "internal_bridge_density") {
             steps.emplace_back(posPrepareInfill);
         } else if (
@@ -1866,14 +1884,9 @@ bool PrintObject::invalidate_state_by_config_options(
             || opt_key == "lateral_lattice_angle_2"
             || opt_key == "infill_overhang_angle") {
             steps.emplace_back(posInfill);
-        } else if (opt_key == "arc_overhang_enabled" ||
-                   opt_key == "arc_overhang_bridges" ||
-                   opt_key == "arc_overhang_overhangs" ||
-                   opt_key == "arc_overhang_recursive_fill" ||
+        } else if (opt_key == "arc_overhang_recursive_fill" ||
                    opt_key == "arc_overhang_overlap" ||
-                   opt_key == "arc_overhang_flow_ratio" ||
-                   opt_key == "arc_overhang_bridge_distance" ||
-                   opt_key == "arc_overhang_min_overhang_distance") {
+                   opt_key == "arc_overhang_flow_ratio") {
             steps.emplace_back(posInfill);
         } else if (opt_key == "sparse_infill_pattern"
                    // Orca: Body centering now also determines bridge anchors during preparation.
@@ -2032,6 +2045,7 @@ bool PrintObject::invalidate_state_by_config_options(
             || opt_key == "support_interface_flow_ratio"
             || opt_key == "support_interface_top_temperature"
             || opt_key == "arc_overhang_speed"
+            || opt_key == "arc_overhang_min_path_time"
             || opt_key == "arc_overhang_stabilization_speed"
             || opt_key == "arc_overhang_layers"
             || opt_key == "arc_overhang_overhang_speed_layers"
@@ -2125,7 +2139,7 @@ void PrintObject::detect_surfaces_type()
     // This is useful if one of the parts is to be dissolved, or if it is transparent and the internal shells
     // should be visible.
     bool spiral_mode      = this->print()->config().spiral_mode.value;
-    bool interface_shells = ! spiral_mode && m_config.interface_shells.value;
+    bool interface_shells = ! spiral_mode && (m_config.interface_shells.value || m_config.rooting.value);
     size_t num_layers     = spiral_mode ? std::min(size_t(this->printing_region(0).config().bottom_shell_layers), m_layers.size()) : m_layers.size();
 
     for (size_t region_id = 0; region_id < this->num_printing_regions(); ++ region_id) {
@@ -2681,7 +2695,7 @@ void PrintObject::discover_vertical_shells()
     bool     spiral_mode      = this->print()->config().spiral_mode.value;
     size_t   num_layers       = spiral_mode ? std::min(size_t(this->printing_region(0).config().bottom_shell_layers), m_layers.size()) : m_layers.size();
     std::vector<DiscoverVerticalShellsCacheEntry> cache_top_botom_regions(num_layers, DiscoverVerticalShellsCacheEntry());
-    bool top_bottom_surfaces_all_regions = this->num_printing_regions() > 1 && ! m_config.interface_shells.value;
+    bool top_bottom_surfaces_all_regions = this->num_printing_regions() > 1 && ! m_config.interface_shells.value && !m_config.rooting.value;
 //    static constexpr const float top_bottom_expansion_coeff = 1.05f;
     // Just a tiny fraction of an infill extrusion width to merge neighbor regions reliably.
     static constexpr const float top_bottom_expansion_coeff = 0.05f;

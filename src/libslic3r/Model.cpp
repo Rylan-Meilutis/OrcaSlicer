@@ -3922,6 +3922,15 @@ void remap_model_filament_slots(Model &model, const std::map<int, int> &slot_rel
             volume->mmu_segmentation_facets.remap_states(*volume, paint_state_map);
         }
     }
+    // Layer-slider tool/color changes refer to the same logical material slots
+    // as painting. Leave literal user G-code and non-tool events untouched.
+    for (auto &[plate, info] : model.plates_custom_gcodes)
+        for (CustomGCode::Item &item : info.gcodes)
+            if (item.type == CustomGCode::ToolChange || item.type == CustomGCode::ColorChange) {
+                const auto it = one_based_slots.find(item.extruder);
+                if (it != one_based_slots.end())
+                    item.extruder = it->second;
+            }
 }
 
 #ifndef NDEBUG

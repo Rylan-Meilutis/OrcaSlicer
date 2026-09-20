@@ -551,7 +551,7 @@ TEST_CASE("Brick walls retain their height and connectivity at changing material
     CHECK_THAT(emitted_length, Catch::Matchers::WithinAbs(planned_length, emitted_segments * std::sqrt(3.) * 0.001));
 }
 
-TEST_CASE("Staggered perimeters use the existing intermediate inner wall flow", "[Flow][StaggeredPerimeters]")
+TEST_CASE("Staggered perimeters do not thicken into neighboring wall courses", "[Flow][StaggeredPerimeters]")
 {
     const auto extrusion_for = [](bool enabled, double flow) {
         return total_positive_extrusion(slice({cube(10.)}, {
@@ -562,14 +562,23 @@ TEST_CASE("Staggered perimeters use the existing intermediate inner wall flow", 
             {"bottom_shell_layers", 0},
             {"sparse_infill_density", "0%"},
             {"perimeter_layering", enabled ? "brick" : "standard"},
+            {"seam_slope_type", "none"},
+            {"seam_start_on_inner_wall", false},
+            {"seam_gap", "0%"},
+            {"retraction_length", 0},
             {"inner_walls_flow_ratio", std::to_string(flow * 100.) + "%"}
         }));
     };
 
+    // Shifted-course entry/realignment and quantized G-code need not have
+    // bit-identical volume to planar paths. Bound that difference separately;
+    // the same brick geometry below must remain unchanged at 110%.
     CHECK_THAT(extrusion_for(true, 1.00),
-               Catch::Matchers::WithinAbs(extrusion_for(false, 1.00), 1e-4));
+               Catch::Matchers::WithinRel(extrusion_for(false, 1.00), 1e-4));
     CHECK(extrusion_for(false, 1.10) > extrusion_for(false, 1.00));
-    CHECK(extrusion_for(true, 1.10) > extrusion_for(true, 1.00));
+    CHECK_THAT(extrusion_for(true, 1.10),
+               Catch::Matchers::WithinAbs(extrusion_for(true, 1.00), 1e-4));
+    CHECK(extrusion_for(true, 0.90) < extrusion_for(true, 1.00));
 }
 
 TEST_CASE("Intermediate inner wall flow changes only prints with at least three walls", "[Flow][Regression]")

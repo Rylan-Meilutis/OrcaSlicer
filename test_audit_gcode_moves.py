@@ -11,6 +11,7 @@ from audit_gcode_moves import WORDS, linearized_gcode
 from audit_arc_gcode import audit_crossings
 from audit_arc_support import audit_support
 from audit_arc_families import audit_families
+from audit_arc_overlap import audit_overlap
 
 
 def read_moves(gcode):
@@ -20,6 +21,38 @@ def read_moves(gcode):
 
 
 class AuditMovesTest(unittest.TestCase):
+    def test_arc_overlap_detects_a_curved_cleanup_retrace(self):
+        # KSR Z50.2: neither centerline crosses the other, but the middle of
+        # the second arc follows the first within about 0.15 mm.
+        source = ("G90\nM83\n;WIDTH:0.45\n;TYPE:Arc bridge\n"
+                  "G0 X150.530 Y74.968 Z50.2\n"
+                  "G1 X150.478 Y74.927 E.01\nG1 X150.341 Y74.850 E.01\n"
+                  "G1 X150.194 Y74.794 E.01\nG1 X150.041 Y74.760 E.01\n"
+                  "G1 X149.885 Y74.748 E.01\nG0 X149.529 Y74.759\n"
+                  "G1 X149.681 Y74.689 E.01\nG1 X149.847 Y74.638 E.01\n"
+                  "G1 X150.018 Y74.610 E.01\nG1 X150.192 Y74.605 E.01\n"
+                  "G1 X150.365 Y74.623 E.01\nG1 X150.533 Y74.664 E.01\n"
+                  "G1 X150.665 Y74.716 E.01\n")
+        self.assertEqual(audit_crossings(io.StringIO(source))["crossings"], [])
+        result = audit_overlap(io.StringIO(source), 50.2)
+        self.assertEqual(len(result["overlaps"]), 1)
+        self.assertGreater(result["overlaps"][0]["overlap_run_mm"], .4)
+
+    def test_arc_overlap_detects_an_interior_retrace_without_a_crossing(self):
+        source = ("G90\nM83\n;WIDTH:0.45\n;TYPE:Outer wall\n"
+                  "G0 X0 Y0 Z1\nG1 X5 E1\n;TYPE:Arc bridge\n"
+                  "G0 X0 Y1\nG1 X1 Y.05 E.1\nG1 X4 E.5\nG1 X5 Y1 E.1\n")
+        self.assertEqual(audit_crossings(io.StringIO(source))["crossings"], [])
+        result = audit_overlap(io.StringIO(source), 1.)
+        self.assertEqual(len(result["overlaps"]), 1)
+        self.assertGreater(result["overlaps"][0]["overlap_run_mm"], 2.9)
+
+    def test_arc_overlap_allows_normal_bonding_and_ignores_other_layers(self):
+        for z, separation in ((1., .3375), (.8, .01)):
+            source = (f"G90\nM83\n;WIDTH:0.45\n;TYPE:Outer wall\nG0 X0 Y0 Z{z}\nG1 X5 E1\n"
+                      f";TYPE:Arc bridge\nG0 X0 Y{separation} Z1\nG1 X5 E1\n")
+            self.assertEqual(audit_overlap(io.StringIO(source), 1.)["overlaps"], [])
+
     def test_fitted_arc_contact_uses_a_resolved_terminal_tangent(self):
         # From KSR's narrow bridge: a coarse chord rotates the free-end
         # tangent enough to falsely reject this genuinely bonded neighbour.

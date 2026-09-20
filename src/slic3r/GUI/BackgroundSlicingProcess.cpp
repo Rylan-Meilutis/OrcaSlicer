@@ -1,4 +1,5 @@
 #include "BackgroundSlicingProcess.hpp"
+#include "libslic3r/Format/SlicedGCode.hpp"
 #include "GUI_App.hpp"
 #include "GUI.hpp"
 #include "MainFrame.hpp"
@@ -115,6 +116,10 @@ BackgroundSlicingProcess::~BackgroundSlicingProcess()
 {
     this->stop();
     this->join_background_thread();
+    if (!m_dispatch_output_path.empty()) {
+        boost::system::error_code ec;
+        boost::filesystem::remove(m_dispatch_output_path, ec);
+    }
     // BBS: move this logic to part plate
     // boost::nowide::remove(m_temp_output_path.c_str());
 }
@@ -267,6 +272,39 @@ void BackgroundSlicingProcess::process_fff()
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": export gcode finished");
     }
     if (this->set_step_started(bspsGCodeFinalize)) {
+        if (m_dispatch_print && (!m_export_path.empty() || !m_upload_job.empty())) {
+            m_print->throw_if_canceled();
+            m_print->set_status(0, _u8L("Preparing print job for mapped printer tools"));
+            m_dispatch_print->process();
+            // Never overwrite the logical preview's memory-mapped G-code.
+            m_dispatch_output_path = (boost::filesystem::temp_directory_path() /
+                boost::filesystem::unique_path("orca-mapped-%%%%-%%%%.gcode")).string();
+            GCodeProcessorResult result;
+            m_dispatch_print->export_gcode(m_dispatch_output_path, &result,
+                [this](const ThumbnailsParams &params) { return render_thumbnails(params); });
+            if (!m_dispatch_spools.empty()) {
+                std::string error;
+                if (!SpoolManagerMetadata::update_gcode_file(m_dispatch_output_path, m_dispatch_spools, error))
+                    throw Slic3r::ExportError(error);
+            }
+            if (boost::filesystem::path(m_export_path).extension() == ".3mf" ||
+                (!m_upload_job.empty() && m_upload_job.upload_data.use_3mf)) {
+                std::string output_name = m_upload_job.empty() ? m_export_path : m_upload_job.upload_data.upload_path.string();
+                run_post_process_scripts(m_dispatch_output_path, false,
+                    m_upload_job.empty() ? "File" : m_upload_job.printhost->get_name(), output_name,
+                    m_dispatch_print->full_print_config());
+                if (m_upload_job.empty())
+                    m_export_path = output_name;
+                else
+                    m_upload_job.upload_data.upload_path = output_name;
+                const std::string package_path = m_dispatch_output_path + ".3mf";
+                if (!store_sliced_gcode_3mf(package_path, *m_dispatch_print, result, m_dispatch_output_path))
+                    throw Slic3r::ExportError(_u8L("Failed to package the mapped print job."));
+                boost::filesystem::remove(m_dispatch_output_path);
+                m_dispatch_output_path = package_path;
+            }
+            m_print->throw_if_canceled();
+        }
         if (!m_export_path.empty()) {
             wxQueueEvent(GUI::wxGetApp().mainframe->m_plater, new wxCommandEvent(m_event_export_began_id));
             if (!m_fff_print->is_BBL_printer())
@@ -576,6 +614,8 @@ bool BackgroundSlicingProcess::stop()
         // Cancel any task planned by the background thread on UI thread.
         cancel_ui_task(m_ui_task);
         m_print->cancel();
+        if (m_dispatch_print)
+            m_dispatch_print->cancel();
         // Wait until the background processing stops by being canceled.
         m_condition.wait(lck, [this]() { return m_state == STATE_CANCELED; });
         // In the "Canceled" state. Reset the state to "Idle".
@@ -621,6 +661,8 @@ void BackgroundSlicingProcess::stop_internal()
         // Set the print state to canceled before unlocking the state_mutex(), so when the worker thread wakes up,
         // it throws the CanceledException().
         m_print->cancel_internal();
+        if (m_dispatch_print)
+            m_dispatch_print->cancel_internal();
         // Allow the worker thread to wake up if blocking on a milestone.
         m_print->state_mutex().unlock();
         // Wait until the background processing stops by being canceled.
@@ -773,12 +815,34 @@ void BackgroundSlicingProcess::reset_export()
 {
     assert(!this->running());
     if (!this->running()) {
+        m_dispatch_print.reset();
+        m_dispatch_spools.clear();
+        m_upload_job = PrintHostJob{};
+        if (!m_dispatch_output_path.empty()) {
+            boost::system::error_code ec;
+            boost::filesystem::remove(m_dispatch_output_path, ec);
+            m_dispatch_output_path.clear();
+        }
         m_export_path.clear();
         m_export_path_on_removable_media = false;
         // invalidate_step expects the mutex to be locked.
         std::scoped_lock<std::mutex> lock(m_print->state_mutex());
         this->invalidate_step(bspsGCodeFinalize);
     }
+}
+
+void BackgroundSlicingProcess::set_dispatch_print(std::unique_ptr<Print> print,
+                                                std::vector<SpoolManagerMetadata::Filament> spools)
+{
+    assert(!running());
+    print->set_status_callback([this](const PrintBase::SlicingStatus &status) {
+        m_print->throw_if_canceled();
+        // Object IDs in dispatch warnings belong to the private snapshot, not
+        // the editable plate. Forward progress only to the logical preview.
+        m_print->set_status(status.percent, status.text);
+    });
+    m_dispatch_print = std::move(print);
+    m_dispatch_spools = std::move(spools);
 }
 
 bool BackgroundSlicingProcess::set_step_started(BackgroundSlicingProcessStep step)
@@ -813,8 +877,8 @@ void BackgroundSlicingProcess::finalize_gcode()
     m_print->set_status(95, _u8L("Running post-processing scripts"));
 
     // Perform the final post-processing of the export path by applying the print statistics over the file name.
-    std::string export_path = m_fff_print->print_statistics().finalize_output_path(m_export_path);
-    std::string output_path = m_temp_output_path;
+    std::string export_path = export_print()->print_statistics().finalize_output_path(m_export_path);
+    std::string output_path = export_source_path();
     // Both output_path and export_path ar in-out parameters.
     // If post processed, output_path will differ from m_temp_output_path as run_post_process_scripts() will make a copy of the G-code to not
     // collide with the G-code viewer memory mapping of the unprocessed G-code. G-code viewer maps unprocessed G-code, because m_gcode_result
@@ -822,7 +886,9 @@ void BackgroundSlicingProcess::finalize_gcode()
     // export_path may be changed by the post-processing script as well if the post processing script decides so, see GH #6042.
     // Runs both post-processing scripts and plugins on a single .pp copy of the G-code (make_copy = true),
     // so neither touches the original file the G-code viewer keeps memory-mapped.
-    bool post_processed = run_post_process_scripts(output_path, true, "File", export_path, m_fff_print->full_print_config());
+    const bool packaged_dispatch = m_dispatch_print && boost::filesystem::path(output_path).extension() == ".3mf";
+    bool post_processed = !packaged_dispatch &&
+        run_post_process_scripts(output_path, true, "File", export_path, export_print()->full_print_config());
 
     auto remove_post_processed_temp_file = [post_processed, &output_path]() {
         if (post_processed)
@@ -946,13 +1012,20 @@ void BackgroundSlicingProcess::prepare_upload()
 
     if (m_print == m_fff_print) {
         if (m_upload_job.upload_data.use_3mf) {
-            source_path = m_upload_job.upload_data.source_path;
+            if (m_dispatch_print) {
+                std::string error;
+                if (copy_file(m_dispatch_output_path, source_path.string(), error) != SUCCESS)
+                    throw Slic3r::ExportError(error);
+                // Metadata is already written inside the package, not its ZIP tail.
+                m_upload_job.upload_data.extended_info.erase("spool_manager_filaments");
+            } else
+                source_path = m_upload_job.upload_data.source_path;
         } else {
             m_print->set_status(95, _utf8(L("Running post-processing scripts")));
             std::string error_message;
-            if (copy_file(m_temp_output_path, source_path.string(), error_message) != SUCCESS)
+            if (copy_file(export_source_path(), source_path.string(), error_message) != SUCCESS)
                 throw Slic3r::RuntimeError(_utf8(L("Copying of the temporary G-code to the output G-code failed.")));
-            m_upload_job.upload_data.upload_path = m_fff_print->print_statistics().finalize_output_path(
+            m_upload_job.upload_data.upload_path = export_print()->print_statistics().finalize_output_path(
                 m_upload_job.upload_data.upload_path.string());
             // Orca: skip post-processing scripts for BBL printers as we have run them already in finalize_gcode()
             // todo: do we need to copy the file?
@@ -965,7 +1038,7 @@ void BackgroundSlicingProcess::prepare_upload()
                 // source_path_str is already a dedicated copy of the temp G-code (see copy_file above), not the
                 // memory-mapped original, so scripts and plugins can modify it in place (make_copy = false).
                 bool post_process = run_post_process_scripts(source_path_str, false, m_upload_job.printhost->get_name(), output_name_str,
-                                             m_fff_print->full_print_config());
+                                             export_print()->full_print_config());
                 if (post_process)
                     m_upload_job.upload_data.upload_path = output_name_str;
             }
@@ -991,6 +1064,7 @@ void BackgroundSlicingProcess::prepare_upload()
 
     m_upload_job.upload_data.source_path = std::move(source_path);
 
+    m_print->throw_if_canceled();
     GUI::wxGetApp().printhost_job_queue().enqueue(std::move(m_upload_job));
 }
 // Executed by the background thread, to start a task on the UI thread.

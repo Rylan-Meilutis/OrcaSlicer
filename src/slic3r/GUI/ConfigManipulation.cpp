@@ -827,8 +827,10 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, in
     toggle_line("staggered_perimeters_inner_only", have_staggered_perimeters);
     toggle_line("staggered_perimeter_offset", have_staggered_perimeters);
     const auto *inner_walls_flow = config->option<ConfigOptionPercent>("inner_walls_flow_ratio");
+    // Brick courses already occupy their scheduled cross-section; their
+    // capped thickening multiplier must not force a different wall order here.
     const bool have_thicker_inner_walls =
-        config->opt_int("wall_loops") >= 3 &&
+        !use_brick_perimeters && config->opt_int("wall_loops") >= 3 &&
         inner_walls_flow != nullptr && inner_walls_flow->get_abs_value(1.) > 1.0 + EPSILON;
     if (have_thicker_inner_walls &&
         config->opt_enum<WallSequence>("wall_sequence") != WallSequence::InnerOuterInner)
@@ -1197,8 +1199,17 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, in
 
     const auto* arc_overhang_enabled = config->opt<ConfigOptionBool>("arc_overhang_enabled");
     const bool has_arc_overhangs = arc_overhang_enabled != nullptr && arc_overhang_enabled->value;
+    const auto *wall_overlap = config->option<ConfigOptionPercent>("overhang_wall_overlap");
+    if (wall_overlap != nullptr) {
+        const auto *extra = config->option<ConfigOptionBool>("extra_perimeters_on_overhangs");
+        const auto *detect = config->option<ConfigOptionBool>("detect_overhang_wall");
+        toggle_field("overhang_wall_overlap", have_perimeters && !has_spiral_vase &&
+            extra && extra->value && detect && detect->value);
+    }
+    if (const auto *overlap = config->option<ConfigOptionPercent>("bridge_line_overlap"))
+        toggle_field("bridge_density", overlap->value == 0.);
     for (auto el : {"arc_overhang_bridges", "arc_overhang_overhangs", "arc_overhang_recursive_fill", "arc_overhang_overlap", "arc_overhang_flow_ratio",
-                    "arc_overhang_speed", "arc_overhang_stabilization_speed", "arc_overhang_layers",
+                    "arc_overhang_speed", "arc_overhang_min_path_time", "arc_overhang_stabilization_speed", "arc_overhang_layers",
                     "arc_overhang_overhang_speed_layers", "arc_overhang_bridge_speed_layers",
                     "arc_overhang_bridge_distance", "arc_overhang_min_overhang_distance"})
         toggle_line(el, has_arc_overhangs);
@@ -1309,6 +1320,9 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, in
     toggle_line("scarf_overhang_threshold", has_seam_slope && config->opt_bool("seam_slope_conditional"));
 
     bool use_beam_interlocking = config->opt_bool("interlocking_beam");
+    const auto *rooting = config->option<ConfigOptionBool>("rooting");
+    for (const char *key : {"rooting_depth", "rooting_width", "rooting_spacing", "rooting_skin"})
+        toggle_line(key, rooting != nullptr && rooting->value);
     toggle_line("mmu_segmented_region_interlocking_depth", !use_beam_interlocking);
     toggle_line("interlocking_beam_width", use_beam_interlocking);
     toggle_line("interlocking_orientation", use_beam_interlocking);

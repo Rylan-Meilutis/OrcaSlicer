@@ -243,6 +243,9 @@ class Print;
             //BBS
             int  object_label_id{-1};
             float print_z{0.0f};
+            // Shared target snapshot, not measured heater temperatures. Copies
+            // of moves made by timing/post-processing retain this association.
+            unsigned int temperature_targets_id{0};
 
             float volumetric_rate() const { return feedrate * mm3_per_mm; }
             float actual_volumetric_rate() const { return actual_feedrate * mm3_per_mm; }
@@ -258,6 +261,12 @@ class Print;
         std::string filename;
         unsigned int id;
         std::vector<MoveVertex> moves;
+        struct TemperatureTargets {
+            std::optional<float> bed;
+            std::map<unsigned int, float> tools;
+        };
+        std::vector<TemperatureTargets> temperature_targets;
+        const TemperatureTargets* temperature_targets_at(unsigned int gcode_id) const;
         // Positions of ends of lines of the final G-code this->filename after TimeProcessor::post_process() finalizes the G-code.
         std::vector<size_t> lines_ends;
         Pointfs printable_area;
@@ -328,6 +337,7 @@ class Print;
             filename = other.filename;
             id = other.id;
             moves = other.moves;
+            temperature_targets = other.temperature_targets;
             lines_ends = other.lines_ends;
             printable_area = other.printable_area;
             bed_exclude_area = other.bed_exclude_area;
@@ -1165,6 +1175,8 @@ class Print;
         ExtruderTemps m_extruder_temps;
         bool  m_is_XL_printer = false;
         int m_highest_bed_temp;
+        GCodeProcessorResult::TemperatureTargets m_temperature_targets;
+        bool m_temperature_targets_changed{true};
         float m_extruded_last_z;
         float m_first_layer_height; // mm
         float m_zero_layer_height; // mm
@@ -1358,6 +1370,7 @@ class Print;
 
         // Set extruder temperature
         void process_M104(const GCodeReader::GCodeLine& line);
+        void process_nozzle_temperature(const GCodeReader::GCodeLine& line, bool wait);
 
         // Process virtual command of M104, in order to help gcodeviewer work
         void process_VM104(const GCodeReader::GCodeLine& line);
@@ -1547,4 +1560,3 @@ class Print;
 } /* namespace Slic3r */
 
 #endif /* slic3r_GCodeProcessor_hpp_ */
-

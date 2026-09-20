@@ -21,10 +21,51 @@
 #include <boost/filesystem.hpp>
 #include <boost/nowide/fstream.hpp>
 #include <nlohmann/json.hpp>
-
 #include <sstream>
 
+TEST_CASE("Printer model validation override round trips in printer profile JSON",
+          "[Config][PrinterModel][Regression]")
+{
+    const auto &options = Slic3r::Preset::printer_options();
+    REQUIRE(std::find(options.begin(), options.end(), "gcode_printer_model") != options.end());
+    Slic3r::DynamicPrintConfig config = Slic3r::DynamicPrintConfig::full_print_config();
+    CHECK(config.opt_string("gcode_printer_model").empty());
+    config.set_deserialize_strict("gcode_printer_model", "PrusaCoreOneINDX");
+    ScopedTemporaryFile file(".json");
+    config.save_to_json(file.string(), "INDX printer", "User", "1.0.0.0");
+    Slic3r::DynamicPrintConfig reloaded;
+    Slic3r::ConfigSubstitutionContext substitutions(Slic3r::ForwardCompatibilitySubstitutionRule::Enable);
+    std::map<std::string, std::string> metadata;
+    std::string reason;
+    REQUIRE(reloaded.load_from_json(file.string(), substitutions, true, metadata, reason) == 0);
+    CHECK(reloaded.opt_string("gcode_printer_model") == "PrusaCoreOneINDX");
+}
+
 using namespace Slic3r;
+
+TEST_CASE("Overhang contact controls round trip in process profile JSON", "[Config][OverhangOverlap]")
+{
+    DynamicPrintConfig config;
+    for (const auto &entry : std::vector<std::pair<std::string, std::string>>{
+             {"bridge_line_overlap", "15%"}, {"overhang_wall_overlap", "10%"},
+             {"arc_overhang_min_path_time", "0.8"}}) {
+        const auto &keys = Preset::print_options();
+        REQUIRE(std::find(keys.begin(), keys.end(), entry.first) != keys.end());
+        config.set_deserialize_strict(entry.first, entry.second);
+    }
+    ScopedTemporaryFile file(".json");
+    config.save_to_json(file.string(), "Overhang contact", "User", "1.0.0.0");
+    DynamicPrintConfig restored;
+    ConfigSubstitutionContext substitutions(ForwardCompatibilitySubstitutionRule::Disable);
+    std::map<std::string, std::string> metadata;
+    std::string reason;
+    REQUIRE(restored.load_from_json(file.string(), substitutions, true, metadata, reason) == 0);
+    for (const auto &key : config.keys())
+        CHECK(restored.opt_serialize(key) == config.opt_serialize(key));
+    const auto defaults = DynamicPrintConfig::full_print_config();
+    for (const char *key : {"bridge_line_overlap", "overhang_wall_overlap", "arc_overhang_min_path_time"})
+        CHECK_THAT(defaults.opt_float(key), Catch::Matchers::WithinAbs(0., EPSILON));
+}
 
 TEST_CASE("Unqualified nonplanar modes are not offered by settings selectors", "[Config][Nonplanar]")
 {
@@ -416,6 +457,20 @@ TEST_CASE("New strength and overhang options preserve existing print defaults", 
     CHECK_FALSE(hull_line_mitigation->values.front());
     CHECK_THAT(hull_line_variation->values.front(),
                Catch::Matchers::WithinAbs(25., EPSILON));
+}
+
+TEST_CASE("Layering migration leaves unrelated partial presets unchanged", "[Config][PerimeterLayering][Regression]")
+{
+    for (const char *key : {"", "printer_model", "filament_type", "layer_height"}) {
+        DYNAMIC_SECTION("Partial preset containing " << key) {
+            DynamicPrintConfig config;
+            if (*key != '\0')
+                config.option(key, true);
+            const auto original_keys = config.keys();
+            config.handle_legacy_composite();
+            CHECK(config.keys() == original_keys);
+        }
+    }
 }
 
 TEST_CASE("Legacy perimeter layering options preserve compatible brick and nonplanar features", "[Config][PerimeterLayering]")

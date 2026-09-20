@@ -32,7 +32,8 @@ using namespace Slic3r::Feature::FuzzySkin;
 
 static WallSequence effective_wall_sequence(const PerimeterGenerator &generator)
 {
-    if (generator.config->wall_loops.value >= 3 &&
+    if (generator.config->perimeter_layering.value != PerimeterLayeringMode::Brick &&
+        generator.config->wall_loops.value >= 3 &&
         generator.config->inner_walls_flow_ratio.get_abs_value(1.) > 1.0 + EPSILON &&
         generator.layer_id > 0 && generator.upper_slices != nullptr)
         return WallSequence::InnerOuterInner;
@@ -1170,8 +1171,14 @@ std::tuple<std::vector<ExtrusionPaths>, Polygons> generate_extra_perimeters_over
                                                                                            const Flow              &overhang_flow,
                                                                                            double                   scaled_resolution,
                                                                                            const PrintObjectConfig &object_config,
-                                                                                           const PrintConfig       &print_config)
+                                                                                           const PrintConfig       &print_config,
+                                                                                           const PrintRegionConfig &region_config)
 {
+    // Keep the first contour and bead footprint unchanged; only increase the
+    // number of inward support courses. Reducing Flow spacing would also shrink
+    // the bead width/volume and defeat the requested lateral contact.
+    const coord_t course_spacing = coord_t(std::lround(overhang_flow.scaled_spacing() *
+        (1. - std::clamp(region_config.overhang_wall_overlap.get_abs_value(1.), 0., 0.2))));
     coord_t anchors_size = std::min(coord_t(scale_(EXTERNAL_INFILL_MARGIN)), overhang_flow.scaled_spacing() * (perimeter_count + 1));
 
     BoundingBox infill_area_bb = get_extents(infill_area).inflated(SCALED_EPSILON);
@@ -1210,6 +1217,49 @@ std::tuple<std::vector<ExtrusionPaths>, Polygons> generate_extra_perimeters_over
             inset_overhang_area_left_unfilled.insert(inset_overhang_area_left_unfilled.end(), overhang_to_cover.begin(),
                                                      overhang_to_cover.end());
             continue;
+        }
+        // Reserve only this connected overhang when it reaches an enabled arc
+        // threshold. Smaller regions still need their ordinary inward courses.
+        // Use the bridge detector's direction and the same edge-contact test
+        // as fill selection, rather than disabling all regions on the layer.
+        if (region_config.arc_overhang_enabled &&
+            (region_config.arc_overhang_bridges || region_config.arc_overhang_overhangs)) {
+            const ExPolygons lower = union_ex(optimized_lower_slices);
+            BridgeDetector detector(overhang, lower, overhang_flow.scaled_spacing());
+            detector.detect_angle();
+            const double angle = detector.angle >= 0. ? detector.angle : 0.;
+            const Vec2d bridge_axis(std::cos(angle), std::sin(angle));
+            const Vec2d depth_axis(-bridge_axis.y(), bridge_axis.x());
+            const Polygons contact = intersection(offset(overhang, scale_(1.)), optimized_lower_slices);
+            const auto projection = [](const Polygons &polygons, const Vec2d &axis) {
+                double lo = std::numeric_limits<double>::max(), hi = std::numeric_limits<double>::lowest();
+                for (const auto &polygon : polygons)
+                    for (const auto &point : polygon.points) {
+                        const double p = point.cast<double>().dot(axis);
+                        lo = std::min(lo, p);
+                        hi = std::max(hi, p);
+                    }
+                return std::make_pair(lo, hi);
+            };
+            const auto [area_min, area_max] = projection(overhang_to_cover, depth_axis);
+            const auto [support_min, support_max] = projection(contact, depth_axis);
+            const double tolerance = std::max<double>(scale_(0.25), 0.5 * overhang_flow.scaled_width());
+            const bool one_sided = !contact.empty() &&
+                ((support_min <= area_min + tolerance) != (support_max >= area_max - tolerance));
+            const bool enabled = one_sided ? region_config.arc_overhang_overhangs : region_config.arc_overhang_bridges;
+            const double threshold = one_sided ? region_config.arc_overhang_min_overhang_distance.value :
+                                                region_config.arc_overhang_bridge_distance.value;
+            double span = 0.;
+            const Vec2d axis = one_sided ? depth_axis : bridge_axis;
+            const ExPolygons unsupported = diff_ex(overhang, offset(contact, 0.5 * overhang_flow.scaled_width()));
+            for (const auto &part : unsupported) {
+                const BoundingBox bb = get_extents(part);
+                span = std::max(span, std::abs(axis.x()) * double(bb.size().x()) + std::abs(axis.y()) * double(bb.size().y()));
+            }
+            if (enabled && !unsupported.empty() && (threshold <= 0. || unscale_(span) > threshold)) {
+                append(inset_overhang_area_left_unfilled, overhang_to_cover);
+                continue;
+            }
         }
         ExtrusionPaths &overhang_region = extra_perims.emplace_back();
 
@@ -1252,7 +1302,7 @@ std::tuple<std::vector<ExtrusionPaths>, Polygons> generate_extra_perimeters_over
                 // do not add the perimeter to result yet, first check if perimeter_polygon is not empty after shrinking - this would mean
                 //  that the polygon was possibly too small for full perimeter loop and in that case try gap fill first
                 perimeter_polygon = union_(perimeter_polygon, anchoring);
-                perimeter_polygon = intersection(offset(perimeter_polygon, -overhang_flow.scaled_spacing()), expanded_overhang_to_cover);
+                perimeter_polygon = intersection(offset(perimeter_polygon, -course_spacing), expanded_overhang_to_cover);
 
                 if (perimeter_polygon.empty()) { // fill possible gaps of single extrusion width
                     Polygons shrinked = intersection(offset(prev, -0.3 * overhang_flow.scaled_spacing()), expanded_overhang_to_cover);
@@ -1369,20 +1419,17 @@ std::tuple<std::vector<ExtrusionPaths>, Polygons> generate_extra_perimeters_over
 void PerimeterGenerator::apply_extra_perimeters(ExPolygons &infill_area)
 {
     // Arc overhangs are selected from bridge fill surfaces after perimeter generation.
-    // Extra overhang perimeters may consume an entire unsupported roof (for example
-    // the top platform of the Autodesk FDM test), leaving no bridge surface for the
-    // arc selector. When arc overhangs are enabled, preserve the fill surface and let
-    // its distance thresholds choose arc or traditional bridge infill.
+    // Reserve eligible connected regions inside the generator, leaving regular
+    // below-threshold regions eligible for extra inward perimeter courses.
     if (!m_spiral_vase && this->lower_slices != nullptr && this->config->detect_overhang_wall &&
         this->config->extra_perimeters_on_overhangs &&
-        !(this->config->arc_overhang_enabled &&
-          (this->config->arc_overhang_bridges || this->config->arc_overhang_overhangs)) &&
         this->config->wall_loops > 0 && this->layer_id > this->object_config->raft_layers) {
         // Generate extra perimeters on overhang areas, and cut them to these parts only, to save print time and material
         auto [extra_perimeters, filled_area] = generate_extra_perimeters_over_overhangs(infill_area, this->lower_slices_polygons(),
                                                                                         this->config->wall_loops, this->overhang_flow,
                                                                                         this->m_scaled_resolution, *this->object_config,
-                                                                                        *this->print_config);
+                                                                                        *this->print_config,
+                                                                                        *this->config);
         if (!extra_perimeters.empty()) {
             ExtrusionEntityCollection *this_islands_perimeters = static_cast<ExtrusionEntityCollection *>(this->loops->entities.back());
             ExtrusionEntityCollection  new_perimeters{};

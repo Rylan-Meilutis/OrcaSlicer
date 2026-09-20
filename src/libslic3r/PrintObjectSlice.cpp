@@ -12,6 +12,7 @@
 //BBS
 #include "ShortestPath.hpp"
 #include "libslic3r/Feature/Interlocking/InterlockingGenerator.hpp"
+#include "libslic3r/Feature/Interlocking/Rooting.hpp"
 
 //! macro used to mark string used at localization, return same string
 #define L(s) Slic3r::I18N::translate(s)
@@ -1247,7 +1248,14 @@ void PrintObject::slice_volumes()
         apply_fuzzy_skin_segmentation(*this, [print]() { print->throw_if_canceled(); });
     }
 
-    InterlockingGenerator::generate_interlocking_structure(this, [print]() { print->throw_if_canceled(); });
+    {
+        const Rooting roots(*this);
+        InterlockingGenerator::generate_interlocking_structure(this, [print]() { print->throw_if_canceled(); });
+        const size_t root_count = roots.apply(*this, [print]() { print->throw_if_canceled(); });
+        if (m_config.rooting && num_printing_regions() > 1 && root_count == 0)
+            this->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL,
+                L("Rooting could not place any roots. Check that different materials touch vertically within one object, that each region uses one filament with walls and top/bottom shells, and that the root depth, diameter and protective skin fit inside the base."));
+    }
     m_print->throw_if_canceled();
 
     BOOST_LOG_TRIVIAL(debug) << "Slicing volumes - make_slices in parallel - begin";

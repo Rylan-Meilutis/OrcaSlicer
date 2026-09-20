@@ -754,6 +754,9 @@ private:
     // top support interface made from a different material type.
     std::map<std::pair<const PrintObject*, unsigned int>, int>
                                         m_dissimilar_support_interface_start;
+    // Actual selected slots, including automatic support-tool assignments.
+    std::map<std::pair<const SupportLayer*, ExtrusionRole>, unsigned int> m_support_contact_filaments;
+    std::map<std::pair<const SupportLayer*, unsigned int>, Polygons> m_dissimilar_support_footprints;
     // Support for G-Code Processor
     float                               m_last_height{ 0.0f };
     float                               m_last_layer_z{ 0.0f };

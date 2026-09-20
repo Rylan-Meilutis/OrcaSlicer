@@ -138,6 +138,8 @@ set(lisbslic3r_sources
     Feature/FuzzySkin/FuzzySkin.hpp
     Feature/Interlocking/InterlockingGenerator.cpp
     Feature/Interlocking/InterlockingGenerator.hpp
+    Feature/Interlocking/Rooting.cpp
+    Feature/Interlocking/Rooting.hpp
     Feature/Interlocking/VoxelUtils.cpp
     Feature/Interlocking/VoxelUtils.hpp
     FileParserError.hpp
@@ -207,6 +209,8 @@ set(lisbslic3r_sources
     Format/DRC.cpp
     Format/DRC.hpp
     Format/bbs_3mf.cpp
+    Format/SlicedGCode.cpp
+    Format/SlicedGCode.hpp
     Format/bbs_3mf.hpp
     format.hpp
     Format/OBJ.cpp

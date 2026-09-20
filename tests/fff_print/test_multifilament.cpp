@@ -2,6 +2,8 @@
 
 #include "libslic3r/GCode/GCodeProcessor.hpp"
 #include "libslic3r/GCodeReader.hpp"
+#include "libslic3r/Layer.hpp"
+#include "libslic3r/ClipperUtils.hpp"
 
 #include "test_helpers.hpp"
 #include "test_utils.hpp"
@@ -23,6 +25,189 @@
 
 using namespace Slic3r;
 using namespace Slic3r::Test;
+
+TEST_CASE("Rooting embeds flared anchors without changing exposed surfaces", "[Multifilament][Rooting]")
+{
+    const std::string shape = GENERATE("stacked", "thin", "same filament", "side by side", "narrow", "cavity", "large nozzle", "no shells", "support filament", "soluble host");
+    const double base_height = shape == "thin" ? 1. : 6.;
+    auto config = multifilament_config(2, {
+        {"rooting", false}, {"rooting_depth", 3.}, {"rooting_width", 1.2},
+        {"rooting_spacing", 6.}, {"rooting_skin", 0.8},
+        {"interlocking_beam", false}, {"layer_height", 0.2}, {"initial_layer_print_height", 0.2},
+        {"elefant_foot_compensation", 0.}, {"xy_contour_compensation", 0.},
+        {"xy_hole_compensation", 0.}, {"enable_prime_tower", false}});
+    Print baseline;
+    Model model;
+    if (shape == "large nozzle")
+        config.set_deserialize_strict("nozzle_diameter", "1.0");
+    if (shape == "no shells")
+        config.set_deserialize_strict("top_shell_layers", "0");
+    if (shape == "support filament")
+        config.set_deserialize_strict("filament_is_support", "0,1");
+    if (shape == "soluble host")
+        config.set_deserialize_strict("filament_soluble", "1,0");
+    TriangleMesh base = make_cube(24., 24., base_height);
+    if (shape == "cavity") {
+        base = make_cube(24., 24., 3.4);
+        for (const Vec3d &position : {Vec3d(0., 0., 3.4), Vec3d(20., 0., 3.4)}) {
+            TriangleMesh wall = make_cube(4., 24., 2.);
+            wall.translate(position.cast<float>());
+            base.merge(wall);
+        }
+        for (const Vec3d &position : {Vec3d(4., 0., 3.4), Vec3d(4., 20., 3.4)}) {
+            TriangleMesh wall = make_cube(16., 4., 2.);
+            wall.translate(position.cast<float>());
+            base.merge(wall);
+        }
+        TriangleMesh roof = make_cube(24., 24., 0.6);
+        roof.translate(0., 0., 5.4);
+        base.merge(roof);
+    }
+    init_print({base}, baseline, model, config);
+    TriangleMesh upper = make_cube(shape == "narrow" ? 2. : 12., 12., 2.);
+    upper.translate(shape == "side by side" ? 24. : 6., 6., shape == "side by side" ? 0. : base_height);
+    model.objects.front()->volumes.front()->config.set("extruder", 1);
+    model.objects.front()->add_volume(upper)->config.set("extruder", shape == "same filament" ? 1 : 2);
+    baseline.apply(model, config);
+    baseline.get_object(0)->slice();
+
+    Print rooted;
+    config.set_deserialize_strict("rooting", "1");
+    rooted.apply(model, config);
+    rooted.set_status_silent();
+    rooted.get_object(0)->slice();
+    const auto &original = baseline.objects().front()->layers();
+    const auto &actual = rooted.objects().front()->layers();
+    REQUIRE(original.size() == actual.size());
+    auto material = [](const Layer *layer, unsigned tool) {
+        ExPolygons result;
+        for (const LayerRegion *region : layer->regions())
+            if (region->region().extruder(frExternalPerimeter) == tool)
+                append(result, to_expolygons(region->slices.surfaces));
+        return union_ex(result);
+    };
+    size_t changed = 0;
+    double deepest_area = 0., stem_area = 0.;
+    ExPolygons previous_roots;
+    for (size_t i = 0; i < actual.size(); ++i) {
+        const ExPolygons a = material(actual[i], 1), b = material(actual[i], 2);
+        const ExPolygons old_a = material(original[i], 1), old_b = material(original[i], 2);
+        CHECK(intersection_ex(a, b).empty());
+        const auto before = union_ex(old_a, old_b), after = union_ex(a, b);
+        CHECK(diff_ex(before, after).empty());
+        CHECK(diff_ex(after, before).empty());
+        const auto roots = diff_ex(b, old_b);
+        if (!roots.empty()) {
+            ++changed;
+            CHECK(actual[i]->print_z <= base_height + EPSILON);
+            CHECK(actual[i]->print_z - actual[i]->height >= base_height - 3. - EPSILON);
+            // Roots never enter the exposed ring around the upper part.
+            CHECK(diff_ex(roots, offset_ex(material(original.back(), 2), -scale_(0.8))).empty());
+            if (!previous_roots.empty())
+                for (const ExPolygon &branch : roots)
+                    CHECK_FALSE(intersection_ex(ExPolygons{branch}, previous_roots).empty());
+            const double root_area = area(to_polygons(roots));
+            if (deepest_area == 0.)
+                deepest_area = root_area;
+            stem_area = root_area;
+            previous_roots = roots;
+        }
+        if (shape != "stacked" || actual[i]->print_z > base_height + EPSILON || actual[i]->print_z <= 0.8 + EPSILON) {
+            CHECK(diff_ex(a, old_a).empty());
+            CHECK(diff_ex(old_a, a).empty());
+            CHECK(diff_ex(b, old_b).empty());
+            CHECK(diff_ex(old_b, b).empty());
+        }
+    }
+    if (shape == "stacked") {
+        CHECK(changed >= 3);
+        CHECK(deepest_area > 2. * stem_area);
+    } else
+        CHECK(changed == 0);
+
+    // Removing the option invalidates slicing and restores native regions.
+    config.set_deserialize_strict("rooting", "0");
+    rooted.apply(model, config);
+    rooted.get_object(0)->slice();
+    for (size_t i = 0; i < original.size(); ++i)
+        for (unsigned tool : {1u, 2u}) {
+            const auto expected = material(original[i], tool);
+            const auto restored = material(rooted.objects().front()->layers()[i], tool);
+            CHECK(diff_ex(expected, restored).empty());
+            CHECK(diff_ex(restored, expected).empty());
+        }
+}
+
+TEST_CASE("Rooting reaches emitted toolpaths below the original interface", "[Multifilament][Rooting][GCode]")
+{
+    const bool enabled = GENERATE(false, true);
+    auto config = multifilament_config(2, {
+        {"rooting", enabled}, {"rooting_depth", 3.}, {"rooting_width", 1.2},
+        {"rooting_spacing", 6.}, {"rooting_skin", 0.8}, {"interlocking_beam", false},
+        {"layer_height", 0.2}, {"initial_layer_print_height", 0.2},
+        {"wall_loops", 3}, {"top_shell_layers", 3}, {"bottom_shell_layers", 3},
+        {"enable_prime_tower", false}, {"skirt_loops", 0}, {"brim_type", "no_brim"}});
+    Print print;
+    Model model;
+    init_print({make_cube(24., 24., 6.)}, print, model, config);
+    TriangleMesh upper = make_cube(12., 12., 2.);
+    upper.translate(6., 6., 6.);
+    model.objects.front()->volumes.front()->config.set("extruder", 1);
+    model.objects.front()->add_volume(upper)->config.set("extruder", 2);
+    print.apply(model, config);
+    const std::string output = gcode(print);
+    GCodeReader reader;
+    int tool = 0;
+    double lowest_upper_material = std::numeric_limits<double>::max();
+    reader.parse_buffer(output, [&](GCodeReader &self, const GCodeReader::GCodeLine &line) {
+        const std::string cmd(line.cmd());
+        if (cmd.size() > 1 && cmd.front() == 'T' && std::isdigit(static_cast<unsigned char>(cmd[1])))
+            tool = std::stoi(cmd.substr(1));
+        if (tool == 1 && line.extruding(self) && (line.has_x() || line.has_y()))
+            lowest_upper_material = std::min(lowest_upper_material, double(line.new_Z(self)));
+    });
+    if (enabled) {
+        CHECK(lowest_upper_material < 6.);
+        CHECK(lowest_upper_material >= 3. - EPSILON);
+    } else
+        CHECK(lowest_upper_material >= 6. - EPSILON);
+    CHECK(lowest_upper_material < 8.);
+}
+
+TEST_CASE("Rooting leaves generated supports and interfaces unchanged", "[Multifilament][Rooting][Support]")
+{
+    TriangleMesh mesh = make_cube(10., 16., 5.);
+    TriangleMesh roof = make_cube(26., 16., 1.);
+    roof.translate(-8., 0., 5.);
+    mesh.merge(roof);
+    auto config = multifilament_config(2, {
+        {"enable_support", true}, {"support_type", "normal(auto)"},
+        {"support_threshold_angle", 30.}, {"support_filament", 2},
+        {"support_interface_filament", 2}, {"support_interface_top_layers", 2},
+        {"support_top_z_distance", 0.2}, {"layer_height", 0.2},
+        {"initial_layer_print_height", 0.2}, {"enable_prime_tower", false},
+        {"rooting", false}, {"interlocking_beam", false}});
+    auto paths = [&](bool enabled) {
+        config.set_deserialize_strict("rooting", enabled ? "1" : "0");
+        Print print;
+        init_and_process_print({mesh}, print, config);
+        std::vector<Points> result;
+        bool has_interface = false;
+        for (const SupportLayer *layer : print.objects().front()->support_layers()) {
+            const auto flat = layer->support_fills.flatten();
+            for (const ExtrusionEntity *entity : flat.entities) {
+                has_interface |= entity->role() == erSupportMaterialInterface;
+                for (const Polyline &line : entity->as_polylines())
+                    result.push_back(line.points);
+            }
+        }
+        CHECK(has_interface);
+        REQUIRE_FALSE(result.empty());
+        return result;
+    };
+    const auto ordinary = paths(false);
+    CHECK(paths(true) == ordinary);
+}
 
 // 0-based tool indices used by extrusions whose role comment contains `role` (needs gcode_comments).
 static std::set<int> tools_for_role(const std::string& gcode, const std::string& role)
@@ -714,4 +899,3 @@ TEST_CASE("Multi-extruder slice stays in bounds with a short max_layer_height", 
     init_and_process_print({ cube(20) }, print, config);
     REQUIRE_FALSE(print.objects().front()->layers().empty());
 }
-

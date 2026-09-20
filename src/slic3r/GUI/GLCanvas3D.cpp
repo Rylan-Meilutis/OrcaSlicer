@@ -1,5 +1,6 @@
 #include "libslic3r/libslic3r.h"
 #include "GLCanvas3D.hpp"
+#include "libslic3r/SequentialGantryGeometry.hpp"
 
 #include <igl/unproject.h>
 
@@ -5750,6 +5751,9 @@ void GLCanvas3D::update_sequential_clearance()
             transform = v->get_instance_transformation();
     }
 
+    const SequentialGantryGeometry gantry = load_sequential_gantry_geometry(fff_print()->config());
+    const Vec2d gantry_clearance = gantry.clearance_reach();
+    const bool modeled_clearance = gantry_clearance.maxCoeff() > 0.;
     // calculates objects 2d hulls (see also: Print::sequential_print_horizontal_clearance_valid())
     // this is done only the first time this method is called while moving the mouse,
     // the results are then cached for following displacements
@@ -5761,6 +5765,8 @@ void GLCanvas3D::update_sequential_clearance()
             shrink_factor = scale_(std::max(0.5f * MAX_OUTER_NOZZLE_DIAMETER, object_skirt_offset) - 0.1);
         else
             shrink_factor = static_cast<float>(scale_(0.5 * fff_print()->config().extruder_clearance_radius.value + object_skirt_offset - 0.1));
+        if (modeled_clearance)
+            shrink_factor = scale_(object_skirt_offset);
 
         double mitter_limit = scale_(0.1);
         m_sequential_print_clearance.m_hull_2d_cache.reserve(m_model->objects.size());
@@ -5817,6 +5823,8 @@ void GLCanvas3D::update_sequential_clearance()
                 inst_pts.emplace_back(scaled<double>(p.x()), scaled<double>(p.y()));
             }
             Polygon convex_hull(std::move(inst_pts));
+            if (modeled_clearance)
+                convex_hull = sequential_clearance_hull(convex_hull, (gantry_clearance * 0.5 - Vec2d::Constant(0.05)).cwiseMax(0.));
             BoundingBox bouding_box = convex_hull.bounding_box();
             BoundingBox plate_bb = plate->get_bounding_box_crd();
             double instance_height = m_model->objects[i]->get_instance_max_z(index++);
@@ -5874,6 +5882,8 @@ void GLCanvas3D::update_sequential_clearance()
     double printable_height = fff_print()->config().printable_height;
     double hc1 = fff_print()->config().extruder_clearance_height_to_lid;
     double hc2 = fff_print()->config().extruder_clearance_height_to_rod;
+    if (const double box_height = gantry.first_box_height(); box_height > 0.)
+        hc2 = std::min(hc2, box_height);
     for (int k = 0; k < bounding_box_count; k++)
     {
         Polygon& convex = convex_and_bounding_boxes[k].hull_polygon;
@@ -6101,8 +6111,13 @@ void GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
     imgui->text(_L("0 means auto spacing."));
 
     ImGui::Separator();
+    const bool modeled_arrangement = seq_print && load_sequential_gantry_geometry(fff_print()->config()).clearance_reach().maxCoeff() > 0.;
+    imgui->disabled_begin(modeled_arrangement);
     if (imgui->bbl_checkbox(_L("Auto rotate for arrangement"), settings_out.enable_rotation))
         appcfg->set("arrange", rot_key.c_str(), settings_out.enable_rotation);
+    imgui->disabled_end();
+    if (modeled_arrangement)
+        imgui->text(_L("Gantry clearance preserves object orientation."));
 
     if (imgui->bbl_checkbox(_L("Allow multiple materials on same plate"), settings_out.allow_multi_materials_on_same_plate))
         appcfg->set("arrange", multi_material_key.c_str(), settings_out.allow_multi_materials_on_same_plate);

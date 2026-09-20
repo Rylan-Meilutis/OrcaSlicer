@@ -239,6 +239,17 @@ TEST_CASE("Every bundled gantry model supplies analyzed non-planar geometry",
 
         SequentialGantryGeometry gantry = load_sequential_gantry_geometry(config);
         REQUIRE_FALSE(gantry.empty());
+        // Explicit selection must reuse the curated collision slices, not
+        // reinterpret the visualization mesh or require matching printer notes.
+        config.printer_notes.value.clear();
+        config.sequential_print_gantry_model.value = "builtin:" + boost::filesystem::path(gantry.model_path).filename().string();
+        const auto selected = load_sequential_gantry_geometry(config);
+        REQUIRE(selected.slices.size() == gantry.slices.size());
+        CHECK(selected.model_path == gantry.model_path);
+        CHECK_THAT(selected.conservative_clearance_radius(),
+                   Catch::Matchers::WithinAbs(gantry.conservative_clearance_radius(), EPSILON));
+        CHECK_THAT(selected.clearance_reach().x(), Catch::Matchers::WithinAbs(gantry.clearance_reach().x(), EPSILON));
+        CHECK_THAT(selected.clearance_reach().y(), Catch::Matchers::WithinAbs(gantry.clearance_reach().y(), EPSILON));
         gantry.set_nozzle_tip_diameter(0.4);
         CHECK_THAT(gantry.maximum_xy_reach(0.001),
                    Catch::Matchers::WithinAbs(0.2, 0.01));
@@ -259,6 +270,14 @@ TEST_CASE("A user gantry STL is converted into conservative collision bands",
     REQUIRE_FALSE(gantry.empty());
     CHECK(gantry.validation_error().empty());
     CHECK(gantry.slices.size() >= 6);
+    CHECK_THAT(gantry.clearance_reach().x(), Catch::Matchers::WithinAbs(5., 0.02));
+    CHECK_THAT(gantry.clearance_reach().y(), Catch::Matchers::WithinAbs(10., 0.02));
+    FullPrintConfig imported;
+    imported.sequential_print_gantry_model.value = model_file.string();
+    imported.extruder_clearance_radius.value = 75.;
+    const auto loaded = load_sequential_gantry_geometry(imported);
+    CHECK_THAT(loaded.clearance_reach().x(), Catch::Matchers::WithinAbs(5., 0.02));
+    CHECK_THAT(loaded.clearance_reach().y(), Catch::Matchers::WithinAbs(10., 0.02));
     CHECK_THAT(gantry.maximum_xy_reach(),
                Catch::Matchers::WithinAbs(std::sqrt(125.), 0.02));
 

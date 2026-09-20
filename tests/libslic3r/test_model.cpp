@@ -75,6 +75,38 @@ TEST_CASE("Slice model material remapping preserves project painting and role as
     CHECK(object->layer_config_ranges.begin()->second.opt_int("top_surface_filament_id") == 2);
 }
 
+TEST_CASE("Material remapping includes layer tool changes without rewriting custom G-code", "[Model][ToolMapping]")
+{
+    Model project;
+    for (int plate : {0, 1}) {
+        auto &info = project.plates_custom_gcodes[plate];
+        info.mode = CustomGCode::MultiExtruder;
+        info.gcodes = {
+            {1., CustomGCode::ToolChange, 1, "", ""},
+            {2., CustomGCode::ColorChange, 2, "#112233", ""},
+            {3., CustomGCode::ToolChange, 0, "", ""},
+            {4., CustomGCode::ToolChange, 3, "", ""},
+            {5., CustomGCode::Custom, 1, "", "T0\nM104 T0 S210"},
+            {6., CustomGCode::PausePrint, 2, "", "Check print"}
+        };
+    }
+    Model job(project);
+    remap_model_filament_slots(job, {{0, 7}, {1, 0}});
+    for (int plate : {0, 1}) {
+        const auto &original = project.plates_custom_gcodes.at(plate);
+        const auto &mapped = job.plates_custom_gcodes.at(plate);
+        CHECK(mapped.mode == original.mode);
+        REQUIRE(mapped.gcodes.size() == original.gcodes.size());
+        CHECK(mapped.gcodes[0].extruder == 8);
+        CHECK(mapped.gcodes[1].extruder == 1);
+        CHECK(mapped.gcodes[1].color == "#112233");
+        CHECK(original.gcodes[0].extruder == 1);
+        CHECK(original.gcodes[1].extruder == 2);
+        for (size_t i = 2; i < mapped.gcodes.size(); ++i)
+            CHECK(mapped.gcodes[i] == original.gcodes[i]);
+    }
+}
+
 // convex_hull_2d does not clip geometry below the bed, so these cases avoid
 // sinking transforms.
 TEST_CASE("A part's 2D convex hull is its footprint projected onto the bed", "[Model]")

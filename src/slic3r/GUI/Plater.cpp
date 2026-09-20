@@ -53,6 +53,9 @@
 #include <wx/timer.h>
 #include <wx/wrapsizer.h>
 #include <wx/scrolwin.h>
+#include <wx/notebook.h>
+#include <wx/srchctrl.h>
+#include <wx/listbox.h>
 #ifdef _WIN32
 #include <wx/richtooltip.h>
 #include <wx/custombgwin.h>
@@ -322,6 +325,343 @@ DynamicPrintConfig filament_sync_host_config()
     return config;
 }
 
+bool uses_independent_tool_dispatch()
+{
+    const auto config = filament_sync_host_config();
+    return !wxGetApp().preset_bundle->use_bbl_network() &&
+        !wxGetApp().preset_bundle->is_bbl_vendor() &&
+        wxGetApp().preset_bundle->get_printer_extruder_count() > 1 &&
+        !config.opt_bool("single_extruder_multi_material");
+}
+
+class ToolMappingDialog final : public DPIDialog
+{
+public:
+    ToolMappingDialog(wxWindow *parent, const PresetBundle &bundle,
+                              const std::vector<unsigned int> &used_materials,
+                              const DynamicPrintConfig &resolved_roles,
+                              const std::vector<SpoolManagerMetadata::Filament> &spools,
+                              const wxString &inventory_error)
+        : DPIDialog(parent, wxID_ANY, _L("Map materials to printer tools"), wxDefaultPosition,
+                    wxDefaultSize, wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER)
+    {
+        m_materials = used_materials;
+        m_material_count = bundle.filament_presets.size();
+        const auto config = bundle.full_config();
+        const size_t capacity = bundle.get_printer_extruder_count();
+        auto *root = new wxBoxSizer(wxVERTICAL);
+        auto *heading = new wxStaticText(this, wxID_ANY, _L("Materials for this plate"));
+        heading->SetFont(Label::Head_14);
+        root->Add(heading, 0, wxLEFT | wxRIGHT | wxTOP, FromDIP(12));
+        auto *help = new wxStaticText(this, wxID_ANY,
+            _L("Match your project colors to loaded printer tools. Suggestions use material and color; you can change any assignment."));
+        help->Wrap(FromDIP(700));
+        root->Add(help, 0, wxEXPAND | wxALL, FromDIP(12));
+        if (inventory_error.empty())
+            root->Add(new wxStaticText(this, wxID_ANY, _L("Loaded materials refreshed from the selected printer.")),
+                      0, wxLEFT | wxRIGHT | wxBOTTOM, FromDIP(12));
+        if (!inventory_error.empty()) {
+            auto *warning = new wxStaticText(this, wxID_ANY,
+                _L("Verify each tool manually.") + "\n" + inventory_error);
+            warning->Wrap(FromDIP(700));
+            root->Add(warning, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, FromDIP(12));
+        }
+        auto *scroll = new wxScrolledWindow(this);
+        scroll->SetScrollRate(0, FromDIP(12));
+        auto *grid = new wxFlexGridSizer(3, FromDIP(16), FromDIP(12));
+        grid->AddGrowableCol(2);
+        auto *source_heading = new wxStaticText(scroll, wxID_ANY, _L("Project material"));
+        source_heading->SetFont(Label::Head_14);
+        grid->Add(source_heading);
+        grid->AddSpacer(FromDIP(20));
+        auto *target_heading = new wxStaticText(scroll, wxID_ANY, _L("Loaded printer tool"));
+        target_heading->SetFont(Label::Head_14);
+        grid->Add(target_heading);
+        BitmapCache icons;
+        std::set<int> taken;
+        std::vector<std::string> materials;
+        std::vector<wxStaticText *> statuses;
+        std::vector<std::pair<wxPanel *, wxColour>> swatches;
+        for (size_t i : used_materials) {
+            const std::string material = config.opt_string("filament_type", i);
+            materials.push_back(material);
+            const wxColour color = spool_colour(config.opt_string("filament_colour", i));
+            auto *source = new wxBoxSizer(wxHORIZONTAL);
+            auto *swatch = new wxPanel(scroll, wxID_ANY, wxDefaultPosition, wxSize(FromDIP(40), FromDIP(40)));
+            swatch->SetBackgroundColour(color);
+            swatches.emplace_back(swatch, color);
+            auto *number = new wxStaticText(swatch, wxID_ANY, wxString::Format("%u", unsigned(i + 1)));
+            number->SetFont(Label::Head_14);
+            number->SetForegroundColour((color.Red() * 299 + color.Green() * 587 + color.Blue() * 114 > 128000) ? *wxBLACK : *wxWHITE);
+            auto *swatch_layout = new wxBoxSizer(wxVERTICAL);
+            swatch_layout->AddStretchSpacer();
+            swatch_layout->Add(number, 0, wxALIGN_CENTER_HORIZONTAL);
+            swatch_layout->AddStretchSpacer();
+            swatch->SetSizer(swatch_layout);
+            source->Add(swatch, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(10));
+            auto *description = new wxBoxSizer(wxVERTICAL);
+            auto *material_label = new wxStaticText(scroll, wxID_ANY, from_u8(material));
+            material_label->SetFont(Label::Head_14);
+            description->Add(material_label, 0, wxBOTTOM, FromDIP(4));
+            auto *label = new wxStaticText(scroll, wxID_ANY,
+                from_u8(bundle.filament_presets[i]));
+            label->SetFont(Label::Body_13);
+            label->SetToolTip(label->GetLabel());
+            label->Wrap(FromDIP(230));
+            description->Add(label);
+            wxString features;
+            for (const auto &key : project_filament_role_keys()) {
+                const auto *role = resolved_roles.option<ConfigOptionInt>(key);
+                if (role != nullptr && role->value == int(i + 1)) {
+                    if (!features.empty()) features += ", ";
+                    features += _(print_config_def.get(key)->label);
+                }
+            }
+            if (!features.empty()) {
+                auto *uses = new wxStaticText(scroll, wxID_ANY, features);
+                uses->SetFont(Label::Body_13);
+                uses->Wrap(FromDIP(230));
+                description->Add(uses, 0, wxTOP, FromDIP(4));
+            }
+            source->Add(description, 1, wxALIGN_CENTER_VERTICAL);
+            grid->Add(source, 0, wxALIGN_CENTER_VERTICAL);
+            grid->Add(new wxStaticText(scroll, wxID_ANY, wxString::FromUTF8("→")), 0, wxALIGN_CENTER);
+            auto *target = new wxBoxSizer(wxVERTICAL);
+            auto *choice = new ComboBox(scroll, wxID_ANY, wxEmptyString, wxDefaultPosition,
+                                       wxSize(FromDIP(330), -1), 0, nullptr, wxCB_READONLY);
+            choice->SetKeepDropArrow(true);
+            choice->SetToolTip(_L("Nozzle diameter is configured in the printer profile. Auto line widths follow the selected nozzle; explicit widths are preserved. Choose a layer height compatible with every nozzle used."));
+            int best = -1;
+            double best_score = std::numeric_limits<double>::max();
+            for (size_t tool = 0; tool < capacity; ++tool) {
+                const auto spool = tool < spools.size() ? spools[tool] : SpoolManagerMetadata::Filament{};
+                const wxColour loaded_color = spool_colour(spool.color);
+                const wxBitmap icon = icons.mksolid(FromDIP(18), FromDIP(18), loaded_color.Red(),
+                    loaded_color.Green(), loaded_color.Blue(), wxALPHA_OPAQUE, true);
+                choice->Append(format_wxstr("%s %d (T%d), %.2f mm — %s", _L("Tool"), int(tool + 1), int(tool),
+                    bundle.printers.get_edited_preset().config.opt_float("nozzle_diameter", tool),
+                    spool.material.empty() ? _L("Unloaded") :
+                    from_u8(spool.material + " / " + spool.name)), icon);
+                if (taken.count(int(tool)) || (inventory_error.empty() && spool.name.empty() &&
+                        spool.material.empty() && spool.spool_id.empty()))
+                    continue;
+                const double score = (normalized_mapping_key(material) == normalized_mapping_key(spool.material) ? 0. : 1.e6) +
+                    std::pow(double(color.Red()) - loaded_color.Red(), 2) +
+                    std::pow(double(color.Green()) - loaded_color.Green(), 2) +
+                    std::pow(double(color.Blue()) - loaded_color.Blue(), 2) + (tool == i ? 0. : 0.1);
+                if (score < best_score) {
+                    best_score = score;
+                    best = int(tool);
+                }
+            }
+            choice->SetSelection(best);
+            taken.insert(best);
+            m_choices.push_back(choice);
+            target->Add(choice, 0, wxEXPAND);
+            auto *status = new wxStaticText(scroll, wxID_ANY, wxEmptyString);
+            status->SetFont(Label::Body_13);
+            statuses.push_back(status);
+            target->Add(status, 0, wxTOP, FromDIP(4));
+            grid->Add(target, 1, wxEXPAND);
+        }
+        // Re-evaluate all rows: changing one tool may resolve (or introduce)
+        // a duplicate in another row. Text carries the status, not color alone.
+        const auto update_matches = [this, statuses, materials, spools, inventory_error, scroll]() {
+            for (size_t row = 0; row < m_choices.size(); ++row) {
+                const int tool = m_choices[row]->GetSelection();
+                wxString text;
+                if (tool < 0)
+                    text = _L("Select a loaded tool");
+                else if (std::count_if(m_choices.begin(), m_choices.end(), [tool](const auto *choice) {
+                        return choice->GetSelection() == tool;
+                    }) > 1)
+                    text = _L("Already assigned to another material");
+                else if (!inventory_error.empty())
+                    text = _L("Check the loaded material manually");
+                else if (size_t(tool) >= spools.size() || (spools[tool].name.empty() &&
+                         spools[tool].material.empty() && spools[tool].spool_id.empty()))
+                    text = _L("Unloaded — load filament before printing");
+                else if (spools[tool].material.empty())
+                    text = _L("Material not reported — verify before printing");
+                else if (normalized_mapping_key(materials[row]) != normalized_mapping_key(spools[tool].material))
+                    text = _L("Different material — check compatibility");
+                else
+                    text = _L("Material matches");
+                statuses[row]->SetLabel(text);
+                statuses[row]->Wrap(FromDIP(330));
+            }
+            scroll->Layout();
+            scroll->FitInside();
+        };
+        for (auto *choice : m_choices)
+            choice->Bind(wxEVT_COMBOBOX, [update_matches](wxCommandEvent &) { update_matches(); });
+        scroll->SetSizer(grid);
+        // Bound the viewport, not the content: eight tools must scroll rather
+        // than imposing an eight-row minimum height on the whole dialog.
+        scroll->SetMinSize(wxSize(FromDIP(720), FromDIP(40 + 80 * int(std::min(size_t(4), used_materials.size())))));
+        root->Add(scroll, 1, wxEXPAND | wxALL, FromDIP(12));
+        auto *note = new wxStaticText(this, wxID_ANY,
+            _L("Nozzle sizes come from the printer profile. Use separate filament slots for different nozzles, even with the same material, and assign their features in Filament Bindings. G-code is regenerated for the selected tools; project profiles stay unchanged."));
+        note->SetFont(Label::Body_13);
+        note->Wrap(FromDIP(700));
+        root->Add(note, 0, wxEXPAND | wxLEFT | wxRIGHT, FromDIP(12));
+        auto *buttons = new wxBoxSizer(wxHORIZONTAL);
+        auto *cancel = new Button(this, _L("Cancel"));
+        auto *confirm = new Button(this, _L("Continue"));
+        cancel->SetStyle(ButtonStyle::Regular, ButtonType::Choice);
+        confirm->SetStyle(ButtonStyle::Confirm, ButtonType::Choice);
+        buttons->AddStretchSpacer();
+        buttons->Add(cancel, 0, wxRIGHT, FromDIP(8));
+        buttons->Add(confirm);
+        root->Add(buttons, 0, wxEXPAND | wxALL, FromDIP(12));
+        cancel->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { EndModal(wxID_CANCEL); });
+        confirm->Bind(wxEVT_BUTTON, [this, materials, spools, inventory_error](wxCommandEvent &) {
+            std::set<int> assigned;
+            std::vector<int> mapping;
+            for (auto *choice : m_choices)
+                mapping.push_back(choice->GetSelection());
+            for (int tool : mapping)
+                if (tool < 0 || !assigned.insert(tool).second) {
+                    show_error(this, _L("Select a different printer tool for each project material."));
+                    return;
+                }
+            if (inventory_error.empty()) {
+                for (int tool : mapping) {
+                    if (size_t(tool) >= spools.size() || (spools[tool].name.empty() &&
+                            spools[tool].material.empty() && spools[tool].spool_id.empty())) {
+                        show_error(this, _L("A selected tool is unloaded. Load a filament before printing."));
+                        return;
+                    }
+                }
+            }
+            bool mismatch = false;
+            for (size_t i = 0; i < mapping.size(); ++i)
+                if (size_t(mapping[i]) < spools.size() && !spools[mapping[i]].material.empty() &&
+                    normalized_mapping_key(materials[i]) != normalized_mapping_key(spools[mapping[i]].material))
+                    mismatch = true;
+            if (mismatch) {
+                MessageDialog warning(this,
+                    _L("A selected tool reports a different material from its project profile. "
+                       "Verify that the loaded filament and printing temperatures are compatible. Continue?"),
+                    _L("Material mismatch"), wxYES_NO | wxNO_DEFAULT | wxICON_WARNING);
+                if (warning.ShowModal() != wxID_YES)
+                    return;
+            }
+            EndModal(wxID_OK);
+        });
+        update_matches();
+        SetSizerAndFit(root);
+        SetSize(wxSize(FromDIP(780), std::min(FromDIP(650), GetSize().y)));
+        wxGetApp().UpdateDlgDarkUI(this);
+        // Filament colors are data; theme conversion must not recolor them.
+        for (const auto &[swatch, color] : swatches) {
+            swatch->SetBackgroundColour(color);
+            for (auto *child : swatch->GetChildren()) {
+                child->SetBackgroundColour(color);
+                child->SetForegroundColour((color.Red() * 299 + color.Green() * 587 + color.Blue() * 114 > 128000) ? *wxBLACK : *wxWHITE);
+            }
+        }
+        CenterOnParent();
+    }
+
+    std::vector<int> tools() const {
+        // Keep unused palette entries bijective in the private config, without
+        // showing them as materials to print or changing their project slots.
+        std::vector<int> result(m_material_count, -1);
+        std::set<int> assigned;
+        for (size_t row = 0; row < m_choices.size(); ++row) {
+            result[m_materials[row]] = m_choices[row]->GetSelection();
+            assigned.insert(result[m_materials[row]]);
+        }
+        int free_tool = 0;
+        for (int &tool : result) {
+            if (tool >= 0) continue;
+            while (assigned.count(free_tool)) ++free_tool;
+            tool = free_tool;
+            assigned.insert(free_tool);
+        }
+        return result;
+    }
+private:
+    std::vector<ComboBox *> m_choices;
+    std::vector<unsigned int> m_materials;
+    size_t m_material_count = 0;
+    void on_dpi_changed(const wxRect &rect) override { SetSize(rect); Layout(); }
+};
+
+// Shared by file export and Print/Send. Called only with the background worker
+// stopped so the source print and its plate membership form a stable snapshot.
+bool prepare_tool_dispatch(wxWindow *parent, const Print &source, const DynamicPrintConfig &plate_config,
+                               std::unique_ptr<Print> &dispatch,
+                               std::vector<SpoolManagerMetadata::Filament> &spools)
+{
+    auto host_config = filament_sync_host_config();
+    const auto &bundle = *wxGetApp().preset_bundle;
+    if (!uses_independent_tool_dispatch())
+        return true;
+    wxString error;
+    if (host_config.opt_enum<PrintHostType>("host_type") == htOctoPrint &&
+        !host_config.opt_string("print_host").empty()) {
+        OctoPrint host(&host_config);
+        wxBusyCursor busy;
+        if (!host.get_selected_filament_spools(spools, error))
+            spools.clear();
+    } else
+        error = _L("Automatic loaded-material detection is not available for this connection. Select the physical tools loaded with these materials.");
+    if (spools.empty() && error.empty())
+        error = _L("No loaded spools were reported by the printer.");
+    const auto used_materials = source.extruders(true);
+    if (used_materials.empty() || std::any_of(used_materials.begin(), used_materials.end(),
+            [&](unsigned int id) { return id >= bundle.filament_presets.size(); })) {
+        show_error(parent, _L("The plate has no valid materials to map. Slice the plate before printing."));
+        return false;
+    }
+    auto resolved_roles = bundle.full_config(false);
+    resolved_roles.apply(plate_config);
+    resolve_project_filament_bindings(resolved_roles, project_default_filament(source.model()));
+    ToolMappingDialog dialog(parent, bundle, used_materials, resolved_roles, spools, error);
+    if (dialog.ShowModal() != wxID_OK)
+        return false;
+    try {
+        Model model(source.model());
+        // Keep only this plate's instances; other plates remain in the project.
+        std::set<ObjectID> instances;
+        for (const PrintObject *object : source.objects())
+            for (const PrintInstance &instance : object->instances())
+                instances.insert(instance.model_instance->id());
+        for (ModelObject *object : model.objects)
+            for (ModelInstance *instance : object->instances)
+                instance->printable = instances.count(instance->id()) != 0;
+        const auto tools = dialog.tools();
+        auto config = bundle.tool_mapped_config(model, tools, plate_config);
+        auto mapped = std::make_unique<Print>();
+        mapped->set_check_multi_filaments_compatibility(source.need_check_multi_filaments_compatibility());
+        auto calibration = source.calib_params();
+        if (calibration.mode != CalibMode::Calib_None) {
+            if (calibration.extruder_id < 0 || size_t(calibration.extruder_id) >= tools.size())
+                throw std::runtime_error(_u8L("The calibration tool is not represented by a project material."));
+            calibration.extruder_id = tools[calibration.extruder_id];
+        }
+        mapped->set_calib_params(calibration);
+        mapped->set_plate_index(source.get_plate_index());
+        mapped->set_plate_origin(source.get_plate_origin());
+        mapped->set_status_silent();
+        mapped->apply(model, config);
+        const auto validation = mapped->validate();
+        if (!validation.string.empty())
+            throw std::runtime_error(validation.string);
+        dispatch = std::move(mapped);
+        const auto *sync = host_config.option<ConfigOptionBool>("sync_spool_manager_filament_names");
+        const auto *embed = host_config.option<ConfigOptionBool>("embed_spool_manager_filament_names");
+        if (sync == nullptr || !sync->value || (embed != nullptr && !embed->value))
+            spools.clear();
+        return true;
+    } catch (const std::exception &exception) {
+        show_error(parent, from_u8(exception.what()));
+        return false;
+    }
+}
+
 class OctoPrintFilamentMappingsDialog final : public DPIDialog
 {
 public:
@@ -341,22 +681,26 @@ public:
         auto *root = new wxBoxSizer(wxVERTICAL);
         auto *intro = new wxStaticText(
             this, wxID_ANY,
-            _L("Map rolls reported by the selected OctoPrint printer to compatible Orca filament profiles. "
-               "Exact-roll mappings win, followed by manufacturer/material, unknown-manufacturer material, "
-               "and finally the default all-rounder."));
+            _L("Choose which Orca profile to use when syncing a material. Brand and material rules are reused for future rolls; roll overrides take priority."));
         intro->Wrap(FromDIP(850));
         root->Add(intro, 0, wxEXPAND | wxALL, FromDIP(12));
 
-        auto *scrolled = new wxScrolledWindow(this, wxID_ANY, wxDefaultPosition,
-                                               wxSize(FromDIP(880), FromDIP(520)),
-                                               wxVSCROLL | wxBORDER_NONE);
-        scrolled->SetScrollRate(0, FromDIP(12));
-        auto *content = new wxBoxSizer(wxVERTICAL);
-        add_roll_mappings(scrolled, content, inventory);
-        add_material_mappings(scrolled, content, inventory);
-        scrolled->SetSizer(content);
-        content->FitInside(scrolled);
-        root->Add(scrolled, 1, wxEXPAND | wxLEFT | wxRIGHT, FromDIP(12));
+        auto *search = new wxSearchCtrl(this, wxID_ANY);
+        search->SetDescriptiveText(_L("Filter profile choices by name…"));
+        root->Add(search, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, FromDIP(12));
+        auto *tabs = new wxNotebook(this, wxID_ANY);
+        for (bool rolls : {false, true}) {
+            auto *page = new wxScrolledWindow(tabs, wxID_ANY, wxDefaultPosition,
+                wxSize(FromDIP(820), FromDIP(330)), wxVSCROLL | wxBORDER_NONE);
+            page->SetScrollRate(0, FromDIP(12));
+            auto *content = new wxBoxSizer(wxVERTICAL);
+            if (rolls) add_roll_mappings(page, content, inventory);
+            else add_material_mappings(page, content, inventory);
+            page->SetSizer(content);
+            content->FitInside(page);
+            tabs->AddPage(page, rolls ? _L("Roll overrides") : _L("Brand & material"));
+        }
+        root->Add(tabs, 1, wxEXPAND | wxLEFT | wxRIGHT, FromDIP(12));
 
         auto *default_box = new wxStaticBoxSizer(wxHORIZONTAL, this, _L("Default all-rounder"));
         auto *default_help = new wxStaticText(
@@ -367,6 +711,13 @@ public:
         m_default_choice = make_profile_choice(this, m_config.get(DEFAULT_FILAMENT_PROFILE_KEY));
         default_box->Add(m_default_choice, 1, wxALIGN_CENTER_VERTICAL | wxALL, FromDIP(8));
         root->Add(default_box, 0, wxEXPAND | wxALL, FromDIP(12));
+        search->Bind(wxEVT_TEXT, [this, search](wxCommandEvent &) {
+            const wxString query = search->GetValue().Lower();
+            for (const auto &[choice, material] : m_search_choices) {
+                const std::string selected = selected_profile(choice);
+                populate_profile_choice(choice, selected, material, query);
+            }
+        });
 
         auto *buttons = new wxBoxSizer(wxHORIZONTAL);
         auto *cancel = new Button(this, _L("Cancel"));
@@ -380,8 +731,8 @@ public:
         cancel->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { EndModal(wxID_CANCEL); });
         save_button->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { save(); EndModal(wxID_OK); });
         SetSizerAndFit(root);
-        SetMinSize(wxSize(FromDIP(760), FromDIP(560)));
-        SetSize(wxSize(FromDIP(920), FromDIP(700)));
+        SetMinSize(wxSize(FromDIP(760), FromDIP(460)));
+        SetSize(wxSize(FromDIP(900), FromDIP(580)));
         wxGetApp().UpdateDlgDarkUI(this);
         CenterOnParent();
     }
@@ -400,6 +751,7 @@ private:
     std::vector<MappingChoice> m_vendor_material_choices;
     std::vector<MappingChoice> m_material_choices;
     ComboBox *m_default_choice {nullptr};
+    std::vector<std::pair<ComboBox *, std::string>> m_search_choices;
 
     void on_dpi_changed(const wxRect &suggested_rect) override
     {
@@ -421,8 +773,9 @@ private:
     {
         std::vector<std::string> seen;
         inventory.erase(std::remove_if(inventory.begin(), inventory.end(), [&](const auto &spool) {
-            const std::string key = normalized_mapping_key(spool.provider + ':' + spool.spool_id);
-            if (spool.spool_id.empty() || std::find(seen.begin(), seen.end(), key) != seen.end())
+            const std::string key = normalized_mapping_key(spool.spool_id.empty() ?
+                spool.vendor + '|' + spool.material + '|' + spool.name : spool.provider + ':' + spool.spool_id);
+            if (std::find(seen.begin(), seen.end(), key) != seen.end())
                 return true;
             seen.push_back(key);
             return false;
@@ -433,20 +786,40 @@ private:
         });
     }
 
-    ComboBox *make_profile_choice(wxWindow *parent, const std::string &selected)
+    void populate_profile_choice(ComboBox *choice, const std::string &selected,
+                                 const std::string &material, const wxString &query = wxEmptyString)
     {
-        auto *choice = new ComboBox(parent, wxID_ANY, wxEmptyString, wxDefaultPosition,
-                                    wxSize(FromDIP(280), -1), 0, nullptr, wxCB_READONLY);
-        for (const wxString &profile : m_profile_choices)
+        choice->Clear();
+        choice->SetToolTip(_L("Choose a profile for this rule. Automatic uses the next matching rule."));
+        choice->Append(m_profile_choices[0]);
+        const auto family = [](std::string value) {
+            boost::algorithm::to_lower(value);
+            if (value == "pla+" || value == "pla plus" || value == "pla pro" || value == "plaplus" || value == "plapro") value = "pla";
+            return value;
+        };
+        for (size_t i = 1; i < m_profile_choices.size(); ++i) {
+            const wxString &profile = m_profile_choices[i];
+            if (!query.empty() && !profile.Lower().Contains(query)) continue;
+            const Preset *preset = wxGetApp().preset_bundle->filaments.find_preset(into_u8(profile));
+            if (!material.empty() && preset != nullptr && family(preset->config.opt_string("filament_type", 0)) != family(material)) continue;
             choice->Append(profile);
-        int index = m_profile_choices.Index(from_u8(selected));
+        }
+        int index = choice->FindString(from_u8(selected));
         if (index == wxNOT_FOUND && !selected.empty()) {
             // Opening and saving the editor must not erase a rule just because
             // its profile is unavailable for the currently selected printer.
             index = choice->Append(from_u8(selected));
-            choice->SetToolTip(_L("This saved profile is currently unavailable or incompatible. Select another profile to change the mapping."));
+            choice->SetToolTip(_L("The current selection is retained even when it does not match the filter. Select another profile to change the mapping."));
         }
         choice->SetSelection(index == wxNOT_FOUND ? 0 : index);
+    }
+
+    ComboBox *make_profile_choice(wxWindow *parent, const std::string &selected, const std::string &material = {})
+    {
+        auto *choice = new ComboBox(parent, wxID_ANY, wxEmptyString, wxDefaultPosition,
+                                    wxSize(FromDIP(280), -1), 0, nullptr, wxCB_READONLY);
+        populate_profile_choice(choice, selected, material);
+        m_search_choices.emplace_back(choice, material);
         return choice;
     }
 
@@ -484,9 +857,14 @@ private:
             grid->Add(new wxStaticText(parent, wxID_ANY, description), 1, wxEXPAND | wxALIGN_CENTER_VERTICAL);
             const std::string key = spool.provider.empty() ? spool.spool_id :
                                     spool.provider + ':' + spool.spool_id;
-            ComboBox *choice = make_profile_choice(parent, mapped_value(m_spool_lines, key));
-            grid->Add(choice, 1, wxEXPAND | wxALIGN_CENTER_VERTICAL);
-            m_roll_choices.push_back({key, choice});
+            if (spool.spool_id.empty()) {
+                grid->Add(new wxStaticText(parent, wxID_ANY, _L("No roll ID; use the material mapping below.")),
+                          0, wxALIGN_CENTER_VERTICAL);
+            } else {
+                ComboBox *choice = make_profile_choice(parent, mapped_value(m_spool_lines, key), spool.material);
+                grid->Add(choice, 1, wxEXPAND | wxALIGN_CENTER_VERTICAL);
+                m_roll_choices.push_back({key, choice});
+            }
         }
         if (inventory.empty()) {
             grid->AddSpacer(1);
@@ -521,17 +899,36 @@ private:
             if (!present)
                 materials.push_back(key);
         }
+        // Saved rules remain editable when the provider is offline or no
+        // longer lists the roll that originally created the brand rule.
+        for (const auto &rule : m_material_lines) {
+            const size_t equals = rule.find('=');
+            if (equals == std::string::npos) continue;
+            const std::string key = rule.substr(0, equals);
+            const size_t separator = key.find('|');
+            const auto material = separator == std::string::npos ?
+                std::make_pair(std::string(), key) : std::make_pair(key.substr(0, separator), key.substr(separator + 1));
+            if (std::none_of(materials.begin(), materials.end(), [&](const auto &item) {
+                    return normalized_mapping_key(item.first) == normalized_mapping_key(material.first) &&
+                           normalized_mapping_key(item.second) == normalized_mapping_key(material.second);
+                }))
+                materials.push_back(material);
+        }
         for (const auto &[vendor, material] : materials) {
             const std::string vendor_key = vendor.empty() ? material : vendor + '|' + material;
             grid->Add(new wxStaticText(parent, wxID_ANY,
                                        vendor.empty() ? from_u8(material) :
                                        from_u8(vendor) + " · " + from_u8(material)),
                       0, wxALIGN_CENTER_VERTICAL);
-            ComboBox *vendor_choice = make_profile_choice(parent, mapped_value(m_material_lines, vendor_key));
-            grid->Add(vendor_choice, 1, wxEXPAND | wxALIGN_CENTER_VERTICAL);
-            m_vendor_material_choices.push_back({vendor_key, vendor_choice});
+            if (vendor.empty()) {
+                grid->Add(new wxStaticText(parent, wxID_ANY, _L("Use the material rule →")), 0, wxALIGN_CENTER_VERTICAL);
+            } else {
+                ComboBox *vendor_choice = make_profile_choice(parent, mapped_value(m_material_lines, vendor_key), material);
+                grid->Add(vendor_choice, 1, wxEXPAND | wxALIGN_CENTER_VERTICAL);
+                m_vendor_material_choices.push_back({vendor_key, vendor_choice});
+            }
 
-            ComboBox *material_choice = make_profile_choice(parent, mapped_value(m_material_lines, material));
+            ComboBox *material_choice = make_profile_choice(parent, mapped_value(m_material_lines, material), material);
             grid->Add(material_choice, 1, wxEXPAND | wxALIGN_CENTER_VERTICAL);
             m_material_choices.push_back({material, material_choice});
             material_choice->Bind(wxEVT_COMBOBOX, [this, material = material](wxCommandEvent &event) {
@@ -1058,6 +1455,7 @@ struct Sidebar::priv
     int editing_filament = -1;
     wxBoxSizer *sizer_filaments = nullptr;
     wxPanel *area_bindings_panel = nullptr;
+    ComboBox *project_print_order = nullptr;
     wxPanel *area_bindings_content = nullptr;
     bool area_bindings_collapsed = false;
     std::vector<wxPanel *> area_binding_rows;
@@ -3559,6 +3957,30 @@ Sidebar::Sidebar(Plater *parent)
     }
 
     {
+        auto *order_row = new wxBoxSizer(wxHORIZONTAL);
+        order_row->Add(new wxStaticText(p->scrolled, wxID_ANY, _L("Project print order")),
+                       1, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(8));
+        p->project_print_order = new ComboBox(p->scrolled, wxID_ANY, wxEmptyString, wxDefaultPosition,
+                                             wxDefaultSize, 0, nullptr, wxCB_READONLY);
+        for (const auto &label : {_L("Use profile"), _L("By layer"), _L("By object"), _L("Custom per plate")})
+            p->project_print_order->Append(label);
+        p->project_print_order->SetToolTip(_L("Override the print order for all existing plates in this project without changing the process profile. Saved with the 3MF project."));
+        order_row->Add(p->project_print_order, 1, wxEXPAND);
+        scrolled_sizer->Add(order_row, 0, wxEXPAND | wxALL, FromDIP(8));
+        p->project_print_order->Bind(wxEVT_COMBOBOX, [this](wxCommandEvent &) {
+            const int selected = p->project_print_order->GetSelection();
+            if (selected < 0 || selected > 2) return;
+            p->plater->take_snapshot(_u8L("Change project print order"));
+            const auto sequence = selected == 0 ? PrintSequence::ByDefault :
+                                  selected == 1 ? PrintSequence::ByLayer : PrintSequence::ByObject;
+            auto &plates = p->plater->get_partplate_list();
+            for (int i = 0; i < plates.get_plate_count(); ++i)
+                plates.get_plate(i)->set_print_seq(sequence);
+            p->plater->update_project_dirty_from_presets();
+            p->plater->set_plater_dirty(true);
+            p->plater->config_change_notification(*plates.get_curr_plate()->config(), "print_sequence");
+            p->plater->update();
+        });
         p->area_bindings_panel = new wxPanel(p->scrolled);
         auto *section_sizer = new wxBoxSizer(wxVERTICAL);
         auto *header = new StaticBox(p->area_bindings_panel, wxID_ANY, wxDefaultPosition,
@@ -3588,6 +4010,8 @@ Sidebar::Sidebar(Plater *parent)
                            1, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(5));
             auto *choice = new ComboBox(row, wxID_ANY, wxEmptyString, wxDefaultPosition, wxDefaultSize,
                                        0, nullptr, wxCB_READONLY);
+            choice->SetKeepDropArrow(true);
+            choice->SetToolTip(_L("Choose the filament slot for this feature. For different nozzle sizes using the same material, add separate slots with the same profile, then select their physical nozzles when printing or exporting."));
             row_sizer->Add(choice, 1, wxEXPAND);
             row->SetSizerAndFit(row_sizer);
             bindings_sizer->Add(row, 0, wxEXPAND | wxTOP | wxBOTTOM, FromDIP(1));
@@ -4468,12 +4892,14 @@ void Sidebar::update_mixed_filament_list()
     }
 
     bool at_limit = (wxGetApp().preset_bundle->filament_presets.size() >= size_t(EnforcerBlockerType::ExtruderMax));
-    p->m_btn_add_mixed_filament->Show(can_mix && !has_mixed && !at_limit);
+    p->m_btn_add_mixed_filament->Show(can_mix && !has_mixed && !at_limit && !uses_independent_tool_dispatch());
     p->m_panel_mixed_title->Show(has_mixed);
     p->m_mixed_scroll_area->Show(has_mixed);
     p->m_panel_mixed_content->Show(has_mixed);
-    if (p->m_btn_mixed_add)
+    if (p->m_btn_mixed_add) {
+        p->m_btn_mixed_add->Show(!uses_independent_tool_dispatch());
         p->m_btn_mixed_add->Enable(!at_limit);
+    }
     p->m_panel_mixed_warning->Show(false);
 
     // Show/dismiss 3D canvas notification for broken mixed filaments
@@ -6611,12 +7037,131 @@ void Sidebar::sync_spool_manager_filaments(DynamicPrintConfig *host_config)
         return material;
     };
 
+    // Resolve unknown materials before changing project slots. Cancelling a
+    // prompt must leave both project assignments and saved mappings intact.
+    const bool logical_palette = uses_independent_tool_dispatch();
+    if (logical_palette) {
+        slots.erase(std::remove_if(slots.begin(), slots.end(), [](const auto &spool) {
+            return spool.name.empty() && spool.material.empty() && spool.spool_id.empty();
+        }), slots.end());
+        if (slots.empty()) {
+            show_error(this, _L("No loaded filaments were reported. The project palette was not changed."), false);
+            return;
+        }
+        if (!wxGetApp().model().objects.empty()) {
+            MessageDialog confirm(this,
+                _L("Replace the project filament palette with the loaded printer materials? Existing assignments keep their material numbers; assignments to removed materials will use material 1. Review painted parts and Filament Bindings before printing."),
+                _L("Sync loaded materials"), wxYES_NO | wxNO_DEFAULT | wxICON_WARNING);
+            if (confirm.ShowModal() != wxID_YES)
+                return;
+        }
+    }
+    if (sync_profiles && wxGetApp().app_config != nullptr) {
+        auto &app_config = *wxGetApp().app_config;
+        auto spool_rules = load_filament_mapping_lines(app_config, SPOOL_PROFILE_MAPPINGS_KEY);
+        auto material_rules = load_filament_mapping_lines(app_config, MATERIAL_PROFILE_MAPPINGS_KEY);
+        std::string default_profile = app_config.get(DEFAULT_FILAMENT_PROFILE_KEY);
+        if (app_config.get("octoprint_profile_mappings_global") != "1") {
+            if (const auto *rules = printer_config.opt<ConfigOptionStrings>(SPOOL_PROFILE_MAPPINGS_KEY))
+                spool_rules = rules->values;
+            if (const auto *rules = printer_config.opt<ConfigOptionStrings>(MATERIAL_PROFILE_MAPPINGS_KEY))
+                material_rules = rules->values;
+            if (const auto *profile = printer_config.opt<ConfigOptionString>(DEFAULT_FILAMENT_PROFILE_KEY))
+                default_profile = profile->value;
+        }
+        bool changed = false;
+        for (const auto &spool : slots) {
+            if (spool.material.empty()) continue;
+            const std::string mapped = SpoolManagerMetadata::mapped_profile_name(
+                spool, spool_rules, material_rules, default_profile);
+            const Preset *existing = bundle.filaments.find_preset(mapped);
+            if (existing != nullptr && existing->is_visible && existing->is_compatible) continue;
+            wxArrayString choices;
+            for (const auto &preset : bundle.filaments)
+                if (preset.is_visible && preset.is_compatible && !preset.is_default &&
+                    normalize_material(preset.config.opt_string("filament_type", 0)) == normalize_material(spool.material))
+                    choices.Add(from_u8(preset.name));
+            if (choices.empty()) {
+                show_error(this, format_wxstr(_L("No compatible filament profile is available for %1%. Add a profile before syncing."),
+                                            from_u8(spool.material)), false);
+                return;
+            }
+            class MaterialProfileDialog final : public DPIDialog {
+            public:
+                using DPIDialog::DPIDialog;
+                void on_dpi_changed(const wxRect &rect) override { SetSize(rect); Layout(); }
+            };
+            MaterialProfileDialog dialog(this, wxID_ANY, _L("Select filament profile"), wxDefaultPosition, wxDefaultSize,
+                             wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER);
+            auto *layout = new wxBoxSizer(wxVERTICAL);
+            auto *label = new wxStaticText(&dialog, wxID_ANY,
+                format_wxstr(_L("Choose the profile for %1%. This choice will be remembered for this brand and material."),
+                             from_u8(spool.vendor + " " + spool.material)));
+            label->Wrap(FromDIP(500));
+            layout->Add(label, 0, wxEXPAND | wxALL, FromDIP(12));
+            auto *search = new wxSearchCtrl(&dialog, wxID_ANY);
+            search->SetDescriptiveText(_L("Search compatible profiles…"));
+            layout->Add(search, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, FromDIP(12));
+            auto *choice = new wxListBox(&dialog, wxID_ANY, wxDefaultPosition,
+                                        wxSize(FromDIP(500), FromDIP(220)), 0, nullptr, wxLB_SINGLE);
+            for (const auto &profile : choices) choice->Append(profile);
+            choice->SetSelection(0);
+            layout->Add(choice, 0, wxEXPAND | wxLEFT | wxRIGHT, FromDIP(12));
+            auto *buttons = new wxBoxSizer(wxHORIZONTAL);
+            auto *cancel = new Button(&dialog, _L("Cancel"));
+            auto *accept = new Button(&dialog, _L("Sync"));
+            search->Bind(wxEVT_TEXT, [search, choice, accept, choices](wxCommandEvent &) {
+                const wxString selected = choice->GetStringSelection();
+                const wxString query = search->GetValue().Lower();
+                choice->Clear();
+                for (const auto &profile : choices)
+                    if (profile.Lower().Contains(query)) choice->Append(profile);
+                if (!choice->SetStringSelection(selected) && choice->GetCount() > 0)
+                    choice->SetSelection(0);
+                accept->Enable(choice->GetSelection() != wxNOT_FOUND);
+            });
+            cancel->SetStyle(ButtonStyle::Regular, ButtonType::Choice);
+            accept->SetStyle(ButtonStyle::Confirm, ButtonType::Choice);
+            buttons->AddStretchSpacer();
+            buttons->Add(cancel, 0, wxRIGHT, FromDIP(8));
+            buttons->Add(accept);
+            layout->Add(buttons, 0, wxEXPAND | wxALL, FromDIP(12));
+            cancel->Bind(wxEVT_BUTTON, [&](wxCommandEvent &) { dialog.EndModal(wxID_CANCEL); });
+            accept->Bind(wxEVT_BUTTON, [&](wxCommandEvent &) { dialog.EndModal(wxID_OK); });
+            dialog.SetSizerAndFit(layout);
+            wxGetApp().UpdateDlgDarkUI(&dialog);
+            dialog.CenterOnParent();
+            if (dialog.ShowModal() != wxID_OK) return;
+            set_mapped_value(material_rules, spool.vendor.empty() ? spool.material : spool.vendor + '|' + spool.material,
+                             into_u8(choice->GetStringSelection()));
+            changed = true;
+        }
+        if (changed) {
+            app_config.set(SPOOL_PROFILE_MAPPINGS_KEY, json(spool_rules).dump());
+            app_config.set(MATERIAL_PROFILE_MAPPINGS_KEY, json(material_rules).dump());
+            app_config.set(DEFAULT_FILAMENT_PROFILE_KEY, default_profile);
+            app_config.set("octoprint_profile_mappings_global", "1");
+            app_config.save();
+        }
+    }
+
     auto &filament_presets = bundle.filament_presets;
     const bool fixed_slots = bundle.has_fixed_filament_slots();
-    // A partial provider report must not delete project materials or invalidate
-    // painted regions and per-print role bindings.
-    const size_t slot_count = fixed_slots ? bundle.max_filament_colors() :
+    const size_t slot_count = logical_palette ? std::min(slots.size(), bundle.max_filament_colors()) :
+        fixed_slots ? bundle.max_filament_colors() :
         std::min(std::max(slots.size(), filament_presets.size()), bundle.max_filament_colors());
+    if (logical_palette) {
+        // Use the existing deletion path so painting, roles and custom layer
+        // changes are remapped, not merely truncated with the palette arrays.
+        while (filament_presets.size() > slot_count) {
+            const size_t previous_count = filament_presets.size();
+            delete_filament(previous_count - 1, 0);
+            if (filament_presets.size() == previous_count) {
+                show_error(this, _L("This project cannot change its filament palette. Open the editable project before syncing."), false);
+                return;
+            }
+        }
+    }
     bundle.set_num_filaments(static_cast<unsigned int>(slot_count));
 
     auto *colors = bundle.project_config.option<ConfigOptionStrings>("filament_colour");
@@ -6685,7 +7230,7 @@ void Sidebar::sync_spool_manager_filaments(DynamicPrintConfig *host_config)
     const size_t synchronized_slots = std::min(filament_presets.size(), slots.size());
     for (size_t index = 0; index < synchronized_slots; ++index) {
         const SpoolManagerMetadata::Filament &spool = slots[index];
-        if (spool.name.empty())
+        if (spool.name.empty() && spool.material.empty() && spool.spool_id.empty())
             continue;
         ++assigned_count;
 
@@ -6804,9 +7349,8 @@ void Sidebar::sync_spool_manager_filaments(DynamicPrintConfig *host_config)
     MessageDialog(
         this,
         format_wxstr(
-            _L("%1% OctoPrint filament tool/slot assignments were synchronized (%2%). "
-               "The assignments are read-only in Orca Slicer and their spool names, materials, "
-               "and colors will be embedded in G-code sent to this OctoPrint host."),
+            _L("%1% loaded OctoPrint materials were synchronized (%2%). "
+               "Physical tools are selected when printing or exporting. G-code metadata follows your filament embedding settings."),
             assigned_count, synchronized_content),
         _L("OctoPrint filament spools"), wxOK | wxICON_INFORMATION).ShowModal();
 }
@@ -6846,7 +7390,10 @@ bool Sidebar::should_show_SEMM_buttons()
     bool is_bbl_vendor = preset_bundle.is_bbl_vendor();
     auto cfg = preset_bundle.printers.get_edited_preset().config;
 
-    return cfg.opt_bool("single_extruder_multi_material") || is_bbl_vendor;
+    const auto host_config = filament_sync_host_config();
+    const auto *host = host_config.opt<ConfigOptionEnum<PrintHostType>>("host_type");
+    return cfg.opt_bool("single_extruder_multi_material") || is_bbl_vendor ||
+        (host != nullptr && host->value == htOctoPrint) || preset_bundle.get_printer_extruder_count() > 1;
 }
 
 void Sidebar::show_SEMM_buttons()
@@ -6921,6 +7468,16 @@ void Sidebar::update_dynamic_filament_list()
 
 void Sidebar::update_area_bindings()
 {
+    if (p->project_print_order != nullptr) {
+        auto &plates = p->plater->get_partplate_list();
+        if (plates.get_plate_count() > 0) {
+            const auto sequence = plates.get_plate(0)->get_print_seq();
+            int selection = sequence == PrintSequence::ByDefault ? 0 : sequence == PrintSequence::ByLayer ? 1 : 2;
+            for (int i = 1; i < plates.get_plate_count(); ++i)
+                if (plates.get_plate(i)->get_print_seq() != sequence) selection = 3;
+            p->project_print_order->SetSelection(selection);
+        }
+    }
     if (p->area_bindings_panel == nullptr)
         return;
     auto *bundle = wxGetApp().preset_bundle;
@@ -7896,7 +8453,9 @@ struct Plater::priv
         }
     }
     void export_gcode(fs::path output_path, bool output_path_on_removable_media);
-    void export_gcode(fs::path output_path, bool output_path_on_removable_media, PrintHostJob upload_job);
+    bool prepare_dispatch(std::unique_ptr<Print> &dispatch, std::vector<SpoolManagerMetadata::Filament> &spools);
+    void export_gcode(fs::path output_path, bool output_path_on_removable_media, PrintHostJob upload_job,
+                      std::unique_ptr<Print> dispatch = {}, std::vector<SpoolManagerMetadata::Filament> spools = {});
 
     void reload_from_disk();
     bool replace_volume_with_stl(int object_idx, int volume_idx, const fs::path& new_path, const std::string& snapshot = "");
@@ -8155,6 +8714,7 @@ Plater::priv::priv(Plater *q, MainFrame *main_frame)
     , config(Slic3r::DynamicPrintConfig::new_from_defaults_keys({
         "printable_area", "bed_exclude_area", "wrapping_exclude_area", "extruder_printable_area", "bed_custom_texture", "bed_custom_model", "print_sequence",
         "extruder_clearance_radius",
+        "sequential_print_gantry_model", "sequential_print_gantry_geometry", "printer_notes",
         "extruder_clearance_height_to_lid", "extruder_clearance_height_to_rod",
 		"nozzle_height", "skirt_type", "skirt_loops", "skirt_speed","min_skirt_length", "skirt_distance", "skirt_start_angle",
         "brim_width", "brim_object_gap", "brim_flow_ratio", "brim_use_efc_outline", "combine_brims", "brim_type", "nozzle_diameter", "single_extruder_multi_material", "preferred_orientation",
@@ -9789,8 +10349,10 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                             // color painting from the author's slot numbers to where each
                             // definition landed, so volumes colored with a mix follow it.
                             // Runs before the objects are handed over to the plater below.
-                            if (load_model && !published_config.mixed_slot_relocations.empty())
+                            if (load_model && !published_config.mixed_slot_relocations.empty()) {
                                 Slic3r::remap_model_filament_slots(model, published_config.mixed_slot_relocations);
+                                this->model.plates_custom_gcodes = model.plates_custom_gcodes;
+                            }
 
                             // BBS: notify the user about published settings that could not be applied.
                             if (!published_config.skipped_keys.empty()) {
@@ -11704,45 +12266,31 @@ bool Plater::priv::restart_background_process(unsigned int state)
 
 void Plater::priv::export_gcode(fs::path output_path, bool output_path_on_removable_media)
 {
-    wxCHECK_RET(!(output_path.empty()), "export_gcode: output_path and upload_job empty");
-
-    BOOST_LOG_TRIVIAL(trace) << boost::format("export_gcode: output_path %1%")%output_path.string();
-    if (model.objects.empty())
-        return;
-
-    if (background_process.is_export_scheduled()) {
-        GUI::show_error(q, _L("Another export job is running."));
-        return;
-    }
-
-    // bitmask of UpdateBackgroundProcessReturnState
-    unsigned int state = update_background_process(true);
-    if (state & priv::UPDATE_BACKGROUND_PROCESS_REFRESH_SCENE)
-        view3D->reload_scene(false);
-
-    if ((state & priv::UPDATE_BACKGROUND_PROCESS_INVALID) != 0)
-        return;
-
-    show_warning_dialog = true;
-    if (! output_path.empty()) {
-        background_process.schedule_export(output_path.string(), output_path_on_removable_media);
-        notification_manager->push_delayed_notification(NotificationType::ExportOngoing, []() {return true; }, 1000, 0);
-    } else {
-        BOOST_LOG_TRIVIAL(info) << "output_path  is empty";
-    }
-
-    // If the SLA processing of just a single object's supports is running, restart slicing for the whole object.
-    this->background_process.set_task(PrintBase::TaskParams());
-    this->restart_background_process(priv::UPDATE_BACKGROUND_PROCESS_FORCE_EXPORT);
+    export_gcode(std::move(output_path), output_path_on_removable_media, PrintHostJob{});
 }
-void Plater::priv::export_gcode(fs::path output_path, bool output_path_on_removable_media, PrintHostJob upload_job)
+bool Plater::priv::prepare_dispatch(std::unique_ptr<Print> &dispatch,
+                                    std::vector<SpoolManagerMetadata::Filament> &spools)
+{
+    if (background_process.current_printer_technology() != ptFFF || !uses_independent_tool_dispatch())
+        return true;
+    if (background_process.is_export_scheduled() || background_process.is_upload_scheduled()) {
+        GUI::show_error(q, _L("Another export job is running."));
+        return false;
+    }
+    background_process.stop();
+    return prepare_tool_dispatch(q, *background_process.fff_print(),
+        *background_process.get_current_plate()->config(), dispatch, spools);
+}
+
+void Plater::priv::export_gcode(fs::path output_path, bool output_path_on_removable_media, PrintHostJob upload_job,
+                               std::unique_ptr<Print> dispatch, std::vector<SpoolManagerMetadata::Filament> spools)
 {
     wxCHECK_RET(!(output_path.empty() && upload_job.empty()), "export_gcode: output_path and upload_job empty");
 
     if (model.objects.empty())
         return;
 
-    if (background_process.is_export_scheduled()) {
+    if (background_process.is_export_scheduled() || background_process.is_upload_scheduled()) {
         GUI::show_error(q, _L("Another export job is running."));
         return;
     }
@@ -11755,6 +12303,19 @@ void Plater::priv::export_gcode(fs::path output_path, bool output_path_on_remova
     if ((state & priv::UPDATE_BACKGROUND_PROCESS_INVALID) != 0)
         return;
 
+    if (background_process.current_printer_technology() == ptFFF && uses_independent_tool_dispatch()) {
+        background_process.stop();
+        if (!dispatch && !prepare_dispatch(dispatch, spools)) {
+            exporting_status = ExportingStatus::NOT_EXPORTING;
+            return;
+        }
+        if (dispatch && !upload_job.empty()) {
+            // Physical slot indices must be preserved, including empty tools.
+            upload_job.upload_data.extended_info.erase("spool_manager_filaments");
+            if (!spools.empty())
+                upload_job.upload_data.extended_info["spool_manager_filaments"] = json(spools).dump();
+        }
+    }
     show_warning_dialog = true;
     if (! output_path.empty()) {
         background_process.schedule_export(output_path.string(), output_path_on_removable_media);
@@ -11762,6 +12323,8 @@ void Plater::priv::export_gcode(fs::path output_path, bool output_path_on_remova
     } else {
         background_process.schedule_upload(std::move(upload_job));
     }
+    if (dispatch)
+        background_process.set_dispatch_print(std::move(dispatch), std::move(spools));
 
     // If the SLA processing of just a single object's supports is running, restart slicing for the whole object.
     this->background_process.set_task(PrintBase::TaskParams());
@@ -13733,7 +14296,10 @@ void Plater::priv::on_action_print_plate(SimpleEvent&)
     }
 
     PresetBundle& preset_bundle = *wxGetApp().preset_bundle;
-    if (preset_bundle.use_bbl_network() || wxGetApp().app_config->get_bool("use_printer_agents")) {
+    if (uses_independent_tool_dispatch() ||
+        (filament_sync_host_config().opt_enum<PrintHostType>("host_type") == htOctoPrint && !preset_bundle.use_bbl_network())) {
+        q->send_gcode_legacy(PLATE_CURRENT_IDX, nullptr);
+    } else if (preset_bundle.use_bbl_network() || wxGetApp().app_config->get_bool("use_printer_agents")) {
         open_machine_select_dialog(partplate_list.get_curr_plate_index());
     } else {
         q->send_gcode_legacy(PLATE_CURRENT_IDX, nullptr);
@@ -13828,6 +14394,11 @@ int Plater::priv::update_print_required_data(Slic3r::DynamicPrintConfig config, 
 
 void Plater::priv::on_action_send_to_printer(bool isall)
 {
+    if (uses_independent_tool_dispatch() || (!wxGetApp().preset_bundle->use_bbl_network() &&
+        filament_sync_host_config().opt_enum<PrintHostType>("host_type") == htOctoPrint)) {
+        q->send_gcode_legacy(isall ? PLATE_ALL_IDX : PLATE_CURRENT_IDX, nullptr);
+        return;
+    }
 	if (!m_send_to_sdcard_dlg) m_send_to_sdcard_dlg = new SendToPrinterDialog(q);
     if (isall) {
         m_send_to_sdcard_dlg->prepare(PLATE_ALL_IDX);
@@ -13856,7 +14427,9 @@ void Plater::priv::on_action_print_all(SimpleEvent&)
     }
 
     PresetBundle& preset_bundle = *wxGetApp().preset_bundle;
-    if (preset_bundle.use_bbl_network() || wxGetApp().app_config->get_bool("use_printer_agents")) {
+    if (uses_independent_tool_dispatch()) {
+        q->send_gcode_legacy(PLATE_ALL_IDX, nullptr);
+    } else if (preset_bundle.use_bbl_network() || wxGetApp().app_config->get_bool("use_printer_agents")) {
         open_machine_select_dialog(PLATE_ALL_IDX);
     } else {
         q->send_gcode_legacy(PLATE_ALL_IDX, nullptr);
@@ -18907,6 +19480,10 @@ void Plater::export_gcode(bool prefer_removable)
             start_dir = appconfig.get_last_output_dir(default_output_file.parent_path().string(), false);
     }
 
+    std::unique_ptr<Print> dispatch;
+    std::vector<SpoolManagerMetadata::Filament> dispatch_spools;
+    if (!p->prepare_dispatch(dispatch, dispatch_spools))
+        return;
     fs::path output_path;
     {
         std::string ext = default_output_file.extension().string();
@@ -18939,7 +19516,7 @@ void Plater::export_gcode(bool prefer_removable)
         p->exporting_status = path_on_removable_media ? ExportingStatus::EXPORTING_TO_REMOVABLE : ExportingStatus::EXPORTING_TO_LOCAL;
         p->last_output_path = output_path.string();
         p->last_output_dir_path = output_path.parent_path().string();
-        p->export_gcode(output_path, path_on_removable_media);
+        p->export_gcode(output_path, path_on_removable_media, PrintHostJob{}, std::move(dispatch), std::move(dispatch_spools));
         // Storing a path to AppConfig either as path to removable media or a path to internal media.
         // is_path_on_removable_drive() is called with the "true" parameter to update its internal database as the user may have shuffled the external drives
         // while the dialog was open.
@@ -18972,6 +19549,10 @@ void Plater::send_to_printer(bool isall)
 //BBS export gcode 3mf to file
 void Plater::export_gcode_3mf(bool export_all)
 {
+    if (uses_independent_tool_dispatch() && export_all && get_partplate_list().get_plate_count() > 1) {
+        show_error(this, _L("Map and export each plate separately so its physical tool assignments can be verified."));
+        return;
+    }
     if (p->model.objects.empty())
         return;
 
@@ -19002,6 +19583,11 @@ void Plater::export_gcode_3mf(bool export_all)
     }
     default_output_file.replace_extension(".gcode.3mf");
     default_output_file = fs::path(Slic3r::fold_utf8_to_ascii(default_output_file.string()));
+
+    std::unique_ptr<Print> dispatch;
+    std::vector<SpoolManagerMetadata::Filament> dispatch_spools;
+    if (!p->prepare_dispatch(dispatch, dispatch_spools))
+        return;
 
     //Get a last save path
     start_dir = appconfig.get_last_output_dir(default_output_file.parent_path().string(), false);
@@ -19034,6 +19620,11 @@ void Plater::export_gcode_3mf(bool export_all)
         int plate_idx = get_partplate_list().get_curr_plate_index();
         if (export_all)
             plate_idx = PLATE_ALL_IDX;
+        if (uses_independent_tool_dispatch()) {
+            p->export_gcode(output_path, path_on_removable_media, PrintHostJob{}, std::move(dispatch), std::move(dispatch_spools));
+            appconfig.update_last_output_dir(output_path.parent_path().string(), false);
+            return;
+        }
         export_3mf(output_path, SaveStrategy::Silence | SaveStrategy::SplitModel | SaveStrategy::WithGcode | SaveStrategy::SkipModel, plate_idx); // BBS: silence
 
         RemovableDriveManager& removable_drive_manager = *wxGetApp().removable_drive_manager();
@@ -20316,15 +20907,27 @@ void Plater::reslice_SLA_until_step(SLAPrintObjectStep step, const ModelObject &
 }
 void Plater::send_gcode_legacy(int plate_idx, Export3mfProgressFn proFn)
 {
-    // if physical_printer is selected, send gcode for this printer
-    // DynamicPrintConfig* physical_printer_config = wxGetApp().preset_bundle->physical_printers.get_selected_printer_config();
-    DynamicPrintConfig* physical_printer_config = &Slic3r::GUI::wxGetApp().preset_bundle->printers.get_edited_preset().config;
-    if (! physical_printer_config || p->model.objects.empty())
+    const bool mapped_dispatch = uses_independent_tool_dispatch();
+    if (mapped_dispatch && plate_idx >= 0 && plate_idx != get_partplate_list().get_curr_plate_index()) {
+        show_error(this, _L("Select the plate you want to print before mapping its tools."));
+        return;
+    }
+    if (mapped_dispatch && plate_idx == PLATE_ALL_IDX && get_partplate_list().get_plate_count() > 1) {
+        show_error(this, _L("Map and send each plate separately so its physical tool assignments can be verified."));
+        return;
+    }
+    // Match filament synchronization: credentials and host selection belong to
+    // the physical printer, with machine-preset settings as the legacy fallback.
+    DynamicPrintConfig host_config = filament_sync_host_config();
+    DynamicPrintConfig *physical_printer_config = &host_config;
+    if (p->model.objects.empty())
         return;
 
     PrintHostJob upload_job(physical_printer_config);
-    if (upload_job.empty())
+    if (upload_job.empty()) {
+        show_error(this, _L("Configure a print host for the selected printer before sending a print."), false);
         return;
+    }
 
     // Orca: the use_3mf printer option makes us send a .gcode.3mf to the printer
     const auto* use_3mf_opt = physical_printer_config->option<ConfigOptionBool>("use_3mf");
@@ -20357,6 +20960,13 @@ void Plater::send_gcode_legacy(int plate_idx, Export3mfProgressFn proFn)
         // Orca: a gcode-in-3mf bundle is named ".gcode.3mf" (matching "Export plate sliced file")
         default_output_file.replace_extension(".gcode.3mf");
     }
+
+    // Confirm materials before asking where to upload the job. Cancellation of
+    // either dialog destroys this private job without altering the project.
+    std::unique_ptr<Print> dispatch;
+    std::vector<SpoolManagerMetadata::Filament> dispatch_spools;
+    if (!p->prepare_dispatch(dispatch, dispatch_spools))
+        return;
 
     // Repetier specific: Query the server for the list of file groups.
     wxArrayString groups;
@@ -20494,7 +21104,8 @@ void Plater::send_gcode_legacy(int plate_idx, Export3mfProgressFn proFn)
             physical_printer_config->option<ConfigOptionBool>("embed_spool_manager_filament_names");
         const bool embed_spool_names = embed_spool_names_opt == nullptr || embed_spool_names_opt->value;
         if (host_type == htOctoPrint && sync_spools_opt != nullptr && sync_spools_opt->value &&
-            embed_spool_names) {
+            embed_spool_names && (preset_bundle->get_printer_extruder_count() <= 1 ||
+                                 physical_printer_config->opt_bool("single_extruder_multi_material"))) {
             auto *octoprint = dynamic_cast<OctoPrint *>(upload_job.printhost.get());
             if (octoprint == nullptr) {
                 show_error(this, _L("OctoPrint filament spool synchronization is not available for this print host."), false);
@@ -20542,7 +21153,7 @@ void Plater::send_gcode_legacy(int plate_idx, Export3mfProgressFn proFn)
             return;
     }
 
-    if (use_3mf) {
+    if (use_3mf && !mapped_dispatch) {
         const std::string serialized_filaments = upload_job.upload_data.extended("spool_manager_filaments");
         if (!serialized_filaments.empty()) {
             try {
@@ -20576,7 +21187,7 @@ void Plater::send_gcode_legacy(int plate_idx, Export3mfProgressFn proFn)
         upload_job.upload_data.source_path = p->m_print_job_data._3mf_path;
     }
 
-    p->export_gcode(fs::path(), false, std::move(upload_job));
+    p->export_gcode(fs::path(), false, std::move(upload_job), std::move(dispatch), std::move(dispatch_spools));
 }
 int Plater::send_gcode(int plate_idx, Export3mfProgressFn proFn)
 {
@@ -20982,6 +21593,10 @@ void Plater::on_config_change(const DynamicPrintConfig &config)
         }
 
         p->config->set_key_value(opt_key, config.option(opt_key)->clone());
+        if (opt_key == "sequential_print_gantry_model" || opt_key == "sequential_print_gantry_geometry" || opt_key == "printer_notes") {
+            p->view3D->get_canvas3d()->reset_sequential_print_clearance();
+            update_scheduled = true;
+        }
         if (opt_key == "printer_technology") {
             this->set_printer_technology(config.opt_enum<PrinterTechnology>(opt_key));
             // print technology is changed, so we should to update a search list

@@ -1,5 +1,6 @@
 #include <catch2/catch_all.hpp>
 
+#include <algorithm>
 #include <cstdlib>
 #include <fstream>
 #include <memory>
@@ -8,6 +9,7 @@
 #include <vector>
 
 #include "libslic3r/GCodeWriter.hpp"
+#include "libslic3r/Exception.hpp"
 #include "libslic3r/GCode.hpp"
 #include "libslic3r/GCode/SpoolManagerMetadata.hpp"
 #include "libslic3r/Model.hpp"
@@ -20,6 +22,131 @@
 
 using namespace Slic3r;
 using namespace Slic3r::Test;
+
+TEST_CASE("Smart bed temperature ignores elevated interface material", "[GCodeWriter][BedTemperature]")
+{
+    const std::string mode = GENERATE("by_highest_temp", "smart_bed_contact");
+    const bool interface_on_bed = GENERATE(false, true);
+    auto config = multifilament_config(2, {
+        {"bed_temperature_formula", mode}, {"enable_support", true},
+        {"support_type", "normal(auto)"}, {"support_filament", interface_on_bed ? 2 : 1},
+        {"dont_support_bridges", false},
+        {"support_interface_filament", 2}, {"support_interface_top_layers", 2},
+        {"enable_prime_tower", false}, {"skirt_loops", 0}, {"brim_type", "no_brim"}
+    });
+    CHECK(config.option("bed_temperature_formula")->serialize() == mode);
+    const BedType bed = config.opt_enum<BedType>("curr_bed_type");
+    config.set_key_value(get_bed_temp_1st_layer_key(bed), new ConfigOptionInts{60, 85});
+    config.set_key_value(get_bed_temp_key(bed), new ConfigOptionInts{55, 80});
+    config.set_key_value("machine_start_gcode", new ConfigOptionString(
+        "; BED_PLACEHOLDER {bed_temperature_initial_layer_single}\n"
+        "; BED_VECTOR {first_layer_bed_temperature[1]} {bed_temperature[1]}\n"));
+    Print print;
+    Model model;
+    init_print({TestMesh::overhang}, print, model, config);
+    const std::string output = gcode(print);
+    const auto first = print.get_slice_used_filaments(true);
+    const auto all = print.get_slice_used_filaments(false);
+    REQUIRE(std::find(all.begin(), all.end(), 1u) != all.end());
+    const bool hotter_on_bed = std::find(first.begin(), first.end(), 1u) != first.end();
+    REQUIRE(hotter_on_bed == interface_on_bed);
+    const int expected_first = hotter_on_bed ? 85 : 60;
+    const int expected_normal = mode == "by_highest_temp" || hotter_on_bed ? 80 : 55;
+    CHECK(output.find("; BED_PLACEHOLDER " + std::to_string(expected_first)) != std::string::npos);
+    if (mode == "smart_bed_contact")
+        CHECK(output.find("; BED_VECTOR " + std::to_string(expected_first) + " " +
+            std::to_string(expected_normal)) != std::string::npos);
+    else
+        CHECK(output.find("; BED_VECTOR 85 80") != std::string::npos);
+    std::vector<int> bed_commands;
+    GCodeReader reader;
+    reader.parse_buffer(output, [&](GCodeReader &, const GCodeReader::GCodeLine &line) {
+        float target;
+        if ((line.cmd_is("M140") || line.cmd_is("M190")) && line.has_value('S', target) && target > 0)
+            bed_commands.push_back(int(target));
+    });
+    REQUIRE_FALSE(bed_commands.empty());
+    CHECK(bed_commands.front() == expected_first);
+    CHECK(bed_commands.back() == expected_normal);
+}
+
+TEST_CASE("Preview heater targets preserve inactive tool temperatures and bed cooldown", "[GCodeWriter][TemperaturePreview]")
+{
+    GCodeProcessor processor;
+    processor.initialize("temperature-preview.gcode");
+    processor.process_buffer("G90\nM83\nM140 S60\nM104 T0 S210\nM109 T7 S240\nG1 X10 F600\n"
+        "M190 R55\nM109 T0 R205\nG1 X20\nM104 T7 S0\nM140 S0\nG1 X30\n");
+    const auto &result = processor.get_result();
+    const auto *first = result.temperature_targets_at(7);
+    REQUIRE(first != nullptr);
+    REQUIRE(first->bed.has_value());
+    CHECK_THAT(*first->bed, Catch::Matchers::WithinAbs(60., 0.01));
+    REQUIRE(first->tools.count(0) == 1);
+    REQUIRE(first->tools.count(7) == 1);
+    CHECK_THAT(first->tools.at(0), Catch::Matchers::WithinAbs(210., 0.01));
+    CHECK_THAT(first->tools.at(7), Catch::Matchers::WithinAbs(240., 0.01));
+    const auto *cooled = result.temperature_targets_at(10);
+    REQUIRE(cooled != nullptr);
+    CHECK_THAT(*cooled->bed, Catch::Matchers::WithinAbs(55., 0.01));
+    CHECK_THAT(cooled->tools.at(0), Catch::Matchers::WithinAbs(205., 0.01));
+    CHECK_THAT(cooled->tools.at(7), Catch::Matchers::WithinAbs(240., 0.01));
+    const auto *off = result.temperature_targets_at(13);
+    REQUIRE(off != nullptr);
+    CHECK_THAT(*off->bed, Catch::Matchers::WithinAbs(0., 0.01));
+    CHECK_THAT(off->tools.at(7), Catch::Matchers::WithinAbs(0., 0.01));
+    // Scrubbing backwards must not show the final shutdown temperatures.
+    CHECK_THAT(*result.temperature_targets_at(7)->bed, Catch::Matchers::WithinAbs(60., 0.01));
+    GCodeProcessorResult copy;
+    copy = result;
+    REQUIRE(copy.temperature_targets_at(7) != nullptr);
+    CHECK_THAT(copy.temperature_targets_at(7)->tools.at(7), Catch::Matchers::WithinAbs(240., 0.01));
+    processor.reset();
+    CHECK(processor.get_result().temperature_targets_at(13) == nullptr);
+}
+
+TEST_CASE("Printer model overrides affect validator metadata without changing the profile",
+          "[GCodeWriter][PrinterModel][Regression]")
+{
+    const bool skip_config = GENERATE(false, true);
+    const std::string override_model = GENERATE(std::string(), std::string("  PrusaCoreOneINDX  "));
+    std::string start = "; PROFILE_MODEL={printer_model}\nM862.3 P\"COREONEINDX\"\n";
+    for (size_t i = 0; i < 1100; ++i)
+        start += "; padding\n";
+    Print print;
+    Model model;
+    init_print({cube(2.)}, print, model, {
+        {"printer_model", "Prusa CORE One HF"},
+        {"gcode_printer_model", override_model},
+        {"gcode_skip_config_block", skip_config},
+        {"machine_start_gcode", start},
+        {"skirt_loops", 0}, {"brim_type", "no_brim"}
+    });
+    const std::string output = gcode(print);
+    const std::string expected = override_model.empty() ? "Prusa CORE One HF" : "PrusaCoreOneINDX";
+    CHECK(print.config().printer_model.value == "Prusa CORE One HF");
+    CHECK(print.full_print_config().opt_string("printer_model") == "Prusa CORE One HF");
+    CHECK(output.find("; PROFILE_MODEL=Prusa CORE One HF") != std::string::npos);
+    CHECK(output.find("M862.3 P\"COREONEINDX\"") != std::string::npos);
+    if (!skip_config || !override_model.empty()) {
+        const auto position = output.rfind("; printer_model = " + expected + "\n");
+        REQUIRE(position != std::string::npos);
+        // The actual validator searches only the final 1000 lines.
+        CHECK(std::count(output.begin() + position, output.end(), '\n') < 1000);
+    } else
+        CHECK(output.find("; printer_model = ") == std::string::npos);
+    if (!override_model.empty())
+        CHECK(output.find("; printer_model = Prusa CORE One HF\n") == std::string::npos);
+}
+
+TEST_CASE("Printer model metadata rejects embedded G-code lines",
+          "[GCodeWriter][PrinterModel][Regression]")
+{
+    Print print;
+    Model model;
+    init_print({cube(2.)}, print, model, {{"gcode_printer_model", "INDX\nM112"}});
+    CHECK(print.validate().opt_key == "gcode_printer_model");
+    CHECK_THROWS_AS(gcode(print), SlicingError);
+}
 
 TEST_CASE("Unused configured tools stay unused in exported startup metadata",
           "[GCodeWriter][INDX][Regression]")

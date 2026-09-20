@@ -24,6 +24,67 @@
 using namespace Slic3r;
 using namespace Slic3r::Test;
 
+TEST_CASE("Extra overhang wall overlap adds inward courses without moving outer walls", "[Perimeters][OverhangOverlap]")
+{
+    const std::string generator = GENERATE(std::string("classic"), std::string("arachne"));
+    const double arc_threshold = GENERATE(-1., 0., 5., 100.);
+    double last_arc_length = 0.;
+    auto paths_for = [&](double overlap, bool enabled) {
+        TriangleMesh model = make_cube(10., 20., 5.);
+        // The mixed case has a 10 mm cantilever on one side and a 4 mm
+        // cantilever on the other: only the latter should receive extra walls.
+        TriangleMesh roof = make_cube(arc_threshold == 5. ? 24. : 30., 20., 2.);
+        roof.translate(-10., 0., 5.);
+        model.merge(roof);
+        Print print;
+        init_and_process_print({model}, print, {
+            {"wall_generator", generator}, {"overhang_wall_overlap", overlap},
+            {"extra_perimeters_on_overhangs", enabled}, {"detect_overhang_wall", true},
+            {"arc_overhang_enabled", arc_threshold >= 0.},
+            {"arc_overhang_bridges", true}, {"arc_overhang_overhangs", true},
+            {"arc_overhang_bridge_distance", std::max(0., arc_threshold)},
+            {"arc_overhang_min_overhang_distance", std::max(0., arc_threshold)},
+            {"enable_support", false},
+            {"wall_loops", 3}, {"layer_height", 0.2}, {"initial_layer_print_height", 0.2}
+        });
+        double length = 0.;
+        last_arc_length = 0.;
+        std::vector<Points> outer;
+        for (const Layer *layer : print.objects().front()->layers())
+            for (const LayerRegion *region : layer->regions()) {
+                const auto entities = region->perimeters.flatten();
+                for (const ExtrusionEntity *entity : entities.entities) {
+                    length += entity->length();
+                    if (entity->role() == erExternalPerimeter || entity->inset_idx == 0)
+                        for (const Polyline &line : entity->as_polylines())
+                            outer.push_back(line.points);
+                }
+                const auto fills = region->fills.flatten();
+                for (const ExtrusionEntity *entity : fills.entities)
+                    if (entity->role() == erArcBridge || entity->role() == erArcOverhang)
+                        last_arc_length += entity->length();
+            }
+        return std::make_pair(length, outer);
+    };
+    const auto normal = paths_for(0., true);
+    const double normal_arc_length = last_arc_length;
+    const auto overlap = paths_for(20., true);
+    if (arc_threshold == 0. || arc_threshold == 5.) {
+        CHECK(normal_arc_length > 0.);
+        CHECK(last_arc_length > 0.);
+    }
+    REQUIRE_FALSE(normal.second.empty());
+    if (arc_threshold == 0.)
+        CHECK_THAT(overlap.first, Catch::Matchers::WithinAbs(normal.first, 1e-6));
+    else
+        CHECK(overlap.first > normal.first);
+    CHECK(overlap.second == normal.second);
+    const auto disabled = paths_for(0., false);
+    const auto disabled_overlap = paths_for(20., false);
+    CHECK_THAT(disabled_overlap.first, Catch::Matchers::WithinAbs(disabled.first, 1e-6));
+    CHECK(disabled_overlap.second == disabled.second);
+}
+
 namespace {
 
 // The layer at this Z is the last one of the base, so its top surface is the ledge.

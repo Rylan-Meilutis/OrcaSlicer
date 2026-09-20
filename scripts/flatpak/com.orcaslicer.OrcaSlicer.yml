@@ -432,6 +432,23 @@ modules:
 
       - type: file
         path: ../../CMakeLists.txt
+      # Standalone G-code regression tests are registered by tests/fff_print.
+      - type: file
+        path: ../../test_audit_gcode_moves.py
+      - type: file
+        path: ../../audit_gcode_moves.py
+      - type: file
+        path: ../../audit_arc_gcode.py
+      - type: file
+        path: ../../audit_arc_support.py
+      - type: file
+        path: ../../audit_arc_families.py
+      - type: file
+        path: ../../audit_arc_overlap.py
+      - type: file
+        path: ../../audit_nonplanar_collisions.py
+      - type: file
+        path: ../../audit_nonplanar_gcode.py
       - type: file
         path: ../../LICENSE.txt
       - type: file

@@ -6,6 +6,7 @@
 #include "libslic3r/ExPolygon.hpp"
 #include "libslic3r/Print.hpp"
 #include "libslic3r/PrintConfig.hpp"
+#include "libslic3r/SequentialGantryGeometry.hpp"
 
 using namespace Slic3r;
 using namespace Slic3r::arrangement;
@@ -150,6 +151,68 @@ TEST_CASE("Arrange places every item on the physical bed", "[Arrange]")
 
     for (const ArrangePolygon &ap : items)
         REQUIRE(ap.bed_idx == 0);
+}
+
+TEST_CASE("Single gantry reach permits tighter sequential packing without overlaps", "[Arrange][SequentialGantryGeometry]")
+{
+    SequentialGantryGeometry gantry;
+    gantry.slices.push_back({0., false, {Polygon::new_scale({{-8., -8.}, {8., -8.}, {8., 8.}, {-8., 8.}})}});
+    const bool doubled = GENERATE(false, true);
+    auto items = squares(4, 20., 20.);
+    for (auto &item : items) item.extrude_ids = {0};
+    auto config = bed_config();
+    config.set_key_value("printable_area", new ConfigOptionPoints{{0, 0}, {75, 0}, {75, 75}, {0, 75}});
+    auto params = seq_print_params(0);
+    params.clearance_height_to_rod = 100.f;
+    params.clearance_height_to_lid = 100.f;
+    params.clearance_radius = float(gantry.conservative_clearance_radius() * (doubled ? 2. : 1.));
+    update_selected_items_inflation(items, &config, params);
+    arrange(items, bed(75, 75), params);
+    const auto on_bed = std::count_if(items.begin(), items.end(), [](const auto &item) { return item.bed_idx == 0; });
+    if (doubled)
+        CHECK(on_bed < 4);
+    else {
+        REQUIRE(on_bed == 4);
+        require_no_overlap(items);
+        ExPolygons envelopes;
+        for (const auto &item : items) {
+            const auto expanded = offset_ex(item.transformed_poly(), scaled(gantry.conservative_clearance_radius() / 2.));
+            envelopes.insert(envelopes.end(), expanded.begin(), expanded.end());
+        }
+        CHECK(disjoint(envelopes));
+    }
+}
+
+TEST_CASE("Modeled gantries keep rear clearance without imposing it sideways", "[Arrange][SequentialGantryGeometry]")
+{
+    SequentialGantryGeometry gantry;
+    gantry.slices.push_back({0., false, {Polygon::new_scale({{-27., -90.}, {28., -90.}, {28., 21.}, {-27., 21.}})}});
+    const Vec2d reach = gantry.clearance_reach();
+    REQUIRE_THAT(reach.x(), Catch::Matchers::WithinAbs(28., 1e-6));
+    REQUIRE_THAT(reach.y(), Catch::Matchers::WithinAbs(90., 1e-6));
+    auto items = squares(3, 20., 20.);
+    const double rotation = GENERATE(0., PI / 4.);
+    for (auto &item : items) {
+        item.extrude_ids = {0};
+        item.rotation = rotation;
+    }
+    auto params = seq_print_params(0);
+    params.clearance_radius = 75.; // Legacy profile value must not inflate modeled objects.
+    params.gantry_clearance = reach;
+    params.allow_rotations = true;
+    params.clearance_height_to_rod = 100.;
+    params.clearance_height_to_lid = 100.;
+    auto config = bed_config();
+    update_selected_items_inflation(items, &config, params);
+    arrange(items, bed(180., 125.), params);
+    ExPolygons envelopes;
+    for (const auto &item : items) {
+        REQUIRE(item.bed_idx == 0);
+        CHECK_THAT(item.rotation, Catch::Matchers::WithinAbs(rotation, 1e-9));
+        envelopes.emplace_back(sequential_clearance_hull(item.transformed_poly().contour, reach * 0.5));
+        CHECK(bed(180., 125.).contains(item.transformed_poly().contour.bounding_box()));
+    }
+    CHECK(disjoint(envelopes));
 }
 
 TEST_CASE("Arranged items stay within the bed", "[Arrange]")

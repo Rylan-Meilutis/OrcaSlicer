@@ -287,6 +287,7 @@ enum class WallInfillOrder {
 enum class BedTempFormula {
     btfFirstFilament,
     btfHighestTemp,
+    btfBedContact,
     count,
 };
 
@@ -1393,6 +1394,11 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionFloatsNullable,     default_junction_deviation))
 
     ((ConfigOptionBool, interlocking_beam))
+    ((ConfigOptionBool, rooting))
+    ((ConfigOptionFloat, rooting_depth))
+    ((ConfigOptionFloat, rooting_width))
+    ((ConfigOptionFloat, rooting_spacing))
+    ((ConfigOptionFloat, rooting_skin))
     ((ConfigOptionFloat,interlocking_beam_width))
     ((ConfigOptionFloat,interlocking_orientation))
     ((ConfigOptionInt,  interlocking_beam_layer_count))
@@ -1555,6 +1561,8 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionEnum<WallInfillOrder>, wall_infill_order))
     ((ConfigOptionBool,                 precise_outer_wall))
     ((ConfigOptionPercent,              bridge_density))
+    ((ConfigOptionPercent,              bridge_line_overlap))
+    ((ConfigOptionPercent,              overhang_wall_overlap))
     ((ConfigOptionFloat,                 filter_out_gap_fill))
     ((ConfigOptionFloatsOrPercentsNullable, small_perimeter_speed))
     ((ConfigOptionFloatsNullable,           small_perimeter_threshold))
@@ -1608,6 +1616,7 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionPercent,              arc_overhang_overlap))
     ((ConfigOptionPercent,              arc_overhang_flow_ratio))
     ((ConfigOptionFloat,                arc_overhang_speed))
+    ((ConfigOptionFloat,                arc_overhang_min_path_time))
     ((ConfigOptionFloat,                arc_overhang_stabilization_speed))
     ((ConfigOptionInt,                  arc_overhang_layers))
     ((ConfigOptionInt,                  arc_overhang_overhang_speed_layers))
@@ -2052,6 +2061,7 @@ PRINT_CONFIG_CLASS_DERIVED_DEFINE(
     ((ConfigOptionStrings,            slicing_pipeline_plugin))
     ((ConfigOptionString,             print_plugin_config_overrides))
     ((ConfigOptionString,             printer_model))
+    ((ConfigOptionString,             gcode_printer_model))
     ((ConfigOptionFloat,              resolution))
     ((ConfigOptionFloats,             retraction_minimum_travel))
     ((ConfigOptionBools,              retract_when_changing_layer))

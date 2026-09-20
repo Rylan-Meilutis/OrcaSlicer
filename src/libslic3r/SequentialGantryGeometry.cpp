@@ -120,6 +120,31 @@ SequentialGantryGeometry load_custom_geometry(const std::string &custom)
 
 } // namespace
 
+Vec2d SequentialGantryGeometry::clearance_reach() const
+{
+    Vec2d reach = Vec2d::Zero();
+    for (const auto &slice : slices) {
+        if (slice.is_box)
+            continue;
+        for (const auto &polygon : slice.polygons)
+            for (const Point &point : polygon.points)
+                reach = reach.cwiseMax(point.cast<double>().cwiseAbs() * SCALING_FACTOR);
+    }
+    return reach;
+}
+
+Polygon sequential_clearance_hull(const Polygon &footprint, const Vec2d &half_extent)
+{
+    Points points;
+    points.reserve(footprint.points.size() * 4);
+    const coord_t x = scale_(half_extent.x()), y = scale_(half_extent.y());
+    for (const Point &point : footprint.points)
+        for (int sx : {-1, 1})
+            for (int sy : {-1, 1})
+                points.emplace_back(point.x() + sx * x, point.y() + sy * y);
+    return Geometry::convex_hull(points);
+}
+
 double SequentialGantryGeometry::conservative_clearance_radius() const
 {
     double radius = 0.;
@@ -339,6 +364,18 @@ SequentialGantryGeometry load_sequential_gantry_geometry(const ConfigBase &confi
             const auto *model_option = config.option<ConfigOptionString>("sequential_print_gantry_model");
             const std::string model = model_option == nullptr ? std::string() : model_option->value;
             if (!model.empty()) {
+                if (model.compare(0, 8, "builtin:") == 0) {
+                    const fs::path directory = fs::path(resources_dir()) / "data" / "printer_gantries";
+                    boost::nowide::ifstream input((directory / "geometries.json").string());
+                    pt::ptree root;
+                    pt::read_json(input, root);
+                    for (const auto &entry : root.get_child("printers"))
+                        if (entry.second.get<std::string>("gantry_model_filename", "") == model.substr(8)) {
+                            auto geometry = parse_geometry(entry.second, directory);
+                            return geometry.validation_error().empty() ? geometry : SequentialGantryGeometry{};
+                        }
+                    return {};
+                }
                 SequentialGantryGeometry geometry = process_sequential_gantry_model(model);
                 if (geometry.validation_error().empty())
                     return geometry;

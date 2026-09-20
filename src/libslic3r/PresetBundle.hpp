@@ -466,6 +466,10 @@ public:
         { return prints.has_defaults_only() && filaments.has_defaults_only() && printers.has_defaults_only(); }
 
     DynamicPrintConfig          full_config(bool apply_extruder = true, std::optional<std::vector<int>>filament_maps = std::nullopt, std::optional<std::vector<int>> filament_volume_maps = std::nullopt) const;
+    // Build an independent dispatch job. Tool indices are zero based; the caller
+    // supplies a model copy, never the editable project. No G-code rewriting.
+    DynamicPrintConfig tool_mapped_config(Model &job_model, const std::vector<int> &tools,
+                                         const DynamicPrintConfig &plate_config) const;
     // full_config() with the some "useless" config removed.
     DynamicPrintConfig          full_config_secure(std::optional<std::vector<int>>filament_maps = std::nullopt) const;
 

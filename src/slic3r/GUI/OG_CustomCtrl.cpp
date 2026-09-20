@@ -88,6 +88,10 @@ void OG_CustomCtrl::init_ctrl_lines()
             continue;
 
         const std::vector<Option>& option_set = line.get_options();
+        // Widget-only rows have no field for this renderer. Do not dereference
+        // front() even if their creator omitted the full_width flag.
+        if (option_set.empty())
+            continue;
         wxCoord height;
 
         // if we have a single option with no label, no sidetext just add it directly to sizer

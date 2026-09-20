@@ -14,6 +14,7 @@
 #include "libslic3r/Format/SL1.hpp"
 #include "slic3r/Utils/PrintHost.hpp"
 #include "libslic3r/GCode/GCodeProcessor.hpp"
+#include "libslic3r/GCode/SpoolManagerMetadata.hpp"
 #include "PartPlate.hpp"
 
 namespace boost { namespace filesystem { class path; } }
@@ -153,6 +154,9 @@ public:
 	// Set print host upload job data to be enqueued to the PrintHostJobQueue
 	// after current print slicing is complete
 	void schedule_upload(Slic3r::PrintHostJob upload_job);
+    // Call while stopped, after scheduling the export/upload. Ownership keeps
+    // the mapped print alive through cancellation and final post-processing.
+    void set_dispatch_print(std::unique_ptr<Print> print, std::vector<SpoolManagerMetadata::Filament> spools);
 	// Clear m_export_path.
 	void reset_export();
 	// Once the G-code export is scheduled, the apply() methods will do nothing.
@@ -248,6 +252,13 @@ private:
 	// Print host upload job to schedule after slicing is complete, used by schedule_upload(),
 	// empty by default (ie. no upload to schedule)
 	PrintHostJob                m_upload_job;
+    std::unique_ptr<Print>      m_dispatch_print;
+    std::string                m_dispatch_output_path;
+    std::vector<SpoolManagerMetadata::Filament> m_dispatch_spools;
+    Print *export_print() const { return m_dispatch_print ? m_dispatch_print.get() : m_fff_print; }
+    const std::string &export_source_path() const {
+        return m_dispatch_print ? m_dispatch_output_path : m_temp_output_path;
+    }
 	// Thread, on which the background processing is executed. The thread will always be present
 	// and ready to execute the slicing process.
 	boost::thread		 		m_thread;

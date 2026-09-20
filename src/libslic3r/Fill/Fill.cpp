@@ -1849,6 +1849,9 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
 
 			if(surface_fill.params.bridge && surface_fill.surface.is_external() && surface_fill.params.density > 99.0){
 				params.density = layerm->region().config().bridge_density.get_abs_value(1.0);
+                const double overlap = layerm->region().config().bridge_line_overlap.get_abs_value(1.0);
+                if (overlap > 0. && !is_arc_fill(params.extrusion_role))
+                    params.density = 1. / (1. - std::clamp(overlap, 0., 0.2));
 				params.dont_adjust = true;
 			}
             if(surface_fill.surface.is_internal_bridge()){

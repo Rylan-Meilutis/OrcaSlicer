@@ -29,6 +29,8 @@ struct SequentialGantryGeometry
 
     bool empty() const { return slices.empty(); }
     double conservative_clearance_radius() const;
+    // Axis-wise nozzle-to-head reach. Rod/lid boxes are checked separately.
+    Vec2d clearance_reach() const;
     double maximum_xy_reach(double maximum_height = std::numeric_limits<double>::max()) const;
     void set_nozzle_tip_diameter(double diameter);
     double first_box_height() const;
@@ -37,6 +39,9 @@ struct SequentialGantryGeometry
     // report why a newly supplied model was rejected.
     std::string validation_error() const;
 };
+
+// Expand a convex footprint by a rectangle in machine space.
+Polygon sequential_clearance_hull(const Polygon &footprint, const Vec2d &half_extent);
 
 // Converts a nozzle-centred STL into conservative horizontal collision bands.
 // The model's lowest Z is treated as the nozzle tip. Each generated footprint

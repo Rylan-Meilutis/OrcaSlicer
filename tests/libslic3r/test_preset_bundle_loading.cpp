@@ -19,6 +19,131 @@
 
 using namespace Slic3r;
 
+TEST_CASE("Imported gantry meshes are owned by the saved printer profile", "[PresetBundle][GantryAssets]")
+{
+    ScopedTemporaryDir directory;
+    const auto source = directory.path() / "source.stl";
+    { std::ofstream stream(source.string(), std::ios::binary); stream << "test mesh bytes"; }
+    Preset preset(Preset::TYPE_PRINTER, "Gantry asset test");
+    preset.config = DynamicPrintConfig::full_print_config();
+    preset.file = (directory.path() / "profiles" / "printer.json").string();
+    preset.config.set_key_value("sequential_print_gantry_model", new ConfigOptionString(source.string()));
+    preset.save(nullptr);
+    const auto saved = preset.config.opt_string("sequential_print_gantry_model");
+    CHECK(boost::filesystem::path(saved).parent_path() == directory.path() / "profiles" / "printer.assets");
+    REQUIRE(boost::filesystem::exists(saved));
+    boost::filesystem::remove(source);
+    preset.save(nullptr);
+    CHECK(preset.config.opt_string("sequential_print_gantry_model") == saved);
+    std::ifstream contents(saved, std::ios::binary);
+    CHECK(std::string(std::istreambuf_iterator<char>(contents), {}) == "test mesh bytes");
+    preset.file = (directory.path() / "profiles" / "copy.json").string();
+    preset.save(nullptr);
+    const auto copied = preset.config.opt_string("sequential_print_gantry_model");
+    CHECK(copied != saved);
+    CHECK(boost::filesystem::exists(copied));
+    CHECK(boost::filesystem::exists(saved));
+    preset.config.set_key_value("sequential_print_gantry_model", new ConfigOptionString("builtin:prusa3d_coreone_indx_gantry.stl"));
+    preset.save(nullptr);
+    CHECK(preset.config.opt_string("sequential_print_gantry_model") == "builtin:prusa3d_coreone_indx_gantry.stl");
+}
+
+TEST_CASE("Project material count may be below printer capacity", "[PresetBundle][Regression]")
+{
+    PresetBundle bundle;
+    auto &config = bundle.printers.get_edited_preset().config;
+    const bool physical_tools = GENERATE(false, true);
+    config.set_deserialize_strict("single_extruder_multi_material", physical_tools ? "0" : "1");
+    config.set_deserialize_strict("nozzle_diameter", physical_tools ? "0.4,0.4,0.4,0.4,0.4,0.4,0.4,0.4" : "0.4");
+    config.set_key_value("host_type", new ConfigOptionEnum<PrintHostType>(htOctoPrint));
+    config.set_deserialize_strict("max_filament_colors", "8");
+    CHECK_FALSE(bundle.has_fixed_filament_slots());
+    bundle.set_num_filaments(2);
+    bundle.update_filament_count();
+    CHECK(bundle.filament_presets.size() == 2);
+    CHECK(bundle.project_config.opt<ConfigOptionStrings>("filament_colour")->size() == 2);
+    bundle.set_num_filaments(9);
+    CHECK(bundle.filament_presets.size() == 8);
+    bundle.set_num_filaments(1);
+    CHECK(bundle.filament_presets.size() == 1);
+}
+
+TEST_CASE("Independent tools retain a reduced material palette through deletion and refresh", "[PresetBundle][ToolMapping]")
+{
+    PresetBundle bundle;
+    auto &printer = bundle.printers.get_edited_preset().config;
+    const auto host = GENERATE(htOctoPrint, htPrusaLink);
+    const int tool_count = GENERATE(2, 8);
+    printer.set_key_value("host_type", new ConfigOptionEnum<PrintHostType>(host));
+    printer.set_deserialize_strict("single_extruder_multi_material", "0");
+    printer.set_key_value("nozzle_diameter", new ConfigOptionFloats(std::vector<double>(tool_count, 0.4)));
+    bundle.set_num_filaments(tool_count);
+    for (int remaining = tool_count; remaining > 1; --remaining)
+        bundle.update_num_filaments(unsigned(bundle.filament_presets.size() - 1));
+    bundle.update_filament_count();
+    bundle.update_multi_material_filament_presets();
+    CHECK(bundle.filament_presets.size() == 1);
+    CHECK(bundle.project_config.opt<ConfigOptionStrings>("filament_colour")->size() == 1);
+    CHECK(bundle.get_printer_extruder_count() == tool_count);
+    CHECK(bundle.max_filament_colors() == size_t(tool_count));
+    bundle.set_num_filaments(tool_count + 1);
+    CHECK(bundle.filament_presets.size() == size_t(tool_count));
+    CHECK(bundle.get_printer_extruder_count() == tool_count);
+}
+
+TEST_CASE("Dispatch mapping preserves the project and binds roles to physical tools", "[PresetBundle][ToolMapping]")
+{
+    PresetBundle bundle;
+    auto &printer = bundle.printers.get_edited_preset().config;
+    printer.set_key_value("host_type", new ConfigOptionEnum<PrintHostType>(htOctoPrint));
+    printer.set_deserialize_strict("single_extruder_multi_material", "0");
+    printer.set_deserialize_strict("nozzle_diameter", "0.4,0.4,0.4,0.4,0.4,0.4,0.4,0.6");
+    bundle.set_num_filaments(2);
+    bundle.project_config.set_key_value("filament_colour", new ConfigOptionStrings{"#123456", "#abcdef"});
+    bundle.project_config.set_key_value("flush_volumes_matrix", new ConfigOptionFloats{0., 120., 140., 0.});
+    bundle.project_config.set_key_value("flush_volumes_vector", new ConfigOptionFloats{10., 20., 30., 40.});
+    bundle.prints.get_edited_preset().config.set_key_value("support_interface_filament", new ConfigOptionInt(-1));
+    bundle.project_config.set_key_value("project_filament_bindings", new ConfigOptionInts{0, 2});
+    Model project;
+    auto *object = project.add_object();
+    object->add_volume(make_cube(5, 5, 5));
+    Model job(project);
+    DynamicPrintConfig plate;
+    plate.set_key_value("outer_wall_filament_id", new ConfigOptionInt(2));
+    const auto config = bundle.tool_mapped_config(job, {7, 0}, plate);
+    CHECK(job.objects.front()->config.extruder() == 8);
+    CHECK_FALSE(project.objects.front()->config.has("extruder"));
+    CHECK(bundle.filament_presets.size() == 2);
+    CHECK(bundle.project_config.opt_string("filament_colour", 0u) == "#123456");
+    CHECK(config.opt_string("filament_colour", 7u) == "#123456");
+    CHECK(config.opt_string("filament_colour", 0u) == "#abcdef");
+    CHECK(config.opt_int("support_interface_filament") == 1);
+    CHECK(config.opt_int("outer_wall_filament_id") == 1);
+    CHECK(config.opt_float("nozzle_diameter", 7) == Catch::Approx(0.6));
+    CHECK(config.option<ConfigOptionInts>("filament_map")->values == std::vector<int>{1,2,3,4,5,6,7,8});
+    const auto &purge = config.option<ConfigOptionFloats>("flush_volumes_matrix")->values;
+    REQUIRE(purge.size() == 64);
+    CHECK(purge[7 * 8] == Catch::Approx(120.));
+    CHECK(purge[7] == Catch::Approx(140.));
+    CHECK(config.opt_float("flush_volumes_vector", 14) == Catch::Approx(10.));
+    CHECK(config.opt_float("flush_volumes_vector", 1) == Catch::Approx(40.));
+}
+
+TEST_CASE("Dispatch rejects duplicate missing and out of range tool assignments", "[PresetBundle][ToolMapping]")
+{
+    PresetBundle bundle;
+    auto &printer = bundle.printers.get_edited_preset().config;
+    printer.set_key_value("host_type", new ConfigOptionEnum<PrintHostType>(htOctoPrint));
+    printer.set_deserialize_strict("nozzle_diameter", "0.4,0.4");
+    bundle.set_num_filaments(2);
+    Model job;
+    job.add_object()->add_volume(make_cube(5, 5, 5));
+    const auto mapping = GENERATE(std::vector<int>{0, 0}, std::vector<int>{0},
+                                  std::vector<int>{0, 2}, std::vector<int>{-1, 1});
+    CHECK_THROWS_AS(bundle.tool_mapped_config(job, mapping, {}), std::invalid_argument);
+    CHECK_FALSE(job.objects.front()->config.has("extruder"));
+}
+
 namespace {
 
 namespace fs = boost::filesystem;

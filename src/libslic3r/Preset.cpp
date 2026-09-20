@@ -705,6 +705,24 @@ void Preset::save(DynamicPrintConfig* parent_config)
         from_str = std::string("Default");
 
     boost::filesystem::create_directories(fs::path(this->file).parent_path());
+    // Keep imported collision meshes with their owning printer preset. Save As
+    // copies into the new preset's assets directory; subsequent saves reuse it.
+    // Built-in identifiers stay portable and do not duplicate bundled assets.
+    if (type == TYPE_PRINTER) {
+        auto *gantry = config.option<ConfigOptionString>("sequential_print_gantry_model");
+        if (gantry != nullptr && !gantry->value.empty() && gantry->value.compare(0, 8, "builtin:") != 0) {
+            fs::path source(gantry->value);
+            if (!source.is_absolute() && !fs::exists(source))
+                source = fs::path(resources_dir()) / source;
+            const fs::path assets = fs::absolute(fs::path(file).parent_path() / (fs::path(file).stem().string() + ".assets"));
+            if (fs::is_regular_file(source) && fs::absolute(source).parent_path() != assets) {
+                fs::create_directories(assets);
+                const fs::path target = assets / fs::unique_path("gantry-%%%%%%%%.stl");
+                fs::copy_file(source, target);
+                gantry->value = target.string();
+            }
+        }
+    }
     const std::string bare_name = get_preset_bare_name(this->name);
 
     //BBS: only save difference if it has parent
@@ -1325,6 +1343,7 @@ static std::vector<std::string> s_Preset_print_options{
     "arc_overhang_overlap",
     "arc_overhang_flow_ratio",
     "arc_overhang_speed",
+    "arc_overhang_min_path_time",
     "arc_overhang_stabilization_speed",
     "arc_overhang_layers",
     "arc_overhang_overhang_speed_layers",
@@ -1347,6 +1366,8 @@ static std::vector<std::string> s_Preset_print_options{
     "wipe_inward_distance",
     "wipe_before_external_loop",
     "bridge_density",
+    "bridge_line_overlap",
+    "overhang_wall_overlap",
     "internal_bridge_density",
     "precise_outer_wall",
     "bridge_acceleration",
@@ -1408,6 +1429,11 @@ static std::vector<std::string> s_Preset_print_options{
     "seam_slope_inner_walls",
     "scarf_overhang_threshold",
     "interlocking_beam",
+    "rooting",
+    "rooting_depth",
+    "rooting_width",
+    "rooting_spacing",
+    "rooting_skin",
     "interlocking_orientation",
     "interlocking_beam_layer_count",
     "interlocking_depth",
@@ -1529,7 +1555,7 @@ static std::vector<std::string> s_Preset_printer_options {
     "print_host_webui",
     "printhost_cafile","printhost_port","printhost_authorization_type",
     "printhost_user", "printhost_password", "printhost_ssl_ignore_revoke", "thumbnails", "thumbnails_format",
-    "use_relative_e_distances", "extruder_type", "use_firmware_retraction", "printer_notes",
+    "use_relative_e_distances", "extruder_type", "use_firmware_retraction", "printer_notes", "gcode_printer_model",
     "grab_length", "support_object_skip_flush", "physical_extruder_map",
     "cooling_tube_retraction",
     "cooling_tube_length", "high_current_on_filament_swap", "parking_pos_retraction", "extra_loading_move", "wipe_tower_type", "purge_in_prime_tower", "enable_filament_ramming", "tool_change_on_wipe_tower", "wait_for_temp_on_wipe_tower",
@@ -3149,6 +3175,9 @@ void PresetCollection::save_current_preset(const std::string &new_name, bool det
         this->get_selected_preset().save(&(parent_preset->config));
     else
         this->get_selected_preset().save(nullptr);
+    if (m_type == Preset::TYPE_PRINTER)
+        if (const auto *model = get_selected_preset().config.option<ConfigOptionString>("sequential_print_gantry_model"))
+            m_edited_preset.config.set_key_value("sequential_print_gantry_model", model->clone());
 }
 
 // A detached standalone preset for the Full Publish receiver: create a user preset holding

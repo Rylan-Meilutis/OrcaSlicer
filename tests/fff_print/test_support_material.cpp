@@ -545,6 +545,38 @@ TEST_CASE("Same-material support interface does not slow the model layer",
     CHECK_THAT(speed->second, Catch::Matchers::WithinAbs(60., 0.01));
 }
 
+TEST_CASE("Dissimilar support courses slow only at vertical material contact", "[SupportMaterial][GCode][Regression]")
+{
+    const bool enabled = GENERATE(false, true);
+    const bool dissimilar = GENERATE(false, true);
+    CAPTURE(enabled, dissimilar);
+    DynamicPrintConfig config = multifilament_config(2, {
+        {"enable_support", true},
+        {"dont_support_bridges", false},
+        {"support_filament", 1},
+        {"support_interface_filament", 2},
+        {"support_interface_top_layers", 3},
+        {"filament_type", dissimilar ? "PLA;PETG" : "PLA;PLA"},
+        {"slow_down_layer_above_dissimilar_support_interface", enabled},
+        {"dissimilar_support_interface_speed", 12},
+        {"support_speed", 60},
+        {"support_interface_speed", 60},
+        {"filament_max_volumetric_speed", "100,100"},
+    });
+    const std::string output = slice({TestMesh::overhang}, config);
+    size_t slowed = 0, normal = 0;
+    GCodeReader reader;
+    reader.parse_buffer(output, [&](GCodeReader &self, const GCodeReader::GCodeLine &line) {
+        if (!line.extruding(self) || line.dist_XY(self) <= 0. ||
+            line.comment().find("support material interface") == std::string_view::npos)
+            return;
+        if (std::abs(line.new_F(self) / 60. - 12.) < 0.01) ++slowed;
+        else if (line.new_F(self) / 60. > 12.) ++normal;
+    });
+    REQUIRE(normal > 0); // Later same-material interface courses remain unaffected.
+    CHECK((slowed > 0) == (enabled && dissimilar));
+}
+
 // The contact layer counts toward the configured interface layer count, so N configured top
 // interface layers produce exactly N interface layers, not N+1.
 TEST_CASE("Support top interface layer count matches the configured value", "[SupportMaterial]")

@@ -267,6 +267,7 @@ bool Print::invalidate_state_by_config_options(const ConfigOptionResolver & /* n
         "filament_notes",
         "process_notes",
         "printer_notes",
+        "gcode_printer_model",
         "use_3mf"
     };
 
@@ -425,6 +426,9 @@ bool Print::invalidate_state_by_config_options(const ConfigOptionResolver & /* n
             //FIXME Killing supports on any change of "filament_soluble" is rough. We should check for each object whether that is necessary.
             osteps.emplace_back(posSupportMaterial);
             osteps.emplace_back(posSimplifySupportPath);
+            if ((opt_key == "filament_soluble" || opt_key == "filament_is_support") &&
+                std::any_of(m_objects.begin(), m_objects.end(), [](const PrintObject *object) { return object->config().rooting.value; }))
+                osteps.emplace_back(posSlice);
         } else if (
                opt_key == "initial_layer_line_width"
             || opt_key == "min_layer_height"
@@ -683,9 +687,9 @@ StringObjectException Print::sequential_print_clearance_valid(const Print &print
 
     auto [object_skirt_offset, _] = print.object_skirt_offset();
     const SequentialGantryGeometry gantry = load_sequential_gantry_geometry(print_config);
-    const double effective_clearance_radius = gantry.empty()
-        ? print_config.extruder_clearance_radius.value
-        : std::max(print_config.extruder_clearance_radius.value, 2. * gantry.conservative_clearance_radius());
+    const Vec2d gantry_clearance = gantry.clearance_reach();
+    const bool modeled_clearance = gantry_clearance.maxCoeff() > 0.;
+    const double effective_clearance_radius = print_config.extruder_clearance_radius.value;
     std::vector<struct print_instance_info> print_instance_with_bounding_box;
     {
         // sequential_print_horizontal_clearance_valid
@@ -697,6 +701,8 @@ StringObjectException Print::sequential_print_clearance_valid(const Print &print
         // Shrink the extruder_clearance_radius a tiny bit, so that if the object arrangement algorithm placed the objects
         // exactly by satisfying the extruder_clearance_radius, this test will not trigger collision.
         float obj_distance = print.is_all_objects_are_short() ? scale_(std::max(0.5f * MAX_OUTER_NOZZLE_DIAMETER, object_skirt_offset) - 0.1) : scale_(0.5 * effective_clearance_radius + object_skirt_offset - 0.1);
+        if (modeled_clearance)
+            obj_distance = scale_(object_skirt_offset);
 
         for (const PrintObject *print_object : print.objects()) {
             assert(! print_object->model_object()->instances.empty());
@@ -710,6 +716,9 @@ StringObjectException Print::sequential_print_clearance_valid(const Print &print
 
                 Polygon convex_hull_no_offset = convex_hull0, convex_hull;
                 auto tmp = offset(convex_hull_no_offset, obj_distance, jtRound, scale_(0.1));
+                if (modeled_clearance)
+                    for (Polygon &hull : tmp)
+                        hull = sequential_clearance_hull(hull, (gantry_clearance * 0.5 - Vec2d::Constant(0.05)).cwiseMax(0.));
                 if (!tmp.empty()) { // tmp may be empty due to clipper's bug, see STUDIO-2452
                     convex_hull = tmp.front();
                     // instance.shift is a position of a centered object, while model object may not be centered.
@@ -1737,6 +1746,12 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
 
     if (m_objects.empty())
         return {std::string()};
+
+    const std::string &model_override = m_config.gcode_printer_model.value;
+    if (std::any_of(model_override.begin(), model_override.end(),
+            [](unsigned char c) { return c < 32 || c == 127; }))
+        return {L("G-code printer model must be a single line without control characters."),
+                nullptr, "gcode_printer_model"};
 
     // Keep old projects readable, but do not let imported or cloud presets
     // bypass the temporary UI quarantine of unqualified non-planar paths.
@@ -4984,13 +4999,16 @@ std::tuple<float, float> Print::object_skirt_offset(double margin_height) const
     float line_width = m_config.initial_layer_line_width.get_abs_value(max_nozzle_diameter);
     float object_skirt_witdh  = skirt_flow().width() + (config().skirt_loops - 1) * skirt_flow().spacing();
     float object_skirt_offset = 0;
+    const Vec2d modeled_reach = load_sequential_gantry_geometry(config()).clearance_reach();
+    const double half_clearance = 0.5 * (modeled_reach.maxCoeff() > 0.
+        ? modeled_reach.minCoeff() : config().extruder_clearance_radius.value);
 
     if (is_all_objects_are_short())
         object_skirt_offset = config().skirt_distance + object_skirt_witdh;
     else if (config().draft_shield == dsEnabled || config().skirt_height * max_layer_height > config().nozzle_height - margin_height)
         object_skirt_offset = config().skirt_distance + line_width;
-    else if (config().skirt_distance + object_skirt_witdh > config().extruder_clearance_radius/2)
-        object_skirt_offset = (config().skirt_distance + object_skirt_witdh - config().extruder_clearance_radius/2);
+    else if (config().skirt_distance + object_skirt_witdh > half_clearance)
+        object_skirt_offset = (config().skirt_distance + object_skirt_witdh - half_clearance);
     else
         return std::make_tuple(0, 0);
 

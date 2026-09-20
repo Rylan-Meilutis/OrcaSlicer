@@ -15,6 +15,10 @@
 #include "libslic3r/Layer.hpp"
 #include "libslic3r/Model.hpp"
 #include "libslic3r/GCodeReader.hpp"
+#include "libslic3r/GCode/GCodeProcessor.hpp"
+#include "libslic3r/PresetBundle.hpp"
+#include "libslic3r/Format/SlicedGCode.hpp"
+#include "libslic3r/miniz_extension.hpp"
 
 #include "test_helpers.hpp"
 #include "test_utils.hpp"
@@ -24,6 +28,197 @@
 #include <iterator>
 
 using namespace Slic3r;
+
+TEST_CASE("Dispatch material selection excludes unused palette slots and unprinted objects", "[Print][ToolMapping]")
+{
+    auto config = Test::multifilament_config(5, {
+        {"enable_prime_tower", "0"}, {"skirts", "0"}, {"brim_type", "no_brim"}});
+    Print print;
+    Model model;
+    Test::init_print({make_cube(4., 4., 0.4), make_cube(4., 4., 0.4)}, print, model, config);
+    model.objects[0]->config.set("extruder", 5);
+    model.objects[1]->config.set("extruder", 2);
+    for (auto *instance : model.objects[1]->instances)
+        instance->printable = false;
+    print.apply(model, config);
+    CHECK(print.extruders(true) == std::vector<unsigned int>{4});
+}
+
+TEST_CASE("Mapped jobs generate physical tool commands and startup used-tool masks", "[Print][ToolMapping]")
+{
+    const bool use_second_material = GENERATE(false, true);
+    const double destination_nozzle = GENERATE(0.4, 0.6);
+    PresetBundle bundle;
+    auto &printer = bundle.printers.get_edited_preset().config;
+    printer.set_key_value("host_type", new ConfigOptionEnum<PrintHostType>(htOctoPrint));
+    printer.set_deserialize_strict("single_extruder_multi_material", "0");
+    printer.set_num_extruders(8);
+    printer.set_deserialize_strict("nozzle_diameter", "0.4,0.4,0.4,0.4,0.4,0.4,0.4,0.4");
+    printer.option<ConfigOptionFloats>("nozzle_diameter")->values[7] = destination_nozzle;
+    printer.set_deserialize_strict("machine_start_gcode",
+        ";MAPPED_INITIAL={initial_tool}\n;MAPPED_USED={is_extruder_used[0]},{is_extruder_used[1]},{is_extruder_used[7]}\n"
+        ";MAPPED_TEMPS={nozzle_temperature[0]},{nozzle_temperature[7]}\n");
+    printer.set_deserialize_strict("machine_end_gcode", "");
+    printer.set_deserialize_strict("change_filament_gcode", "T{next_extruder}\n");
+    bundle.set_num_filaments(2);
+    // Use distinct temperatures so a T-only string rewrite cannot pass.
+    auto material = bundle.filaments.get_edited_preset().config;
+    material.set_key_value("nozzle_temperature", new ConfigOptionInts{205});
+    material.set_key_value("nozzle_temperature_initial_layer", new ConfigOptionInts{215});
+    bundle.filaments.load_preset("", "Dispatch PLA A", material, false);
+    material.set_key_value("nozzle_temperature", new ConfigOptionInts{225});
+    material.set_key_value("nozzle_temperature_initial_layer", new ConfigOptionInts{235});
+    bundle.filaments.load_preset("", "Dispatch PLA B", material, false);
+    bundle.filament_presets = {"Dispatch PLA A", "Dispatch PLA B"};
+    auto &process = bundle.prints.get_edited_preset().config;
+    process.set_deserialize_strict("enable_prime_tower", "0");
+    process.set_deserialize_strict("skirts", "0");
+    process.set_deserialize_strict("brim_type", "no_brim");
+    process.set_deserialize_strict("layer_height", "0.2");
+    process.set_deserialize_strict("initial_layer_print_height", "0.2");
+    Model project;
+    Print setup;
+    Test::init_print({make_cube(4., 4., 0.4), make_cube(4., 4., 0.4)}, setup, project, bundle.full_config(false));
+    project.objects[0]->config.set("extruder", 1);
+    project.objects[1]->config.set("extruder", use_second_material ? 2 : 1);
+    setup.apply(project, bundle.full_config(false));
+    const std::vector<unsigned int> logical_tools = use_second_material ?
+        std::vector<unsigned int>{0, 1} : std::vector<unsigned int>{0};
+    CHECK(setup.extruders(true) == logical_tools);
+    Model job(project);
+    const auto config = bundle.tool_mapped_config(job, {7, 0}, {});
+    CHECK_THAT(config.opt_float("nozzle_diameter", 7u), Catch::Matchers::WithinAbs(destination_nozzle, 1e-9));
+    CHECK_THAT(config.opt_float("nozzle_diameter", 0u), Catch::Matchers::WithinAbs(0.4, 1e-9));
+    CHECK(config.opt_int("nozzle_temperature_initial_layer", 0u) == 235);
+    CHECK(config.opt_int("nozzle_temperature_initial_layer", 7u) == 215);
+    Print print;
+    print.set_status_silent();
+    print.apply(job, config);
+    const std::vector<unsigned int> physical_tools = use_second_material ?
+        std::vector<unsigned int>{0, 7} : std::vector<unsigned int>{7};
+    CHECK(print.extruders(true) == physical_tools);
+    const std::string gcode = Test::gcode(print);
+    const auto used_mask = gcode.find(";MAPPED_USED=");
+    REQUIRE(used_mask != std::string::npos);
+    INFO(gcode.substr(used_mask, 100));
+    const std::string mask = use_second_material ? ";MAPPED_USED=true,false,true" : ";MAPPED_USED=false,false,true";
+    CHECK(gcode.find(mask) != std::string::npos);
+    CHECK(gcode.find(";MAPPED_TEMPS=225,205") != std::string::npos);
+    CHECK(gcode.find("\nT7\n") != std::string::npos);
+    CHECK((gcode.find("\nT0\n") != std::string::npos) == use_second_material);
+    CHECK(gcode.find("\nT1\n") == std::string::npos);
+    CHECK(project.objects[0]->config.extruder() == 1);
+    CHECK(project.objects[1]->config.extruder() == (use_second_material ? 2 : 1));
+    CHECK(bundle.filament_presets.size() == 2);
+    ScopedTemporaryFile raw(".gcode"), package(".gcode.3mf");
+    GCodeProcessorResult result;
+    print.export_gcode(raw.string(), &result);
+    REQUIRE(store_sliced_gcode_3mf(package.string(), print, result, raw.string()));
+    mz_zip_archive archive{};
+    REQUIRE(open_zip_reader(&archive, package.string()));
+    struct CloseArchive {
+        mz_zip_archive *archive;
+        ~CloseArchive() { close_zip_reader(archive); }
+    } guard{&archive};
+    const auto entry = [&](const char *name) {
+        size_t size = 0;
+        void *data = mz_zip_reader_extract_file_to_heap(&archive, name, &size, 0);
+        REQUIRE(data != nullptr);
+        std::string content(static_cast<const char *>(data), size);
+        mz_free(data);
+        return content;
+    };
+    CHECK(entry("Metadata/plate_1.gcode").find(mask) != std::string::npos);
+    const auto metadata = entry("Metadata/slice_info.config");
+    CHECK(metadata.find("<filament id=\"8\"") != std::string::npos);
+    CHECK((metadata.find("<filament id=\"1\"") != std::string::npos) == use_second_material);
+    CHECK(metadata.find("<filament id=\"2\"") == std::string::npos);
+}
+
+TEST_CASE("Identical materials bound to different features use their mapped nozzle geometry", "[Print][ToolMapping][ProjectFilamentBindings]")
+{
+    const bool with_support = GENERATE(false, true);
+    PresetBundle bundle;
+    auto &printer = bundle.printers.get_edited_preset().config;
+    printer.set_num_extruders(3);
+    printer.set_deserialize_strict("single_extruder_multi_material", "0");
+    printer.set_deserialize_strict("nozzle_diameter", "0.6,0.2,0.4");
+    printer.set_deserialize_strict("change_filament_gcode", "T{next_extruder}\n");
+    printer.set_deserialize_strict("layer_change_gcode", "G92 E0\n");
+    bundle.set_num_filaments(3); // The same profile in all three logical slots.
+    auto &process = bundle.prints.get_edited_preset().config;
+    process.set_deserialize_strict({{"enable_prime_tower", "0"}, {"skirts", "0"}, {"brim_type", "no_brim"},
+        {"layer_height", "0.1"}, {"initial_layer_print_height", "0.1"}, {"wall_generator", "classic"},
+        {"wall_loops", "2"}, {"sparse_infill_density", "30%"}, {"top_shell_layers", "2"}, {"bottom_shell_layers", "2"},
+        {"line_width", "0"}, {"initial_layer_line_width", "0"}, {"outer_wall_line_width", "0"},
+        {"inner_wall_line_width", "0"}, {"sparse_infill_line_width", "0"}, {"support_line_width", "0"}});
+    for (const auto &key : project_filament_role_keys())
+        process.set_key_value(key, new ConfigOptionInt(-1));
+    process.set_key_value("raft_layers", new ConfigOptionInt(with_support ? 3 : 0));
+    bundle.project_config.set_key_value("project_filament_bindings", new ConfigOptionInts{3, 2, 1, 2, 3, 3, 1, 1});
+    Model project;
+    Print setup;
+    Test::init_print({make_cube(10., 10., 1.2)}, setup, project, bundle.full_config(false));
+    Model job(project);
+    const auto config = bundle.tool_mapped_config(job, {1, 2, 0}, {});
+    Print print;
+    print.set_status_silent();
+    print.apply(job, config);
+    const auto validation = print.validate();
+    INFO(validation.string);
+    REQUIRE(validation.string.empty());
+    print.process();
+    REQUIRE_FALSE(print.objects().empty());
+    const auto *object = print.objects().front();
+    REQUIRE_FALSE(object->layers().empty());
+    REQUIRE_FALSE(object->layers().front()->regions().empty());
+    const auto &region = object->layers().front()->regions().front()->region();
+    const auto outer = region.flow(*object, frExternalPerimeter, 0.1, false);
+    const auto inner = region.flow(*object, frPerimeter, 0.1, false);
+    const auto infill = region.flow(*object, frInfill, 0.1, false);
+    CHECK(region.extruder(frExternalPerimeter) == 2);
+    CHECK(region.extruder(frPerimeter) == 3);
+    CHECK(region.extruder(frInfill) == 1);
+    CHECK_THAT(outer.nozzle_diameter(), Catch::Matchers::WithinAbs(0.2, 1e-6));
+    CHECK_THAT(inner.nozzle_diameter(), Catch::Matchers::WithinAbs(0.4, 1e-6));
+    CHECK_THAT(infill.nozzle_diameter(), Catch::Matchers::WithinAbs(0.6, 1e-6));
+    CHECK(outer.width() < inner.width());
+    CHECK(inner.width() < infill.width());
+    CHECK(outer.mm3_per_mm() < inner.mm3_per_mm());
+    CHECK(inner.mm3_per_mm() < infill.mm3_per_mm());
+    CHECK_THAT(support_material_flow(object, 0.1f).nozzle_diameter(), Catch::Matchers::WithinAbs(0.6, 1e-6));
+    CHECK_THAT(support_material_interface_flow(object, 0.1f).nozzle_diameter(), Catch::Matchers::WithinAbs(0.4, 1e-6));
+
+    ScopedTemporaryFile raw(".gcode");
+    GCodeProcessorResult result;
+    print.export_gcode(raw.string(), &result);
+    std::set<ExtrusionRole> found;
+    for (const auto &move : result.moves) {
+        if (move.type != EMoveType::Extrude) continue;
+        if (move.extrusion_role == erExternalPerimeter) {
+            CHECK(int(move.extruder_id) == 1);
+            CHECK_THAT(move.width, Catch::Matchers::WithinAbs(outer.width(), 0.01));
+            found.insert(move.extrusion_role);
+        } else if (move.extrusion_role == erPerimeter) {
+            CHECK(int(move.extruder_id) == 2);
+            CHECK_THAT(move.width, Catch::Matchers::WithinAbs(inner.width(), 0.01));
+            found.insert(move.extrusion_role);
+        } else if (move.extrusion_role == erInternalInfill) {
+            CHECK(int(move.extruder_id) == 0);
+            CHECK_THAT(move.width, Catch::Matchers::WithinAbs(infill.width(), 0.01));
+            found.insert(move.extrusion_role);
+        } else if (move.extrusion_role == erSupportMaterial) {
+            CHECK(int(move.extruder_id) == 0);
+            found.insert(move.extrusion_role);
+        } else if (move.extrusion_role == erSupportMaterialInterface) {
+            CHECK(int(move.extruder_id) == 2);
+            found.insert(move.extrusion_role);
+        }
+    }
+    CHECK(found.size() == (with_support ? 5 : 3));
+    CHECK(bundle.filament_presets.size() == 3);
+    CHECK(process.opt_int("outer_wall_filament_id") == -1);
+}
 
 TEST_CASE("Per-print area slots reach sliced wall and infill regions",
           "[Print][ProjectFilamentBindings][Regression]")
@@ -263,6 +458,49 @@ TEST_CASE("Internal seam starts and finishes inside without retracing the reserv
             CHECK(overlap < 0.005);
         }
     }
+}
+
+TEST_CASE("Opposite winding inner walls keep connected seam entries and returns", "[Print][Seam][ReverseTail]")
+{
+    const std::string generator = GENERATE("classic", "arachne");
+    const std::string layering = GENERATE("standard", "brick");
+    Print print;
+    Test::init_and_process_print({make_cube(12., 12., 1.)}, print, {
+        {"wall_generator", generator}, {"wall_sequence", "outer wall/inner wall"},
+        {"wall_loops", 3}, {"perimeter_layering", layering},
+        {"staggered_perimeters_inner_only", true}, {"seam_start_on_inner_wall", true},
+        {"seam_slope_type", "none"}, {"seam_gap", 0.06}, {"seam_position", "back"},
+        {"enable_arc_fitting", false}, {"gcode_comments", true}, {"skirt_loops", 0},
+        {"brim_type", "no_brim"}, {"layer_height", 0.2}, {"initial_layer_print_height", 0.2},
+        {"sparse_infill_density", "0%"}, {"top_shell_layers", 0}, {"bottom_shell_layers", 0}
+    });
+    // Opposite winding changes the available tail direction, not the wall
+    // footprint. The seam planner must qualify both possible deposit orders.
+    std::function<void(ExtrusionEntity &)> reverse_inner = [&](ExtrusionEntity &entity) {
+        if (auto *collection = dynamic_cast<ExtrusionEntityCollection *>(&entity)) {
+            for (auto *child : collection->entities) reverse_inner(*child);
+        } else if (entity.inset_idx == 1) {
+            entity.reverse();
+        }
+    };
+    for (const Layer *layer : print.objects().front()->layers())
+        for (LayerRegion *region : layer->regions())
+            reverse_inner(region->perimeters);
+    ScopedTemporaryFile file(".gcode");
+    print.export_gcode(file.string(), nullptr, nullptr);
+    size_t entries = 0, returns = 0;
+    GCodeReader reader;
+    reader.parse_file(file.string(), [&](GCodeReader &self, const GCodeReader::GCodeLine &line) {
+        const auto comment = line.comment();
+        // Exclude approach travels, whose comments also contain the seam name.
+        if (comment == " outer wall seam transition" || comment == " outer wall seam return") {
+            CHECK(line.extruding(self));
+            if (comment == " outer wall seam transition") ++entries;
+            else ++returns;
+        }
+    });
+    CHECK(entries > 0);
+    CHECK(returns == entries);
 }
 
 TEST_CASE("Inner wall seam preparation follows the configured seam position", "[Print][Seam]")
@@ -911,6 +1149,45 @@ TEST_CASE("Sequential printing follows model order", "[Print]")
     });
 
     REQUIRE_THAT(first_object_peak_z, Catch::Matchers::WithinAbs(20.0, 0.3));
+}
+
+TEST_CASE("Sequential object spacing accounts for one moving gantry rather than two", "[Print][SequentialGantryGeometry]")
+{
+    const double gap = GENERATE(6., 9., 15.);
+    Print print;
+    Model model;
+    place_two_cubes_apart(gap, {
+        {"print_sequence", "by object"}, {"extruder_clearance_radius", "75"},
+        {"extruder_clearance_height_to_rod", "100"}, {"extruder_clearance_height_to_lid", "100"},
+        {"skirts", "0"}, {"brim_type", "no_brim"},
+        {"sequential_print_gantry_geometry", R"({"slices":[{"height":0,"type":"convex","polygons":["-8,-8;8,-8;8,8;-8,8"]}]})"}
+    }, print, model);
+    const auto result = Print::sequential_print_clearance_valid(print);
+    INFO(result.string);
+    CHECK(result.string.empty() == (gap > 8.));
+}
+
+TEST_CASE("Modeled sequential clearance distinguishes side gaps from rear gaps", "[Print][SequentialGantryGeometry]")
+{
+    const bool along_y = GENERATE(false, true);
+    const double gap = GENERATE(25., 35., 95.);
+    auto config = DynamicPrintConfig::full_print_config();
+    config.set_deserialize_strict({
+        {"print_sequence", "by object"}, {"extruder_clearance_radius", "75"},
+        {"extruder_clearance_height_to_rod", "100"}, {"extruder_clearance_height_to_lid", "100"},
+        {"skirts", "0"}, {"brim_type", "no_brim"},
+        {"sequential_print_gantry_geometry", R"({"slices":[{"height":0,"type":"convex","polygons":["-27,-90;28,-90;28,21;-27,21"]}]})"}
+    });
+    auto a = Test::cube(20.);
+    auto b = Test::cube(20.);
+    a.translate(50., 50., 0.);
+    b.translate(along_y ? 50. : 70. + gap, along_y ? 70. + gap : 50., 0.);
+    Print print;
+    Model model;
+    Test::init_print(std::vector<TriangleMesh>{std::move(a), std::move(b)}, print, model, config, nullptr, false);
+    const auto result = Print::sequential_print_clearance_valid(print);
+    INFO(result.string);
+    CHECK(result.string.empty() == (gap > (along_y ? 90. : 28.)));
 }
 
 // A sequential (by-object) print must publish the print-level nozzle group result just

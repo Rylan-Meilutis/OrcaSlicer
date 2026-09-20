@@ -1920,10 +1920,11 @@ boost::any& Choice::get_value()
         else
             m_value = field->GetSelection();
     }
-    else if (m_opt_id == "inherits" && field->GetSelection() >= 0 &&
+    else if ((m_opt_id == "inherits" ||
+              (m_opt.type == coString && m_opt.gui_type == ConfigOptionDef::GUIType::select_open)) && field->GetSelection() >= 0 &&
              size_t(field->GetSelection()) < m_opt.enum_values.size()) {
-        // The inheritance selector uses a user-facing "None" label whose
-        // stored value is the empty parent name.
+        // String selectors display labels but persist stable values, including
+        // empty Automatic/None values and builtin: gantry identifiers.
         m_value = m_opt.enum_values[size_t(field->GetSelection())];
     }
     else if (m_opt.gui_type == ConfigOptionDef::GUIType::f_enum_open || m_opt.gui_type == ConfigOptionDef::GUIType::i_enum_open) {

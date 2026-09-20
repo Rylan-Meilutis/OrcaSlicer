@@ -793,13 +793,17 @@ arrangement::ArrangeParams init_arrange_params(Plater *p)
     }
 
     if (params.is_seq_print) {
-        const SequentialGantryGeometry gantry = load_sequential_gantry_geometry(print_config);
+        // The background Print can still contain the previous preset when
+        // arranging immediately after a model selection (or with auto-slicing off).
+        const SequentialGantryGeometry gantry = load_sequential_gantry_geometry(
+            wxGetApp().preset_bundle->printers.get_edited_preset().config);
         if (!gantry.empty()) {
-            // ArrangeParams expresses the required center-to-center clearance
-            // as a diameter, whereas the geometry is measured from the nozzle.
-            params.clearance_radius = std::max(
-                params.clearance_radius,
-                static_cast<float>(2. * (gantry.conservative_clearance_radius() + object_skirt_offset)));
+            // A model replaces the legacy circular fallback. In particular,
+            // a long rear housing must not impose that gap sideways too.
+            if (const Vec2d reach = gantry.clearance_reach(); reach.maxCoeff() > 0.) {
+                params.gantry_clearance = reach + Vec2d::Constant(2. * object_skirt_offset);
+                params.clearance_radius = 0.;
+            }
             if (const double box_height = gantry.first_box_height(); box_height > 0.)
                 params.clearance_height_to_rod = std::min(params.clearance_height_to_rod, static_cast<float>(box_height));
         }

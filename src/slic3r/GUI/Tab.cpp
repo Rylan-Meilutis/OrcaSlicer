@@ -7,6 +7,9 @@
 #include "libslic3r/FilamentMixer.hpp"
 #include "libslic3r/Utils.hpp"
 #include "libslic3r/Model.hpp"
+#include "libslic3r/SequentialGantryGeometry.hpp"
+#include <boost/property_tree/json_parser.hpp>
+#include <boost/nowide/fstream.hpp>
 #include "libslic3r/PublishSettings.hpp"
 #include "libslic3r/GCode/GCodeProcessor.hpp"
 
@@ -2881,6 +2884,7 @@ void TabPrint::build()
         optgroup->append_single_option_line("bridge_flow", "quality_settings_bridging#flow-ratio");
         optgroup->append_single_option_line("internal_bridge_flow", "quality_settings_bridging#flow-ratio");
         optgroup->append_single_option_line("bridge_density", "quality_settings_bridging#bridge-density");
+        optgroup->append_single_option_line("bridge_line_overlap");
         optgroup->append_single_option_line("internal_bridge_density", "quality_settings_bridging#bridge-density");
         optgroup->append_single_option_line("thick_bridges", "quality_settings_bridging#thick-bridges");
         optgroup->append_single_option_line("thick_internal_bridges", "quality_settings_bridging#thick-bridges");
@@ -2897,6 +2901,7 @@ void TabPrint::build()
         optgroup->append_single_option_line("arc_overhang_overlap");
         optgroup->append_single_option_line("arc_overhang_flow_ratio");
         optgroup->append_single_option_line("arc_overhang_speed");
+        optgroup->append_single_option_line("arc_overhang_min_path_time");
         optgroup->append_single_option_line("arc_overhang_stabilization_speed");
         optgroup->append_single_option_line("arc_overhang_layers");
         optgroup->append_single_option_line("arc_overhang_overhang_speed_layers");
@@ -2906,6 +2911,7 @@ void TabPrint::build()
 
         optgroup = page->new_optgroup(L("Overhangs"), L"param_overhang");
         optgroup->append_single_option_line("detect_overhang_wall", "quality_settings_overhangs#detect-overhang-wall");
+        optgroup->append_single_option_line("overhang_wall_overlap");
         optgroup->append_single_option_line("unsupported_wall_last", "quality_settings_overhangs#unsupported-wall-last");
         optgroup->append_single_option_line("make_overhang_printable", "quality_settings_overhangs#make-overhang-printable");
         optgroup->append_single_option_line("make_overhang_printable_angle", "quality_settings_overhangs#maximum-angle");
@@ -3194,6 +3200,10 @@ void TabPrint::build()
         optgroup->append_single_option_line("interlocking_beam_layer_count", "multimaterial_settings_advanced#interlocking-beam-layers");
         optgroup->append_single_option_line("interlocking_depth", "multimaterial_settings_advanced#interlocking-depth");
         optgroup->append_single_option_line("interlocking_boundary_avoidance", "multimaterial_settings_advanced#interlocking-boundary-avoidance");
+
+        optgroup = page->new_optgroup(L("Rooting"), L"rooting");
+        for (const char *key : {"rooting", "rooting_depth", "rooting_width", "rooting_spacing", "rooting_skin"})
+            optgroup->append_single_option_line(key);
 
     page = add_options_page(L("Others"), "custom-gcode_other"); // ORCA: icon only visible on placeholders
         optgroup = page->new_optgroup(L("Skirt"), L"param_skirt");
@@ -5229,6 +5239,7 @@ void TabPrinter::build_fff()
         optgroup->append_single_option_line("printer_structure", "printer_basic_information_advanced#printer-structure");
         optgroup->append_single_option_line("gcode_flavor", "printer_basic_information_advanced#g-code-flavor");
         optgroup->append_single_option_line("gcode_skip_config_block", "printer_basic_information_advanced#skip-g-code-config-block");
+        optgroup->append_single_option_line("gcode_printer_model");
         optgroup->append_single_option_line("pellet_modded_printer", "printer_basic_information_advanced#pellet-modded-printer");
         optgroup->append_single_option_line("bbl_use_printhost", "printer_basic_information_advanced#use-3rd-party-print-host");
 
@@ -5320,8 +5331,67 @@ void TabPrinter::build_fff()
         optgroup->append_single_option_line("extruder_clearance_height_to_rod", "printer_basic_information_extruder_clearance#height-to-rod");
         optgroup->append_single_option_line("extruder_clearance_height_to_lid", "printer_basic_information_extruder_clearance#height-to-lid");
         optgroup->append_single_option_line("nonplanar_toolhead_clearance_angle");
-        optgroup->append_single_option_line("sequential_print_gantry_geometry");
-        optgroup->append_single_option_line("sequential_print_gantry_model");
+        {
+            Option model = optgroup->get_option("sequential_print_gantry_model");
+            model.opt.gui_type = ConfigOptionDef::GUIType::select_open;
+            model.opt.enum_values = {""};
+            model.opt.enum_labels = {L("Automatic (printer profile)")};
+            try {
+                boost::nowide::ifstream input((boost::filesystem::path(resources_dir()) / "data/printer_gantries/geometries.json").string());
+                boost::property_tree::ptree registry;
+                boost::property_tree::read_json(input, registry);
+                for (const auto &entry : registry.get_child("printers")) {
+                    const auto filename = entry.second.get<std::string>("gantry_model_filename", "");
+                    if (filename.empty()) continue;
+                    model.opt.enum_values.push_back("builtin:" + filename);
+                    std::string label = boost::filesystem::path(filename).stem().string();
+                    boost::replace_all(label, "_", " ");
+                    model.opt.enum_labels.push_back(label);
+                }
+            } catch (const std::exception &error) {
+                BOOST_LOG_TRIVIAL(warning) << "Cannot list built-in gantry models: " << error.what();
+            }
+            optgroup->append_single_option_line(model);
+            const auto previous_change = optgroup->m_on_change;
+            optgroup->m_on_change = [this, previous_change](const t_config_option_key &key, const boost::any &value) {
+                // Clear a legacy geometry override before publishing the model
+                // change, otherwise the first refresh still loads the old one.
+                if (key == "sequential_print_gantry_model")
+                    m_config->set_key_value("sequential_print_gantry_geometry", new ConfigOptionString());
+                if (previous_change) previous_change(key, value);
+            };
+            Line import_line{"", ""};
+            // Widget-only rows must bypass OG_CustomCtrl's option renderer,
+            // which requires at least one option (and dereferences front()).
+            import_line.full_width = 1;
+            import_line.append_widget([this](wxWindow *parent) {
+                auto *sizer = new wxBoxSizer(wxHORIZONTAL);
+                auto *button = new Button(parent, _L("Import gantry model…"));
+                button->SetStyle(ButtonStyle::Regular, ButtonType::Parameter);
+                button->SetToolTip(_L("Select a nozzle-centred STL. Saving the printer profile copies the model into an assets folder beside its JSON file."));
+                sizer->Add(button);
+                button->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
+                    wxFileDialog dialog(this, _L("Select gantry collision model"), wxEmptyString, wxEmptyString,
+                                        "STL files (*.stl)|*.stl", wxFD_OPEN | wxFD_FILE_MUST_EXIST);
+                    if (dialog.ShowModal() != wxID_OK) return;
+                    const std::string path = into_u8(dialog.GetPath());
+                    try {
+                        wxBusyCursor busy;
+                        const auto geometry = process_sequential_gantry_model(path);
+                        if (!geometry.validation_error().empty())
+                            throw std::runtime_error(geometry.validation_error());
+                        load_key_value("sequential_print_gantry_geometry", std::string());
+                        load_key_value("sequential_print_gantry_model", path);
+                        update_changed_ui();
+                        on_presets_changed();
+                    } catch (const std::exception &error) {
+                        show_error(this, from_u8(error.what()));
+                    }
+                });
+                return sizer;
+            });
+            optgroup->append_line(import_line);
+        }
 
         optgroup = page->new_optgroup(L("Adaptive bed mesh"), "param_adaptive_mesh");
         optgroup->append_single_option_line("bed_mesh_min", "printer_basic_information_adaptive_bed_mesh#bed-mesh");
@@ -6275,6 +6345,9 @@ void TabPrinter::toggle_options()
     //}
     if (m_active_page->title() == L("Basic information")) {
         const auto &printer_cfg = m_preset_bundle->printers.get_edited_preset().config;
+        // The radius is only the legacy fallback, not an extra minimum on a
+        // selected/automatically matched toolhead model.
+        toggle_line("extruder_clearance_radius", load_sequential_gantry_geometry(printer_cfg).clearance_reach().maxCoeff() == 0.);
 
         // SoftFever: hide BBL specific settings
         for (auto el : {"scan_first_layer", "bbl_calib_mark_logo", "bbl_use_printhost"})

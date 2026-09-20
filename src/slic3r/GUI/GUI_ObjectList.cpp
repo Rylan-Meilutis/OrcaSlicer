@@ -6612,6 +6612,31 @@ void ObjectList::set_extruder_for_selected_items(const int extruder)
 
     take_snapshot(_u8L("Change Filaments"));
 
+    // Filament configuration belongs to an object, not an instance. Detach
+    // selected copies before editing so their siblings keep their materials.
+    std::map<int, std::set<int>> instance_groups;
+    wxDataViewItemArray targets;
+    for (const wxDataViewItem &item : sels) {
+        if (m_objects_model->GetItemType(item) & itInstance)
+            instance_groups[m_objects_model->GetObjectIdByItem(item)].insert(m_objects_model->GetInstanceIdByItem(item));
+        else
+            targets.Add(item);
+    }
+    for (const auto &[object_id, instances] : instance_groups) {
+        const wxDataViewItem parent = m_objects_model->GetItemById(object_id);
+        if (std::find(targets.begin(), targets.end(), parent) != targets.end())
+            continue;
+        if (instances.size() == (*m_objects)[object_id]->instances.size())
+            targets.Add(parent);
+        else {
+            const size_t new_object_id = m_objects->size();
+            instances_to_separated_object(object_id, instances);
+            targets.Add(m_objects_model->GetItemById(new_object_id));
+        }
+    }
+    sels = targets;
+    SetSelections(sels);
+
     for (const wxDataViewItem& sel_item : sels)
     {
         /* We can change extruder for Object/Volume only.

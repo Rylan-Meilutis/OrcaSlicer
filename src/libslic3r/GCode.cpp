@@ -2970,6 +2970,10 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
                                    print.get_layered_nozzle_group_result());
     const bool is_bbl_printers = print.is_BBL_printer();
     const bool skip_config_block = print.config().gcode_skip_config_block;
+    const std::string &model_override = print.config().gcode_printer_model.value;
+    if (std::any_of(model_override.begin(), model_override.end(),
+            [](unsigned char c) { return c < 32 || c == 127; }))
+        throw SlicingError(_(L("G-code printer model must be a single line without control characters.")));
     const WipeTowerType wipe_tower_type = print.wipe_tower_type();
     m_calib_config.clear();
     // Orca: Calibration overrides are reapplied after object/region settings in _extrude().
@@ -2997,6 +3001,8 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
     m_arc_overhang_overhang_start.clear();
     m_arc_overhang_bridge_start.clear();
     m_dissimilar_support_interface_start.clear();
+    m_support_contact_filaments.clear();
+    m_dissimilar_support_footprints.clear();
     // Clearance validation needs ordered occupancy only on a variable-Z layer
     // and on the physical layer immediately below it. Building grids for every
     // extrusion on every other layer dominates export time on tall models.
@@ -3664,7 +3670,7 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
         const ConfigOptionInts* first_bed_temp_opt = m_config.option<ConfigOptionInts>(get_bed_temp_1st_layer_key((BedType)curr_bed_type));
         const ConfigOptionInts* bed_temp_opt = m_config.option<ConfigOptionInts>(get_bed_temp_key((BedType)curr_bed_type));
         int target_bed_temp = 0;
-        if (m_config.bed_temperature_formula == BedTempFormula::btfHighestTemp)
+        if (m_config.bed_temperature_formula != BedTempFormula::btfFirstFilament)
             target_bed_temp = get_highest_bed_temperature(true, print);
         else
             target_bed_temp = get_bed_temperature(initial_extruder_id, true, curr_bed_type);
@@ -3682,6 +3688,17 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
 
         // SoftFever: support variables `first_layer_temperature` and `first_layer_bed_temperature`
         this->placeholder_parser().set("first_layer_bed_temperature", new ConfigOptionInts(*first_bed_temp_opt));
+        if (m_config.bed_temperature_formula == BedTempFormula::btfBedContact) {
+            // Older startup templates index these vectors by the initial tool.
+            // Keep their syntax intact while applying the job's bed policy.
+            const size_t count = first_bed_temp_opt->values.size();
+            const ConfigOptionInts first(std::vector<int>(count, target_bed_temp));
+            const ConfigOptionInts normal(std::vector<int>(bed_temp_opt->values.size(),
+                get_highest_bed_temperature(false, print)));
+            this->placeholder_parser().set("first_layer_bed_temperature", new ConfigOptionInts(first));
+            this->placeholder_parser().set("bed_temperature_initial_layer", new ConfigOptionInts(first));
+            this->placeholder_parser().set("bed_temperature", new ConfigOptionInts(normal));
+        }
         this->placeholder_parser().set("first_layer_temperature", new ConfigOptionInts(m_config.nozzle_temperature_initial_layer));
         this->placeholder_parser().set("max_print_height",new ConfigOptionInt(m_config.printable_height));
         this->placeholder_parser().set("z_offset", new ConfigOptionFloat(m_config.z_offset));
@@ -4257,6 +4274,10 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
 
           file.write("; CONFIG_BLOCK_END\n\n");
       } // !skip_config_block
+      // Nozzle Filament Validator reads the file tail, not its header.
+      // Keep the explicit identity there even without the optional config dump.
+      if (skip_config_block && !boost::trim_copy(model_override).empty())
+          file.write_format("; printer_model = %s\n", boost::trim_copy(model_override).c_str());
 
     }
     file.write("\n");
@@ -4775,7 +4796,11 @@ int GCode::get_highest_bed_temperature(const bool is_first_layer, const Print& p
 {
     auto bed_type = m_config.curr_bed_type;
     int bed_temp = 0;
-    for (auto fidx : print.get_slice_used_filaments(is_first_layer)) {
+    // The bed remains in contact with the first layer, not the tool currently
+    // printing an elevated interface. Sequential prints collect every object's
+    // first-layer tools in this same list.
+    const bool bed_contact_only = m_config.bed_temperature_formula == BedTempFormula::btfBedContact;
+    for (auto fidx : print.get_slice_used_filaments(is_first_layer || bed_contact_only)) {
         bed_temp = std::max(bed_temp, get_bed_temperature(fidx, is_first_layer, bed_type));
     }
     return bed_temp;
@@ -4791,7 +4816,7 @@ void GCode::_print_first_layer_bed_temperature(GCodeOutputStream &file, Print &p
     // BBS
     std::vector<int> temps_per_bed;
     int bed_temp = 0;
-    if (m_config.bed_temperature_formula.value == BedTempFormula::btfHighestTemp) {
+    if (m_config.bed_temperature_formula.value != BedTempFormula::btfFirstFilament) {
         bed_temp = get_highest_bed_temperature(true, print);
     }
     else {
@@ -5919,7 +5944,7 @@ LayerResult GCode::process_layer(
 
         // BBS
         int bed_temp = 0;
-        if (m_config.bed_temperature_formula == BedTempFormula::btfHighestTemp)
+        if (m_config.bed_temperature_formula != BedTempFormula::btfFirstFilament)
             bed_temp = get_highest_bed_temperature(false,print);
         else
             bed_temp = get_bed_temperature(first_extruder_id, false, m_config.curr_bed_type);
@@ -7376,6 +7401,9 @@ void GCode::apply_print_config(const PrintConfig &print_config)
 void GCode::append_full_config(const Print &print, std::string &str)
 {
     DynamicPrintConfig cfg = print.full_print_config();
+    const std::string model = boost::trim_copy(print.config().gcode_printer_model.value);
+    if (!model.empty())
+        cfg.option<ConfigOptionString>("printer_model")->value = model;
     { // correct the flush_volumes_matrix with flush_multiplier values
         // Fast purge mode uses flush_multiplier_fast; Default is inert.
         std::vector<double> temp_cfg_flush_multiplier = (print.config().prime_volume_mode == PrimeVolumeMode::pvmFast)
@@ -8037,7 +8065,7 @@ std::string GCode::extrude_loop(const ExtrusionLoop&        loop_ref,
                 const auto transition_intersections =
                     all_inner_wall_distancer.intersections_with_line<true>(transition);
                 const double endpoint_tolerance2 = scaled<double>(0.01) * scaled<double>(0.01);
-                const bool transition_crosses_inner_wall = std::any_of(
+                bool transition_crosses_inner_wall = std::any_of(
                     transition_intersections.begin(), transition_intersections.end(),
                     [&inner_start, endpoint_tolerance2](const auto &intersection) {
                         return (intersection.first - inner_start).template cast<double>().squaredNorm() >
@@ -8063,17 +8091,7 @@ std::string GCode::extrude_loop(const ExtrusionLoop&        loop_ref,
                 // Reserve the complete inner-wall tail, but deposit its latter
                 // half on entry and its former half on exit. Both meet inside
                 // the wall, without retracing the primer or the inner loop.
-                if (!transition_crosses_inner_wall && !primer_paths.empty()) {
-                    const Point exit_inner = primer_paths.front().first_point();
-                    const Line exit(paths.back().last_point(), exit_inner);
-                    const auto exit_intersections =
-                        all_inner_wall_distancer.intersections_with_line<true>(exit);
-                    const bool crosses_inner = std::any_of(
-                        exit_intersections.begin(), exit_intersections.end(),
-                        [&exit_inner, endpoint_tolerance2](const auto &intersection) {
-                            return (intersection.first - exit_inner).template cast<double>().squaredNorm() >
-                                   endpoint_tolerance2;
-                        });
+                if (!primer_paths.empty()) {
                     Lines outer_lines;
                     for (const ExtrusionPath &path : paths)
                         append(outer_lines, path.polyline.to_polyline().lines());
@@ -8086,17 +8104,52 @@ std::string GCode::extrude_loop(const ExtrusionLoop&        loop_ref,
                                        endpoint_tolerance2;
                             });
                     };
-                    Point intersection;
-                    const bool crossed_connectors = transition.intersection(exit, &intersection) &&
-                        (intersection - outer_start).cast<double>().squaredNorm() > endpoint_tolerance2;
-                    if (!crosses_inner && !crossed_connectors &&
-                        !crosses_outer(transition, outer_start) &&
-                        !crosses_outer(exit, paths.back().last_point()) &&
-                        internal_seam_height_compatible(primer_paths.back().last_point3().z(),
-                            paths.front().first_point3().z(), transition.length()) &&
-                        internal_seam_height_compatible(paths.back().last_point3().z(),
-                            primer_paths.front().first_point3().z(), exit.length()) &&
-                        exit.length() <= 2. * max_transition_length) {
+                    const auto can_join = [&](const ExtrusionPaths &tail) {
+                        const Point entry_inner = tail.back().last_point();
+                        const Point exit_inner = tail.front().first_point();
+                        const Line entry(entry_inner, outer_start);
+                        const Line exit(paths.back().last_point(), exit_inner);
+                        const auto crosses_inner = [&](const Line &connector, const Point &endpoint) {
+                            const auto intersections = all_inner_wall_distancer.intersections_with_line<true>(connector);
+                            return std::any_of(intersections.begin(), intersections.end(),
+                                [&](const auto &intersection) {
+                                    return (intersection.first - endpoint).template cast<double>().squaredNorm() >
+                                           endpoint_tolerance2;
+                                });
+                        };
+                        Point intersection;
+                        const bool crossed = entry.intersection(exit, &intersection) &&
+                            (intersection - outer_start).cast<double>().squaredNorm() > endpoint_tolerance2;
+                        // Either connector may reach the far end of the reserved
+                        // tail. Apply the return's length bound symmetrically;
+                        // the near endpoint must still be within the original
+                        // two-nozzle adjacency radius checked above.
+                        return entry.length() > scaled<double>(0.05) &&
+                            entry.length() <= 2. * max_transition_length && exit.length() <= 2. * max_transition_length &&
+                            !crossed && !crosses_inner(entry, entry_inner) && !crosses_inner(exit, exit_inner) &&
+                            !crosses_outer(entry, outer_start) && !crosses_outer(exit, paths.back().last_point()) &&
+                            internal_seam_height_compatible(tail.back().last_point3().z(),
+                                paths.front().first_point3().z(), entry.length()) &&
+                            internal_seam_height_compatible(paths.back().last_point3().z(),
+                                tail.front().first_point3().z(), exit.length());
+                    };
+                    bool joined = can_join(primer_paths);
+                    if (!joined) {
+                        // The reserved footprint is independent of deposition direction.
+                        // Try the opposite direction at corners before falling back, without
+                        // changing the original reservation used to trim the inner wall.
+                        ExtrusionPaths reversed = primer_paths;
+                        std::reverse(reversed.begin(), reversed.end());
+                        for (ExtrusionPath &path : reversed)
+                            path.reverse();
+                        if (can_join(reversed)) {
+                            primer_paths = std::move(reversed);
+                            joined = true;
+                        }
+                    }
+                    if (joined) {
+                        inner_start = primer_paths.back().last_point();
+                        transition_crosses_inner_wall = false;
                         ExtrusionLoop tail(primer_paths);
                         const double half_length = tail.length() * 0.5;
                         tail.clip_end(half_length, &inner_seam_finish);
@@ -9243,6 +9296,45 @@ std::string GCode::_extrude(const ExtrusionPath &input_path, std::string descrip
         unsigned(-1) : m_writer.filament()->id();
     const auto dissimilar_interface_key = std::make_pair(print_object, current_filament_id);
     if (m_config.slow_down_layer_above_dissimilar_support_interface.value &&
+        current_filament_id < m_config.filament_type.values.size() && is_support(path.role())) {
+        if (const auto *support = dynamic_cast<const SupportLayer *>(m_layer)) {
+            m_support_contact_filaments[{support, path.role()}] = current_filament_id;
+            const auto &layers = support->object()->support_layers();
+            const auto previous = std::lower_bound(layers.begin(), layers.end(), support->bottom_z() + EPSILON,
+                [](const SupportLayer *layer, double z) { return layer->print_z < z; });
+            if (previous != layers.begin()) {
+                const SupportLayer *below = *std::prev(previous);
+                // Only vertically touching courses qualify. A same-height
+                // side boundary, or support across an air gap, is not contact.
+                if (std::abs(below->print_z - support->bottom_z()) < 0.001) {
+                    const auto key = std::make_pair(below, current_filament_id);
+                    auto footprint = m_dissimilar_support_footprints.find(key);
+                    if (footprint == m_dissimilar_support_footprints.end()) {
+                        Polygons coverage;
+                        std::function<void(const ExtrusionEntity &)> collect = [&](const ExtrusionEntity &entity) {
+                            if (const auto *collection = dynamic_cast<const ExtrusionEntityCollection *>(&entity)) {
+                                for (const auto *child : collection->entities) collect(*child);
+                                return;
+                            }
+                            const auto slot = m_support_contact_filaments.find({below, entity.role()});
+                            if (slot == m_support_contact_filaments.end() ||
+                                slot->second >= m_config.filament_type.values.size()) return;
+                            const auto &material = m_config.filament_type.get_at(slot->second);
+                            const auto &current_material = m_config.filament_type.get_at(current_filament_id);
+                            if (!material.empty() && !current_material.empty() && material != current_material)
+                                entity.polygons_covered_by_width(coverage, float(SCALED_EPSILON));
+                        };
+                        collect(below->support_fills);
+                        footprint = m_dissimilar_support_footprints.emplace(key, union_(coverage)).first;
+                    }
+                    if (!footprint->second.empty() &&
+                        !intersection_pl(Polylines{path.as_polyline()}, footprint->second).empty())
+                        dissimilar_interface_speed_blend = 0.;
+                }
+            }
+        }
+    }
+    if (m_config.slow_down_layer_above_dissimilar_support_interface.value &&
         print_object != nullptr && m_layer != nullptr && !is_support(path.role()) &&
         current_filament_id != unsigned(-1)) {
         const int interface_filament = print_object->config().support_interface_filament.value - 1;
@@ -9511,7 +9603,12 @@ std::string GCode::_extrude(const ExtrusionPath &input_path, std::string descrip
         ((!layer_has_top_surface && !layer_has_bridge_surface) || path.staggered_perimeter) &&
         m_config.wall_loops.value >= 3 && path.role() == erPerimeter &&
         path.inset_idx > 0 && path.inset_idx < m_config.wall_loops.value - 1;
-    const double inner_walls_flow = m_config.inner_walls_flow_ratio.get_abs_value(1.);
+    // Brick courses interleave with walls deposited later at another height.
+    // Their scheduled cross-section already fills that space; thickening them
+    // at emission cannot be made safe by ordinary inner/outer wall ordering.
+    const double requested_inner_walls_flow = m_config.inner_walls_flow_ratio.get_abs_value(1.);
+    const double inner_walls_flow = m_config.perimeter_layering.value == PerimeterLayeringMode::Brick ?
+        std::min(1., requested_inner_walls_flow) : requested_inner_walls_flow;
     if (use_inner_walls_flow)
         _mm3_per_mm *= inner_walls_flow;
 
@@ -9642,6 +9739,12 @@ std::string GCode::_extrude(const ExtrusionPath &input_path, std::string descrip
     if (FILAMENT_CONFIG(filament_max_volumetric_speed) > 0) {
         // cap speed with max_volumetric_speed anyway (even if user is not using autospeed)
         speed = std::min(speed, FILAMENT_CONFIG(filament_max_volumetric_speed) / _mm3_per_mm);
+    }
+    if (is_arc_fill(path.role()) && m_config.arc_overhang_min_path_time.value > 0.) {
+        // One limit per native arc path, independent of its tessellation or G2/G3
+        // fitting. Never speed up a path already capped by flow or other limits.
+        speed = std::min(speed, std::max(0.1,
+            unscale<double>(path.length()) / m_config.arc_overhang_min_path_time.value));
     }
     // ORCA: resonance‑avoidance on short external perimeters
 {
@@ -10337,8 +10440,8 @@ std::string GCode::_extrude(const ExtrusionPath &input_path, std::string descrip
                 double extrusion_ratio = 1;
                 // A non-planar skin's local Z offset changes the deposited
                 // shell thickness. Brick/staggered walls are merely shifted
-                // bodily upward, so their volume must come exclusively from
-                // the existing inner_walls_flow_ratio setting.
+                // bodily upward, so their volume comes from the scheduled
+                // cross-section, not the absolute Z offset.
                 if (!path.nonplanar_surface && path.role() != erIroning &&
                     !path.staggered_perimeter) {
                     extrusion_ratio = (path.height + z_diff) / path.height;

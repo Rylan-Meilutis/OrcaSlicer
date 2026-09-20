@@ -1,5 +1,6 @@
 #include "Arrange.hpp"
 #include "Print.hpp"
+#include "SequentialGantryGeometry.hpp"
 #include "BoundingBox.hpp"
 #include "libslic3r.h"
 
@@ -92,8 +93,8 @@ void update_arrange_params(ArrangeParams& params, const DynamicPrintConfig* prin
     params.bed_shrink_y += params.brim_skirt_distance;
     // for sequential print, we need to inflate the bed because clearance_radius is so large
     if (params.is_seq_print) {
-        params.bed_shrink_x -= params.clearance_radius / 2;
-        params.bed_shrink_y -= params.clearance_radius / 2;
+        params.bed_shrink_x -= (params.gantry_clearance.maxCoeff() > 0. ? params.gantry_clearance.x() : params.clearance_radius) / 2;
+        params.bed_shrink_y -= (params.gantry_clearance.maxCoeff() > 0. ? params.gantry_clearance.y() : params.clearance_radius) / 2;
     }
 }
 
@@ -102,7 +103,7 @@ void update_selected_items_inflation(ArrangePolygons& selected, const DynamicPri
     Points      bedpts = get_shrink_bedpts(print_cfg, params);
     BoundingBox bedbb = Polygon(bedpts).bounding_box();
     // set obj distance for auto seq_print
-    if (params.is_seq_print) {
+    if (params.is_seq_print && params.gantry_clearance.maxCoeff() == 0.) {
         bool all_objects_are_short = std::all_of(selected.begin(), selected.end(), [&](ArrangePolygon& ap) { return ap.height < params.nozzle_height; });
         if (all_objects_are_short) {
             params.min_obj_distance = std::max(params.min_obj_distance, scaled(std::max(MAX_OUTER_NOZZLE_DIAMETER/2.f, params.object_skirt_offset*2)+0.001));
@@ -136,7 +137,8 @@ void update_unselected_items_inflation(ArrangePolygons& unselected, const Dynami
     float exclusion_gap = 1.f;
     if (params.is_seq_print) {
         // bed_shrink_x is typically (-params.clearance_radius / 2+5) for seq_print
-        exclusion_gap = std::max(exclusion_gap, params.clearance_radius / 2 + params.bed_shrink_x + 1.f);  // +1mm gap so the exclusion region is not too close
+        const float x_clearance = params.gantry_clearance.maxCoeff() > 0. ? float(params.gantry_clearance.x()) : params.clearance_radius;
+        exclusion_gap = std::max(exclusion_gap, x_clearance / 2 + params.bed_shrink_x + 1.f);  // +1mm gap so the exclusion region is not too close
         // dont forget to move the excluded region
         for (auto& region : unselected) {
             if (region.is_virt_object) region.poly.translate(scaled(params.bed_shrink_x), scaled(params.bed_shrink_y));
@@ -1127,20 +1129,38 @@ void arrange(ArrangePolygons &      arrangables,
     std::vector<Item> items, fixeditems;
     items.reserve(arrangables.size());
 
-    for (ArrangePolygon &arrangeable : arrangables)
-        process_arrangeable(arrangeable, items);
+    const bool modeled_clearance = params.is_seq_print && params.gantry_clearance.maxCoeff() > 0.;
+    auto process = [&](const ArrangePolygon &source, std::vector<Item> &output) {
+        if (!modeled_clearance || source.is_virt_object) {
+            process_arrangeable(source, output);
+            return;
+        }
+        ArrangePolygon expanded = source;
+        expanded.poly.contour.rotate(source.rotation);
+        expanded.poly.contour = sequential_clearance_hull(expanded.poly.contour, params.gantry_clearance * 0.5);
+        expanded.rotation = 0.;
+        process_arrangeable(expanded, output);
+    };
+    for (const ArrangePolygon &arrangeable : arrangables)
+        process(arrangeable, items);
 
     for (const ArrangePolygon &fixed: excludes)
-        process_arrangeable(fixed, fixeditems);
+        process(fixed, fixeditems);
 
     for (Item &itm : fixeditems) itm.inflate(scaled(-2. * EPSILON));
 
-    _arrange(items, fixeditems, to_nestbin(bed), params, params.progressind, params.stopcondition);
+    ArrangeParams packing_params = params;
+    // These envelopes are fixed to machine axes, not object axes. Preserve
+    // existing object orientations rather than rotate the gantry with them.
+    if (modeled_clearance)
+        packing_params.allow_rotations = false;
+    _arrange(items, fixeditems, to_nestbin(bed), packing_params, params.progressind, params.stopcondition);
 
     for(size_t i = 0; i < items.size(); ++i) {
         Point tr = items[i].translation();
         arrangables[i].translation = {coord_t(tr.x()), coord_t(tr.y())};
-        arrangables[i].rotation    = items[i].rotation();
+        if (!modeled_clearance || arrangables[i].is_virt_object)
+            arrangables[i].rotation = items[i].rotation();
         arrangables[i].bed_idx     = items[i].binId();
         arrangables[i].itemid      = items[i].itemId();  // arrange order is useful for sequential printing
     }

@@ -3970,6 +3970,24 @@ void GCodeViewer::render_legend(float &legend_height, int canvas_width, int canv
         wxGetApp().plater()->get_current_canvas3D()->request_extra_frame();
     }
 
+    if (m_gcode_result != nullptr && m_viewer.get_vertices_count() > 0) {
+        const auto *targets = m_gcode_result->temperature_targets_at(m_viewer.get_current_vertex().gcode_id);
+        if (targets != nullptr && (targets->bed.has_value() || !targets->tools.empty())) {
+            ImGui::Separator();
+            imgui.text(_u8L("Temperature targets (℃)"));
+            char value[32];
+            if (targets->bed.has_value()) {
+                std::snprintf(value, sizeof(value), "%.0f", *targets->bed);
+                imgui.text(_u8L("Bed") + ": " + value);
+            }
+            for (const auto &[tool, temperature] : targets->tools) {
+                std::snprintf(value, sizeof(value), "%.0f", temperature);
+                imgui.text(_u8L("Tool") + " " + std::to_string(tool + 1) +
+                    " (T" + std::to_string(tool) + "): " + value);
+            }
+        }
+    }
+
     // data used to properly align items in columns when showing time
     std::vector<float> offsets;
     std::vector<std::string> labels;

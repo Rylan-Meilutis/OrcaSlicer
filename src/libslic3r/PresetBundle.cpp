@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <set>
+#include <numeric>
 #include <fstream>
 #include <unordered_set>
 #include <boost/filesystem.hpp>
@@ -3420,11 +3421,33 @@ void PresetBundle::export_selections(AppConfig &config)
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": printer %1%, print %2%, filaments[0] %3% ")%printers.get_selected_preset_name() % prints.get_selected_preset_name() %filament_presets[0];
 }
 
+static bool uses_octoprint_tool_mapping(const PresetBundle &bundle)
+{
+    const DynamicPrintConfig &config = bundle.physical_printers.get_selected_idx() != size_t(-1) ?
+        bundle.physical_printers.get_selected_printer().config : bundle.printers.get_edited_preset().config;
+    const auto *host = config.opt<ConfigOptionEnum<PrintHostType>>("host_type");
+    return host != nullptr && host->value == htOctoPrint;
+}
+
+static bool uses_independent_tool_materials(const PresetBundle &bundle)
+{
+    // Match the native Bambu model registry without changing its AMS palette.
+    const auto vendor = bundle.vendors.find("BBL");
+    const auto model = bundle.printers.get_edited_preset().config.opt_string("printer_model");
+    const bool bambu = vendor != bundle.vendors.end() && std::any_of(
+        vendor->second.models.begin(), vendor->second.models.end(),
+        [&](const auto &entry) { return entry.name == model; });
+    return !bambu && bundle.get_printer_extruder_count() > 1 &&
+        !bundle.printers.get_edited_preset().config.opt_bool("single_extruder_multi_material");
+}
+
 // BBS
 size_t PresetBundle::max_filament_colors() const
 {
     const Preset& printer = printers.get_edited_preset();
     const auto* configured = printer.config.opt<ConfigOptionInt>("max_filament_colors");
+    if ((uses_octoprint_tool_mapping(*this) || uses_independent_tool_materials(*this)) && get_printer_extruder_count() > 1)
+        return size_t(get_printer_extruder_count());
     const bool single_extruder_multi_material =
         printer.config.opt_bool("single_extruder_multi_material") &&
         get_printer_extruder_count() == 1;
@@ -3435,11 +3458,10 @@ size_t PresetBundle::max_filament_colors() const
 
 bool PresetBundle::has_fixed_filament_slots() const
 {
-    const Preset &printer = printers.get_edited_preset();
-    const auto *configured = printer.config.opt<ConfigOptionInt>("max_filament_colors");
-    return printer.config.opt_bool("single_extruder_multi_material") &&
-           get_printer_extruder_count() == 1 &&
-           configured != nullptr && configured->value > 0;
+    // Project materials are logical slots, not a list of every loaded tool.
+    // max_filament_colors limits capacity; it must not force empty slots into
+    // every project or prevent deleting an unused project material.
+    return false;
 }
 
 static std::string fixed_filament_slot_color(size_t index)
@@ -3456,7 +3478,7 @@ static std::string fixed_filament_slot_color(size_t index)
 void PresetBundle::set_num_filaments(unsigned int n, std::string new_color)
 {
     const bool fixed_slots = has_fixed_filament_slots();
-    n = unsigned(fixed_slots ? max_filament_colors() : std::min<size_t>(n, max_filament_colors()));
+    n = unsigned(fixed_slots ? max_filament_colors() : std::clamp<size_t>(n, 1, max_filament_colors()));
     unsigned old_filament_count = this->filament_presets.size();
     if (n > old_filament_count && old_filament_count != 0)
         filament_presets.resize(n, filament_presets.back());
@@ -4528,7 +4550,8 @@ void PresetBundle::update_filament_count()
 {
     if (printers.get_edited_preset().printer_technology() != ptFFF)
         return;
-    const size_t num_extruders = static_cast<size_t>(get_printer_extruder_count());
+    const size_t num_extruders = (uses_octoprint_tool_mapping(*this) || uses_independent_tool_materials(*this)) ? 1 :
+        static_cast<size_t>(get_printer_extruder_count());
     if (filament_presets.size() >= num_extruders)
         return;
     filament_presets.resize(num_extruders, filament_presets.empty()
@@ -4580,6 +4603,108 @@ DynamicPrintConfig PresetBundle::full_config_secure(std::optional<std::vector<in
     config.erase("printhost_password");    
     config.erase("printhost_port");
     return config;
+}
+
+DynamicPrintConfig PresetBundle::tool_mapped_config(Model &job_model, const std::vector<int> &tools,
+                                                   const DynamicPrintConfig &plate_config) const
+{
+    const size_t count = filament_presets.size();
+    const size_t capacity = get_printer_extruder_count();
+    std::set<int> assigned;
+    if (tools.size() != count || count == 0 || count > capacity)
+        throw std::invalid_argument("The material mapping must include each project filament and fit the printer.");
+    for (int tool : tools)
+        if (tool < 0 || size_t(tool) >= capacity || !assigned.insert(tool).second)
+            throw std::invalid_argument("Each material must map to a different available printer tool.");
+
+    PresetBundle job(*this);
+    job.prints.get_edited_preset().config.apply(plate_config);
+    DynamicPrintConfig roles = full_config(false);
+    roles.apply(plate_config);
+    resolve_project_filament_bindings(roles, project_default_filament(job_model));
+    std::vector<std::string> mapped_roles = project_filament_role_keys();
+    mapped_roles.emplace_back("wipe_tower_filament");
+    for (const std::string &key : mapped_roles) {
+        const int slot = roles.opt_int(key);
+        if (slot > int(count))
+            throw std::invalid_argument("A print role refers to an unavailable project filament.");
+        job.prints.get_edited_preset().config.set_key_value(key,
+            new ConfigOptionInt(slot > 0 ? tools[slot - 1] + 1 : slot));
+    }
+
+    // Unused physical slots carry a valid profile but acquire no geometry.
+    // Recompose from presets so nozzle-dependent profile variants are resolved
+    // by Print::apply for the destination nozzle, not copied from the old one.
+    job.filament_presets.assign(capacity, filament_presets.front());
+    for (size_t i = 0; i < count; ++i)
+        job.filament_presets[tools[i]] = filament_presets[i];
+    const auto remap_vector = [&](const char *key) {
+        const auto *source = dynamic_cast<const ConfigOptionVectorBase *>(project_config.option(key));
+        if (source == nullptr || source->size() == 0)
+            return;
+        auto *dest = static_cast<ConfigOptionVectorBase *>(source->clone());
+        job.project_config.set_key_value(key, dest);
+        dest->resize(capacity, source);
+        for (size_t i = 0; i < capacity; ++i)
+            dest->set_at(source, i, 0);
+        for (size_t i = 0; i < count; ++i)
+            dest->set_at(source, tools[i], i < source->size() ? i : 0);
+    };
+    for (const char *key : {"filament_colour", "filament_colour_type", "filament_multi_colour", "filament_volume_map"})
+        remap_vector(key);
+    // Virtual mixtures require more than one physical tool per material and
+    // cannot be represented by this one-to-one dispatch dialog.
+    if (const auto *mixed = project_config.option<ConfigOptionBools>("filament_is_mixed"))
+        if (std::any_of(mixed->values.begin(), mixed->values.end(), [](bool value) { return value; }))
+            throw std::invalid_argument("Physical tool mapping is not available for virtual mixed filaments.");
+    for (const char *key : {"filament_is_mixed", "filament_mixed_components", "filament_mixed_sublayer_ratios",
+                            "filament_mixed_gradient", "filament_mixed_gradient_range", "filament_mixed_gradient_curve",
+                            "filament_mixed_gradient_per_part"})
+        remap_vector(key);
+
+    // Purge volumes are indexed by material pair, with one matrix per nozzle.
+    for (const char *key : {"flush_volumes_vector", "flush_volumes_matrix"}) {
+        const auto *source = project_config.option<ConfigOptionFloats>(key);
+        if (source == nullptr || source->values.empty())
+            continue;
+        const bool matrix = std::string(key) == "flush_volumes_matrix";
+        const size_t old_block = matrix ? count * count : count * 2;
+        const size_t new_block = matrix ? capacity * capacity : capacity * 2;
+        if (source->size() % old_block != 0)
+            throw std::invalid_argument("Invalid purge-volume table for the project material count.");
+        std::vector<double> values(source->size() / old_block * new_block, 0.);
+        for (size_t block = 0; block < source->size() / old_block; ++block)
+            for (size_t i = 0; i < count; ++i)
+                for (size_t j = 0; j < (matrix ? count : 2); ++j)
+                    values[block * new_block + tools[i] * (matrix ? capacity : 2) + (matrix ? tools[j] : j)] =
+                        source->values[block * old_block + i * (matrix ? count : 2) + j];
+        job.project_config.set_key_value(key, new ConfigOptionFloats(values));
+    }
+    std::vector<int> identity(capacity);
+    std::iota(identity.begin(), identity.end(), 1);
+    job.project_config.set_key_value("filament_map", new ConfigOptionInts(identity));
+    job.project_config.set_key_value("filament_nozzle_map", new ConfigOptionInts(std::vector<int>(capacity, 0)));
+    job.project_config.set_key_value("filament_map_mode", new ConfigOptionEnum<FilamentMapMode>(fmmManual));
+    // Per-print symbolic bindings have been resolved above. Do not resolve
+    // them a second time against the new physical numbering.
+    job.project_config.erase("project_filament_bindings");
+    job.project_config.erase("project_filament_roles");
+    DynamicPrintConfig result = job.full_config(false, identity);
+    for (const char *key : {"print_host", "print_host_webui", "printhost_apikey", "printhost_cafile",
+                            "printhost_user", "printhost_password", "printhost_port"})
+        result.erase(key);
+    for (const std::string &key : mapped_roles)
+        result.set_key_value(key, job.prints.get_edited_preset().config.option(key)->clone());
+
+    std::map<int, int> relocations;
+    for (size_t i = 0; i < count; ++i)
+        relocations.emplace(int(i), tools[i]);
+    // Implicit model-part material means logical slot 1, not physical T0.
+    for (ModelObject *object : job_model.objects)
+        if (!object->config.has("extruder") || object->config.extruder() <= 0)
+            object->config.set("extruder", 1);
+    remap_model_filament_slots(job_model, relocations);
+    return result;
 }
 
 std::vector<std::vector<std::vector<float>>> PresetBundle::get_full_flush_matrix(bool with_multiplier) const
@@ -7309,7 +7434,7 @@ void PresetBundle::update_multi_material_filament_presets(size_t to_delete_filam
     size_t num_filaments = this->filament_presets.size();
 
     auto* nozzle_diameter = static_cast<const ConfigOptionFloats*>(printers.get_edited_preset().config.option("nozzle_diameter"));
-    size_t num_extruders  = nozzle_diameter->values.size();
+    size_t num_extruders  = (uses_octoprint_tool_mapping(*this) || uses_independent_tool_materials(*this)) ? 1 : nozzle_diameter->values.size();
     if (num_extruders > num_filaments) { // Verify validity of the current filament presets.
         for (size_t i = 0; i < std::min(this->filament_presets.size(), num_extruders); ++i)
             this->filament_presets[i] = this->filaments.find_preset(this->filament_presets[i], true)->name;
