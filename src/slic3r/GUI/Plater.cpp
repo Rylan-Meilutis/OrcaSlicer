@@ -56,6 +56,7 @@
 #include <wx/notebook.h>
 #include <wx/srchctrl.h>
 #include <wx/listbox.h>
+#include <wx/checklst.h>
 #ifdef _WIN32
 #include <wx/richtooltip.h>
 #include <wx/custombgwin.h>
@@ -354,7 +355,7 @@ public:
         heading->SetFont(Label::Head_14);
         root->Add(heading, 0, wxLEFT | wxRIGHT | wxTOP, FromDIP(12));
         auto *help = new wxStaticText(this, wxID_ANY,
-            _L("Match your project colors to loaded printer tools. Suggestions use material and color; you can change any assignment."));
+            _L("Match your project colors to loaded printer tools. Suggestions use material, color and the nozzle selected during sync; you can change any assignment."));
         help->Wrap(FromDIP(700));
         root->Add(help, 0, wxEXPAND | wxALL, FromDIP(12));
         if (inventory_error.empty())
@@ -433,6 +434,18 @@ public:
             choice->SetToolTip(_L("Nozzle diameter is configured in the printer profile. Auto line widths follow the selected nozzle; explicit widths are preserved. Choose a layer height compatible with every nozzle used."));
             int best = -1;
             double best_score = std::numeric_limits<double>::max();
+            const auto *source_tools = bundle.project_config.opt<ConfigOptionInts>("filament_map");
+            const auto *map_mode = bundle.project_config.opt<ConfigOptionEnum<FilamentMapMode>>("filament_map_mode");
+            const int preferred_tool = map_mode && map_mode->value == fmmManual && source_tools && i < source_tools->values.size()
+                ? source_tools->values[i] - 1 : int(i);
+            const bool has_selected_nozzle = map_mode && map_mode->value == fmmManual &&
+                preferred_tool >= 0 && size_t(preferred_tool) < capacity;
+            const double selected_diameter = has_selected_nozzle ?
+                bundle.printers.get_edited_preset().config.opt_float("nozzle_diameter", preferred_tool) : 0.;
+            if (has_selected_nozzle)
+                description->Add(new wxStaticText(scroll, wxID_ANY,
+                    format_wxstr(_L("Selected nozzle: %1% mm"), wxString::Format("%.2f", selected_diameter))),
+                    0, wxTOP, FromDIP(4));
             for (size_t tool = 0; tool < capacity; ++tool) {
                 const auto spool = tool < spools.size() ? spools[tool] : SpoolManagerMetadata::Filament{};
                 const wxColour loaded_color = spool_colour(spool.color);
@@ -446,9 +459,10 @@ public:
                         spool.material.empty() && spool.spool_id.empty()))
                     continue;
                 const double score = (normalized_mapping_key(material) == normalized_mapping_key(spool.material) ? 0. : 1.e6) +
+                    (has_selected_nozzle && std::abs(selected_diameter - bundle.printers.get_edited_preset().config.opt_float("nozzle_diameter", tool)) > 0.001 ? 250000. : 0.) +
                     std::pow(double(color.Red()) - loaded_color.Red(), 2) +
                     std::pow(double(color.Green()) - loaded_color.Green(), 2) +
-                    std::pow(double(color.Blue()) - loaded_color.Blue(), 2) + (tool == i ? 0. : 0.1);
+                    std::pow(double(color.Blue()) - loaded_color.Blue(), 2) + (int(tool) == preferred_tool ? 0. : 0.1);
                 if (score < best_score) {
                     best_score = score;
                     best = int(tool);
@@ -7040,14 +7054,74 @@ void Sidebar::sync_spool_manager_filaments(DynamicPrintConfig *host_config)
     // Resolve unknown materials before changing project slots. Cancelling a
     // prompt must leave both project assignments and saved mappings intact.
     const bool logical_palette = uses_independent_tool_dispatch();
+    std::vector<int> selected_tools;
     if (logical_palette) {
-        slots.erase(std::remove_if(slots.begin(), slots.end(), [](const auto &spool) {
-            return spool.name.empty() && spool.material.empty() && spool.spool_id.empty();
-        }), slots.end());
-        if (slots.empty()) {
+        wxArrayString choices;
+        std::vector<size_t> loaded_tools;
+        for (size_t tool = 0; tool < std::min(slots.size(), size_t(bundle.get_printer_extruder_count())); ++tool) {
+            const auto &spool = slots[tool];
+            if (spool.name.empty() && spool.material.empty() && spool.spool_id.empty())
+                continue;
+            loaded_tools.push_back(tool);
+            choices.Add(format_wxstr(_L("Tool %1% — %2% mm — %3% — %4%"), int(tool + 1),
+                from_u8(get_diameter_string(bundle.printers.get_edited_preset().config.opt_float("nozzle_diameter", tool))),
+                from_u8(spool.name.empty() ? spool.vendor + " " + spool.material : spool.name),
+                from_u8(spool.color_name.empty() ? spool.color : spool.color_name)));
+        }
+        if (loaded_tools.empty()) {
             show_error(this, _L("No loaded filaments were reported. The project palette was not changed."), false);
             return;
         }
+        class SyncToolsDialog final : public DPIDialog {
+        public:
+            using DPIDialog::DPIDialog;
+            void on_dpi_changed(const wxRect &rect) override { SetSize(rect); Layout(); }
+        };
+        SyncToolsDialog dialog(this, wxID_ANY, _L("Sync loaded materials"), wxDefaultPosition, wxDefaultSize,
+                               wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER);
+        auto *layout = new wxBoxSizer(wxVERTICAL);
+        auto *description = new wxStaticText(&dialog, wxID_ANY,
+            _L("Choose the loaded tools to import. Each checked tool becomes one project filament. Unchecked tools are not imported."));
+        description->Wrap(FromDIP(520));
+        layout->Add(description, 0, wxEXPAND | wxALL, FromDIP(12));
+        auto *tools = new wxCheckListBox(&dialog, wxID_ANY, wxDefaultPosition,
+            wxSize(FromDIP(520), FromDIP(220)), choices);
+        for (unsigned i = 0; i < tools->GetCount(); ++i)
+            tools->Check(i, i < bundle.max_filament_colors());
+        layout->Add(tools, 1, wxEXPAND | wxLEFT | wxRIGHT, FromDIP(12));
+        auto *count = new wxStaticText(&dialog, wxID_ANY, wxEmptyString);
+        layout->Add(count, 0, wxEXPAND | wxALL, FromDIP(12));
+        auto *buttons = new wxBoxSizer(wxHORIZONTAL);
+        auto *cancel = new Button(&dialog, _L("Cancel"));
+        auto *accept = new Button(&dialog, _L("Sync"));
+        cancel->SetStyle(ButtonStyle::Regular, ButtonType::Choice);
+        accept->SetStyle(ButtonStyle::Confirm, ButtonType::Choice);
+        buttons->AddStretchSpacer();
+        buttons->Add(cancel, 0, wxRIGHT, FromDIP(8));
+        buttons->Add(accept);
+        layout->Add(buttons, 0, wxEXPAND | wxALL, FromDIP(12));
+        const auto update_count = [&] {
+            wxArrayInt checked;
+            tools->GetCheckedItems(checked);
+            count->SetLabel(format_wxstr(_L("Selected tools: %1% / %2%"), checked.size(), bundle.max_filament_colors()));
+            accept->Enable(!checked.empty() && checked.size() <= bundle.max_filament_colors());
+        };
+        tools->Bind(wxEVT_CHECKLISTBOX, [&](wxCommandEvent &) { update_count(); });
+        cancel->Bind(wxEVT_BUTTON, [&](wxCommandEvent &) { dialog.EndModal(wxID_CANCEL); });
+        accept->Bind(wxEVT_BUTTON, [&](wxCommandEvent &) { dialog.EndModal(wxID_OK); });
+        update_count();
+        dialog.SetSizerAndFit(layout);
+        wxGetApp().UpdateDlgDarkUI(&dialog);
+        dialog.CenterOnParent();
+        if (dialog.ShowModal() != wxID_OK)
+            return;
+        std::vector<SpoolManagerMetadata::Filament> selected;
+        for (unsigned i = 0; i < tools->GetCount(); ++i)
+            if (tools->IsChecked(i)) {
+                selected.push_back(slots[loaded_tools[i]]);
+                selected_tools.push_back(int(loaded_tools[i]) + 1);
+            }
+        slots = std::move(selected);
         if (!wxGetApp().model().objects.empty()) {
             MessageDialog confirm(this,
                 _L("Replace the project filament palette with the loaded printer materials? Existing assignments keep their material numbers; assignments to removed materials will use material 1. Review painted parts and Filament Bindings before printing."),
@@ -7163,6 +7237,13 @@ void Sidebar::sync_spool_manager_filaments(DynamicPrintConfig *host_config)
         }
     }
     bundle.set_num_filaments(static_cast<unsigned int>(slot_count));
+    if (logical_palette) {
+        // Keep the chosen nozzle/material pair when compacting non-adjacent
+        // tools. Dispatch still refreshes inventory and asks for confirmation.
+        bundle.project_config.set_key_value("filament_map", new ConfigOptionInts(selected_tools));
+        bundle.project_config.set_key_value("filament_nozzle_map", new ConfigOptionInts(std::vector<int>(slot_count, 0)));
+        bundle.project_config.set_key_value("filament_map_mode", new ConfigOptionEnum<FilamentMapMode>(fmmManual));
+    }
 
     auto *colors = bundle.project_config.option<ConfigOptionStrings>("filament_colour");
     auto *multi_colors = bundle.project_config.option<ConfigOptionStrings>("filament_multi_colour");

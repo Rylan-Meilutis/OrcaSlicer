@@ -2156,6 +2156,9 @@ PRINT_CONFIG_CLASS_DERIVED_DEFINE(
     ((ConfigOptionBool,                gcode_comments))
     ((ConfigOptionInt,                 slow_down_layers))
     ((ConfigOptionPercents,            arc_overhang_cooling))
+    ((ConfigOptionFloats,              filament_arc_min_path_time))
+    ((ConfigOptionBools,               filament_arc_auto_cooling))
+    ((ConfigOptionFloats,              filament_arc_cover_speed))
     ((ConfigOptionInts,                support_material_interface_fan_speed))
     ((ConfigOptionInts,                internal_bridge_fan_speed)) // ORCA: Add support for separate internal bridge fan speed control
     ((ConfigOptionInts,                ironing_fan_speed))

@@ -3859,7 +3859,7 @@ void PrintConfigDef::init_fff_params()
     
     def = this->add("filament_density", coFloats);
     def->label = L("Density");
-    def->tooltip = L("Filament density, for statistical purposes only.");
+    def->tooltip = L("Filament density, used for weight estimates and optional automatic arc cooling estimates.");
     def->sidetext = L(u8"g/cm³");	// grams per cubic centimeter, CIS languages need translation
     def->min = 0;
     def->mode = comAdvanced;
@@ -4519,6 +4519,38 @@ void PrintConfigDef::init_fff_params()
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionPercents{ 100 });
     
+    def = this->add("filament_arc_min_path_time", coFloats);
+    def->label = L("Minimum arc path time");
+    def->tooltip = L("Minimum printing time for each arc overhang or arc bridge path using this filament. "
+                     "Slows short arcs to allow neighboring strands to cool. The larger of this value and the process minimum is used. "
+                     "A positive value overrides the automatic material estimate. Zero uses the automatic estimate when enabled, otherwise the process setting. "
+                     "Speed cannot fall below 0.1 mm/s; this is not a guaranteed cooling dwell.");
+    def->sidetext = "s";
+    def->min = 0;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloats{ 0. });
+
+    def = this->add("filament_arc_cover_speed", coFloats);
+    def->label = L("Maximum arc covering speed");
+    def->tooltip = L("Maximum printing speed on layers following arc overhangs or arc bridges, using this filament. "
+                     "The limit applies throughout the process's arc speed-transition layers, in addition to its speed ramp. "
+                     "It affects the whole object on those layers. A positive value overrides the automatic material estimate. "
+                     "Zero uses the automatic estimate when enabled, otherwise the process settings without an additional limit.");
+    def->sidetext = "mm/s";
+    def->min = 0;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloats{ 0. });
+
+    def = this->add("filament_arc_auto_cooling", coBools);
+    def->label = L("Automatic arc cooling estimates");
+    def->tooltip = L("Estimate arc path time and covering speed from material type, density, temperature, cooling and bead size. "
+                     "Uses generic PLA, PETG, ABS, ASA and PC reference properties and assumed airflow, not a calibrated thermal simulation. "
+                     "Unsupported materials or conditions fall back to process settings. Positive advanced overrides take precedence. "
+                     "Does not change fan speed, temperature, flow or dimensions. Physical validation is required.");
+    def->mode = comSimple;
+    // Preserve existing profiles and projects; enabling this is an explicit opt-in.
+    def->set_default_value(new ConfigOptionBools{ false });
+
     // ORCA: Add support for separate internal bridge fan speed control
     def = this->add("internal_bridge_fan_speed", coInts);
     def->label = L("Internal bridges fan speed");
@@ -5436,14 +5468,14 @@ void PrintConfigDef::init_fff_params()
 
     def = this->add("rooting", coBool);
     def->label = L("Rooting");
-    def->tooltip = L("Embed branching roots of the upper material into the material below a vertical material interface. Buried branches join into a narrow stem at the interface to resist pull-out. Only applies to different filaments in the same multipart or painted object, not support structures. Both regions require walls, top and bottom shells, and a consistent filament for all features. Preserves the upper part and exposed surfaces. Enables internal interface shells; increases material changes. Mechanical strength must be verified with a test print.");
+    def->tooltip = L("Embed a shallow, spreading root network below a vertical material interface. The attachment follows the upper model's footprint; thick primary limbs divide recursively into thinner lateral branches. Buried branches may spread beyond that footprint while preserving surface skins and cavities. Only applies to different filaments in the same multipart or painted object, not support structures. Both regions require walls, top and bottom shells, and a consistent filament for all features. Enables internal interface shells; increases material changes. Mechanical strength must be verified with a test print.");
     def->category = L("Multimaterial");
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionBool(false));
 
     def = this->add("rooting_depth", coFloat);
     def->label = L("Root depth");
-    def->tooltip = L("Maximum depth below the material interface. Roots are skipped if the full depth and protective skin cannot fit inside the lower material.");
+    def->tooltip = L("Maximum depth below the material interface. Roots shorten to fit the lower material while preserving the protective skin. Roots are skipped if there is insufficient depth for connected branches.");
     def->sidetext = L("mm");
     def->min = 0.4;
     def->max = 20.;
@@ -5453,7 +5485,7 @@ void PrintConfigDef::init_fff_params()
 
     def = this->add("rooting_width", coFloat);
     def->label = L("Root branch diameter");
-    def->tooltip = L("Diameter of each root branch and the connecting stem. Must be at least twice the larger nozzle diameter of the two materials. Branches spread below the interface and converge gradually while printing upward.");
+    def->tooltip = L("Minimum terminal branch diameter, before its rounded end cap. Must be at least twice the larger nozzle diameter of the two materials. Parent limbs are thicker and divide recursively into smaller branches. Recursion stops at this diameter or when clearance is insufficient; the attachment follows the upper model's shape.");
     def->sidetext = L("mm");
     def->min = 0.4;
     def->max = 10.;
@@ -5463,7 +5495,7 @@ void PrintConfigDef::init_fff_params()
 
     def = this->add("rooting_spacing", coFloat);
     def->label = L("Root spacing");
-    def->tooltip = L("Distance between root centers. Automatically increased when necessary to leave host material between neighboring root systems.");
+    def->tooltip = L("Distance between root attachment centers. Automatically increased for broad primary limbs. Buried branches from the same material may merge into a connected network.");
     def->sidetext = L("mm");
     def->min = 1.;
     def->max = 100.;
@@ -5473,7 +5505,7 @@ void PrintConfigDef::init_fff_params()
 
     def = this->add("rooting_skin", coFloat);
     def->label = L("Root protective skin");
-    def->tooltip = L("Minimum clearance from roots to the contact edge, lower material side walls, cavities and bottom. Exposed ledges and the upper part's top layers are not modified. Roots that cannot fit are skipped rather than clipped.");
+    def->tooltip = L("Minimum protective skin at the attachment edge and around buried roots, including side walls, cavities, bottom and exposed top surfaces. Branches may spread beyond the upper part only below this top skin. Branches shorten or stop when they cannot fit; they are never clipped into disconnected fragments.");
     def->sidetext = L("mm");
     def->min = 0.4;
     def->max = 10.;

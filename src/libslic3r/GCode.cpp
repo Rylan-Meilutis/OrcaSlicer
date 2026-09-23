@@ -1,6 +1,7 @@
 #include "BoundingBox.hpp"
 #include "Config.hpp"
 #include "GCode/WipePathHelpers.hpp"
+#include "GCode/ArcCooling.hpp"
 #include "GCodeWriter.hpp"
 #include "Polygon.hpp"
 #include "PrintConfig.hpp"
@@ -6809,6 +6810,55 @@ LayerResult GCode::process_layer(
                             break;
                         }
                     }
+                    ExPolygons arc_anchor_mask;
+                    if (has_arc_overhang) {
+                        Polygons arc_coverage;
+                        double anchor_margin = 0.;
+                        std::function<void(const ExtrusionEntity &)> collect_arc_contacts;
+                        collect_arc_contacts = [&](const ExtrusionEntity &entity) {
+                            if (const auto *path = dynamic_cast<const ExtrusionPath *>(&entity)) {
+                                if (!is_arc_fill(path->role()) || path->polyline.points.empty()) return;
+                                for (const Point &point : {path->first_point(), path->last_point()}) {
+                                    Polygon contact = make_circle(scale_(0.5 * path->width), SCALED_EPSILON);
+                                    contact.translate(point);
+                                    arc_coverage.push_back(std::move(contact));
+                                }
+                            } else if (const auto *collection = dynamic_cast<const ExtrusionEntityCollection *>(&entity)) {
+                                for (const auto *child : collection->entities) collect_arc_contacts(*child);
+                            } else if (const auto *paths = dynamic_cast<const ExtrusionMultiPath *>(&entity)) {
+                                for (const auto &path : paths->paths) collect_arc_contacts(path);
+                            }
+                        };
+                        std::function<double(const ExtrusionEntity &)> wall_width;
+                        wall_width = [&](const ExtrusionEntity &entity) {
+                            if (const auto *path = dynamic_cast<const ExtrusionPath *>(&entity))
+                                return double(path->width);
+                            double width = 0.;
+                            if (const auto *loop = dynamic_cast<const ExtrusionLoop *>(&entity))
+                                for (const auto &path : loop->paths) width = std::max(width, double(path.width));
+                            else if (const auto *paths = dynamic_cast<const ExtrusionMultiPath *>(&entity))
+                                for (const auto &path : paths->paths) width = std::max(width, double(path.width));
+                            else if (const auto *collection = dynamic_cast<const ExtrusionEntityCollection *>(&entity))
+                                for (const auto *child : collection->entities) width = std::max(width, wall_width(*child));
+                            return width;
+                        };
+                        for (size_t region_id = 0; region_id < by_region_specific.size(); ++region_id) {
+                            const auto &config = print.get_print_region(region_id).config();
+                            // Retain the local wall stack, not just the innermost
+                            // contact bead: an anchor may itself lean on a wall.
+                            for (const ExtrusionEntity *entity : by_region_specific[region_id].perimeters)
+                                anchor_margin = std::max(anchor_margin,
+                                    wall_width(*entity) * std::max(1, config.wall_loops.value));
+                            for (const ExtrusionEntity *entity : by_region_specific[region_id].infills)
+                                if (is_arc_fill(entity->role()))
+                                    collect_arc_contacts(*entity);
+                        }
+                        // Preserve at least a millimeter of lead-in at each
+                        // contact, including the local supporting wall stack.
+                        // Only endpoints need wall anchors; using the whole arc
+                        // footprint also printed unrelated walls beside its crown.
+                        arc_anchor_mask = offset_ex(union_ex(arc_coverage), float(scale_(std::max(1., anchor_margin))));
+                    }
                     {
                         // Some otherwise valid draped paths are blocked only
                         // by walls assigned to this same nominal layer. Their
@@ -6823,17 +6873,19 @@ LayerResult GCode::process_layer(
                         if (bridge_overhang_before_walls) {
                             gcode += this->extrude_infill(print, by_region_specific, false, erBridgeInfill, false, true);
                             gcode += this->extrude_infill(print, by_region_specific, false, erInternalBridgeInfill, false, true);
-                            gcode += this->extrude_infill(print, by_region_specific, false, erArcOverhang, false, true);
-                            gcode += this->extrude_infill(print, by_region_specific, false, erArcBridge, false, true);
                         }
                         // Print perimeters of regions that has is_infill_first == false
-                        gcode += this->extrude_perimeters(print, by_region_specific, first_layer, false);
-                        // Arc overhangs replace only the innermost unsupported
-                        // wall. Print the retained outer walls first so each arc
-                        // starts on an existing perimeter ledge.
-                        if (has_arc_overhang && !bridge_overhang_before_walls) {
+                        gcode += this->extrude_perimeters(print, by_region_specific, first_layer, false, false,
+                            has_arc_overhang ? &arc_anchor_mask : nullptr);
+                        // Arc contacts now have their local wall anchors. Emit
+                        // arcs before ordinary fill and the remaining wall spans.
+                        if (has_arc_overhang) {
                             gcode += this->extrude_infill(print, by_region_specific, false, erArcOverhang);
                             gcode += this->extrude_infill(print, by_region_specific, false, erArcBridge);
+                            // Only the anchor spans needed to precede the arcs.
+                            // Resume each region's normal wall/fill order now.
+                            gcode += this->extrude_perimeters(print, by_region_specific, first_layer, false, true,
+                                &arc_anchor_mask);
                         }
                         if (!has_wipe_tower && need_insert_timelapse_gcode_for_traditional && printer_structure == PrinterStructure::psI3
                             && !has_insert_timelapse_gcode && has_infill(by_region_specific)) {
@@ -6844,10 +6896,13 @@ LayerResult GCode::process_layer(
                         }
                         // Then print infill
                         gcode += this->extrude_infill(print, by_region_specific, false,
-                            has_arc_overhang && !bridge_overhang_before_walls ? erCount : erMixed,
+                            has_arc_overhang ? erCount : erMixed,
                             bridge_overhang_before_walls);
                         // Then the walls left hanging in mid air, now that the infill can anchor them
                         gcode += this->extrude_perimeters(print, by_region_specific, first_layer, false, true);
+                        if (has_arc_overhang)
+                            gcode += this->extrude_perimeters(print, by_region_specific, first_layer, true, true,
+                                &arc_anchor_mask);
                         // Then print perimeters of regions that has is_infill_first == true
                         gcode += this->extrude_perimeters(print, by_region_specific, first_layer, true);
                     }
@@ -8041,6 +8096,7 @@ std::string GCode::extrude_loop(const ExtrusionLoop&        loop_ref,
             if (line_idx != size_t(-1) && transition_distance > scaled<double>(0.05) &&
                 transition_distance <= max_transition_length) {
                 ExtrusionPaths primer_paths;
+                bool restore_reserved_gap = false;
                 if (prime_gap_idx != size_t(-1) &&
                     prime_gap_distance2 <= max_transition_length * max_transition_length) {
                     primer_paths =
@@ -8048,9 +8104,8 @@ std::string GCode::extrude_loop(const ExtrusionLoop&        loop_ref,
                     m_inner_seam_prime_gaps.erase(
                         m_inner_seam_prime_gaps.begin() + prime_gap_idx);
                     align_prime_with_outer_entry(primer_paths);
+                    restore_reserved_gap = true;
                 } else if (!planned_outer_first_prime.empty()) {
-                    m_pending_inner_seam_primes.emplace_back(
-                        planned_outer_first_prime);
                     primer_paths = std::move(planned_outer_first_prime);
                 } else {
                     // Outer-first order has no already omitted material to
@@ -8092,6 +8147,29 @@ std::string GCode::extrude_loop(const ExtrusionLoop&        loop_ref,
                 // half on entry and its former half on exit. Both meet inside
                 // the wall, without retracing the primer or the inner loop.
                 if (!primer_paths.empty()) {
+                    // Restrict the extra footprint test to sharp corners near
+                    // the seam. Ordinary smooth-wall seam behavior is unchanged.
+                    const Lines contour_lines = loop.polygon().lines();
+                    const double corner_distance = scale_(2. * std::max(paths.front().width, paths.back().width));
+                    bool corner_seam = false;
+                    for (size_t i = 0; i < contour_lines.size(); ++i) {
+                        const Line &before = contour_lines[i];
+                        const Line &after = contour_lines[(i + 1) % contour_lines.size()];
+                        if ((before.b - outer_start).cast<double>().squaredNorm() > corner_distance * corner_distance)
+                            continue;
+                        const Vec2d incoming = (before.b - before.a).cast<double>();
+                        const Vec2d outgoing = (after.b - after.a).cast<double>();
+                        if (incoming.dot(outgoing) < std::sqrt(0.5) * incoming.norm() * outgoing.norm()) {
+                            corner_seam = true;
+                            break;
+                        }
+                    }
+                    Polygons wall_envelope;
+                    if (corner_seam) {
+                        for (const ExtrusionEntity *entity : region_perimeters)
+                            entity->polygons_covered_by_width(wall_envelope, float(SCALED_EPSILON));
+                        wall_envelope = union_(wall_envelope);
+                    }
                     Lines outer_lines;
                     for (const ExtrusionPath &path : paths)
                         append(outer_lines, path.polyline.to_polyline().lines());
@@ -8118,21 +8196,52 @@ std::string GCode::extrude_loop(const ExtrusionLoop&        loop_ref,
                                 });
                         };
                         Point intersection;
+                        // Only a genuinely shared outer endpoint is allowed.
+                        // With a nonzero seam gap the entry and return may
+                        // intersect just inside the outer wall; treating that
+                        // crossing as endpoint tolerance creates an X seam.
+                        const bool shared_outer_endpoint = outer_start == paths.back().last_point();
                         const bool crossed = entry.intersection(exit, &intersection) &&
-                            (intersection - outer_start).cast<double>().squaredNorm() > endpoint_tolerance2;
+                            !(shared_outer_endpoint && intersection == outer_start);
+                        // Check deposited bead footprints, not just centerlines.
+                        // The entry and return may share the round endpoint cap
+                        // at the outer seam, but must not overlap farther inside
+                        // the wall (notably with diagonal connectors at corners).
+                        bool beads_fit = true;
+                        if (corner_seam) {
+                            const double entry_radius = scale_(0.25 * (tail.back().width + paths.front().width));
+                            const double exit_radius = scale_(0.25 * (paths.back().width + tail.front().width));
+                            const Polygons entry_bead = offset(Polyline{entry.a, entry.b}, float(entry_radius),
+                                ClipperLib::jtRound, SCALED_EPSILON, ClipperLib::etOpenRound);
+                            const Polygons exit_bead = offset(Polyline{exit.a, exit.b}, float(exit_radius),
+                                ClipperLib::jtRound, SCALED_EPSILON, ClipperLib::etOpenRound);
+                            Polygons junctions;
+                            for (const auto &junction : {std::make_pair(outer_start, entry_radius),
+                                                         std::make_pair(paths.back().last_point(), exit_radius)}) {
+                                Polygon cap = make_circle(junction.second + SCALED_EPSILON, SCALED_EPSILON);
+                                cap.translate(junction.first);
+                                junctions.push_back(std::move(cap));
+                            }
+                            const bool bead_overlap = !diff(Slic3r::intersection(entry_bead, exit_bead), junctions).empty();
+                            const bool outside_walls = !diff(entry_bead, wall_envelope).empty() ||
+                                                       !diff(exit_bead, wall_envelope).empty();
+                            beads_fit = !bead_overlap && !outside_walls;
+                        }
                         // Either connector may reach the far end of the reserved
                         // tail. Apply the return's length bound symmetrically;
                         // the near endpoint must still be within the original
                         // two-nozzle adjacency radius checked above.
                         return entry.length() > scaled<double>(0.05) &&
                             entry.length() <= 2. * max_transition_length && exit.length() <= 2. * max_transition_length &&
-                            !crossed && !crosses_inner(entry, entry_inner) && !crosses_inner(exit, exit_inner) &&
+                            !crossed && beads_fit &&
+                            !crosses_inner(entry, entry_inner) && !crosses_inner(exit, exit_inner) &&
                             !crosses_outer(entry, outer_start) && !crosses_outer(exit, paths.back().last_point()) &&
                             internal_seam_height_compatible(tail.back().last_point3().z(),
                                 paths.front().first_point3().z(), entry.length()) &&
                             internal_seam_height_compatible(paths.back().last_point3().z(),
                                 tail.front().first_point3().z(), exit.length());
                     };
+                    const ExtrusionPaths reservation = primer_paths;
                     bool joined = can_join(primer_paths);
                     if (!joined) {
                         // The reserved footprint is independent of deposition direction.
@@ -8148,6 +8257,10 @@ std::string GCode::extrude_loop(const ExtrusionLoop&        loop_ref,
                         }
                     }
                     if (joined) {
+                        // Trim the future inner loop in its original direction,
+                        // independently of the chosen connector direction.
+                        if (!restore_reserved_gap)
+                            m_pending_inner_seam_primes.emplace_back(reservation);
                         inner_start = primer_paths.back().last_point();
                         transition_crosses_inner_wall = false;
                         ExtrusionLoop tail(primer_paths);
@@ -8162,10 +8275,16 @@ std::string GCode::extrude_loop(const ExtrusionLoop&        loop_ref,
                             inner_seam_finish.front().first_point3(), paths.back(), inner_seam_finish.front());
                         inner_seam_finish.insert(inner_seam_finish.begin(), std::move(connector));
                     }
+                    if (!joined) {
+                        if (!restore_reserved_gap)
+                            primer_paths.clear();
+                        m_unprimed_outer_seams.emplace_back(outer_start);
+                        transition_crosses_inner_wall = true;
+                    }
                 }
                 for (const ExtrusionPath &primer_path : primer_paths)
                     gcode += this->_extrude(
-                        primer_path, "outer wall seam prime", speed_for_path(primer_path));
+                        primer_path, inner_seam_finish.empty() ? "inner wall seam restore" : "outer wall seam prime", speed_for_path(primer_path));
                 if (!transition_crosses_inner_wall) {
                     ExtrusionPath seam_transition(
                         Polyline3(Points3{Point3(inner_start, paths.front().first_point3().z()), paths.front().first_point3()}),
@@ -8552,7 +8671,7 @@ std::string GCode::extrude_path(const ExtrusionPath& path, const std::string& de
 }
 
 // Extrude perimeters: Decide where to put seams (hide or align seams).
-std::string GCode::extrude_perimeters(const Print &print, const std::vector<ObjectByExtruder::Island::Region> &by_region, bool is_first_layer, bool is_infill_first, bool unsupported_loops_only)
+std::string GCode::extrude_perimeters(const Print &print, const std::vector<ObjectByExtruder::Island::Region> &by_region, bool is_first_layer, bool is_infill_first, bool unsupported_loops_only, const ExPolygons *arc_anchor_mask)
 {
     std::string gcode;
     for (const ObjectByExtruder::Island::Region &region : by_region)
@@ -8571,9 +8690,14 @@ std::string GCode::extrude_perimeters(const Print &print, const std::vector<Obje
                 [](const ExtrusionEntity *entity) { return is_arc_fill(entity->role()); });
             // BBS: for first layer, we always print wall firstly to get better bed adhesive force
             // This behaviour is same with cura
-            // Arc anchors always precede the arcs, irrespective of the ordinary
-            // infill-first preference. The second perimeter pass then stays empty.
-            const bool should_print = replace_unsupported_perimeters ? !is_infill_first :
+            // Arc-only finishing passes must not pick up ordinary deferred
+            // walls: those still wait for their supporting infill below.
+            if (arc_anchor_mask != nullptr && unsupported_loops_only && !replace_unsupported_perimeters)
+                continue;
+            // Anchors precede arcs regardless of infill-first. The remaining
+            // spans follow the configured order, just like ordinary walls.
+            const bool arc_anchor_pass = replace_unsupported_perimeters && !unsupported_loops_only;
+            const bool should_print = arc_anchor_pass ? !is_infill_first :
                 (is_first_layer ? !is_infill_first : (m_config.is_infill_first == is_infill_first));
             if (!should_print) continue;
 
@@ -8654,9 +8778,7 @@ std::string GCode::extrude_perimeters(const Print &print, const std::vector<Obje
                 }
             }
             if (replace_unsupported_perimeters) {
-            // Arc anchors were already emitted before the infill. Do not repeat
-            // them in the deferred unsupported-wall pass.
-            if (unsupported_loops_only)
+            if (unsupported_loops_only && arc_anchor_mask == nullptr)
                 continue;
             const int wall_loops = std::max(0, m_config.wall_loops.value);
             const int replaced_inset =
@@ -8674,8 +8796,22 @@ std::string GCode::extrude_perimeters(const Print &print, const std::vector<Obje
                     // Arc fill replaces every wall fragment that would itself
                     // need bridge/overhang extrusion. Supported fragments remain
                     // and are emitted first as the arc's physical anchor.
-                    if (path->role() != erOverhangPerimeter && !path->nonplanar_surface)
-                        gcode += this->extrude_path(*path, "perimeter", -1.);
+                    if (path->role() != erOverhangPerimeter && !path->nonplanar_surface) {
+                        if (arc_anchor_mask == nullptr) {
+                            gcode += this->extrude_path(*path, "perimeter", -1.);
+                        } else {
+                            // Complementary clips emit each retained wall span
+                            // once. Keep deposited geometry/flow and Z metadata;
+                            // only the timing of non-anchor sections changes.
+                            ExtrusionEntityCollection pieces;
+                            if (unsupported_loops_only)
+                                path->subtract_expolygons(*arc_anchor_mask, &pieces);
+                            else
+                                path->intersect_expolygons(*arc_anchor_mask, &pieces);
+                            for (const ExtrusionEntity *piece : pieces.entities)
+                                gcode += this->extrude_path(static_cast<const ExtrusionPath &>(*piece), "perimeter", -1.);
+                        }
+                    }
                 } else if (const auto *multipath = dynamic_cast<const ExtrusionMultiPath *>(&entity)) {
                     for (const ExtrusionPath &path : multipath->paths)
                         extrude_anchor_perimeters(path);
@@ -9722,6 +9858,36 @@ std::string GCode::_extrude(const ExtrusionPath &input_path, std::string descrip
         if (blend)
             speed = std::min(speed, Slic3r::lerp(
                 m_config.arc_overhang_stabilization_speed.value, speed, *blend));
+    // Use the depositing material, not the printer's physical tool index. A
+    // material cap must not be interpolated away by the process speed ramp.
+    std::optional<ArcCoolingEstimate> arc_estimate;
+    if (FILAMENT_CONFIG(filament_arc_auto_cooling) &&
+        layer_id() >= FILAMENT_CONFIG(close_fan_the_first_x_layers) &&
+        (is_arc_fill(path.role()) || overhang_speed_blend || bridge_speed_blend)) {
+        // Arc flow defines an equivalent round strand diameter. Covering paths
+        // are flattened, so use a reference bridge diameter for that nozzle.
+        const double diameter = is_arc_fill(path.role()) ?
+            std::sqrt(4. * path.mm3_per_mm / PI) : 1.125 * NOZZLE_CONFIG(nozzle_diameter);
+        arc_estimate = estimate_arc_cooling(FILAMENT_CONFIG(filament_type),
+            FILAMENT_CONFIG(filament_density),
+            layer_id() == 0 ? FILAMENT_CONFIG(nozzle_temperature_initial_layer) : FILAMENT_CONFIG(nozzle_temperature),
+            FILAMENT_CONFIG(chamber_temperature), FILAMENT_CONFIG(arc_overhang_cooling), diameter);
+    }
+    // The thermal model is an uncalibrated estimate, not permission to crawl
+    // below the material's usable printing speed on every short arc. Keep
+    // explicit process/material overrides separate from this automatic bound.
+    const double arc_auto_min_speed = std::max(0.1, double(FILAMENT_CONFIG(slow_down_min_speed)));
+    const double arc_cover_override = FILAMENT_CONFIG(filament_arc_cover_speed);
+    const double arc_cover_speed = arc_cover_override > 0. ? arc_cover_override :
+        (arc_estimate ? std::max(arc_auto_min_speed, arc_estimate->cover_speed) : 0.);
+    if ((overhang_speed_blend || bridge_speed_blend) && arc_cover_speed > 0.) {
+        if (arc_cover_override > 0.)
+            speed = std::min(speed, arc_cover_speed);
+        else {
+            const double recovery = std::min(overhang_speed_blend.value_or(1.), bridge_speed_blend.value_or(1.));
+            speed = std::min(speed, Slic3r::lerp(arc_cover_speed, speed, recovery));
+        }
+    }
     if (dissimilar_interface_speed_blend) {
         const double slowed_speed = m_config.dissimilar_support_interface_speed.get_abs_value(speed);
         speed = std::min(speed, Slic3r::lerp(slowed_speed, speed, *dissimilar_interface_speed_blend));
@@ -9740,11 +9906,25 @@ std::string GCode::_extrude(const ExtrusionPath &input_path, std::string descrip
         // cap speed with max_volumetric_speed anyway (even if user is not using autospeed)
         speed = std::min(speed, FILAMENT_CONFIG(filament_max_volumetric_speed) / _mm3_per_mm);
     }
-    if (is_arc_fill(path.role()) && m_config.arc_overhang_min_path_time.value > 0.) {
+    const double arc_time_override = FILAMENT_CONFIG(filament_arc_min_path_time);
+    const double arc_min_path_time = std::max(m_config.arc_overhang_min_path_time.value,
+        arc_time_override);
+    if (is_arc_fill(path.role()) && arc_estimate && arc_time_override <= 0.) {
+        const double length = unscale<double>(path.length());
+        const double diameter = std::sqrt(4. * path.mm3_per_mm / PI);
+        // Smoothly relax the material minimum for paths shorter than four
+        // strand diameters. Bound automatic extra time to 2x the planned time,
+        // rather than demanding a full thermal cooldown on every tiny path.
+        const double short_path_fraction = std::clamp(length / (4. * diameter), 0., 1.);
+        const double floor = std::max({0.1, 0.5 * speed,
+            std::min(speed, arc_auto_min_speed) * short_path_fraction});
+        speed = std::min(speed, std::max(floor, length / arc_estimate->path_time));
+    }
+    if (is_arc_fill(path.role()) && arc_min_path_time > 0.) {
         // One limit per native arc path, independent of its tessellation or G2/G3
         // fitting. Never speed up a path already capped by flow or other limits.
         speed = std::min(speed, std::max(0.1,
-            unscale<double>(path.length()) / m_config.arc_overhang_min_path_time.value));
+            unscale<double>(path.length()) / arc_min_path_time));
     }
     // ORCA: resonance‑avoidance on short external perimeters
 {

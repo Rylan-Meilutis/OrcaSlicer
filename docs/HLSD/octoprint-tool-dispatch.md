@@ -36,7 +36,8 @@ the selected physical printer's loaded spool inventory afresh. Only materials
 in the selected print's used-extruder set are shown (including support and
 explicit layer tool changes), not the whole project palette. Unused entries
 receive private, distinct filler assignments without generating tool use. It
-suggests distinct tools by material and color; the user can change every
+suggests distinct tools by material and color, with nozzle-size preference when
+the project has a manual nozzle assignment from sync; the user can change every
 assignment. Missing inventory permits explicitly verified manual assignment.
 Known material mismatches require confirmation. Each dispatch prompts again,
 so changing loaded spools cannot silently reuse an old assignment. Multi-plate
@@ -53,11 +54,24 @@ the scrolling area.
 Empty physical slots display as Unloaded and cannot be confirmed after a
 successful inventory read. The upstream mixed-filament add controls are hidden
 for independent-tool OctoPrint dispatch, while existing mixed entries remain
-editable for project compatibility. Sync from machine compacts loaded materials
+editable for project compatibility. Sync from machine first presents a checklist
+of loaded tools using their original physical numbers, configured diameters,
+names and colors. The
+checked count determines the palette size (at least one and no more than printer
+capacity). Unloaded tools are omitted. Cancelling this selection changes neither
+the project nor saved profile mappings. Sync compacts only the selected materials
 into the logical palette rather than preserving holes for unloaded tools. For
 an existing model it asks before replacing the palette; removed tail entries
 use the existing filament deletion/remapping path and fall back to material 1.
 An empty or failed inventory does not erase the project's palette.
+Printer-settings callbacks, including those invoked while loading a preset,
+do not add or remove project filaments to match nozzle count or color capacity.
+Sync retains selected tools in the existing manual `filament_map`, preserving
+nozzle/material pairs even when only non-adjacent tools are selected. Duplicate
+profiles or colors remain separate slots for different nozzle sizes. Nozzle
+diameters stay in the printer profile; sync does not overwrite that geometry.
+Dispatch refreshes inventory and confirms assignments rather than treating this
+preference as permission to print on an unchecked tool.
 
 `PresetBundle::tool_mapped_config` composes an independent job from the current
 presets and plate overrides. It remaps colors, material profiles, purge tables,

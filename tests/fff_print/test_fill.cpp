@@ -20,6 +20,7 @@
 #include "libslic3r/AABBTreeLines.hpp"
 #include "libslic3r/Fill/Fill.hpp"
 #include "libslic3r/Flow.hpp"
+#include "libslic3r/GCode/ArcCooling.hpp"
 #include "libslic3r/GCode/GCodeProcessor.hpp"
 #include "libslic3r/GCodeReader.hpp"
 #include "libslic3r/Geometry.hpp"
@@ -3107,18 +3108,33 @@ TEST_CASE("Arc overhang keeps a distinct G-code feature role", "[Fill][ArcOverha
 
 TEST_CASE("Short arc path time limits speed without changing deposited geometry", "[Fill][ArcOverhang][ArcCooling]")
 {
+    const double minimum_print_speed = GENERATE(2., 20.);
     const double minimum_time = GENERATE(0., 2.);
-    const double radius = GENERATE(1., 4.);
+    const bool automatic = GENERATE(false, true);
+    const int fan_off_layers = GENERATE(0, 3);
+    const double material_minimum_time = GENERATE(0., 3.);
+    const double material_cover_speed = GENERATE(0., 7.);
+    const double radius = GENERATE(0.2, 1., 4.);
     const ExtrusionRole role = GENERATE(erArcOverhang, erArcBridge);
-    CAPTURE(minimum_time, radius, role);
+    CAPTURE(minimum_time, material_minimum_time, material_cover_speed, radius, role);
     Print print;
-    Test::init_and_process_print({make_cube(10., 10., 0.4)}, print, {
+    Test::init_and_process_print({make_cube(10., 10., 0.8)}, print, {
         {"layer_height", 0.2}, {"initial_layer_print_height", 0.2},
         {"arc_overhang_speed", 5.}, {"arc_overhang_min_path_time", minimum_time},
+        {"filament_arc_min_path_time", material_minimum_time},
+        {"filament_arc_auto_cooling", automatic},
+        {"close_fan_the_first_x_layers", fan_off_layers},
+        {"filament_type", "PLA"}, {"filament_density", 1.24},
+        {"nozzle_temperature", 215}, {"chamber_temperature", 0},
+        {"arc_overhang_cooling", "100%"}, {"nozzle_diameter", 0.4},
+        {"filament_arc_cover_speed", material_cover_speed},
+        {"arc_overhang_overhang_speed_layers", 1}, {"arc_overhang_bridge_speed_layers", 1},
+        {"outer_wall_speed", 40.}, {"inner_wall_speed", 40.}, {"internal_solid_infill_speed", 40.},
+        {"slow_down_min_speed", minimum_print_speed},
         {"slow_down_for_layer_cooling", false}, {"enable_arc_fitting", false},
         {"seam_slope_type", "none"}, {"seam_start_on_inner_wall", false}
     });
-    const Layer &layer = *print.objects().front()->layers().back();
+    const Layer &layer = *print.objects().front()->layers()[1];
     LayerRegion &region = *layer.regions().front();
     const Vec2d center = unscale(get_extents(layer.lslices).center());
     region.fills.clear();
@@ -3140,9 +3156,35 @@ TEST_CASE("Short arc path time limits speed without changing deposited geometry"
     print.export_gcode(file.string(), &preview, nullptr);
     size_t moves = 0;
     double emitted_length = 0.;
-    const double expected_speed = minimum_time > 0. ? std::min(5., length / minimum_time) : 5.;
+    const auto estimate = estimate_arc_cooling("PLA", 1.24, 215., 0., 100., 0.4);
+    REQUIRE(estimate.has_value());
+    const auto cover_estimate = estimate_arc_cooling("PLA", 1.24, 215., 0., 100., 0.45);
+    REQUIRE(cover_estimate.has_value());
+    const double effective_time = std::max(minimum_time, material_minimum_time);
+    // With a one-layer recovery window, automatic caps have fully recovered
+    // on the covering layer. Only explicit manual caps remain fixed.
+    const double effective_cover_speed = material_cover_speed;
+    double expected_speed = effective_time > 0. ? std::min(5., length / effective_time) : 5.;
+    if (automatic && fan_off_layers <= 1 && material_minimum_time <= 0.) {
+        const double floor = radius == 0.2 ? 2.5 : std::max(2.5, std::min(5., minimum_print_speed));
+        expected_speed = std::min(expected_speed, std::max(floor, length / estimate->path_time));
+    }
+    size_t covering_moves = 0;
+    size_t recovered_moves = 0;
+    size_t automatic_recovered_moves = 0;
     for (size_t i = 1; i < preview.moves.size(); ++i) {
         const auto &move = preview.moves[i];
+        if (automatic && material_cover_speed == 0. && move.type == EMoveType::Extrude &&
+            std::abs(move.position.z() - 0.6f) < 0.001f && move.feedrate > minimum_print_speed + 0.002)
+            ++automatic_recovered_moves;
+        if (move.type == EMoveType::Extrude && effective_cover_speed > 0.) {
+            if (std::abs(move.position.z() - 0.6f) < 0.001f) {
+                ++covering_moves;
+                CHECK(move.feedrate <= effective_cover_speed + 0.002);
+            }
+            if (std::abs(move.position.z() - 0.8f) < 0.001f && move.feedrate > effective_cover_speed + 0.002)
+                ++recovered_moves;
+        }
         if (move.type != EMoveType::Extrude || move.extrusion_role != role)
             continue;
         ++moves;
@@ -3150,6 +3192,12 @@ TEST_CASE("Short arc path time limits speed without changing deposited geometry"
         CHECK_THAT(move.feedrate, Catch::Matchers::WithinAbs(expected_speed, 0.002));
     }
     REQUIRE(moves > 1);
+    if (effective_cover_speed > 0.) {
+        CHECK(covering_moves > 0);
+        CHECK(recovered_moves > 0);
+    }
+    if (automatic && material_cover_speed == 0.)
+        CHECK(automatic_recovered_moves > 0);
     CHECK_THAT(emitted_length, Catch::Matchers::WithinAbs(length, 0.01));
 }
 
@@ -3255,14 +3303,97 @@ TEST_CASE("Bridge and overhang ordering can precede walls on only the affected l
                first_supporting_fill->extrusion_role == erInternalBridgeInfill));
     const float affected_z = first_supporting_fill->position.z();
 
-    CHECK(std::none_of(preview.moves.begin(), first_supporting_fill, [affected_z](const auto &move) {
-        return move.type == EMoveType::Extrude && is_perimeter(move.extrusion_role) &&
-               std::abs(move.position.z() - affected_z) < 0.001f;
-    }));
+    // Arc paths may require local wall anchors even with fill-before-walls.
+    // Ordinary bridge ordering retains its existing behavior.
+    if (!use_arc_overhangs)
+        CHECK(std::none_of(preview.moves.begin(), first_supporting_fill, [affected_z](const auto &move) {
+            return move.type == EMoveType::Extrude && is_perimeter(move.extrusion_role) &&
+                   std::abs(move.position.z() - affected_z) < 0.001f;
+        }));
     CHECK(std::any_of(std::next(first_supporting_fill), preview.moves.end(), [affected_z](const auto &move) {
         return move.type == EMoveType::Extrude && is_perimeter(move.extrusion_role) &&
                std::abs(move.position.z() - affected_z) < 0.001f;
     }));
+}
+
+TEST_CASE("Arc anchors precede arcs and remaining walls follow the configured infill order exactly once", "[Fill][ArcOverhang][Ordering]")
+{
+    const bool infill_first = GENERATE(false, true);
+    const bool bridge_first = GENERATE(false, true);
+    const auto role = GENERATE(erArcOverhang, erArcBridge);
+    CAPTURE(infill_first, bridge_first, role);
+    Print print;
+    Test::init_and_process_print({make_cube(10., 10., 0.6)}, print, {
+        {"layer_height", 0.2}, {"initial_layer_print_height", 0.2},
+        {"wall_loops", 2}, {"is_infill_first", infill_first},
+        {"bridge_overhang_before_walls", bridge_first},
+        {"enable_arc_fitting", false}, {"seam_slope_type", "none"},
+        {"seam_start_on_inner_wall", false}
+    });
+    const Layer &layer = *print.objects().front()->layers()[1];
+    LayerRegion &region = *layer.regions().front();
+    const Vec2d center = unscale(get_extents(layer.lslices).center());
+    region.perimeters.clear();
+    region.fills.clear();
+    const auto make_path = [&](ExtrusionRole path_role, double x0, double x1, double y) {
+        ExtrusionPath path(path_role, 0.08, 0.4, 0.2);
+        path.polyline.points = {Point3(scale_(center.x() + x0), scale_(center.y() + y), 0.),
+                                Point3(scale_(center.x() + x1), scale_(center.y() + y), 0.)};
+        return path;
+    };
+    // The middle of this wall supports the arc; its distant ends do not.
+    auto *walls = new ExtrusionEntityCollection;
+    walls->append(make_path(erExternalPerimeter, -4., 4., 0.));
+    region.perimeters.entities.push_back(walls);
+    auto *arcs = new ExtrusionEntityCollection;
+    arcs->no_sort = true;
+    auto arc = make_path(role, -1., 1., 0.35);
+    // The crown passes beside a separate wall, but only endpoints anchor it.
+    arc.polyline.points.insert(arc.polyline.points.begin() + 1,
+        Point3(scale_(center.x()), scale_(center.y() + 3.), 0.));
+    const double expected_arc_length = unscale<double>(arc.length());
+    arcs->append(arc);
+    walls->append(make_path(erExternalPerimeter, -0.5, 0.5, 3.35));
+    region.fills.entities.push_back(arcs);
+    auto *ordinary = new ExtrusionEntityCollection;
+    ordinary->append(make_path(erSolidInfill, -3., 3., 3.));
+    region.fills.entities.push_back(ordinary);
+    ScopedTemporaryFile file(".gcode");
+    GCodeProcessorResult preview;
+    print.export_gcode(file.string(), &preview, nullptr);
+    bool saw_arc = false, saw_fill = false;
+    double early_wall = 0., late_wall = 0., arc_length = 0., fill_length = 0.;
+    for (size_t i = 1; i < preview.moves.size(); ++i) {
+        const auto &move = preview.moves[i];
+        if (move.type != EMoveType::Extrude || std::abs(move.position.z() - 0.4f) > 0.001f)
+            continue;
+        const double length = (move.position - preview.moves[i - 1].position).norm();
+        if (is_arc_fill(move.extrusion_role)) {
+            CHECK(early_wall > 0.);
+            CHECK_FALSE(saw_fill);
+            saw_arc = true;
+            arc_length += length;
+        } else if (move.extrusion_role == erSolidInfill) {
+            CHECK(saw_arc);
+            if (!infill_first) CHECK(late_wall > 0.);
+            saw_fill = true;
+            fill_length += length;
+        } else if (move.extrusion_role == erExternalPerimeter) {
+            if (saw_arc) {
+                CHECK(saw_fill == infill_first);
+                late_wall += length;
+            } else {
+                CHECK(move.position.y() < center.y() + 2.);
+                early_wall += length;
+            }
+        }
+    }
+    CHECK(early_wall > 0.);
+    CHECK(late_wall > 0.);
+    CHECK(saw_fill);
+    CHECK_THAT(early_wall + late_wall, Catch::Matchers::WithinAbs(9., 0.005));
+    CHECK_THAT(arc_length, Catch::Matchers::WithinAbs(expected_arc_length, 0.005));
+    CHECK_THAT(fill_length, Catch::Matchers::WithinAbs(6., 0.005));
 }
 
 TEST_CASE("Narrow bridge G-code keeps every arc path anchored and curved",

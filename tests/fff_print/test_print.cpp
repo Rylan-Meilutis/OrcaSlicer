@@ -135,7 +135,7 @@ TEST_CASE("Mapped jobs generate physical tool commands and startup used-tool mas
     CHECK(metadata.find("<filament id=\"2\"") == std::string::npos);
 }
 
-TEST_CASE("Identical materials bound to different features use their mapped nozzle geometry", "[Print][ToolMapping][ProjectFilamentBindings]")
+TEST_CASE("Same or dissimilar materials bound to different features use their mapped nozzle geometry", "[Print][ToolMapping][ProjectFilamentBindings]")
 {
     const bool with_support = GENERATE(false, true);
     PresetBundle bundle;
@@ -146,6 +146,16 @@ TEST_CASE("Identical materials bound to different features use their mapped nozz
     printer.set_deserialize_strict("change_filament_gcode", "T{next_extruder}\n");
     printer.set_deserialize_strict("layer_change_gcode", "G92 E0\n");
     bundle.set_num_filaments(3); // The same profile in all three logical slots.
+    if (GENERATE(false, true)) {
+        const std::vector<std::string> materials{"PLA", "PETG", "TPU"};
+        for (size_t i = 0; i < materials.size(); ++i) {
+            auto filament = bundle.filaments.default_preset().config;
+            filament.set_key_value("filament_type", new ConfigOptionStrings{materials[i]});
+            const auto name = "mapped " + materials[i];
+            bundle.filaments.load_preset("", name, filament, false);
+            bundle.filament_presets[i] = name;
+        }
+    }
     auto &process = bundle.prints.get_edited_preset().config;
     process.set_deserialize_strict({{"enable_prime_tower", "0"}, {"skirts", "0"}, {"brim_type", "no_brim"},
         {"layer_height", "0.1"}, {"initial_layer_print_height", "0.1"}, {"wall_generator", "classic"},
@@ -323,7 +333,7 @@ TEST_CASE("Internal seam entries and returns preserve the original wall material
     const std::string wall_generator = GENERATE("classic", "arachne");
     CAPTURE(wall_generator);
     const auto generate_gcode = [&](bool prepare_outer_seam) {
-        return slice({cube(20.0)}, {
+        return slice({make_cylinder(10., 1., PI / 60.)}, {
             {"wall_generator", wall_generator},
             {"wall_loops", 2},
             {"wall_sequence", "outer wall/inner wall"},
@@ -377,25 +387,50 @@ TEST_CASE("Internal seam starts and finishes inside without retracing the reserv
           "[Print][Seam][Regression]")
 {
     const std::string generator = GENERATE("classic", "arachne");
-    const std::string sequence = GENERATE("outer wall/inner wall", "inner wall/outer wall");
+    const std::string sequence = GENERATE("outer wall/inner wall", "inner wall/outer wall", "inner-outer-inner wall");
     const double gap = GENERATE(0., 0.06);
-    const bool curved = GENERATE(false, true);
+    const std::string shape = GENERATE("cube", "cylinder", "concave hole");
+    const bool reverse_inner = GENERATE(false, true);
     const std::string layering = GENERATE("standard", "brick");
-    CAPTURE(generator, sequence, gap, curved, layering);
-    const std::string output = slice({curved ? make_cylinder(6., 1., PI / 60.) : make_cube(12., 12., 1.)}, {
+    CAPTURE(generator, sequence, gap, shape, layering, reverse_inner);
+    TriangleMesh mesh = shape == "concave hole" ? Test::mesh(Test::TestMesh::cube_with_concave_hole) :
+        shape == "cylinder" ? make_cylinder(6., 1., PI / 60.) : make_cube(12., 12., 1.);
+    mesh.scale(Vec3f(1.f, 1.f, 1.f / mesh.bounding_box().size().z()));
+    Print print;
+    Test::init_and_process_print({mesh}, print, {
         {"wall_generator", generator}, {"wall_sequence", sequence}, {"wall_loops", 3},
         {"perimeter_layering", layering}, {"staggered_perimeters_inner_only", true},
         {"seam_start_on_inner_wall", true}, {"seam_slope_type", "none"}, {"seam_gap", gap},
         {"enable_arc_fitting", false}, {"gcode_comments", true}, {"skirt_loops", 0},
         {"brim_type", "no_brim"}, {"layer_height", 0.2}, {"initial_layer_print_height", 0.2},
         {"sparse_infill_density", "0%"}, {"top_shell_layers", 0}, {"bottom_shell_layers", 0}});
-    struct Segment { Vec2d a, b; double z; };
+    if (reverse_inner) {
+        std::function<void(ExtrusionEntity &)> reverse = [&](ExtrusionEntity &entity) {
+            if (auto *collection = dynamic_cast<ExtrusionEntityCollection *>(&entity)) {
+                for (auto *child : collection->entities) reverse(*child);
+            } else if (entity.inset_idx == 1) {
+                entity.reverse();
+            }
+        };
+        for (const Layer *layer : print.objects().front()->layers())
+            for (LayerRegion *region : layer->regions())
+                reverse(region->perimeters);
+    }
+    ScopedTemporaryFile file(".gcode");
+    print.export_gcode(file.string(), nullptr, nullptr);
+    struct Segment { Vec2d a, b; double z; std::string comment; };
     std::vector<Segment> segments;
     bool in_seam = false;
     Vec2d inside_start = Vec2d::Zero();
     size_t entries = 0, returns = 0, finishes = 0;
     GCodeReader reader;
-    reader.parse_buffer(output, [&](GCodeReader &self, const GCodeReader::GCodeLine &line) {
+    reader.parse_file(file.string(), [&](GCodeReader &self, const GCodeReader::GCodeLine &line) {
+        if (line.extruding(self) && line.dist_XY(self) > 0.001)
+            segments.push_back({Vec2d(self.x(), self.y()), Vec2d(line.new_X(self), line.new_Y(self)), self.z(), std::string(line.comment())});
+        // Concave contours may deliberately fall back to an ordinary seam.
+        // They must still never cross or duplicate another extrusion.
+        if (shape == "concave hole")
+            return;
         const std::string comment(line.comment());
         const bool prime = comment.find("outer wall seam prime") != std::string::npos;
         const bool finish = comment.find("outer wall seam finish") != std::string::npos;
@@ -421,11 +456,10 @@ TEST_CASE("Internal seam starts and finishes inside without retracing the reserv
             in_seam = false;
             ++finishes;
         }
-        if (line.extruding(self) && line.dist_XY(self) > 0.001)
-            segments.push_back({Vec2d(self.x(), self.y()), Vec2d(line.new_X(self), line.new_Y(self)), self.z()});
     });
     CHECK_FALSE(in_seam);
-    REQUIRE(entries > 0);
+    if (shape == "cylinder")
+        REQUIRE(entries > 0);
     CHECK(returns == entries);
     CHECK(finishes == entries);
     // Include later inner walls, not just the entry itself: reserving a tail
@@ -446,7 +480,7 @@ TEST_CASE("Internal seam starts and finishes inside without retracing the reserv
                 const bool interior_crossing =
                     u * other.norm() > 0.005 && (1. - u) * other.norm() > 0.005 &&
                     distance > 0.005 && distance < (a.b - a.a).norm() - 0.005;
-                CAPTURE(i, j, distance, u);
+                CAPTURE(i, j, distance, u, a.comment, b.comment, a.a.x(), a.a.y(), a.b.x(), a.b.y(), b.a.x(), b.a.y(), b.b.x(), b.b.y());
                 CHECK_FALSE(interior_crossing);
                 continue;
             }
@@ -465,7 +499,7 @@ TEST_CASE("Opposite winding inner walls keep connected seam entries and returns"
     const std::string generator = GENERATE("classic", "arachne");
     const std::string layering = GENERATE("standard", "brick");
     Print print;
-    Test::init_and_process_print({make_cube(12., 12., 1.)}, print, {
+    Test::init_and_process_print({make_cylinder(6., 1., PI / 60.)}, print, {
         {"wall_generator", generator}, {"wall_sequence", "outer wall/inner wall"},
         {"wall_loops", 3}, {"perimeter_layering", layering},
         {"staggered_perimeters_inner_only", true}, {"seam_start_on_inner_wall", true},
@@ -508,7 +542,7 @@ TEST_CASE("Inner wall seam preparation follows the configured seam position", "[
     const std::string seam_position =
         GENERATE("nearest", "aligned", "aligned_back", "back", "random");
     CAPTURE(seam_position);
-    const std::string generated_gcode = slice({cube(20.0)}, {
+    const std::string generated_gcode = slice({make_cylinder(10., 1., PI / 60.)}, {
         {"wall_generator", "classic"},
         {"wall_loops", 2},
         {"wall_sequence", "outer wall/inner wall"},
@@ -596,7 +630,7 @@ TEST_CASE("Qualified scarf seams replace internal entries without removing inner
     };
     const auto baseline = deposited(output(false), false);
     const auto combined = deposited(output(true), true);
-    CHECK(first_layer_entries > 0);
+    if (smooth) CHECK(first_layer_entries > 0);
     CHECK_THAT(combined.first, Catch::Matchers::WithinAbs(baseline.first, 0.05));
     CHECK_THAT(combined.second, Catch::Matchers::WithinAbs(baseline.second, 0.01));
     if (smooth) {
@@ -604,7 +638,7 @@ TEST_CASE("Qualified scarf seams replace internal entries without removing inner
         CHECK(entries == 0);
     } else {
         CHECK(slopes == 0);
-        CHECK(entries > 0);
+        CHECK(entries == 0); // Sharp corners fall back when connector beads overlap.
     }
 }
 
@@ -635,6 +669,7 @@ TEST_CASE("Internal seam preparation preserves wall material with variable heigh
             const std::string comment(line.comment());
             const bool original_wall = comment.find("perimeter") != std::string::npos ||
                 comment.find("outer wall seam prime") != std::string::npos ||
+                comment.find("inner wall seam restore") != std::string::npos ||
                 comment.find("outer wall seam finish") != std::string::npos;
             if (line.extruding(self) && original_wall)
                 length += std::hypot(line.dist_XY(self), line.new_Z(self) - self.z());
@@ -646,7 +681,7 @@ TEST_CASE("Internal seam preparation preserves wall material with variable heigh
     CHECK_THAT(perimeter_length(true), Catch::Matchers::WithinAbs(baseline, 0.05));
 }
 
-TEST_CASE("Brick courses use continuous internal seams across corner height offsets",
+TEST_CASE("Brick courses preserve wall material when unsafe corner connectors fall back",
           "[Print][Seam][StaggeredPerimeters][Regression]")
 {
     const std::string generator = GENERATE("classic", "arachne");
@@ -701,9 +736,9 @@ TEST_CASE("Brick courses use continuous internal seams across corner height offs
     };
     const double expected = volume(output(false), false);
     CHECK_THAT(volume(output(true), true), Catch::Matchers::WithinAbs(expected, 0.015));
-    CHECK(entries > 0);
-    CHECK(returns == entries);
-    CHECK(raised_entries > 0);
+    CHECK(entries == 0);
+    CHECK(returns == 0);
+    CHECK(raised_entries == 0);
 }
 
 SCENARIO("Changing the number of solid shell layers does not make all surfaces internal", "[Print]") {

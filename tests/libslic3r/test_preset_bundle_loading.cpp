@@ -91,6 +91,30 @@ TEST_CASE("Independent tools retain a reduced material palette through deletion 
     CHECK(bundle.get_printer_extruder_count() == tool_count);
 }
 
+TEST_CASE("Loading an independent printer capacity preserves the project palette", "[PresetBundle][ToolMapping]")
+{
+    PresetBundle bundle;
+    auto &printer = bundle.printers.get_edited_preset().config;
+    printer.set_key_value("host_type", new ConfigOptionEnum<PrintHostType>(GENERATE(htOctoPrint, htPrusaLink)));
+    printer.set_deserialize_strict("single_extruder_multi_material", "0");
+    printer.set_deserialize_strict("max_filament_colors", GENERATE("0", "8"));
+    const unsigned count = GENERATE(1, 2, 3, 4, 5, 6, 7, 8);
+    bundle.set_num_filaments(count);
+    const auto names = bundle.filament_presets;
+    const auto colors = bundle.project_config.opt<ConfigOptionStrings>("filament_colour")->values;
+    for (const int capacity : {8, 4, 8}) {
+        bundle.on_extruders_count_changed(capacity);
+        // GUI_App::load_current_presets uses this same policy to avoid
+        // expanding the project again after the core load has completed.
+        REQUIRE(bundle.uses_logical_filament_slots());
+        bundle.update_filament_count();
+        bundle.update_multi_material_filament_presets();
+        CHECK(bundle.get_printer_extruder_count() == capacity);
+        CHECK(bundle.filament_presets == names);
+        CHECK(bundle.project_config.opt<ConfigOptionStrings>("filament_colour")->values == colors);
+    }
+}
+
 TEST_CASE("Dispatch mapping preserves the project and binds roles to physical tools", "[PresetBundle][ToolMapping]")
 {
     PresetBundle bundle;
@@ -127,6 +151,46 @@ TEST_CASE("Dispatch mapping preserves the project and binds roles to physical to
     CHECK(purge[7] == Catch::Approx(140.));
     CHECK(config.opt_float("flush_volumes_vector", 14) == Catch::Approx(10.));
     CHECK(config.opt_float("flush_volumes_vector", 1) == Catch::Approx(40.));
+}
+
+TEST_CASE("Every nonempty tool subset preserves mixed nozzle and material assignments", "[PresetBundle][ToolMapping]")
+{
+    const std::vector<double> diameters{0.2, 0.4, 0.6, 0.8, 0.25, 0.4, 0.6, 0.2};
+    const std::vector<std::string> materials{"PLA", "PETG", "TPU", "ABS", "ASA", "PC", "PLA", "PETG"};
+    for (unsigned mask = 1; mask < 256; ++mask) {
+        CAPTURE(mask);
+        PresetBundle bundle;
+        auto &printer = bundle.printers.get_edited_preset().config;
+        printer.set_num_extruders(8);
+        printer.set_deserialize_strict("single_extruder_multi_material", "0");
+        printer.set_key_value("nozzle_diameter", new ConfigOptionFloats(diameters));
+        std::vector<int> tools;
+        for (int tool = 7; tool >= 0; --tool)
+            if (mask & (1u << tool)) tools.push_back(tool);
+        bundle.set_num_filaments(unsigned(tools.size()));
+        for (size_t i = 0; i < tools.size(); ++i) {
+            auto filament = bundle.filaments.default_preset().config;
+            filament.set_key_value("filament_type", new ConfigOptionStrings{materials[tools[i]]});
+            const std::string name = "subset material " + std::to_string(i);
+            bundle.filaments.load_preset("", name, filament, false);
+            bundle.filament_presets[i] = name;
+        }
+        Model project;
+        for (size_t i = 0; i < tools.size(); ++i) {
+            auto *object = project.add_object();
+            object->add_volume(make_cube(1, 1, 1));
+            object->config.set_key_value("extruder", new ConfigOptionInt(int(i + 1)));
+        }
+        Model job(project);
+        const auto mapped = bundle.tool_mapped_config(job, tools, {});
+        CHECK(bundle.filament_presets.size() == tools.size());
+        CHECK(mapped.opt<ConfigOptionFloats>("nozzle_diameter")->values == diameters);
+        for (size_t i = 0; i < tools.size(); ++i) {
+            CHECK(job.objects[i]->config.extruder() == tools[i] + 1);
+            CHECK(project.objects[i]->config.extruder() == int(i + 1));
+            CHECK(mapped.opt_string("filament_type", unsigned(tools[i])) == materials[tools[i]]);
+        }
+    }
 }
 
 TEST_CASE("Dispatch rejects duplicate missing and out of range tool assignments", "[PresetBundle][ToolMapping]")

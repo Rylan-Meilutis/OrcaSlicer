@@ -8710,21 +8710,17 @@ void GUI_App::load_current_presets(bool active_preset_combox/*= false*/, bool ch
 
     auto& edited_printer_preset = preset_bundle->printers.get_edited_preset();
     PrinterTechnology printer_technology = edited_printer_preset.printer_technology();
-    // Keep the project filament slots aligned with the saved printer limit.
-    // Without a configured limit, fixed multi-tool printers still follow their
-    // physical nozzle count.
-    if (printer_technology == ptFFF) {
+    // Tool capacity is not the project's material count. Mapped-tool projects
+    // keep their palette until the user adds/removes materials or explicitly
+    // syncs loaded tools. Use the same policy as PresetBundle's load paths.
+    if (printer_technology == ptFFF && !preset_bundle->uses_logical_filament_slots()) {
         const auto *nozzle_diameter =
             edited_printer_preset.config.option<ConfigOptionFloats>("nozzle_diameter");
         const size_t nozzle_count = nozzle_diameter != nullptr ? nozzle_diameter->values.size() : 1;
-        const int configured_colors = edited_printer_preset.config.opt_int("max_filament_colors");
         const bool single_extruder_multi_material =
             edited_printer_preset.config.opt_bool("single_extruder_multi_material") &&
             nozzle_count == 1;
-        if (single_extruder_multi_material && configured_colors > 0) {
-            preset_bundle->set_num_filaments(
-                static_cast<unsigned int>(configured_colors));
-        } else if (!single_extruder_multi_material) {
+        if (!single_extruder_multi_material) {
             // Mixed-color slots are virtual filaments kept at the tail of the list, so they have no
             // nozzle of their own and the count has to allow for them. Only ever grow: this sizes
             // the list so the combo boxes have something to bind to, and set_num_filaments() trims

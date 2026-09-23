@@ -28,11 +28,14 @@ using namespace Slic3r::Test;
 
 TEST_CASE("Rooting embeds flared anchors without changing exposed surfaces", "[Multifilament][Rooting]")
 {
-    const std::string shape = GENERATE("stacked", "thin", "same filament", "side by side", "narrow", "cavity", "large nozzle", "no shells", "support filament", "soluble host");
-    const double base_height = shape == "thin" ? 1. : 6.;
+    const std::string shape = GENERATE("stacked", "shallow", "spreading", "deep request", "deep roots", "L contact", "ring contact", "thin", "same filament", "side by side", "narrow", "cavity", "large nozzle", "no shells", "support filament", "soluble host");
+    const double base_height = shape == "thin" ? 1. : shape == "shallow" ? 2.4 : shape == "deep roots" ? 12. : 6.;
+    const double requested_depth = shape == "deep request" ? 20. : shape == "deep roots" ? 8. : shape == "spreading" ? 4. : 3.;
+    const bool expect_roots = shape == "stacked" || shape == "shallow" || shape == "spreading" || shape == "deep request" || shape == "deep roots" || shape == "L contact" || shape == "ring contact";
+    CAPTURE(shape);
     auto config = multifilament_config(2, {
-        {"rooting", false}, {"rooting_depth", 3.}, {"rooting_width", 1.2},
-        {"rooting_spacing", 6.}, {"rooting_skin", 0.8},
+        {"rooting", false}, {"rooting_depth", requested_depth}, {"rooting_width", 1.2},
+        {"rooting_spacing", shape == "spreading" ? 100. : 6.}, {"rooting_skin", 0.8},
         {"interlocking_beam", false}, {"layer_height", 0.2}, {"initial_layer_print_height", 0.2},
         {"elefant_foot_compensation", 0.}, {"xy_contour_compensation", 0.},
         {"xy_hole_compensation", 0.}, {"enable_prime_tower", false}});
@@ -65,6 +68,20 @@ TEST_CASE("Rooting embeds flared anchors without changing exposed surfaces", "[M
     }
     init_print({base}, baseline, model, config);
     TriangleMesh upper = make_cube(shape == "narrow" ? 2. : 12., 12., 2.);
+    if (shape == "L contact" || shape == "ring contact") {
+        upper = make_cube(12., 5., 2.);
+        TriangleMesh side = make_cube(5., 7., 2.);
+        side.translate(0., 5., 0.);
+        upper.merge(side);
+        if (shape == "ring contact") {
+            side = make_cube(7., 5., 2.);
+            side.translate(5., 7., 0.);
+            upper.merge(side);
+            side = make_cube(5., 2., 2.);
+            side.translate(7., 5., 0.);
+            upper.merge(side);
+        }
+    }
     upper.translate(shape == "side by side" ? 24. : 6., 6., shape == "side by side" ? 0. : base_height);
     model.objects.front()->volumes.front()->config.set("extruder", 1);
     model.objects.front()->add_volume(upper)->config.set("extruder", shape == "same filament" ? 1 : 2);
@@ -87,7 +104,10 @@ TEST_CASE("Rooting embeds flared anchors without changing exposed surfaces", "[M
         return union_ex(result);
     };
     size_t changed = 0;
-    double deepest_area = 0., stem_area = 0.;
+    double maximum_span = 0.;
+    size_t maximum_branches = 0;
+    bool outside_contact = false;
+    const auto attachment = offset_ex(material(original.back(), 2), -scale_(0.8));
     ExPolygons previous_roots;
     for (size_t i = 0; i < actual.size(); ++i) {
         const ExPolygons a = material(actual[i], 1), b = material(actual[i], 2);
@@ -100,28 +120,48 @@ TEST_CASE("Rooting embeds flared anchors without changing exposed surfaces", "[M
         if (!roots.empty()) {
             ++changed;
             CHECK(actual[i]->print_z <= base_height + EPSILON);
-            CHECK(actual[i]->print_z - actual[i]->height >= base_height - 3. - EPSILON);
-            // Roots never enter the exposed ring around the upper part.
-            CHECK(diff_ex(roots, offset_ex(material(original.back(), 2), -scale_(0.8))).empty());
-            if (!previous_roots.empty())
-                for (const ExPolygon &branch : roots)
-                    CHECK_FALSE(intersection_ex(ExPolygons{branch}, previous_roots).empty());
-            const double root_area = area(to_polygons(roots));
-            if (deepest_area == 0.)
-                deepest_area = root_area;
-            stem_area = root_area;
+            CHECK(actual[i]->print_z - actual[i]->height >= std::max(0.8, base_height - requested_depth) - EPSILON);
+            // Lateral branches may leave the contact footprint only once buried
+            // below the ledge's protective top skin.
+            if (actual[i]->print_z > base_height - 0.8 + EPSILON)
+                CHECK(diff_ex(roots, attachment).empty());
+            else
+                outside_contact |= !diff_ex(roots, attachment).empty();
+            CHECK(diff_ex(roots, offset_ex(old_a, -scale_(0.8))).empty());
+            if (!previous_roots.empty()) {
+                for (const ExPolygon &branch : previous_roots)
+                    CHECK_FALSE(intersection_ex(ExPolygons{branch}, roots).empty());
+            }
+            const double span = unscale_(get_extents(roots).size().x());
+            maximum_span = std::max(maximum_span, span);
+            maximum_branches = std::max(maximum_branches, roots.size());
+            if (std::abs(actual[i]->print_z - base_height) < EPSILON) {
+                CHECK(diff_ex(attachment, roots).empty());
+                CHECK(diff_ex(roots, attachment).empty());
+            }
             previous_roots = roots;
         }
-        if (shape != "stacked" || actual[i]->print_z > base_height + EPSILON || actual[i]->print_z <= 0.8 + EPSILON) {
+        if (!expect_roots || actual[i]->print_z > base_height + EPSILON || actual[i]->print_z <= 0.8 + EPSILON) {
             CHECK(diff_ex(a, old_a).empty());
             CHECK(diff_ex(old_a, a).empty());
             CHECK(diff_ex(b, old_b).empty());
             CHECK(diff_ex(old_b, b).empty());
         }
     }
-    if (shape == "stacked") {
+    if (expect_roots) {
         CHECK(changed >= 3);
-        CHECK(deepest_area > 2. * stem_area);
+        if (shape == "deep roots") {
+            CHECK(maximum_branches > 4);
+            CHECK(outside_contact);
+            CHECK(maximum_span > 2. * requested_depth);
+        }
+        if (shape == "spreading") {
+            // One seed, not a grid of independent four-circle anchors. A shallow
+            // tree must fork again and spread much farther than its depth.
+            CHECK(maximum_branches >= 8);
+            CHECK(outside_contact);
+            CHECK(maximum_span > 3. * requested_depth);
+        }
     } else
         CHECK(changed == 0);
 
@@ -141,9 +181,11 @@ TEST_CASE("Rooting embeds flared anchors without changing exposed surfaces", "[M
 TEST_CASE("Rooting reaches emitted toolpaths below the original interface", "[Multifilament][Rooting][GCode]")
 {
     const bool enabled = GENERATE(false, true);
+    const bool interlocking = GENERATE(false, true);
+    CAPTURE(enabled, interlocking);
     auto config = multifilament_config(2, {
         {"rooting", enabled}, {"rooting_depth", 3.}, {"rooting_width", 1.2},
-        {"rooting_spacing", 6.}, {"rooting_skin", 0.8}, {"interlocking_beam", false},
+        {"rooting_spacing", 6.}, {"rooting_skin", 0.8}, {"interlocking_beam", interlocking},
         {"layer_height", 0.2}, {"initial_layer_print_height", 0.2},
         {"wall_loops", 3}, {"top_shell_layers", 3}, {"bottom_shell_layers", 3},
         {"enable_prime_tower", false}, {"skirt_loops", 0}, {"brim_type", "no_brim"}});
@@ -167,11 +209,23 @@ TEST_CASE("Rooting reaches emitted toolpaths below the original interface", "[Mu
             lowest_upper_material = std::min(lowest_upper_material, double(line.new_Z(self)));
     });
     if (enabled) {
-        CHECK(lowest_upper_material < 6.);
+        CHECK(lowest_upper_material <= 3.4 + EPSILON);
         CHECK(lowest_upper_material >= 3. - EPSILON);
-    } else
+    } else if (!interlocking)
         CHECK(lowest_upper_material >= 6. - EPSILON);
+    else
+        // Beams themselves reach below this horizontal contact, but do not
+        // substitute for the deeper roots requested by the 3 mm depth.
+        CHECK(lowest_upper_material > 3.4);
     CHECK(lowest_upper_material < 8.);
+    ScopedTemporaryFile file(".gcode");
+    GCodeProcessorResult preview;
+    print.export_gcode(file.string(), &preview, nullptr);
+    double preview_lowest = std::numeric_limits<double>::max();
+    for (const auto &move : preview.moves)
+        if (move.type == EMoveType::Extrude && move.extruder_id == 1)
+            preview_lowest = std::min(preview_lowest, double(move.position.z()));
+    CHECK_THAT(preview_lowest, Catch::Matchers::WithinAbs(lowest_upper_material, 0.001));
 }
 
 TEST_CASE("Rooting leaves generated supports and interfaces unchanged", "[Multifilament][Rooting][Support]")

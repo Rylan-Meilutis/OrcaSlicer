@@ -3446,7 +3446,7 @@ size_t PresetBundle::max_filament_colors() const
 {
     const Preset& printer = printers.get_edited_preset();
     const auto* configured = printer.config.opt<ConfigOptionInt>("max_filament_colors");
-    if ((uses_octoprint_tool_mapping(*this) || uses_independent_tool_materials(*this)) && get_printer_extruder_count() > 1)
+    if (uses_logical_filament_slots() && get_printer_extruder_count() > 1)
         return size_t(get_printer_extruder_count());
     const bool single_extruder_multi_material =
         printer.config.opt_bool("single_extruder_multi_material") &&
@@ -3462,6 +3462,11 @@ bool PresetBundle::has_fixed_filament_slots() const
     // max_filament_colors limits capacity; it must not force empty slots into
     // every project or prevent deleting an unused project material.
     return false;
+}
+
+bool PresetBundle::uses_logical_filament_slots() const
+{
+    return uses_octoprint_tool_mapping(*this) || uses_independent_tool_materials(*this);
 }
 
 static std::string fixed_filament_slot_color(size_t index)
@@ -4550,7 +4555,7 @@ void PresetBundle::update_filament_count()
 {
     if (printers.get_edited_preset().printer_technology() != ptFFF)
         return;
-    const size_t num_extruders = (uses_octoprint_tool_mapping(*this) || uses_independent_tool_materials(*this)) ? 1 :
+    const size_t num_extruders = uses_logical_filament_slots() ? 1 :
         static_cast<size_t>(get_printer_extruder_count());
     if (filament_presets.size() >= num_extruders)
         return;
@@ -7434,7 +7439,7 @@ void PresetBundle::update_multi_material_filament_presets(size_t to_delete_filam
     size_t num_filaments = this->filament_presets.size();
 
     auto* nozzle_diameter = static_cast<const ConfigOptionFloats*>(printers.get_edited_preset().config.option("nozzle_diameter"));
-    size_t num_extruders  = (uses_octoprint_tool_mapping(*this) || uses_independent_tool_materials(*this)) ? 1 : nozzle_diameter->values.size();
+    size_t num_extruders  = uses_logical_filament_slots() ? 1 : nozzle_diameter->values.size();
     if (num_extruders > num_filaments) { // Verify validity of the current filament presets.
         for (size_t i = 0; i < std::min(this->filament_presets.size(), num_extruders); ++i)
             this->filament_presets[i] = this->filaments.find_preset(this->filament_presets[i], true)->name;
