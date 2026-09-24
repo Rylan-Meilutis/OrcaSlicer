@@ -49,6 +49,7 @@
 #include <boost/log/trivial.hpp>
 
 #include "libslic3r.h"
+#include "LifecycleEvents.hpp"
 #include "Utils.hpp"
 #include "Time.hpp"
 #include "PlaceholderParser.hpp"
@@ -3070,6 +3071,7 @@ void PresetCollection::save_current_preset(const std::string &new_name, bool det
     // 1) Find the preset with a new_name or create a new one,
     // initialize it with the edited config.
     auto it = this->find_preset_internal(new_name);
+    const bool preset_existed = (it != m_presets.end() && it->name == new_name);
     if (it != m_presets.end() && it->name == new_name) {
         // Preset with the same name found.
         Preset &preset = *it;
@@ -3180,6 +3182,14 @@ void PresetCollection::save_current_preset(const std::string &new_name, bool det
     if (m_type == Preset::TYPE_PRINTER)
         if (const auto *model = get_selected_preset().config.option<ConfigOptionString>("sequential_print_gantry_model"))
             m_edited_preset.config.set_key_value("sequential_print_gantry_model", model->clone());
+
+    {
+        LifecycleEventContext ctx;
+        ctx.name  = new_name;
+        ctx.msg = preset_existed ? "overwrite" : "new";
+        ctx.code = LifecycleEvtCode::Ok;
+        fire_lifecycle_event(LifecycleEvent::PresetSaved, ctx);
+    }
 }
 
 // A detached standalone preset for the Full Publish receiver: create a user preset holding
