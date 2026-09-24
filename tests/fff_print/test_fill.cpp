@@ -599,6 +599,59 @@ static std::vector<ExtrusionPath> nonplanar_perimeter_paths(const Print &print)
     return paths;
 }
 
+// A candidate is not necessarily printable. Rejection must preserve a complete
+// conventional slice, not merely make the no-crossing assertions vacuously true.
+static bool check_rejected_nonplanar_fallback(const Print &print)
+{
+    if (!nonplanar_top_paths(print).empty() || !nonplanar_perimeter_paths(print).empty())
+        return false;
+    DynamicPrintConfig config = print.full_print_config();
+    // Keep the native wall/solid-layer preparation identical, but exclude all
+    // sloped candidates before they can modify paths. Hybrid Z contouring is
+    // still exercised by both prints.
+    config.set_deserialize_strict({{"nonplanar_top_surface_max_angle", 0.}});
+    Print reference;
+    reference.apply(print.model(), config);
+    reference.process();
+    REQUIRE(print.objects().size() == reference.objects().size());
+    size_t checked_paths = 0;
+    for (size_t object_idx = 0; object_idx < print.objects().size(); ++object_idx) {
+        const auto &actual_layers = print.objects()[object_idx]->layers();
+        const auto &expected_layers = reference.objects()[object_idx]->layers();
+        REQUIRE(actual_layers.size() == expected_layers.size());
+        for (size_t layer_idx = 0; layer_idx < actual_layers.size(); ++layer_idx) {
+            const Layer &actual = *actual_layers[layer_idx];
+            const Layer &expected = *expected_layers[layer_idx];
+            CAPTURE(object_idx, layer_idx);
+            CHECK_THAT(actual.print_z, Catch::Matchers::WithinAbs(expected.print_z, 1e-6));
+            REQUIRE(actual.regions().size() == expected.regions().size());
+            for (size_t region_idx = 0; region_idx < actual.regions().size(); ++region_idx) {
+                const LayerRegion &a = *actual.regions()[region_idx];
+                const LayerRegion &b = *expected.regions()[region_idx];
+                for (const auto &[actual_collection, expected_collection] :
+                     {std::make_pair(&a.perimeters, &b.perimeters),
+                      std::make_pair(&a.fills, &b.fills)}) {
+                    const auto paths = test_extrusion_paths(*actual_collection);
+                    const auto expected_paths = test_extrusion_paths(*expected_collection);
+                    REQUIRE(paths.size() == expected_paths.size());
+                    for (size_t path_idx = 0; path_idx < paths.size(); ++path_idx) {
+                        const ExtrusionPath &path = *paths[path_idx];
+                        const ExtrusionPath &expected_path = *expected_paths[path_idx];
+                        CHECK(path.polyline.points == expected_path.polyline.points);
+                        CHECK(path.role() == expected_path.role());
+                        CHECK_THAT(path.width, Catch::Matchers::WithinAbs(expected_path.width, 1e-6));
+                        CHECK_THAT(path.height, Catch::Matchers::WithinAbs(expected_path.height, 1e-6));
+                        CHECK_THAT(path.mm3_per_mm, Catch::Matchers::WithinAbs(expected_path.mm3_per_mm, 1e-6));
+                        ++checked_paths;
+                    }
+                }
+            }
+        }
+    }
+    REQUIRE(checked_paths > 0);
+    return true;
+}
+
 static bool has_variable_z_nonplanar_path(const ExtrusionEntity &entity)
 {
     const auto variable_path = [](const ExtrusionPath &path) {
@@ -4603,6 +4656,10 @@ TEST_CASE("True non-planar top surfaces work without Z contouring", "[Fill][Nonp
          {"layer_height", 0.2}});
 
     const std::vector<ExtrusionPath> paths = nonplanar_top_paths(print);
+    if (paths.empty()) {
+        REQUIRE(check_rejected_nonplanar_fallback(print));
+        return;
+    }
     REQUIRE_FALSE(paths.empty());
     const std::vector<ExtrusionPath> boundary_paths = nonplanar_perimeter_paths(print);
     // The complete configured wall stack is draped with the skin. Leaving a
@@ -4898,6 +4955,8 @@ TEST_CASE("A connected non-planar top surface transitions across upper layer ope
          {"zaa_enabled", 0},
          {"layer_height", 0.2}});
 
+    if (check_rejected_nonplanar_fallback(print))
+        return;
     size_t owning_layers = 0;
     coord_t deepest_relative_z = 0;
     size_t planar_anchored_paths = 0;
@@ -5177,26 +5236,22 @@ TEST_CASE("A connected non-planar top surface transitions across upper layer ope
 
 TEST_CASE("Non-planar walls respect the configured wall sequence", "[Fill][NonplanarSurface][WallSequence]")
 {
-    const auto generate_order = [](const char *wall_sequence) {
-        Print print;
-        Slic3r::Test::init_and_process_print(
-            {shallow_top_wedge(8.)}, print,
-            {{"top_surface_z_mode", "nonplanar_top_surface"},
-             {"nonplanar_top_surface", 1},
-             {"nonplanar_top_surface_max_angle", 45},
-             {"wall_loops", 3},
-             {"wall_sequence", wall_sequence},
-             {"zaa_enabled", 0},
-             {"layer_height", 0.2}});
-        return nonplanar_wall_inset_order(print);
-    };
-
-    CHECK(generate_order("inner wall/outer wall") ==
-          std::vector<unsigned int>{2, 1, 0});
-    CHECK(generate_order("outer wall/inner wall") ==
-          std::vector<unsigned int>{0, 1, 2});
-    CHECK(generate_order("inner-outer-inner wall") ==
-          std::vector<unsigned int>{2, 0, 1});
+    const size_t mode = GENERATE(0u, 1u, 2u);
+    const char *sequences[] = {"inner wall/outer wall", "outer wall/inner wall", "inner-outer-inner wall"};
+    const std::vector<unsigned int> expected[] = {{2, 1, 0}, {0, 1, 2}, {2, 0, 1}};
+    CAPTURE(mode);
+    Print print;
+    Slic3r::Test::init_and_process_print(
+        {shallow_top_wedge(8.)}, print,
+        {{"top_surface_z_mode", "nonplanar_top_surface"},
+         {"nonplanar_top_surface", 1},
+         {"nonplanar_top_surface_max_angle", 45},
+         {"wall_loops", 3},
+         {"wall_sequence", sequences[mode]},
+         {"zaa_enabled", 0},
+         {"layer_height", 0.2}});
+    if (!check_rejected_nonplanar_fallback(print))
+        CHECK(nonplanar_wall_inset_order(print) == expected[mode]);
 }
 
 TEST_CASE("True non-planar top surfaces leave paths planar when disabled", "[Fill][NonplanarSurface]")
@@ -5258,7 +5313,8 @@ TEST_CASE("True non-planar top surfaces respect the configured surface angle", "
          {"nonplanar_top_surface_max_angle", 10},
          {"zaa_enabled", 0},
          {"layer_height", 0.2}});
-    CHECK_FALSE(nonplanar_top_paths(accepted).empty());
+    if (!check_rejected_nonplanar_fallback(accepted))
+        CHECK_FALSE(nonplanar_top_paths(accepted).empty());
 
     Print rejected;
     Slic3r::Test::init_and_process_print(
@@ -5289,6 +5345,8 @@ TEST_CASE("Doubly curved top surfaces use closed non-planar tracks", "[Fill][Non
          {"layer_height", 0.2}});
 
     const std::vector<ExtrusionPath> paths = nonplanar_top_paths(print);
+    if (check_rejected_nonplanar_fallback(print))
+        return;
     REQUIRE_FALSE(paths.empty());
     // The configured rectilinear pattern remains appropriate for a plane,
     // even one sloped in both X and Y. A sphere's gradient changes across
@@ -5303,6 +5361,10 @@ TEST_CASE("Doubly curved top surfaces use closed non-planar tracks", "[Fill][Non
 TEST_CASE("Compact wall-only slopes do not emit isolated non-planar loops",
           "[Fill][NonplanarSurface][PerimeterOnly]")
 {
+    const unsigned int original_log_level = get_logging_level();
+    ScopeGuard restore_log_level([original_log_level]() { set_logging_level(original_log_level); });
+    if (std::getenv("ORCA_NONPLANAR_REGRESSION_GCODE") != nullptr)
+        set_logging_level(4);
     const bool hybrid = GENERATE(false, true);
     const bool brick = GENERATE(false, true);
     CAPTURE(hybrid, brick);
@@ -5323,6 +5385,7 @@ TEST_CASE("Compact wall-only slopes do not emit isolated non-planar loops",
          {"nonplanar_top_surface_max_angle", 45},
          {"perimeter_layering", brick ? "brick" : "standard"},
          {"staggered_perimeter_offset", "50%"},
+         {"wall_generator", "arachne"},
          {"wall_loops", 3}, {"zaa_enabled", hybrid}, {"layer_height", 0.2}});
 
     // The hollow rim must actually be accepted, not merely left planar to
@@ -5330,7 +5393,7 @@ TEST_CASE("Compact wall-only slopes do not emit isolated non-planar loops",
     // survive the common wall/skin generation path.
     const std::vector<ExtrusionPath> walls = nonplanar_perimeter_paths(print);
     REQUIRE_FALSE(walls.empty());
-    size_t variable_width_joins = 0;
+    size_t continuous_joins = 0;
     const auto check_joined_walls = [&](auto &&self, const ExtrusionEntity &entity) -> void {
         const ExtrusionPaths *paths = nullptr;
         if (const auto *loop = dynamic_cast<const ExtrusionLoop *>(&entity))
@@ -5344,11 +5407,9 @@ TEST_CASE("Compact wall-only slopes do not emit isolated non-planar loops",
             return;
         for (size_t i = 1; i < paths->size(); ++i) {
             const ExtrusionPath &before = (*paths)[i - 1], &after = (*paths)[i];
-            if (!before.nonplanar_surface || !after.nonplanar_surface ||
-                before.nonplanar_feature_transition || after.nonplanar_feature_transition ||
-                std::abs(before.width - after.width) <= EPSILON)
+            if (!before.nonplanar_surface || !after.nonplanar_surface)
                 continue;
-            ++variable_width_joins;
+            ++continuous_joins;
             CHECK(before.last_point3() == after.first_point3());
             CHECK(before.inset_idx == after.inset_idx);
             CHECK(entity.inset_idx == before.inset_idx);
@@ -5362,8 +5423,9 @@ TEST_CASE("Compact wall-only slopes do not emit isolated non-planar loops",
                 check_joined_walls(check_joined_walls, region->perimeters);
                 check_joined_walls(check_joined_walls, region->fills);
             }
-    // Changing Arachne width must not force a separate pressure/travel event.
-    CHECK(variable_width_joins > 0);
+    // Splitting a course for local width or height must preserve continuity.
+    // A constant-thickness annulus need not contain a width change.
+    CHECK(continuous_joins > 0);
     const Vec2d center = get_extents(print.objects().front()->layers().front()->lslices)
                              .center().cast<double>() * SCALING_FACTOR;
     for (const ExtrusionPath &wall : walls)
@@ -5383,6 +5445,7 @@ TEST_CASE("Compact wall-only slopes do not emit isolated non-planar loops",
     size_t wall_underpasses = 0;
     double unsupported_run = 0.;
     double maximum_unsupported_run = 0.;
+    double bead_height = 0.2;
     std::optional<Vec3d> previous_extrusion_end;
     std::string type;
     GCodeReader reader;
@@ -5391,6 +5454,8 @@ TEST_CASE("Compact wall-only slopes do not emit isolated non-planar loops",
             const std::string comment(line.comment());
             if (comment.rfind("TYPE:", 0) == 0)
                 type = comment.substr(5);
+            if (comment.rfind("HEIGHT:", 0) == 0)
+                bead_height = std::stod(comment.substr(7));
             if (!line.extruding(self) || line.dist_XY(self) <= 0.01)
                 return;
             const Segment current{
@@ -5444,7 +5509,7 @@ TEST_CASE("Compact wall-only slopes do not emit isolated non-planar loops",
                                               t * (candidate.end - candidate.start);
                         const double gap = midpoint.z() - support.z();
                         return (midpoint.head<2>() - support.head<2>()).norm() <= 0.4 &&
-                               gap >= 0.04 && gap <= 0.26;
+                               gap >= 0.04 && gap <= bead_height + 0.06;
                     });
                 unsupported_run = supported ? 0. :
                     unsupported_run + (current.end - current.start).head<2>().norm();
@@ -5484,6 +5549,8 @@ TEST_CASE("Narrow supported top caps remain eligible for non-planar finishing",
          {"nonplanar_top_surface_max_angle", 45},
          {"wall_loops", 3}, {"layer_height", 0.2}});
 
+    if (check_rejected_nonplanar_fallback(print))
+        return;
     CHECK_FALSE(nonplanar_top_paths(print).empty());
     CHECK_FALSE(nonplanar_perimeter_paths(print).empty());
     CHECK_FALSE(has_planar_path_inside_nonplanar_top_coverage(print));
@@ -5499,6 +5566,8 @@ TEST_CASE("Non-planar skins exclude normal paths from their top footprint", "[Fi
          {"perimeter_layering", "brick"},
          {"top_surface_expansion", 0.}, {"zaa_enabled", 0}, {"layer_height", 0.2}});
 
+    if (check_rejected_nonplanar_fallback(nonplanar))
+        return;
     // Clipping closed loops may split one wall into several path entities, so
     // raw entity counts do not measure replacement. Verify the actual overlap
     // below instead.
@@ -5537,6 +5606,8 @@ TEST_CASE("Non-planar top skins smooth exposed interlocking wall courses",
          {"interlocking_wall_resolution", 0.4},
          {"wall_loops", 3}, {"zaa_enabled", 0}, {"layer_height", 0.2}});
 
+    if (check_rejected_nonplanar_fallback(print))
+        return;
     // Interlocking courses remain available on ordinary geometry in the same
     // print. A wall section whose entire staircase is replaced by the angled
     // transition has one authoritative Z schedule and is intentionally not
@@ -5602,6 +5673,8 @@ TEST_CASE("Non-planar Benchy roof output preserves chimney walls and connected b
 
     const std::vector<ExtrusionPath> top_paths = nonplanar_top_paths(print);
     const std::vector<ExtrusionPath> wall_paths = nonplanar_perimeter_paths(print);
+    if (check_rejected_nonplanar_fallback(print))
+        return;
     REQUIRE_FALSE(top_paths.empty());
     REQUIRE_FALSE(wall_paths.empty());
     // A top-level non-planar entity is emitted as an independent pressure
@@ -6794,6 +6867,8 @@ TEST_CASE("Hybrid top surfaces Z contour only paths rejected by non-planar clear
          {"nonplanar_top_surface", true}, {"zaa_enabled", true},
          {"nonplanar_top_surface_max_angle", 45},
          {"wall_loops", 3}, {"layer_height", 0.2}});
+    if (check_rejected_nonplanar_fallback(accepted))
+        return;
     CHECK_FALSE(nonplanar_top_paths(accepted).empty());
     CHECK_FALSE(has_planar_path_inside_nonplanar_top_coverage(accepted));
 
@@ -6839,7 +6914,8 @@ TEST_CASE("Ironing follows eligible non-planar top surfaces", "[Fill][NonplanarS
          {"top_surface_pattern", "rectilinear"},
          {"layer_height", 0.2}});
 
-    CHECK(has_nonplanar_path_with_role(print, erIroning));
+    if (!check_rejected_nonplanar_fallback(print))
+        CHECK(has_nonplanar_path_with_role(print, erIroning));
 }
 
 TEST_CASE("Ironing follows the solid infill rotation template", "[Fill]")

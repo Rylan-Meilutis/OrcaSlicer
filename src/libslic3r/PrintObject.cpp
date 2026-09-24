@@ -1045,6 +1045,23 @@ void PrintObject::contour_z()
     if (has_nonplanar_surfaces)
         m_print->set_status(41, L("Generating non-planar surface paths"));
 
+    // Candidate marking may split loops and adjust flow before consolidation
+    // rejects a region. Restoring only point Z cannot recover those edits.
+    // Keep the native graph until at least one replacement is accepted.
+    struct NativeRegionPaths {
+        LayerRegion *region;
+        ExtrusionEntityCollection perimeters;
+        ExtrusionEntityCollection fills;
+    };
+    std::vector<std::vector<NativeRegionPaths>> native_paths(m_print->num_print_regions());
+    if (has_nonplanar_surfaces)
+        for (Layer *layer : m_layers)
+            for (size_t idx = 0; idx < layer->regions().size(); ++idx) {
+                LayerRegion *region = layer->regions()[idx];
+                if (nonplanar_perimeters_enabled(region->region().config()))
+                    native_paths[idx].push_back({region, region->perimeters, region->fills});
+            }
+
     std::vector<std::pair<double, double>> nonplanar_projection_z_ranges;
     nonplanar_projection_z_ranges.reserve(m_layers.size());
     for (const Layer *layer : m_layers) {
@@ -1141,6 +1158,33 @@ void PrintObject::contour_z()
             }
             m_print->throw_if_canceled();
         }) : std::function<void(const NonplanarProgress &)>{});
+
+    const auto has_accepted_path = [](auto &&self, const ExtrusionEntity &entity) -> bool {
+        if (const auto *path = dynamic_cast<const ExtrusionPath *>(&entity))
+            return path->nonplanar_surface && path->nonplanar_clearance_validated;
+        if (const auto *loop = dynamic_cast<const ExtrusionLoop *>(&entity))
+            return std::any_of(loop->paths.begin(), loop->paths.end(),
+                [&](const ExtrusionPath &path) { return self(self, path); });
+        if (const auto *multi = dynamic_cast<const ExtrusionMultiPath *>(&entity))
+            return std::any_of(multi->paths.begin(), multi->paths.end(),
+                [&](const ExtrusionPath &path) { return self(self, path); });
+        if (const auto *collection = dynamic_cast<const ExtrusionEntityCollection *>(&entity))
+            return std::any_of(collection->entities.begin(), collection->entities.end(),
+                [&](const ExtrusionEntity *child) { return self(self, *child); });
+        return false;
+    };
+    for (auto &region_paths : native_paths) {
+        const bool accepted = std::any_of(region_paths.begin(), region_paths.end(),
+            [&](const NativeRegionPaths &paths) {
+                return has_accepted_path(has_accepted_path, paths.region->perimeters) ||
+                       has_accepted_path(has_accepted_path, paths.region->fills);
+            });
+        if (!accepted)
+            for (auto &paths : region_paths) {
+                paths.region->perimeters = std::move(paths.perimeters);
+                paths.region->fills = std::move(paths.fills);
+            }
+    }
 
     // Hybrid mode deliberately runs in two passes. Consolidation first owns
     // and replaces every collision-safe non-planar patch. Z contouring then

@@ -523,6 +523,7 @@ TEST_CASE("Brick walls retain their height and connectivity at changing material
         // checking conservation against the pre-seam perimeter geometry.
         const bool original_wall = comment.find("perimeter") != std::string::npos ||
             comment.find("outer wall seam prime") != std::string::npos ||
+            comment.find("inner wall seam restore") != std::string::npos ||
             comment.find("outer wall seam finish") != std::string::npos;
         if (line.extruding(self) && original_wall) {
             perimeter_tools.insert(active_tool);
