@@ -11,6 +11,10 @@
 
 #include <catch2/catch_all.hpp>
 
+// Standalone libslic3r consumers provide the NanoSVG implementation.
+#define NANOSVG_IMPLEMENTATION
+#include "nanosvg/nanosvg.h"
+
 #include "fg_test_serialization.hpp"
 #include "fg_test_evaluator.hpp"
 #include "fg_test_utils.hpp"
