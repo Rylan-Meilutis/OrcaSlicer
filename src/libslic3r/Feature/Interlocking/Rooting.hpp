@@ -7,8 +7,8 @@ namespace Slic3r {
 class PrintObject;
 
 // Snapshot native material contacts before beam interlocking creates artificial
-// ones. Accepted roots reserve local envelopes after beams, keeping their floor
-// and connecting stems intact while leaving unrelated interlocks unchanged.
+// ones. Roots attach below the lowest beam course when present, preserving
+// the beam band and reserving protective skins around the buried branches.
 class Rooting {
 public:
     explicit Rooting(const PrintObject &object);

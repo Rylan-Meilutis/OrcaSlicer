@@ -886,6 +886,7 @@ void ViewerImpl::reset()
     m_layers.reset();
     m_view_range.reset();
     m_extrusion_roles.reset();
+    m_settings.hidden_filaments.reset();
     m_options.clear();
     m_used_extruders.clear();
     m_total_time = { 0.0f, 0.0f };
@@ -1210,6 +1211,8 @@ void ViewerImpl::update_enabled_entities()
     for (size_t i = range[0]; i < range[1]; ++i) {
         const PathVertex& v = m_vertices[i];
 
+        if (m_settings.hidden_filaments[v.extruder_id])
+            continue;
         if (!m_valid_lines_bitset[i] && !v.is_option())
             continue;
         if (v.is_travel()) {
@@ -1584,6 +1587,22 @@ bool ViewerImpl::is_extrusion_role_visible(EGCodeExtrusionRole role) const
 void ViewerImpl::toggle_extrusion_role_visibility(EGCodeExtrusionRole role)
 {
     m_settings.extrusion_roles_visibility[size_t(role)] = ! m_settings.extrusion_roles_visibility[size_t(role)];
+    refresh_visibility();
+}
+
+bool ViewerImpl::is_filament_visible(uint8_t filament_id) const
+{
+    return !m_settings.hidden_filaments[filament_id];
+}
+
+void ViewerImpl::toggle_filament_visibility(uint8_t filament_id)
+{
+    m_settings.hidden_filaments.flip(filament_id);
+    refresh_visibility();
+}
+
+void ViewerImpl::refresh_visibility()
+{
     const Interval old_enabled_range = m_view_range.get_enabled();
     const Interval old_visible_range = m_view_range.get_visible();
     update_view_full_range();
@@ -1890,6 +1909,8 @@ size_t ViewerImpl::get_used_gpu_memory() const
 
 static bool is_visible(const PathVertex& v, const Settings& settings)
 {
+    if (settings.hidden_filaments[v.extruder_id])
+        return false;
     const EOptionType option_type = move_type_to_option(v.type);
     try
     {

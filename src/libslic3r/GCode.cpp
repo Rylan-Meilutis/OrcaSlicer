@@ -6328,7 +6328,18 @@ LayerResult GCode::process_layer(
     {
         // Order individual islands rather than whole instances. Off for by-object sequencing,
         // sequential printing, and the explicit AsObjectList order, which tour whole instances.
-        const bool island_level_ordering = print.config().print_sequence != PrintSequence::ByObject &&
+        // Keep an arc-bearing object's islands together so its arc islands can
+        // precede unrelated perimeter islands. The generic nearest-neighbor tour
+        // otherwise visits isolated pillars first and defeats arc-first ordering.
+        const bool layer_has_arcs = std::any_of(by_extruder.begin(), by_extruder.end(), [](const auto &entry) {
+            for (const auto &object : entry.second)
+                for (const auto &island : object.islands)
+                    for (const auto &region : island.by_region)
+                        for (const auto *fill : region.infills)
+                            if (is_arc_fill(fill->role())) return true;
+            return false;
+        });
+        const bool island_level_ordering = !layer_has_arcs && print.config().print_sequence != PrintSequence::ByObject &&
             single_object_instance_idx == size_t(-1) &&
             print.config().print_order != PrintOrder::AsObjectList;
         // A mixed-color slot is absent from layer_tools.extruders by design: resolve_mixed_filaments()
@@ -6757,6 +6768,14 @@ LayerResult GCode::process_layer(
                             island_order.emplace_back(i);
                     }
                 }
+                // Preserve the travel order within each group, but finish arc
+                // islands before unrelated pillars and holes on this object.
+                std::stable_partition(island_order.begin(), island_order.end(), [&](size_t index) {
+                    for (const auto &region : islands[index].by_region)
+                        for (const auto *fill : region.infills)
+                            if (is_arc_fill(fill->role())) return true;
+                    return false;
+                });
                 // Schedule early non-planar work across the complete visit,
                 // not independently inside each island. A single physical
                 // course may be partitioned into several islands by the

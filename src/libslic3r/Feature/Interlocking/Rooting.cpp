@@ -34,7 +34,7 @@ Polygon root_disk(double x, double y, double radius)
 // Adjacent samples overlap; the rounded parent node blends fork junctions.
 std::vector<Polygons> root_branch(const Vec3d &a, const Vec3d &b, double radius_a, double radius_b,
     const std::vector<Layer *> &layers, size_t bottom, size_t top, double contact_z,
-    const std::function<void()> &cancel)
+    const std::function<void()> &cancel, double vertical_scale = 1.)
 {
     const int samples = std::max(1, int(std::ceil((b - a).norm() / (0.25 * radius_b))));
     std::vector<Polygons> result(top - bottom);
@@ -46,7 +46,7 @@ std::vector<Polygons> root_branch(const Vec3d &a, const Vec3d &b, double radius_
             const double t = double(i) / samples;
             const Vec3d center = a + t * (b - a);
             const double radius = radius_a + t * (radius_b - radius_a);
-            const double dz = descent - center.z();
+            const double dz = (descent - center.z()) / vertical_scale;
             const double r2 = radius * radius - dz * dz;
             if (r2 > EPSILON * EPSILON)
                 disks.push_back(root_disk(center.x(), center.y(), std::sqrt(r2)));
@@ -87,19 +87,28 @@ size_t Rooting::apply(PrintObject &object, const std::function<void()> &cancel) 
 
     size_t count = 0;
     const auto &layers = object.layers();
+    // Freeze beam additions before any roots are applied. Later root contacts
+    // must not mistake a previously grown root for part of the beam joint.
+    std::vector<std::vector<ExPolygons>> beams(layers.size());
+    if (config.interlocking_beam)
+        for (size_t z = 0; z < layers.size(); ++z) {
+            cancel();
+            for (size_t r = 0; r < object.num_printing_regions(); ++r)
+                beams[z].push_back(diff_ex(to_expolygons(layers[z]->get_region(r)->slices.surfaces), m_slices[z][r]));
+        }
     std::vector<ExPolygons> occupied(layers.size());
-    for (size_t top = 1; top < layers.size(); ++top) {
+    for (size_t interface_top = 1; interface_top < layers.size(); ++interface_top) {
         cancel();
-        const double contact_z = layers[top - 1]->print_z;
         for (size_t upper = 0; upper < object.num_printing_regions(); ++upper) {
-            if (m_slices[top][upper].empty() || !coherent_material(object.printing_region(upper), object.print()->config()))
+            if (m_slices[interface_top][upper].empty() || !coherent_material(object.printing_region(upper), object.print()->config()))
                 continue;
             const auto upper_tool = object.printing_region(upper).extruder(frExternalPerimeter);
             // Only new downward-facing material, not a continuing vertical seam.
-            const ExPolygons new_material = diff_ex(m_slices[top][upper], m_slices[top - 1][upper]);
+            const ExPolygons new_material = diff_ex(m_slices[interface_top][upper], m_slices[interface_top - 1][upper]);
             if (new_material.empty())
                 continue;
             for (size_t host = 0; host < object.num_printing_regions(); ++host) {
+                size_t top = interface_top;
                 const auto host_tool = object.printing_region(host).extruder(frExternalPerimeter);
                 if (host == upper || host_tool == upper_tool || m_slices[top - 1][host].empty() ||
                     !coherent_material(object.printing_region(host), object.print()->config()))
@@ -107,9 +116,32 @@ size_t Rooting::apply(PrintObject &object, const std::function<void()> &cancel) 
                 const auto &nozzles = object.print()->config().nozzle_diameter;
                 if (width + EPSILON < 2. * std::max(nozzles.get_at(upper_tool - 1), nozzles.get_at(host_tool - 1)))
                     continue;
-                const ExPolygons contact = intersection_ex(new_material, m_slices[top - 1][host]);
+                ExPolygons contact = intersection_ex(new_material, m_slices[top - 1][host]);
                 if (contact.empty())
                     continue;
+                bool below_beams = false;
+                if (config.interlocking_beam) {
+                    ExPolygons bottom_beams;
+                    for (size_t z = interface_top; z-- > 0;) {
+                        cancel();
+                        const auto overlap = intersection_ex(beams[z][upper], contact);
+                        if (overlap.empty()) break;
+                        top = z;
+                        bottom_beams = overlap;
+                        below_beams = true;
+                    }
+                    if (below_beams) {
+                        // A broad collar below the last beam course joins its
+                        // teeth without replacing the alternating beam band.
+                        ExPolygons attached;
+                        for (const auto &part : contact)
+                            if (!intersection_ex(offset_ex(ExPolygons{part}, -scale_(skin)), bottom_beams).empty())
+                                attached.push_back(part);
+                        contact = std::move(attached);
+                    }
+                }
+                if (top == 0 || contact.empty()) continue;
+                const double contact_z = layers[top - 1]->print_z;
 
                 // Qualify against the native host, not beam-created pockets.
                 // Reserve the local envelope for roots; elsewhere beams remain.
@@ -150,6 +182,7 @@ size_t Rooting::apply(PrintObject &object, const std::function<void()> &cancel) 
                     continue;
                 const double taper_height = contact_z - layers[bottom]->print_z;
                 if (taper_height < 0.5 * width) continue;
+                const double vertical_scale = std::min(1., taper_height / (2. * width));
                 // The collar stays under the upper part. Buried limbs may extend
                 // beyond it, but only where a full native top/bottom skin remains.
                 std::vector<ExPolygons> permitted(top - bottom);
@@ -174,6 +207,41 @@ size_t Rooting::apply(PrintObject &object, const std::function<void()> &cancel) 
                 };
                 const double pitch = std::max(config.rooting_spacing.value, 4. * width + skin);
                 std::vector<Polygons> additions(top - bottom);
+                const double collar_depth = std::min(0.25 * taper_height, 0.5 * width);
+                const double web_radius = 0.5 * std::max(skin, 2. * nozzles.get_at(host_tool - 1));
+                // Preserve the host's existing topology, including a printable
+                // web between neighboring limbs. Testing an eroded host also
+                // catches connections that are only a hairline wide.
+                std::vector<ExPolygons> host_sections(top - bottom);
+                std::vector<std::vector<size_t>> host_core_counts(top - bottom);
+                for (size_t z = bottom; z < top; ++z) {
+                    host_sections[z - bottom] = diff_ex(m_slices[z][host], occupied[z]);
+                    for (const auto &part : host_sections[z - bottom])
+                        host_core_counts[z - bottom].push_back(offset_ex(ExPolygons{part}, -scale_(web_radius)).size());
+                }
+                const auto preserves_host_webs = [&](const std::vector<Polygons> &tree,
+                                                     const std::vector<Polygons> &branch) {
+                    for (size_t z = bottom; z < top; ++z) {
+                        cancel();
+                        // The model-shaped attachment is intentionally a plate;
+                        // enforce webs in the load-bearing root network below it.
+                        if (contact_z - layers[z]->print_z <= collar_depth + EPSILON) continue;
+                        const size_t i = z - bottom;
+                        Polygons proposed = additions[i];
+                        append(proposed, tree[i]);
+                        append(proposed, branch[i]);
+                        const auto roots = union_ex(proposed);
+                        for (size_t h = 0; h < host_sections[i].size(); ++h) {
+                            const auto &host_part = host_sections[i][h];
+                            if (intersection_ex(ExPolygons{host_part}, roots).empty()) continue;
+                            const auto remaining = diff_ex(ExPolygons{host_part}, roots);
+                            if (remaining.size() > 1 || remaining.empty()) return false;
+                            const auto core = offset_ex(remaining, -scale_(web_radius));
+                            if (core.empty() || core.size() > host_core_counts[i][h]) return false;
+                        }
+                    }
+                    return true;
+                };
                 const ExPolygons contact_collar = offset_ex(contact, -scale_(skin));
                 ExPolygons collar;
                 Points placed_centers;
@@ -200,34 +268,45 @@ size_t Rooting::apply(PrintObject &object, const std::function<void()> &cancel) 
                             return unscale(Point(candidate - center)).norm() < pitch - EPSILON;
                         })) continue;
                         const double x = unscale_(candidate.x()), y = unscale_(candidate.y());
-                        // Four primary limbs, then binary forks: at most 16
-                        // tips. Shallower/smaller contacts use fewer levels.
+                        // Fit the trunk independently of branching depth. A
+                        // narrow contact must not lose its lateral roots merely
+                        // because an area-preserving trunk for every tip is wide.
                         for (int levels = 3; levels >= 1; --levels) {
-                            const double radius = 0.5 * width * std::sqrt(4. * std::pow(2., levels - 1));
-                            if (radius > taper_height) continue;
+                            const double radius = width * (0.75 + 0.25 * levels);
+                            if (radius * vertical_scale > taper_height) continue;
                             const Vec3d origin(x, y, 0.);
-                            auto tree = root_branch(origin, origin, radius, radius, layers, bottom, top, contact_z, cancel);
-                            if (!fits(tree)) continue;
+                            auto tree = root_branch(origin, origin, radius, radius, layers, bottom, top, contact_z, cancel, vertical_scale);
+                            const std::vector<Polygons> empty_tree(top - bottom);
+                            if (!fits(tree) || !preserves_host_webs(empty_tree, tree)) continue;
                             std::function<bool(const Vec3d &, double, double, int)> grow;
                             grow = [&](const Vec3d &parent, double parent_radius, double heading, int level) {
                                 cancel();
-                                const double child_radius = parent_radius / (level == 0 ? 2. : std::sqrt(2.));
-                                if (child_radius + EPSILON < 0.5 * width) return false;
-                                const double descent = std::min(taper_height - child_radius,
-                                    skin + child_radius + std::max(0., taper_height - skin - 2. * child_radius) * (level + 1.) / levels);
-                                const double reach = taper_height * std::pow(0.72, level);
+                                const double child_radius = std::max(0.5 * width, parent_radius * 0.65);
+                                const double vertical_radius = child_radius * vertical_scale;
+                                const double descent = std::min(taper_height - vertical_radius,
+                                    skin + vertical_radius + std::max(0., taper_height - skin - 2. * vertical_radius) * (level + 1.) / levels);
+                                const double reach = std::max(taper_height, 2. * width) * std::pow(0.72, level);
                                 for (int attempt = 0; attempt < 6; ++attempt) {
                                     const double length = reach * std::pow(0.75, attempt);
                                     if (length < child_radius) break;
                                     const Vec3d child(parent.x() + length * std::cos(heading),
                                         parent.y() + length * std::sin(heading), std::max(parent.z(), descent));
                                     auto branch = root_branch(parent, child, parent_radius, child_radius,
-                                        layers, bottom, top, contact_z, cancel);
-                                    if (!fits(branch)) continue;
+                                        layers, bottom, top, contact_z, cancel, vertical_scale);
+                                    if (!fits(branch) || !preserves_host_webs(tree, branch)) continue;
                                     for (size_t z = 0; z < tree.size(); ++z) append(tree[z], std::move(branch[z]));
-                                    if (level + 1 < levels)
-                                        for (double turn : {-PI / 5., PI / 5.})
-                                            grow(child, child_radius, heading + turn, level + 1);
+                                    if (level + 1 < levels) {
+                                        // Side roots emerge along the limb, not
+                                        // only at its terminal tip. Keep the main
+                                        // limb intact and taper the offshoots to
+                                        // the configured printable minimum.
+                                        for (double turn : {-PI / 3., PI / 3.}) {
+                                            const double t = turn < 0. ? 0.55 : 0.8;
+                                            const Vec3d fork = parent + t * (child - parent);
+                                            const double fork_radius = parent_radius + t * (child_radius - parent_radius);
+                                            grow(fork, fork_radius, heading + turn, level + 1);
+                                        }
+                                    }
                                     return true;
                                 }
                                 return false;
@@ -250,7 +329,6 @@ size_t Rooting::apply(PrintObject &object, const std::function<void()> &cancel) 
                 // A conformal attachment follows the upper model (including
                 // holes), not a cylinder. It blends into the buried root trees.
                 collar = union_ex(collar);
-                const double collar_depth = std::min(0.25 * taper_height, 0.5 * width);
                 for (size_t z = bottom; z < top; ++z) {
                     const double descent = contact_z - layers[z]->print_z;
                     if (descent <= collar_depth + EPSILON)
@@ -268,12 +346,14 @@ size_t Rooting::apply(PrintObject &object, const std::function<void()> &cancel) 
                             append(nearby, additions[k - bottom]);
                     auto guard = intersection_ex(offset_ex(union_ex(nearby), scale_(skin)), m_slices[z][host]);
                     guard = diff_ex(guard, union_ex(other_material(z), occupied[z]));
+                    if (config.interlocking_beam)
+                        guard = diff_ex(guard, beams[z][upper]);
                     auto &from = layers[z]->get_region(host)->slices;
                     auto &to = layers[z]->get_region(upper)->slices;
                     from.set(union_ex(to_expolygons(from.surfaces), guard), stInternal);
                     to.set(diff_ex(to_expolygons(to.surfaces), guard), stInternal);
                 }
-                for (size_t z = top; z < layers.size(); ++z) {
+                for (size_t z = top; !below_beams && z < layers.size(); ++z) {
                     cancel();
                     const auto attachment = diff_ex(intersection_ex(collar, m_slices[z][upper]), other_material(z));
                     if (attachment.empty()) break;

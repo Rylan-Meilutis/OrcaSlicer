@@ -132,6 +132,8 @@ public:
     // Toggle the visibility state of the given extrusion role.
     //
     void toggle_extrusion_role_visibility(EGCodeExtrusionRole role);
+    bool is_filament_visible(uint8_t filament_id) const;
+    void toggle_filament_visibility(uint8_t filament_id);
     //
     // Return the color used to render the given extrusion rols.
     //

@@ -6,6 +6,7 @@
 #define VGCODE_SETTINGS_HPP
 
 #include "../include/Types.hpp"
+#include <bitset>
 
 #include <map>
 
@@ -13,6 +14,8 @@ namespace libvgcode {
 
 struct Settings
 {
+        // PathVertex stores a uint8_t logical filament id, not a physical tool.
+        std::bitset<256> hidden_filaments;
 		//
 	  // Visualization parameters
 		//

@@ -24,16 +24,18 @@ Both regions must use one filament consistently for walls and fill, with nonzero
 wall, top-shell and bottom-shell counts. Mixed feature-filament overrides are
 rejected rather than producing roots with the wrong material in their core.
 Original slices are captured before beam interlocking. Roots are applied after
-beams, reserving accepted root envelopes for native host material and roots.
-Beams remain outside these envelopes; they cannot replace the root's protective
-floor or interrupt its stem in the receiving material. Third-material regions
-are never reclaimed.
+beams. Where a contiguous beam joint extends below the native contact, roots
+start below its lowest course. A model-shaped collar joins the beam teeth from
+below without replacing the alternating beam band. Root depth is the additional
+depth below that band, limited by the base's remaining protective floor.
+Beam additions are snapshotted before growing roots so one root cannot become
+another root's beam attachment. Third-material regions are never reclaimed.
 Artificial beam interfaces therefore cannot recursively seed roots. Roots never
 seed other roots during the same slice either.
 
-Native upper geometry, including its top layers, is unchanged. Inside the
-attachment footprint, beam-altered courses are restored to the native upper
-material so beams cannot cut the root connection. Buried branches may extend
+Native upper geometry, including its top layers, is unchanged when beams are
+disabled. In combined mode the beam-only geometry above the root attachment
+is preserved instead. Buried branches may extend
 beyond the contact patch only where a full protective top skin remains.
 Per-course clearance checks include host side walls, native material above and
 below the branch, and third-material regions. This preserves ledges, holes,
@@ -43,19 +45,30 @@ contacts and bases too shallow for connected branches can therefore receive no r
 
 Depth shortens to the available host material above a complete protective floor,
 and is quantized inward to complete existing layers. The configured diameter is
-the minimum tip diameter and must be at least twice the larger participating nozzle
-diameter before a rounded terminal cap. Four primary limbs feed binary forks,
-with at most three generations (16 terminal branches) per seed. Parent radii
-scale with the square root of the number of daughter limbs rather than narrowing
-all limbs into a tip-width stem. Small/shallow contacts use fewer generations.
+the minimum tip width in XY and must be at least twice the larger participating nozzle
+diameter before a rounded terminal cap. Shallow roots use vertically flattened
+sweeps without reducing that XY width, and lateral reach has a width-based floor
+so reducing depth does not collapse the root into a narrow vertical peg.
+Four primary limbs retain their tips
+while smaller side branches emerge at staggered positions along each limb.
+Those branches recursively grow their own side branches, with at most three
+generations (28 limbs) per seed. The trunk's fit is not tied to the sum of all
+terminal cross-sectional areas, which would suppress branching at small contacts.
+Radii taper to the printable minimum. Small/shallow contacts use fewer generations.
 Tapered sphere sweeps produce connected, rounded junctions and long horizontal
 cross-sections, rather than circles that merely translate with layer height.
 Horizontal reach is independent of a fixed vertical branch slope and targets
 roughly twice the usable root depth, shortened as needed by the actual base.
 All growth is deterministic and bounded: three generations, six length attempts
 per branch, a minimum printable tip radius, and cancellation between courses.
-Spacing separates attachment centers; same-material branches may merge into a
-connected network. Material polygons are transferred, not
+Spacing separates attachment centers. Before accepting each limb, the generator
+checks the accumulated roots against each native host component. It shortens or
+rejects a limb that encloses a disconnected host pocket or severs a printable
+host web. The web check erodes the remaining base by half the larger of the
+protective-skin width and two host-nozzle diameters. The model-shaped attachment
+plate is exempt; the constraint applies to the buried branching network below it.
+Same-material branches may merge only while preserving these host connections.
+Material polygons are transferred, not
 overlaid: the combined model volume remains unchanged and material regions stay
 disjoint. Standard slicing, tool ordering and G-code export handle the new regions.
 
@@ -68,7 +81,8 @@ those settings or certify a structural fastener joint. It can add many tool chan
 Regression coverage in `test_multifilament.cpp` checks material-volume conservation,
 disjointness, preserved exposed regions, model-shaped attachments, holes,
 lateral branch spread and connections between adjacent courses,
-rejection of shallow/narrow/cavity cases, and restoration when disabled. Geometric
+preserved beam courses with shallow roots beneath them,
+rejection of insufficient-depth/narrow/cavity cases, and restoration when disabled. Geometric
 checks do not replace pull-out testing or inspection of the final sliced toolpaths.
 
 Preview represents roots as ordinary walls and fill in the owning filament, not

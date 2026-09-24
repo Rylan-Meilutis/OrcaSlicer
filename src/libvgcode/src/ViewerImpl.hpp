@@ -155,6 +155,9 @@ public:
 
     bool is_extrusion_role_visible(EGCodeExtrusionRole role) const;
     void toggle_extrusion_role_visibility(EGCodeExtrusionRole role);
+    bool is_filament_visible(uint8_t filament_id) const;
+    void toggle_filament_visibility(uint8_t filament_id);
+    void refresh_visibility();
 
     const Interval& get_view_full_range() const { return m_view_range.get_full(); }
     const Interval& get_view_enabled_range() const { return m_view_range.get_enabled(); }

@@ -4678,7 +4678,13 @@ void GCodeViewer::render_legend(float &legend_height, int canvas_width, int canv
                 }
 
                 float checkbox_pos = std::max(predictable_icon_pos, color_print_offsets[_u8L("Display")]); // ORCA prefer predictable_icon_pos when header not reacing end
-                append_item(EItemType::Rect, libvgcode::convert(tool_colors[extruder_idx]), columns_offsets, false, checkbox_pos/*ORCA*/, true, []() {});
+                append_item(EItemType::Rect, libvgcode::convert(tool_colors[extruder_idx]), columns_offsets,
+                    true, checkbox_pos, m_viewer.is_filament_visible(extruder_idx), [this, extruder_idx]() {
+                        m_viewer.toggle_filament_visibility(extruder_idx);
+                        update_moves_slider();
+                        wxGetApp().plater()->get_current_canvas3D()->set_as_dirty();
+                        wxGetApp().plater()->get_current_canvas3D()->request_extra_frame();
+                    });
             }
             i++;
         }

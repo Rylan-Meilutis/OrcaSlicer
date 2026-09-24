@@ -5476,7 +5476,7 @@ void PrintConfigDef::init_fff_params()
 
     def = this->add("rooting_depth", coFloat);
     def->label = L("Root depth");
-    def->tooltip = L("Maximum depth below the material interface. Roots shorten to fit the lower material while preserving the protective skin. Roots are skipped if there is insufficient depth for connected branches.");
+    def->tooltip = L("Maximum root depth below the material interface, or below the lowest beam-interlocking course when both features apply. The beam joint is preserved. Roots shorten and flatten vertically to fit the lower material while retaining lateral branches and protective skins. Roots are skipped if there is insufficient depth for connected branches.");
     def->sidetext = L("mm");
     def->min = 0.4;
     def->max = 20.;
@@ -5486,7 +5486,7 @@ void PrintConfigDef::init_fff_params()
 
     def = this->add("rooting_width", coFloat);
     def->label = L("Root branch diameter");
-    def->tooltip = L("Minimum terminal branch diameter, before its rounded end cap. Must be at least twice the larger nozzle diameter of the two materials. Parent limbs are thicker and divide recursively into smaller branches. Recursion stops at this diameter or when clearance is insufficient; the attachment follows the upper model's shape.");
+    def->tooltip = L("Minimum terminal branch width in XY, before its rounded end cap. Must be at least twice the larger nozzle diameter of the two materials. Parent limbs are thicker and grow recursively smaller side branches. Shallow roots flatten vertically without reducing this width; the attachment follows the upper model's shape.");
     def->sidetext = L("mm");
     def->min = 0.4;
     def->max = 10.;

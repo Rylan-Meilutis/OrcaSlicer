@@ -28,14 +28,14 @@ using namespace Slic3r::Test;
 
 TEST_CASE("Rooting embeds flared anchors without changing exposed surfaces", "[Multifilament][Rooting]")
 {
-    const std::string shape = GENERATE("stacked", "shallow", "spreading", "deep request", "deep roots", "L contact", "ring contact", "thin", "same filament", "side by side", "narrow", "cavity", "large nozzle", "no shells", "support filament", "soluble host");
+    const std::string shape = GENERATE("stacked", "dense", "shallow", "spreading", "small contact", "deep request", "deep roots", "L contact", "ring contact", "thin", "same filament", "side by side", "narrow", "cavity", "large nozzle", "no shells", "support filament", "soluble host");
     const double base_height = shape == "thin" ? 1. : shape == "shallow" ? 2.4 : shape == "deep roots" ? 12. : 6.;
-    const double requested_depth = shape == "deep request" ? 20. : shape == "deep roots" ? 8. : shape == "spreading" ? 4. : 3.;
-    const bool expect_roots = shape == "stacked" || shape == "shallow" || shape == "spreading" || shape == "deep request" || shape == "deep roots" || shape == "L contact" || shape == "ring contact";
+    const double requested_depth = shape == "deep request" ? 20. : shape == "deep roots" ? 8. : (shape == "spreading" || shape == "small contact") ? 4. : 3.;
+    const bool expect_roots = shape == "stacked" || shape == "dense" || shape == "shallow" || shape == "spreading" || shape == "small contact" || shape == "deep request" || shape == "deep roots" || shape == "L contact" || shape == "ring contact";
     CAPTURE(shape);
     auto config = multifilament_config(2, {
         {"rooting", false}, {"rooting_depth", requested_depth}, {"rooting_width", 1.2},
-        {"rooting_spacing", shape == "spreading" ? 100. : 6.}, {"rooting_skin", 0.8},
+        {"rooting_spacing", (shape == "spreading" || shape == "small contact") ? 100. : shape == "dense" ? 1. : 6.}, {"rooting_skin", 0.8},
         {"interlocking_beam", false}, {"layer_height", 0.2}, {"initial_layer_print_height", 0.2},
         {"elefant_foot_compensation", 0.}, {"xy_contour_compensation", 0.},
         {"xy_hole_compensation", 0.}, {"enable_prime_tower", false}});
@@ -49,7 +49,7 @@ TEST_CASE("Rooting embeds flared anchors without changing exposed surfaces", "[M
         config.set_deserialize_strict("filament_is_support", "0,1");
     if (shape == "soluble host")
         config.set_deserialize_strict("filament_soluble", "1,0");
-    TriangleMesh base = make_cube(24., 24., base_height);
+    TriangleMesh base = make_cube(shape == "dense" ? 32. : 24., shape == "dense" ? 32. : 24., base_height);
     if (shape == "cavity") {
         base = make_cube(24., 24., 3.4);
         for (const Vec3d &position : {Vec3d(0., 0., 3.4), Vec3d(20., 0., 3.4)}) {
@@ -68,6 +68,10 @@ TEST_CASE("Rooting embeds flared anchors without changing exposed surfaces", "[M
     }
     init_print({base}, baseline, model, config);
     TriangleMesh upper = make_cube(shape == "narrow" ? 2. : 12., 12., 2.);
+    if (shape == "dense")
+        upper = make_cube(20., 20., 2.);
+    if (shape == "small contact")
+        upper = make_cube(5.6, 5.6, 2.);
     if (shape == "L contact" || shape == "ring contact") {
         upper = make_cube(12., 5., 2.);
         TriangleMesh side = make_cube(5., 7., 2.);
@@ -117,6 +121,13 @@ TEST_CASE("Rooting embeds flared anchors without changing exposed surfaces", "[M
         CHECK(diff_ex(before, after).empty());
         CHECK(diff_ex(after, before).empty());
         const auto roots = diff_ex(b, old_b);
+        if (shape == "dense" && actual[i]->print_z < base_height - 0.6 - EPSILON) {
+            // Crowded roots must not enclose host pockets or leave the base
+            // connected only by sub-printable necks.
+            REQUIRE(old_a.size() == 1);
+            CHECK(a.size() == 1);
+            CHECK(offset_ex(a, -scale_(0.4)).size() == 1);
+        }
         if (!roots.empty()) {
             ++changed;
             CHECK(actual[i]->print_z <= base_height + EPSILON);
@@ -161,6 +172,13 @@ TEST_CASE("Rooting embeds flared anchors without changing exposed surfaces", "[M
             CHECK(maximum_branches >= 8);
             CHECK(outside_contact);
             CHECK(maximum_span > 3. * requested_depth);
+        }
+        if (shape == "small contact") {
+            // Web preservation may prune crowded offshoots, but must still
+            // produce recursive branching rather than four plain stems.
+            CHECK(maximum_branches > 4);
+            CHECK(outside_contact);
+            CHECK(maximum_span > 5.6);
         }
     } else
         CHECK(changed == 0);
@@ -210,7 +228,9 @@ TEST_CASE("Rooting reaches emitted toolpaths below the original interface", "[Mu
     });
     if (enabled) {
         CHECK(lowest_upper_material <= 3.4 + EPSILON);
-        CHECK(lowest_upper_material >= 3. - EPSILON);
+        // Combined mode measures root depth below the beam band, while
+        // retaining the protective floor even if that limits total depth.
+        CHECK(lowest_upper_material >= (interlocking ? 0.8 : 3.) - EPSILON);
     } else if (!interlocking)
         CHECK(lowest_upper_material >= 6. - EPSILON);
     else
@@ -226,6 +246,78 @@ TEST_CASE("Rooting reaches emitted toolpaths below the original interface", "[Mu
         if (move.type == EMoveType::Extrude && move.extruder_id == 1)
             preview_lowest = std::min(preview_lowest, double(move.position.z()));
     CHECK_THAT(preview_lowest, Catch::Matchers::WithinAbs(lowest_upper_material, 0.001));
+}
+
+TEST_CASE("Shallow roots attach below beam interlocking without replacing its courses", "[Multifilament][Rooting][Interlocking]")
+{
+    const double depth = GENERATE(1.2, 2.0, 3.0);
+    const int beam_layers = GENERATE(1, 2);
+    CAPTURE(depth, beam_layers);
+    auto config = multifilament_config(2, {
+        {"rooting", false}, {"rooting_depth", depth}, {"rooting_width", 1.2},
+        {"rooting_skin", 0.8}, {"rooting_spacing", 100.},
+        {"interlocking_beam", true}, {"interlocking_beam_layer_count", beam_layers},
+        {"layer_height", 0.2}, {"initial_layer_print_height", 0.2},
+        {"elefant_foot_compensation", 0.}, {"xy_contour_compensation", 0.},
+        {"xy_hole_compensation", 0.}, {"enable_prime_tower", false}});
+    Print beam_only, combined;
+    Model model;
+    init_print({make_cube(24., 24., 8.)}, beam_only, model, config);
+    TriangleMesh upper = make_cube(12., 12., 2.);
+    upper.translate(6., 6., 8.);
+    model.objects.front()->volumes.front()->config.set("extruder", 1);
+    model.objects.front()->add_volume(upper)->config.set("extruder", 2);
+    beam_only.apply(model, config);
+    beam_only.get_object(0)->slice();
+    config.set_deserialize_strict("rooting", "1");
+    combined.apply(model, config);
+    combined.get_object(0)->slice();
+    const auto &before = beam_only.objects().front()->layers();
+    const auto &after = combined.objects().front()->layers();
+    REQUIRE(before.size() == after.size());
+    const auto material = [](const Layer *layer, unsigned tool) {
+        ExPolygons result;
+        for (const auto *region : layer->regions())
+            if (region->region().extruder(frExternalPerimeter) == tool)
+                append(result, to_expolygons(region->slices.surfaces));
+        return union_ex(result);
+    };
+    size_t beam_bottom = 0;
+    while (beam_bottom < before.size() && material(before[beam_bottom], 2).empty()) ++beam_bottom;
+    REQUIRE(beam_bottom > 0);
+    REQUIRE(beam_bottom < before.size());
+    REQUIRE(before[beam_bottom]->print_z < 8.);
+    const double attachment_z = before[beam_bottom - 1]->print_z;
+    size_t root_courses = 0;
+    double buried_span = 0.;
+    ExPolygons previous;
+    for (size_t z = 0; z < before.size(); ++z) {
+        CAPTURE(z, before[z]->print_z, beam_bottom);
+        const auto old_host = material(before[z], 1), old_upper = material(before[z], 2);
+        const auto host = material(after[z], 1), roots = material(after[z], 2);
+        // The beam generator can already contain rounding slivers at its
+        // material boundary. Rooting must not add any new overlap.
+        CHECK(diff_ex(intersection_ex(host, roots), intersection_ex(old_host, old_upper)).empty());
+        CHECK(diff_ex(union_ex(host, roots), union_ex(old_host, old_upper)).empty());
+        CHECK(diff_ex(union_ex(old_host, old_upper), union_ex(host, roots)).empty());
+        if (z >= beam_bottom) {
+            // Neither the beam teeth nor the model above may be overwritten.
+            CHECK(diff_ex(roots, old_upper).empty());
+            CHECK(diff_ex(old_upper, roots).empty());
+        } else if (!roots.empty()) {
+            ++root_courses;
+            CHECK(after[z]->print_z - after[z]->height >= attachment_z - depth - EPSILON);
+            if (after[z]->print_z < attachment_z - 0.5 * 1.2 - EPSILON)
+                buried_span = std::max(buried_span, unscale_(get_extents(roots).size().x()));
+        }
+        if (!previous.empty())
+            for (const auto &part : previous)
+                CHECK_FALSE(intersection_ex(ExPolygons{part}, roots).empty());
+        previous = roots;
+    }
+    CHECK(root_courses >= 3);
+    CHECK(buried_span > 2. * depth);
+    CHECK_FALSE(intersection_ex(material(after[beam_bottom - 1], 2), material(before[beam_bottom], 2)).empty());
 }
 
 TEST_CASE("Rooting leaves generated supports and interfaces unchanged", "[Multifilament][Rooting][Support]")

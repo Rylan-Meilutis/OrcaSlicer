@@ -3396,6 +3396,53 @@ TEST_CASE("Arc anchors precede arcs and remaining walls follow the configured in
     CHECK_THAT(fill_length, Catch::Matchers::WithinAbs(6., 0.005));
 }
 
+TEST_CASE("Arc islands precede isolated perimeter islands", "[Fill][ArcOverhang][Ordering]")
+{
+    const std::string order = GENERATE("default", "as_obj_list", "best_of", "snake");
+    CAPTURE(order);
+    TriangleMesh mesh = make_cube(10., 10., 0.6);
+    TriangleMesh pillar = make_cube(2., 2., 0.6);
+    pillar.translate(15., 0., 0.);
+    mesh.merge(pillar);
+    Print print;
+    Test::init_and_process_print({mesh}, print, {
+        {"layer_height", 0.2}, {"initial_layer_print_height", 0.2},
+        {"wall_loops", 2}, {"enable_arc_fitting", false}, {"print_order", order},
+        {"seam_start_on_inner_wall", false}, {"seam_slope_type", "none"}
+    });
+    const Layer &layer = *print.objects().front()->layers()[1];
+    REQUIRE(layer.lslices.size() == 2);
+    const auto large = std::max_element(layer.lslices.begin(), layer.lslices.end(),
+        [](const ExPolygon &a, const ExPolygon &b) { return a.area() < b.area(); });
+    const Vec2d center = unscale(get_extents(*large).center());
+    LayerRegion &region = *layer.regions().front();
+    auto *arcs = new ExtrusionEntityCollection;
+    arcs->no_sort = true;
+    ExtrusionPath arc(erArcBridge, 0.08, 0.4, 0.2);
+    arc.polyline.points = {
+        Point3(scale_(center.x() - 4.), scale_(center.y()), 0.),
+        Point3(scale_(center.x()), scale_(center.y() + 3.), 0.),
+        Point3(scale_(center.x() + 4.), scale_(center.y()), 0.)};
+    arcs->append(arc);
+    region.fills.clear();
+    region.fills.entities.push_back(arcs);
+    ScopedTemporaryFile file(".gcode");
+    GCodeProcessorResult preview;
+    print.export_gcode(file.string(), &preview, nullptr);
+    bool saw_arc = false, saw_isolated_wall = false;
+    for (const auto &move : preview.moves) {
+        if (move.type != EMoveType::Extrude || std::abs(move.position.z() - 0.4f) > 0.001f)
+            continue;
+        if (is_arc_fill(move.extrusion_role)) saw_arc = true;
+        if (is_perimeter(move.extrusion_role) && move.position.x() > center.x() + 7.) {
+            CHECK(saw_arc);
+            saw_isolated_wall = true;
+        }
+    }
+    CHECK(saw_arc);
+    CHECK(saw_isolated_wall);
+}
+
 TEST_CASE("Narrow bridge G-code keeps every arc path anchored and curved",
           "[Fill][ArcOverhang][GCode][Narrow]")
 {

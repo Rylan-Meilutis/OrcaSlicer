@@ -127,6 +127,16 @@ void Viewer::toggle_extrusion_role_visibility(EGCodeExtrusionRole role)
     m_impl->toggle_extrusion_role_visibility(role);
 }
 
+bool Viewer::is_filament_visible(uint8_t filament_id) const
+{
+    return m_impl->is_filament_visible(filament_id);
+}
+
+void Viewer::toggle_filament_visibility(uint8_t filament_id)
+{
+    m_impl->toggle_filament_visibility(filament_id);
+}
+
 const Color& Viewer::get_extrusion_role_color(EGCodeExtrusionRole role) const
 {
     return m_impl->get_extrusion_role_color(role);
