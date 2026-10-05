@@ -7079,17 +7079,22 @@ void Sidebar::sync_spool_manager_filaments(DynamicPrintConfig *host_config)
     // Resolve unknown materials before changing project slots. Cancelling a
     // prompt must leave both project assignments and saved mappings intact.
     const bool logical_palette = uses_independent_tool_dispatch();
+    const bool single_nozzle_palette = printer_config.opt_bool("single_extruder_multi_material");
+    const bool select_loaded_materials = logical_palette || single_nozzle_palette;
     std::vector<int> selected_tools;
-    if (logical_palette) {
+    if (select_loaded_materials) {
         wxArrayString choices;
         std::vector<size_t> loaded_tools;
-        for (size_t tool = 0; tool < std::min(slots.size(), size_t(bundle.get_printer_extruder_count())); ++tool) {
+        const size_t available_slots = single_nozzle_palette ? slots.size() :
+            std::min(slots.size(), size_t(bundle.get_printer_extruder_count()));
+        for (size_t tool = 0; tool < available_slots; ++tool) {
             const auto &spool = slots[tool];
             if (spool.name.empty() && spool.material.empty() && spool.spool_id.empty())
                 continue;
             loaded_tools.push_back(tool);
-            choices.Add(format_wxstr(_L("Tool %1% — %2% mm — %3% — %4%"), int(tool + 1),
-                from_u8(get_diameter_string(bundle.printers.get_edited_preset().config.opt_float("nozzle_diameter", tool))),
+            choices.Add(format_wxstr(single_nozzle_palette ?
+                _L("Slot %1% — %2% mm — %3% — %4%") : _L("Tool %1% — %2% mm — %3% — %4%"), int(tool + 1),
+                from_u8(get_diameter_string(bundle.printers.get_edited_preset().config.opt_float("nozzle_diameter", single_nozzle_palette ? 0 : tool))),
                 from_u8(spool.name.empty() ? spool.vendor + " " + spool.material : spool.name),
                 from_u8(spool.color_name.empty() ? spool.color : spool.color_name)));
         }
@@ -7106,7 +7111,7 @@ void Sidebar::sync_spool_manager_filaments(DynamicPrintConfig *host_config)
                                wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER);
         auto *layout = new wxBoxSizer(wxVERTICAL);
         auto *description = new wxStaticText(&dialog, wxID_ANY,
-            _L("Choose the loaded tools to import. Each checked tool becomes one project filament. Unchecked tools are not imported."));
+            _L("Choose the loaded materials to import. Each checked entry becomes one project filament. Unchecked entries are not imported."));
         description->Wrap(FromDIP(520));
         layout->Add(description, 0, wxEXPAND | wxALL, FromDIP(12));
         auto *tools = new wxCheckListBox(&dialog, wxID_ANY, wxDefaultPosition,
@@ -7128,7 +7133,7 @@ void Sidebar::sync_spool_manager_filaments(DynamicPrintConfig *host_config)
         const auto update_count = [&] {
             wxArrayInt checked;
             tools->GetCheckedItems(checked);
-            count->SetLabel(format_wxstr(_L("Selected tools: %1% / %2%"), checked.size(), bundle.max_filament_colors()));
+            count->SetLabel(format_wxstr(_L("Selected materials: %1% / %2%"), checked.size(), bundle.max_filament_colors()));
             accept->Enable(!checked.empty() && checked.size() <= bundle.max_filament_colors());
         };
         tools->Bind(wxEVT_CHECKLISTBOX, [&](wxCommandEvent &) { update_count(); });
@@ -7246,10 +7251,10 @@ void Sidebar::sync_spool_manager_filaments(DynamicPrintConfig *host_config)
 
     auto &filament_presets = bundle.filament_presets;
     const bool fixed_slots = bundle.has_fixed_filament_slots();
-    const size_t slot_count = logical_palette ? std::min(slots.size(), bundle.max_filament_colors()) :
+    const size_t slot_count = select_loaded_materials ? std::min(slots.size(), bundle.max_filament_colors()) :
         fixed_slots ? bundle.max_filament_colors() :
         std::min(std::max(slots.size(), filament_presets.size()), bundle.max_filament_colors());
-    if (logical_palette) {
+    if (select_loaded_materials) {
         // Use the existing deletion path so painting, roles and custom layer
         // changes are remapped, not merely truncated with the palette arrays.
         while (filament_presets.size() > slot_count) {
@@ -7262,10 +7267,11 @@ void Sidebar::sync_spool_manager_filaments(DynamicPrintConfig *host_config)
         }
     }
     bundle.set_num_filaments(static_cast<unsigned int>(slot_count));
-    if (logical_palette) {
+    if (select_loaded_materials) {
         // Keep the chosen nozzle/material pair when compacting non-adjacent
         // tools. Dispatch still refreshes inventory and asks for confirmation.
-        bundle.project_config.set_key_value("filament_map", new ConfigOptionInts(selected_tools));
+        bundle.project_config.set_key_value("filament_map", new ConfigOptionInts(
+            single_nozzle_palette ? std::vector<int>(slot_count, 1) : selected_tools));
         bundle.project_config.set_key_value("filament_nozzle_map", new ConfigOptionInts(std::vector<int>(slot_count, 0)));
         bundle.project_config.set_key_value("filament_map_mode", new ConfigOptionEnum<FilamentMapMode>(fmmManual));
     }

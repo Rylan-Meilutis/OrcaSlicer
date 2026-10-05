@@ -6993,6 +6993,7 @@ void PrintConfigDef::init_fff_params()
     def->tooltip = L("For two or more walls, start on the adjacent inner wall, connect to the outer wall, then return "
                      "inside to finish the seam. The entry and finish use separate portions of a reserved inner-wall "
                      "segment, without printing that segment twice. The selected wall sequence is preserved. "
+                     "Unpainted seams near sharp corners may move slightly onto a nearby straight wall to make room for the connections. "
                      "If the connections would cross another wall, use a non-extruding approach instead. "
                      "Brick courses keep their original heights and use sloped entry and exit connections where "
                      "the local slope and wall intersections permit. Surface-following walls do not use this internal seam. "

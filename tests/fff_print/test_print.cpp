@@ -459,7 +459,7 @@ TEST_CASE("Internal seam starts and finishes inside without retracing the reserv
         }
     });
     CHECK_FALSE(in_seam);
-    if (shape == "cylinder")
+    if (shape == "cylinder" || shape == "cube")
         REQUIRE(entries > 0);
     CHECK(returns == entries);
     CHECK(finishes == entries);
@@ -639,7 +639,7 @@ TEST_CASE("Qualified scarf seams replace internal entries without removing inner
         CHECK(entries == 0);
     } else {
         CHECK(slopes == 0);
-        CHECK(entries == 0); // Sharp corners fall back when connector beads overlap.
+        CHECK(entries > 0); // A nearby straight span permits non-crossing L entries.
     }
 }
 
@@ -682,7 +682,7 @@ TEST_CASE("Internal seam preparation preserves wall material with variable heigh
     CHECK_THAT(perimeter_length(true), Catch::Matchers::WithinAbs(baseline, 0.05));
 }
 
-TEST_CASE("Brick courses preserve wall material when unsafe corner connectors fall back",
+TEST_CASE("Brick courses preserve wall material when corner seams move to straight spans",
           "[Print][Seam][StaggeredPerimeters][Regression]")
 {
     const std::string generator = GENERATE("classic", "arachne");
@@ -737,9 +737,9 @@ TEST_CASE("Brick courses preserve wall material when unsafe corner connectors fa
     };
     const double expected = volume(output(false), false);
     CHECK_THAT(volume(output(true), true), Catch::Matchers::WithinAbs(expected, 0.015));
-    CHECK(entries == 0);
-    CHECK(returns == 0);
-    CHECK(raised_entries == 0);
+    CHECK(entries > 0);
+    CHECK(returns == entries);
+    CHECK(raised_entries > 0);
 }
 
 TEST_CASE("Timelapse g-code is emitted once per layer for Bambu and non-Bambu printers", "[Print][Regression]")

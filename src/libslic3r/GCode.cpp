@@ -7836,6 +7836,15 @@ std::string GCode::extrude_loop(const ExtrusionLoop&        loop_ref,
         prepare_inner_seam &&
         loop.role() == erPerimeter && loop.inset_idx == 1;
     if (adjacent_inner_seam) {
+        // The outer plan may move a corner seam to a straight span. Reserve
+        // the inner tail at that same location, not at the old corner chosen
+        // independently by SeamPlacer (which would leave an unconsumed gap).
+        for (const auto &entry : m_outer_seam_plans)
+            if (entry.second.inner_entry && entry.second.inner_loop == &loop_ref) {
+                loop.split_at(loop.get_closest_path_and_point(
+                    entry.second.loop.first_point(), false).foot_pt, false);
+                break;
+            }
         const double maximum_outer_distance2 =
             scaled<double>(2.0 * nozzle_diameter) * scaled<double>(2.0 * nozzle_diameter);
         const double on_loop_tolerance2 =
@@ -8804,6 +8813,55 @@ std::string GCode::extrude_perimeters(const Print &print, const std::vector<Obje
                             float overhang = std::numeric_limits<float>::lowest();
                             m_seam_placer.place_seam(m_layer, placed, last_pos(), overhang, false);
                             const bool scarf = scarf_seam_qualified(placed, overhang);
+                            // At a sharp vertex the two inner-wall connectors
+                            // occupy the same wedge. Try a nearby straight span
+                            // before reserving any inner-wall material. Never
+                            // override painted seam enforcers or blockers.
+                            const auto &volumes = m_layer->object()->model_object()->volumes;
+                            const bool painted = std::any_of(volumes.begin(), volumes.end(),
+                                [](const ModelVolume *volume) { return volume->is_seam_painted(); });
+                            if (!scarf && !painted && !placed.paths.empty() &&
+                                std::all_of(placed.paths.begin(), placed.paths.end(),
+                                    [](const ExtrusionPath &path) { return path.role() == erExternalPerimeter; })) {
+                                const Point original = placed.first_point();
+                                const Lines lines = placed.polygon().lines();
+                                const double width = scale_(placed.paths.front().width);
+                                const double corner_radius = 2. * width;
+                                bool at_corner = false;
+                                for (size_t i = 0; i < lines.size(); ++i) {
+                                    const Line &before = lines[i];
+                                    const Line &after = lines[(i + 1) % lines.size()];
+                                    const Vec2d incoming = (before.b - before.a).cast<double>();
+                                    const Vec2d outgoing = (after.b - after.a).cast<double>();
+                                    if ((before.b - original).cast<double>().squaredNorm() <= corner_radius * corner_radius &&
+                                        incoming.dot(outgoing) < std::sqrt(0.5) * incoming.norm() * outgoing.norm()) {
+                                        at_corner = true;
+                                        break;
+                                    }
+                                }
+                                if (at_corner) {
+                                    const double clearance = 2.5 * width;
+                                    double best_distance2 = 9. * width * width;
+                                    Point best = original;
+                                    for (const Line &line : lines) {
+                                        const Vec2d direction = (line.b - line.a).cast<double>();
+                                        const double length = direction.norm();
+                                        if (length < 2. * clearance)
+                                            continue;
+                                        const double along = std::clamp(
+                                            (original - line.a).cast<double>().dot(direction) / length,
+                                            clearance, length - clearance);
+                                        const Point candidate = line.a + (direction * (along / length)).cast<coord_t>();
+                                        const double distance2 = (candidate - original).cast<double>().squaredNorm();
+                                        if (distance2 < best_distance2) {
+                                            best = candidate;
+                                            best_distance2 = distance2;
+                                        }
+                                    }
+                                    if (best != original)
+                                        placed.split_at(best, false);
+                                }
+                            }
                             m_outer_seam_plans.emplace(source, OuterSeamPlan{std::move(placed), scarf});
                         }
                     };

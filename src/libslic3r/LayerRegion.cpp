@@ -799,13 +799,17 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
             // even though it remains inside the aggregate model silhouette.
             const ExPolygons current_region_coverage = union_ex(
                 to_polygons(this->slices.surfaces));
+            const ExPolygons lower_region_coverage = union_ex(to_polygons(
+                this->layer()->lower_layer->get_region(region_id)->slices.surfaces));
             const ExPolygons upper_coverage =
                 this->layer()->upper_layer == nullptr ? ExPolygons{} :
-                union_ex(to_polygons(
+                intersection_ex(lower_region_coverage, union_ex(to_polygons(
                     this->layer()->upper_layer->get_region(region_id)
-                        ->slices.surfaces));
+                        ->slices.surfaces)));
+            // A raised entry bead is taller than a normal wall bead. It must
+            // be buried above AND supported below; upper coverage alone admits
+            // outward overhangs, leaving the thick bead exposed underneath.
             ExPolygons lower_staggered_coverage;
-            ExPolygons lower_region_coverage;
             // Perimeters are generated in parallel across layers, so course
             // continuity must be derived from slice geometry rather than from
             // whether the lower layer's path entities happen to be ready. A
@@ -815,19 +819,22 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
             if (this->layer()->lower_layer->lower_layer != nullptr) {
                 const coord_t clearance = scale_(0.5 * this->flow(frPerimeter).width()) +
                     coord_t(SCALED_EPSILON);
-                lower_region_coverage = union_ex(to_polygons(
-                    this->layer()->lower_layer->get_region(region_id)
-                        ->slices.surfaces));
                 lower_staggered_coverage = intersection_ex(
                     shrink_ex(current_region_coverage, clearance),
                     shrink_ex(lower_region_coverage, clearance));
+                // Apply the same support rule to the inferred previous course
+                // so an unsupported lower wall cannot create a half-height exit.
+                lower_staggered_coverage = intersection_ex(lower_staggered_coverage,
+                    shrink_ex(union_ex(to_polygons(this->layer()->lower_layer->lower_layer
+                        ->get_region(region_id)->slices.surfaces)), clearance));
             }
             apply_staggered_perimeters(
                 this->perimeters, -1, z_offset,
                 region_config.staggered_perimeters_inner_only.value,
                 current_region_coverage,
                 upper_coverage,
-                lower_staggered_coverage, lower_region_coverage);
+                lower_staggered_coverage, this->layer()->lower_layer->lower_layer == nullptr ?
+                    ExPolygons{} : lower_region_coverage);
         }
     }
     if (region_config.perimeter_layering.value ==

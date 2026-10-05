@@ -147,6 +147,42 @@ TEST_CASE("Staggered perimeters raise only supported odd inner walls", "[Flow][S
     }
 }
 
+TEST_CASE("Raised brick beads stay supported underneath outward steps",
+          "[Flow][StaggeredPerimeters][Regression]")
+{
+    const std::string generator = GENERATE("classic", "arachne");
+    TriangleMesh model = make_cube(10., 20., 2.);
+    TriangleMesh upper = make_cube(20., 20., 2.);
+    upper.translate(0., 0., 2.);
+    model.merge(upper);
+    Print print;
+    Slic3r::Test::init_and_process_print({model}, print, {
+        {"layer_height", 0.2},
+        {"initial_layer_print_height", 0.2},
+        {"wall_generator", generator},
+        {"wall_loops", 4},
+        // Test the brick eligibility itself, independently of overhang role tagging.
+        {"detect_overhang_wall", false},
+        {"top_shell_layers", 0},
+        {"bottom_shell_layers", 0},
+        {"sparse_infill_density", "0%"},
+        {"perimeter_layering", "brick"},
+        {"staggered_perimeters_inner_only", true},
+        {"staggered_perimeter_offset", "50%"}
+    });
+    const auto paths = staggered_wall_paths(print);
+    REQUIRE_FALSE(paths.empty());
+    for (const auto &[layer, path] : paths) {
+        REQUIRE(layer->lower_layer != nullptr);
+        const Polygons footprint = path->polygons_covered_by_width(float(SCALED_EPSILON));
+        CAPTURE(generator, layer->print_z, path->width, path->height);
+        // Clipping and interpolated ramp vertices round to integer coordinates.
+        // Allow two coordinate units, not a printable overhang allowance.
+        CHECK(diff_ex(footprint, offset_ex(layer->lower_layer->lslices, 2.),
+                      ApplySafetyOffset::No).empty());
+    }
+}
+
 TEST_CASE("Staggered perimeters can include buried outer walls",
           "[Flow][StaggeredPerimeters]")
 {
