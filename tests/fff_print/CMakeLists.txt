@@ -35,6 +35,7 @@ orcaslicer_discover_tests(${_TEST_NAME}_tests)
 # Exercise the emitted-G-code audit itself, including known-invalid controls.
 # A validator which silently accepts unsupported walls must fail the test run.
 add_test(NAME gcode_audit_regressions
-    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/test_audit_gcode_moves.py")
+    COMMAND "${CMAKE_COMMAND}" "-DTEST_SCRIPT=${CMAKE_SOURCE_DIR}/test_audit_gcode_moves.py"
+            -P "${CMAKE_SOURCE_DIR}/tests/run_python_test.cmake")
 set_tests_properties(gcode_audit_regressions PROPERTIES
     LABELS "GCode;NonplanarSurface;Regression" TIMEOUT 120)
