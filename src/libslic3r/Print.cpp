@@ -136,6 +136,13 @@ bool Print::invalidate_state_by_config_options(const ConfigOptionResolver & /* n
         "filament_arc_min_path_time",
         "filament_arc_cover_speed",
         "filament_arc_auto_cooling",
+        "filament_fast_temperature_changes",
+        "filament_auto_feature_temperature",
+        "filament_arc_temperature",
+        "filament_bridge_temperature",
+        "filament_overhang_temperature",
+        "filament_support_interface_temperature",
+        "filament_reduce_support_interface_temperature",
         "default_acceleration",
         "deretraction_speed",
         "close_fan_the_first_x_layers",
@@ -431,7 +438,9 @@ bool Print::invalidate_state_by_config_options(const ConfigOptionResolver & /* n
             osteps.emplace_back(posSupportMaterial);
             osteps.emplace_back(posSimplifySupportPath);
             if ((opt_key == "filament_soluble" || opt_key == "filament_is_support") &&
-                std::any_of(m_objects.begin(), m_objects.end(), [](const PrintObject *object) { return object->config().rooting.value; }))
+                std::any_of(m_objects.begin(), m_objects.end(), [](const PrintObject *object) {
+                    return object->config().rooting.value || object->config().rooting_xy.value;
+                }))
                 osteps.emplace_back(posSlice);
         } else if (
                opt_key == "initial_layer_line_width"

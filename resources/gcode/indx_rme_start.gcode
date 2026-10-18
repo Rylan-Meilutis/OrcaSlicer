@@ -1,5 +1,10 @@
 ; CORE One INDX start G-code for OrcaSlicer + RME firmware
 ; Based on the current Prusa INDX startup with RME CORE One enhancements
+; RME_DEPOSITION_BOUNDS=1
+; RME_TEMPERATURE_ADAPTIVE_PA=0
+; Set the preceding PA flag to 1 ONLY with firmware supporting temperature-list M976 A.
+; Orca resolves deposition bounds and enabled PA temperature plans after G-code generation.
+; PA plans contain initial/minimum/maximum deposition targets, up to eight unique temperatures.
 
 M75 ; start print timer / serial print mode
 
@@ -47,6 +52,7 @@ M83 ; extruder relative mode
 
 ; Home XY before vent control or tool pickup (once only)
 G28 XY
+M400 ; finish XY homing before changing the vent, without picking a tool
 
 ; --- RME chamber vent control ---
 {if chamber_temperature[initial_tool] > 35}

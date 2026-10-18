@@ -11,6 +11,71 @@
 using namespace Slic3r;
 using namespace Slic3r::Test;
 
+TEST_CASE("Bridge temperature is independent of arcs and restores normal extrusion", "[Cooling][FeatureTemperature]")
+{
+    const bool fast = GENERATE(false, true);
+    const std::string output = slice({TestMesh::bridge}, {
+        {"filament_fast_temperature_changes", fast},
+        {"filament_bridge_temperature", 201},
+        {"filament_arc_temperature", 202},
+        {"nozzle_temperature", 215},
+        {"arc_overhang_enabled", false}
+    });
+    const auto target = output.find("M104 S201");
+    CHECK((target != std::string::npos) == fast);
+    CHECK(output.find("M104 S202") == std::string::npos);
+    if (fast)
+        CHECK(output.find("M104 S215", target) != std::string::npos);
+}
+
+TEST_CASE("Arc fill uses its own temperature rather than the straight bridge target", "[Cooling][FeatureTemperature]")
+{
+    const std::string output = slice({TestMesh::bridge}, {
+        {"filament_fast_temperature_changes", true},
+        {"filament_bridge_temperature", 201},
+        {"filament_arc_temperature", 202},
+        {"nozzle_temperature", 215},
+        {"arc_overhang_enabled", true},
+        {"arc_overhang_bridges", true},
+        {"arc_overhang_bridge_distance", 0.}
+    });
+    const auto target = output.find("M104 S202");
+    REQUIRE(target != std::string::npos);
+    CHECK(output.find("M104 S215", target) != std::string::npos);
+}
+
+TEST_CASE("Calibration ignores feature temperature overrides", "[Cooling][FeatureTemperature]")
+{
+    Print print;
+    init_and_process_print({TestMesh::bridge}, print, {
+        {"filament_fast_temperature_changes", true},
+        {"filament_bridge_temperature", 201},
+        {"filament_arc_temperature", 202},
+        {"filament_overhang_temperature", 203},
+        {"arc_overhang_enabled", false}
+    });
+    print.calib_mode() = CalibMode::Calib_Temp_Tower;
+    const auto output = gcode(print);
+    CHECK(output.find("M104 S201") == std::string::npos);
+    CHECK(output.find("M104 S202") == std::string::npos);
+    CHECK(output.find("M104 S203") == std::string::npos);
+}
+
+TEST_CASE("Steep wall temperature does not require overhang fan or speed controls", "[Cooling][FeatureTemperature]")
+{
+    const std::string output = slice({TestMesh::overhang}, {
+        {"filament_fast_temperature_changes", true},
+        {"filament_overhang_temperature", 203},
+        {"nozzle_temperature", 215},
+        {"enable_overhang_speed", false},
+        {"enable_overhang_bridge_fan", false},
+        {"arc_overhang_enabled", false}
+    });
+    const auto target = output.find("M104 S203");
+    REQUIRE(target != std::string::npos);
+    CHECK(output.find("M104 S215", target) != std::string::npos);
+}
+
 // The fan is held off for the first close_fan_the_first_x_layers layers, so an explicit
 // fan-off command is emitted.
 TEST_CASE("Fan is held off for the initial layers", "[Cooling]")

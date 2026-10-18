@@ -115,9 +115,16 @@ private:
     bool m_link_text_hover = false;
     bool m_paint_brim_mode = false;
     bool m_painting_stroke = false;
+    bool m_has_painted_position = false;
     Vec3f m_last_painted_position = Vec3f::Zero();
     
     PickingModel m_cylinder;
+    GLModel m_brush_preview;
+    bool m_brush_preview_dirty = true;
+    bool m_square_brush = false;
+    bool m_erase_brush = false;
+    ExPolygons brim_exclusion() const;
+    bool valid_brush_position(const Vec3f &position);
 
     // This map holds all translated description texts, so they can be easily referenced during layout calculations
     // etc. When language changes, GUI is recreated and this class constructed again, so the change takes effect.
@@ -186,6 +193,7 @@ protected:
     float get_brim_default_radius() const;
     ExPolygon make_polygon(BrimPoint point, const Geometry::Transformation &trsf);
     void find_single();
+    bool unproject_on_bed(const Vec2d &mouse_position, Vec3f &object_position) const;
 };
 
 wxDECLARE_EVENT(wxEVT_THREAD_DONE, wxCommandEvent);

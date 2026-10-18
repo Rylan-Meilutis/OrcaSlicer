@@ -1252,9 +1252,9 @@ void PrintObject::slice_volumes()
         const Rooting roots(*this);
         InterlockingGenerator::generate_interlocking_structure(this, [print]() { print->throw_if_canceled(); });
         const size_t root_count = roots.apply(*this, [print]() { print->throw_if_canceled(); });
-        if (m_config.rooting && num_printing_regions() > 1 && root_count == 0)
+        if ((m_config.rooting || m_config.rooting_xy) && num_printing_regions() > 1 && root_count == 0)
             this->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL,
-                L("Rooting could not place any roots. Check that different materials touch vertically within one object, that each region uses one filament with walls and top/bottom shells, and that the root depth, diameter and protective skin fit inside the base."));
+                L("Rooting could not place any roots. Check that different materials touch in an enabled rooting direction within one object, that each region uses one filament with walls and top/bottom shells, and that the root depth, diameter and protective skin fit inside the base."));
     }
     m_print->throw_if_canceled();
 

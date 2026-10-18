@@ -3,6 +3,7 @@
 #include "MsgDialog.hpp"
 #include "I18N.hpp"
 #include <wx/dcgraph.h>
+#include <wx/choice.h>
 #include "MainFrame.hpp"
 #include "Widgets/DialogButtons.hpp"
 #include "Widgets/HyperLink.hpp"
@@ -15,6 +16,59 @@
 #include "libslic3r/TemperatureTowerPresets.hpp"
 
 namespace Slic3r { namespace GUI {
+
+void show_seam_calibration_dialog(wxWindow *parent, Plater *plater)
+{
+    wxDialog dialog(parent, wxID_ANY, _L("Seam calibration"));
+    auto *layout = new wxBoxSizer(wxVERTICAL);
+    auto *description = new wxStaticText(&dialog, wxID_ANY,
+        _L("Scarf: sharp, rounded, circular and concave coupons at 0, 30 and 60 degrees from vertical.\n"
+           "Each 8 mm band repeats the same geometry. Bottom band: normal seam; then Start + n × Step.\n"
+           "Front ticks identify test bands (1, 2, ...). L-entry: one tick OFF, two ticks ON.\n"
+           "L-entry: matched OFF / ON coupons. Scarf is disabled so it cannot mask the L-entry.\n"
+           "Seams face the rear (+Y). Temperature is not swept. Save the generated project with your results."));
+    description->Wrap(dialog.FromDIP(540));
+    layout->Add(description, 0, wxALL, dialog.FromDIP(12));
+    auto *grid = new wxFlexGridSizer(2, dialog.FromDIP(8), dialog.FromDIP(12));
+    grid->AddGrowableCol(1);
+    auto *kind = new wxChoice(&dialog, wxID_ANY);
+    for (const auto &label : {_L("Scarf length (mm)"), _L("Scarf start height (%)"),
+                              _L("Scarf flow ratio"), _L("Scarf speed (mm/s)"), _L("L-seam inner entry: OFF / ON")})
+        kind->Append(label);
+    kind->SetSelection(0);
+    grid->Add(new wxStaticText(&dialog, wxID_ANY, _L("Test")), 0, wxALIGN_CENTER_VERTICAL);
+    grid->Add(kind, 1, wxEXPAND);
+    auto field = [&](const wxString &label, const wxString &value) {
+        auto *control = new wxTextCtrl(&dialog, wxID_ANY, value);
+        grid->Add(new wxStaticText(&dialog, wxID_ANY, label), 0, wxALIGN_CENTER_VERTICAL);
+        grid->Add(control, 1, wxEXPAND);
+        return control;
+    };
+    auto *start = field(_L("Start"), "5");
+    auto *step = field(_L("Step"), "5");
+    auto *count = field(_L("Test bands (1–8, plus control)"), "4");
+    kind->Bind(wxEVT_CHOICE, [=](wxCommandEvent &) {
+        const char *starts[] = {"5", "0", "0.8", "15", "0"};
+        const char *steps[] = {"5", "20", "0.05", "10", "0"};
+        const int selection = kind->GetSelection();
+        start->SetValue(starts[selection]); step->SetValue(steps[selection]);
+        for (auto *control : {start, step, count}) control->Enable(selection != 4);
+    });
+    layout->Add(grid, 0, wxEXPAND | wxLEFT | wxRIGHT, dialog.FromDIP(12));
+    layout->Add(dialog.CreateSeparatedButtonSizer(wxOK | wxCANCEL), 0, wxEXPAND | wxALL, dialog.FromDIP(12));
+    dialog.SetSizerAndFit(layout);
+    while (dialog.ShowModal() == wxID_OK) {
+        double first, increment;
+        long bands;
+        if (!start->GetValue().ToDouble(&first) || !step->GetValue().ToDouble(&increment) ||
+            !count->GetValue().ToLong(&bands) || bands < 1 || bands > 8) {
+            wxMessageBox(_L("Enter numeric values and between 1 and 8 test bands."), _L("Invalid range"), wxOK | wxICON_WARNING, parent);
+            continue;
+        }
+        plater->calib_seams(kind->GetSelection(), first, increment, int(bands));
+        break;
+    }
+}
 
 std::vector<InputShaperType> input_shaper_types_for_flavor(GCodeFlavor flavor);
 

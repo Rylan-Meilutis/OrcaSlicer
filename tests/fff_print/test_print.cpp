@@ -14,6 +14,7 @@
 #include "libslic3r/Print.hpp"
 #include "libslic3r/Layer.hpp"
 #include "libslic3r/Model.hpp"
+#include "libslic3r/SeamCalibration.hpp"
 #include "libslic3r/GCodeReader.hpp"
 #include "libslic3r/GCode/GCodeProcessor.hpp"
 #include "libslic3r/PresetBundle.hpp"
@@ -29,6 +30,78 @@
 #include <string_view>
 
 using namespace Slic3r;
+
+TEST_CASE("Scarf calibration exports a conventional control followed by sloped seams", "[Print][SeamCalibration]")
+{
+    const int shape = GENERATE(0, 1, 2, 3);
+    const int slope_row = GENERATE(0, 1, 2);
+    auto config = Test::multifilament_config(1, {{"initial_layer_print_height", 0.2},
+        {"enable_arc_fitting", false}, {"gcode_comments", true}, {"skirt_loops", 0}, {"brim_type", "no_brim"}});
+    SeamCalibrationParams params;
+    params.count = 2;
+    Model generated;
+    make_seam_calibration(generated, config, params);
+    Print print;
+    Model model;
+    const auto *coupon = generated.objects[shape + slope_row * 4];
+    Test::init_print({coupon->volumes.front()->mesh()}, print, model, config);
+    model.objects[0]->config.assign_config(coupon->config);
+    model.objects[0]->layer_config_ranges = coupon->layer_config_ranges;
+    print.apply(model, config);
+    const auto output = Test::gcode(print);
+    for (const Layer *layer : print.objects().front()->layers())
+        if (layer->print_z > 8.001)
+            for (const LayerRegion *region : layer->regions())
+                if (!region->perimeters.entities.empty())
+                    CHECK_THAT(region->region().config().seam_slope_min_length.value,
+                        Catch::Matchers::WithinAbs(params.start + (layer->print_z > 16.001 ? params.step : 0.), 1e-6));
+    size_t control_slopes = 0, test_slopes = 0;
+    GCodeReader reader;
+    reader.parse_buffer(output, [&](GCodeReader &self, const GCodeReader::GCodeLine &line) {
+        if (line.extruding(self) && line.dist_XY(self) > 0.01 && std::abs(line.new_Z(self) - self.z()) > 0.0001) {
+            if (std::max(self.z(), line.new_Z(self)) <= 8.001) ++control_slopes;
+            else ++test_slopes;
+        }
+    });
+    CHECK(control_slopes == 0);
+    CHECK(test_slopes > 0);
+}
+
+TEST_CASE("L seam calibration exposes actual inner entry moves only on enabled coupons", "[Print][SeamCalibration]")
+{
+    const int shape = GENERATE(0, 1, 2, 3);
+    const bool enabled = GENERATE(false, true);
+    auto config = Test::multifilament_config(1, {{"initial_layer_print_height", 0.2},
+        {"enable_arc_fitting", false}, {"gcode_comments", true}, {"skirt_loops", 0}, {"brim_type", "no_brim"}});
+    SeamCalibrationParams params;
+    params.kind = SeamCalibrationKind::InnerEntry;
+    Model generated;
+    make_seam_calibration(generated, config, params);
+    const auto *coupon = generated.objects[shape + (enabled ? 4 : 0)];
+    Print print;
+    Model model;
+    Test::init_print({coupon->volumes.front()->mesh()}, print, model, config);
+    model.objects[0]->config.assign_config(coupon->config);
+    print.apply(model, config);
+    const auto output = Test::gcode(print);
+    size_t entries = 0, returns = 0;
+    GCodeReader reader;
+    reader.parse_buffer(output, [&](GCodeReader &self, const GCodeReader::GCodeLine &line) {
+        const std::string comment(line.comment());
+        if (comment.find("outer wall seam transition") != std::string::npos) {
+            CHECK(line.extruding(self));
+            CHECK(line.dist_XY(self) > 0.);
+            ++entries;
+        }
+        if (comment.find("outer wall seam return") != std::string::npos) {
+            CHECK(line.extruding(self));
+            ++returns;
+        }
+    });
+    if (enabled) CHECK(entries > 0);
+    else CHECK(entries == 0);
+    CHECK(entries == returns);
+}
 
 TEST_CASE("Dispatch material selection excludes unused palette slots and unprinted objects", "[Print][ToolMapping]")
 {

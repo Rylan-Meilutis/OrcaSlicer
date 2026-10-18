@@ -1664,7 +1664,7 @@ bool PrintObject::invalidate_state_by_config_options(
     std::vector<PrintObjectStep> steps;
     bool invalidated = false;
     for (const t_config_option_key &opt_key : opt_keys) {
-        if (m_config.rooting && (opt_key == "wall_loops" || opt_key == "top_shell_layers" ||
+        if ((m_config.rooting || m_config.rooting_xy) && (opt_key == "wall_loops" || opt_key == "top_shell_layers" ||
             opt_key == "bottom_shell_layers" || opt_key == "outer_wall_filament_id" ||
             opt_key == "inner_wall_filament_id" || opt_key == "sparse_infill_filament_id" ||
             opt_key == "internal_solid_filament_id" || opt_key == "top_surface_filament_id" ||
@@ -1768,6 +1768,7 @@ bool PrintObject::invalidate_state_by_config_options(
             || opt_key == "make_overhang_printable_hole_size"
             || opt_key == "interlocking_beam"
             || opt_key == "rooting"
+            || opt_key == "rooting_xy"
             || opt_key == "rooting_depth"
             || opt_key == "rooting_width"
             || opt_key == "rooting_spacing"
@@ -2189,7 +2190,7 @@ void PrintObject::detect_surfaces_type()
     // This is useful if one of the parts is to be dissolved, or if it is transparent and the internal shells
     // should be visible.
     bool spiral_mode      = this->print()->config().spiral_mode.value;
-    bool interface_shells = ! spiral_mode && (m_config.interface_shells.value || m_config.rooting.value);
+    bool interface_shells = ! spiral_mode && (m_config.interface_shells.value || m_config.rooting.value || m_config.rooting_xy.value);
     size_t num_layers     = spiral_mode ? std::min(size_t(this->printing_region(0).config().bottom_shell_layers), m_layers.size()) : m_layers.size();
 
     for (size_t region_id = 0; region_id < this->num_printing_regions(); ++ region_id) {
@@ -2745,7 +2746,7 @@ void PrintObject::discover_vertical_shells()
     bool     spiral_mode      = this->print()->config().spiral_mode.value;
     size_t   num_layers       = spiral_mode ? std::min(size_t(this->printing_region(0).config().bottom_shell_layers), m_layers.size()) : m_layers.size();
     std::vector<DiscoverVerticalShellsCacheEntry> cache_top_botom_regions(num_layers, DiscoverVerticalShellsCacheEntry());
-    bool top_bottom_surfaces_all_regions = this->num_printing_regions() > 1 && ! m_config.interface_shells.value && !m_config.rooting.value;
+    bool top_bottom_surfaces_all_regions = this->num_printing_regions() > 1 && ! m_config.interface_shells.value && !m_config.rooting.value && !m_config.rooting_xy.value;
 //    static constexpr const float top_bottom_expansion_coeff = 1.05f;
     // Just a tiny fraction of an infill extrusion width to merge neighbor regions reliably.
     static constexpr const float top_bottom_expansion_coeff = 0.05f;

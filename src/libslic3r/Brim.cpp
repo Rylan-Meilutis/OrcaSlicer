@@ -349,9 +349,49 @@ static ExPolygons make_brim_ears_auto(const ExPolygons& obj_expoly, coord_t size
     return mouse_ears_ex;
 }
 
+Polygon brim_point_footprint(const BrimPoint &point, const Transform3d &transform)
+{
+    const Vec3d center = transform * point.pos.cast<double>();
+    Polygon footprint;
+    if (point.square()) {
+        for (const Vec2d &corner : {Vec2d(-1., -1.), Vec2d(1., -1.), Vec2d(1., 1.), Vec2d(-1., 1.)})
+            footprint.points.push_back(Point::new_scale(center.head<2>() + corner * point.head_front_radius));
+    } else {
+        for (size_t i = 0; i < POLY_SIDE_COUNT; ++i) {
+            const double angle = 2. * PI * i / POLY_SIDE_COUNT;
+            footprint.points.push_back(Point::new_scale(center.head<2>() + Vec2d(std::cos(angle), std::sin(angle)) * point.head_front_radius));
+        }
+    }
+    return footprint;
+}
+
+ExPolygons painted_brim_area(const BrimPoints &points, const Transform3d &transform)
+{
+    ExPolygons result;
+    ExPolygons additions;
+    for (const BrimPoint &point : points) {
+        const Polygons footprint{brim_point_footprint(point, transform)};
+        if (point.erases()) {
+            result = diff_ex(union_ex(result, additions), footprint);
+            additions.clear();
+        } else additions.emplace_back(footprint.front());
+    }
+    return union_ex(result, additions);
+}
+
+ExPolygons connected_brim_paint(const ExPolygons &painted, const ExPolygons &first_layer)
+{
+    ExPolygons connected;
+    for (const ExPolygon &part : painted)
+        if (!intersection_ex(ExPolygons{part}, first_layer).empty())
+            connected.push_back(part);
+    return connected;
+}
+
 static ExPolygons make_brim_ears(const PrintObject* object)
 {
     ExPolygons mouse_ears_ex;
+    ExPolygons additions;
     BrimPoints brim_ear_points = object->model_object()->brim_points;
     if (brim_ear_points.size() <= 0) {
         return mouse_ears_ex;
@@ -378,14 +418,12 @@ static ExPolygons make_brim_ears(const PrintObject* object)
             double angle = (2.0 * PI * i) / POLY_SIDE_COUNT;
             point_round.points.emplace_back(size_ear * cos(angle), size_ear * sin(angle));
         }
-        mouse_ears_ex.emplace_back();
-        mouse_ears_ex.back().contour = point_round;
         Vec3f pos = pt.transform(model_trsf);
         int32_t pt_x = scale_(pos.x());
         int32_t pt_y = scale_(pos.y());
 
         //ORCA: Project painted ears to the EFC-adjusted outline when enabled.
-        if (use_efc_outline) {
+        if (use_efc_outline && pt.shape == BrimPoint::Shape::Ear) {
             if (efc_outline == nullptr) {
                 //ORCA: Compute the EFC-adjusted outline lazily for painted ear projection.
                 efc_outline_storage = get_print_object_bottom_layer_expolygons(*object);
@@ -400,14 +438,35 @@ static ExPolygons make_brim_ears(const PrintObject* object)
                         *efc_outline,
                         Point(pt_x, pt_y),
                         closest_point)) {
+                    // Brush stamps may lie outside the model. Move those by
+                    // the outline correction, rather than snapping the entire
+                    // painted region back onto the edge like a mouse ear.
+                    Point raw_point;
+                    const Point painted_point(pt_x, pt_y);
+                    if (find_containing_expolygon_index(raw_outline, painted_point) < 0 &&
+                        closest_point_on_expolygons(raw_outline, painted_point, raw_point))
+                        closest_point += painted_point - raw_point;
                     pt_x = closest_point.x();
                     pt_y = closest_point.y();
                 }
             }
         }
 
-        mouse_ears_ex.back().contour.translate(Point(pt_x, pt_y));
+        Polygon footprint = pt.shape == BrimPoint::Shape::Ear ? point_round : brim_point_footprint(pt, model_trsf);
+        if (pt.shape == BrimPoint::Shape::Ear)
+            footprint.translate(Point(pt_x, pt_y));
+        const ExPolygons painted{ExPolygon(footprint)};
+        if (pt.erases()) {
+            mouse_ears_ex = diff_ex(union_ex(mouse_ears_ex, additions), painted);
+            additions.clear();
+        } else append(additions, painted);
     }
+    mouse_ears_ex = union_ex(mouse_ears_ex, additions);
+    // Erasing can separate a previously attached painted region. Do not emit
+    // detached scraps of brush paint as independent first-layer islands.
+    if (std::any_of(brim_ear_points.begin(), brim_ear_points.end(),
+        [](const BrimPoint &point) { return point.shape != BrimPoint::Shape::Ear; }))
+        mouse_ears_ex = connected_brim_paint(mouse_ears_ex, raw_outline);
     return mouse_ears_ex;
 }
 

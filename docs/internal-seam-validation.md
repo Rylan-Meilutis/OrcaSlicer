@@ -1,5 +1,44 @@
 # Internal seam and brick preview validation
 
+## Printable seam calibration
+
+**Calibration → Seam calibration** creates an ordinary, saveable project using
+the selected process and first filament. It does not overwrite presets.
+
+Scarf tests vary one of length (mm), start height (percent of layer height), flow
+ratio, or speed (mm/s). There are four shapes: sharp square, rounded square,
+circle with a hole, and a concave corner. Rows use 0°, 30° and 60° wall slopes
+measured from vertical; each slope reverses within the band to expose both sides
+of the overhang. These are deliberately demanding coupons, not guaranteed
+support-free production settings.
+
+Each band is 8 mm high. The lowest band is a conventional-seam control. Test
+band 1 uses Start, band 2 uses Start + Step, and so on (up to eight test bands).
+Raised front ticks identify the test-band number; the control has no ticks.
+Object names list the angle and bottom-to-top values. The rear (+Y) is the seam
+side. Evaluate the middle of each band, not its boundary or first-layer effects.
+Other scarf parameters are retained, but conditional scarf, whole-loop scarf,
+inner-wall scarf, brick layering, L-entry, supports and arc overhangs are disabled
+to isolate the tested seam. The layer height is half the first nozzle diameter.
+Temperature is not swept. Scarf speed remains subject to the normal wall speed,
+volumetric and cooling limits; inspect the speed preview before comparing bands.
+
+L-entry mode creates paired OFF and ON versions of each shape. One front tick
+means OFF; two means ON. Both use ordinary (non-scarf) seams and three walls.
+Scarf qualification otherwise takes precedence over L-entry, which can make an
+enabled inner-entry setting appear inactive. Geometry clearance checks can also
+reject a particular entry and retain a conventional seam; the calibration does
+not bypass them.
+
+In Preview, isolate outer-wall paths and step through the rear seam with the
+horizontal toolpath slider. ON coupons should start inside, extrude out to the
+outer wall, complete it and return inside. With G-code comments enabled these
+moves contain `outer wall seam transition` and `outer wall seam return`.
+Automated tests inspect those moves and scarf Z ramps; the existing seam suite
+checks crossings and wall-material conservation. They do not predict a physical
+bulge. Keep the 3MF, printed G-code and photos of the front tick labels and rear
+seams together when evaluating a material or reporting a defect.
+
 September 16 checkpoint:
 
 - Eligible non-scarf outer loops start along the latter half of a reserved

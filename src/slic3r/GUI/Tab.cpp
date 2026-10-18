@@ -3220,7 +3220,7 @@ void TabPrint::build()
         optgroup->append_single_option_line("interlocking_boundary_avoidance", "multimaterial_settings_advanced#interlocking-boundary-avoidance");
 
         optgroup = page->new_optgroup(L("Rooting"), L"rooting");
-        for (const char *key : {"rooting", "rooting_depth", "rooting_width", "rooting_spacing", "rooting_skin"})
+        for (const char *key : {"rooting", "rooting_xy", "rooting_depth", "rooting_width", "rooting_spacing", "rooting_skin"})
             optgroup->append_single_option_line(key);
 
     page = add_options_page(L("Others"), "custom-gcode_other"); // ORCA: icon only visible on placeholders
@@ -4749,6 +4749,15 @@ void TabFilament::build()
         optgroup->append_single_option_line("support_material_interface_fan_speed", "material_cooling#support-interface-fan-speed");
         optgroup->append_single_option_line("ironing_fan_speed", "material_cooling#ironing-fan-speed"); // ORCA: Add support for ironing fan speed control
 
+        optgroup = page->new_optgroup(L("Fast-response feature temperatures"));
+        optgroup->append_single_option_line("filament_fast_temperature_changes");
+        optgroup->append_single_option_line("filament_auto_feature_temperature");
+        optgroup->append_single_option_line("filament_arc_temperature");
+        optgroup->append_single_option_line("filament_bridge_temperature");
+        optgroup->append_single_option_line("filament_overhang_temperature");
+        optgroup->append_single_option_line("filament_reduce_support_interface_temperature");
+        optgroup->append_single_option_line("filament_support_interface_temperature");
+
         optgroup = page->new_optgroup(L("Auxiliary part cooling fan"), L"param_cooling_aux_fan");
         optgroup->append_single_option_line("additional_cooling_fan_speed", "material_cooling#auxiliary-part-cooling-fan");
 
@@ -4947,6 +4956,12 @@ void TabFilament::toggle_options()
     auto printer_cfg = m_preset_bundle->printers.get_edited_preset().config;
 
     if (m_active_page->title() == L("Cooling")) {
+        const bool fast_temperature = m_config->opt_bool("filament_fast_temperature_changes", 0);
+        for (const char *key : {"filament_auto_feature_temperature", "filament_arc_temperature",
+             "filament_bridge_temperature", "filament_overhang_temperature", "filament_reduce_support_interface_temperature"})
+            toggle_option(key, fast_temperature);
+        toggle_option("filament_support_interface_temperature", fast_temperature &&
+            m_config->opt_bool("filament_reduce_support_interface_temperature", 0));
         bool has_enable_overhang_bridge_fan = m_config->opt_bool("enable_overhang_bridge_fan", 0);
         for (auto el : {"overhang_fan_speed", "overhang_fan_threshold", "internal_bridge_fan_speed"}) // ORCA: Add support for separate internal bridge fan speed control
             toggle_option(el, has_enable_overhang_bridge_fan);

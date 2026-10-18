@@ -1,4 +1,4 @@
-# Rooting at vertical material interfaces
+# Rooting at material interfaces
 
 Rooting is an opt-in process/object setting in the Multimaterial tab. It assigns
 buried volumes of the lower material to the material beginning above it. The broad
@@ -8,6 +8,26 @@ smaller lateral branches. The wider buried footprint provides
 an undercut against vertical pull-out; it is not a guarantee of joint strength.
 Flexible materials can still deform out of an anchor, and material combinations
 need physical qualification.
+
+XY rooting is an independent, default-off switch for sideways contacts. It grows
+rounded, branching fans into the adjoining material, like roots entering a cliff.
+The smaller native region on a course supplies the root material; the larger
+region is the host (region order breaks equal-area ties). This is a geometric
+heuristic, not a prediction of load direction. The shared depth setting limits
+sideways penetration, while spacing separates both attachment sites and Z bands.
+Two primary limbs produce recursive side branches, with three generations and
+six shortening attempts per limb. Exposed side, top and bottom skins, third
+materials and printable host webs constrain the complete swept geometry.
+Roots that cannot fit or connect to their owning material are rejected rather
+than clipped into floating fragments. Connectivity may pass through adjacent
+courses, allowing attachment to alternating beam teeth. Existing beam additions
+are preserved; sideways growth starts at the outside of their attachment band.
+At beam joints, the neck fits the beam tooth and widens behind the neighboring
+teeth before branching. Growth follows the native material boundary normal,
+not the diagonal tooth edges. Primary limbs must extend beyond short stubs;
+otherwise that attachment is rejected. The swept tips stay within the selected
+penetration depth.
+Vertical and XY rooting can be enabled together.
 
 The controls are root depth, branch diameter, spacing and protective skin. Old
 profiles and projects default to rooting disabled; no existing keys change meaning.
@@ -55,6 +75,10 @@ Those branches recursively grow their own side branches, with at most three
 generations (28 limbs) per seed. The trunk's fit is not tied to the sum of all
 terminal cross-sectional areas, which would suppress branching at small contacts.
 Radii taper to the printable minimum. Small/shallow contacts use fewer generations.
+Narrow annular contacts use smaller trunks down to the configured branch
+diameter, retaining the model-shaped collar and the full protective skin. Seed
+search includes their inset contours instead of relying on a bounding-box center
+that may lie inside a screw hole.
 Tapered sphere sweeps produce connected, rounded junctions and long horizontal
 cross-sections, rather than circles that merely translate with layer height.
 Horizontal reach is independent of a fixed vertical branch slope and targets

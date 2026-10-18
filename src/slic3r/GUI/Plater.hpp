@@ -372,6 +372,7 @@ public:
     //ORCA: Add pattern parameter to calib_flowrate
     void calib_flowrate(bool is_linear, int pass, InfillPattern pattern = ipArchimedeanChords);
     void calib_temp(const Calib_Params& params);
+    void calib_seams(int kind, double start, double step, int count);
     void calib_max_vol_speed(const Calib_Params& params);
     void calib_retraction(const Calib_Params& params);
     void calib_VFA(const Calib_Params& params);

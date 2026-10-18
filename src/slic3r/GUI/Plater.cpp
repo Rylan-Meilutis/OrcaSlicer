@@ -41,6 +41,7 @@
 #include <wx/filedlg.h>
 #include <wx/choicdlg.h>
 #include <wx/choice.h>
+#include <wx/spinctrl.h>
 #include <wx/dnd.h>
 #include <wx/progdlg.h>
 #include <wx/string.h>
@@ -77,6 +78,7 @@
 #include "libslic3r/GCode/ThumbnailData.hpp"
 #include "libslic3r/GCode/SpoolManagerMetadata.hpp"
 #include "libslic3r/Model.hpp"
+#include "libslic3r/SeamCalibration.hpp"
 #include "libslic3r/SLA/SupportPoint.hpp"
 #include "libslic3r/SLA/ReprojectPointsOnMesh.hpp"
 #include "libslic3r/Polygon.hpp"
@@ -4023,6 +4025,98 @@ Sidebar::Sidebar(Plater *parent)
             p->plater->update();
         });
         p->area_bindings_panel = new wxPanel(p->scrolled);
+        auto *adhesion = new wxButton(p->scrolled, wxID_ANY, _L("Project raft and brim…"));
+        scrolled_sizer->Add(adhesion, 0, wxEXPAND | wxALL, FromDIP(8));
+        adhesion->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
+            auto &plates = p->plater->get_partplate_list();
+            const auto &profile = wxGetApp().preset_bundle->prints.get_edited_preset().config;
+            const auto &overrides = *plates.get_curr_plate()->config();
+            DynamicPrintConfig effective = profile;
+            effective.apply(overrides);
+            wxDialog dialog(this, wxID_ANY, _L("Project raft and brim"));
+            auto *layout = new wxBoxSizer(wxVERTICAL);
+            auto *note = new wxStaticText(&dialog, wxID_ANY,
+                _L("Applies to all existing plates in this project. Object overrides take precedence. The process profile is not changed."));
+            note->Wrap(FromDIP(420));
+            layout->Add(note, 0, wxEXPAND | wxALL, FromDIP(12));
+            auto *inherit = new wxCheckBox(&dialog, wxID_ANY, _L("Use process profile settings"));
+            const std::vector<std::string> keys{"brim_type", "brim_width", "brim_object_gap", "raft_layers",
+                "brim_flow_ratio", "raft_contact_distance", "raft_expansion", "raft_first_layer_expansion", "raft_first_layer_density"};
+            inherit->SetValue(std::none_of(keys.begin(), keys.end(), [&](const auto &key) { return overrides.has(key); }));
+            layout->Add(inherit, 0, wxALL, FromDIP(12));
+            auto *grid = new wxFlexGridSizer(2, FromDIP(8), FromDIP(12));
+            grid->AddGrowableCol(1);
+            auto *type = new wxChoice(&dialog, wxID_ANY);
+            const std::vector<BrimType> types{btNoBrim, btAutoBrim, btOuterOnly, btInnerOnly, btOuterAndInner, btEar, btPainted};
+            for (const auto &label : {_L("None"), _L("Auto"), _L("Outer only"), _L("Inner only"),
+                                      _L("Outer and inner"), _L("Mouse ears"), _L("Painted")}) type->Append(label);
+            const auto found = std::find(types.begin(), types.end(), effective.opt_enum<BrimType>("brim_type"));
+            type->SetSelection(found == types.end() ? 0 : int(found - types.begin()));
+            auto *width = new wxSpinCtrlDouble(&dialog, wxID_ANY);
+            width->SetRange(0., 100.); width->SetIncrement(0.5); width->SetDigits(2);
+            width->SetValue(effective.opt_float("brim_width"));
+            auto *gap = new wxSpinCtrlDouble(&dialog, wxID_ANY);
+            gap->SetRange(0., 5.); gap->SetIncrement(0.05); gap->SetDigits(2);
+            gap->SetValue(effective.opt_float("brim_object_gap"));
+            auto *raft = new wxSpinCtrl(&dialog, wxID_ANY);
+            raft->SetRange(0, 100); raft->SetValue(effective.opt_int("raft_layers"));
+            auto add = [&](const wxString &label, wxWindow *control) {
+                grid->Add(new wxStaticText(&dialog, wxID_ANY, label), 0, wxALIGN_CENTER_VERTICAL);
+                grid->Add(control, 1, wxEXPAND);
+            };
+            add(_L("Brim type"), type);
+            add(_L("Brim width (mm)"), width);
+            add(_L("Brim-object gap (mm)"), gap);
+            add(_L("Raft layers"), raft);
+            struct NumericSetting { const char *key; wxString label; double min, max, step; };
+            const std::vector<NumericSetting> settings{
+                {"brim_flow_ratio", _L("Brim flow ratio"), 0., 2., 0.05},
+                {"raft_contact_distance", _L("Raft contact Z distance (mm)"), 0., 10., 0.05},
+                {"raft_expansion", _L("Raft expansion (mm)"), 0., 100., 0.5},
+                {"raft_first_layer_expansion", _L("Raft first layer expansion (mm)"), 0., 100., 0.5},
+                {"raft_first_layer_density", _L("Raft first layer density (%)"), 10., 100., 1.}};
+            std::vector<wxSpinCtrlDouble *> extra;
+            for (const auto &setting : settings) {
+                auto *control = new wxSpinCtrlDouble(&dialog, wxID_ANY);
+                control->SetRange(setting.min, setting.max);
+                control->SetIncrement(setting.step);
+                control->SetDigits(2);
+                control->SetValue(effective.option(setting.key)->getFloat());
+                add(setting.label, control);
+                extra.push_back(control);
+            }
+            auto enable = [&] {
+                for (wxWindow *control : std::vector<wxWindow *>{type, width, gap, raft}) control->Enable(!inherit->GetValue());
+                for (auto *control : extra) control->Enable(!inherit->GetValue());
+            };
+            enable();
+            inherit->Bind(wxEVT_CHECKBOX, [&](wxCommandEvent &) { enable(); });
+            layout->Add(grid, 1, wxEXPAND | wxALL, FromDIP(12));
+            layout->Add(dialog.CreateSeparatedButtonSizer(wxOK | wxCANCEL), 0, wxEXPAND | wxALL, FromDIP(12));
+            dialog.SetSizerAndFit(layout);
+            wxGetApp().UpdateDlgDarkUI(&dialog);
+            if (dialog.ShowModal() != wxID_OK) return;
+            p->plater->take_snapshot(_u8L("Change project raft and brim"));
+            for (int i = 0; i < plates.get_plate_count(); ++i) {
+                auto *config = plates.get_plate(i)->config();
+                plates.get_plate(i)->update_slice_result_valid_state(false);
+                if (inherit->GetValue()) {
+                    for (const auto &key : keys) config->erase(key);
+                } else {
+                    config->set_key_value("brim_type", new ConfigOptionEnum<BrimType>(types[type->GetSelection()]));
+                    config->set_key_value("brim_width", new ConfigOptionFloat(width->GetValue()));
+                    config->set_key_value("brim_object_gap", new ConfigOptionFloat(gap->GetValue()));
+                    config->set_key_value("raft_layers", new ConfigOptionInt(raft->GetValue()));
+                    for (size_t n = 0; n < settings.size(); ++n)
+                        config->set_deserialize_strict(settings[n].key, std::to_string(extra[n]->GetValue()));
+                }
+            }
+            p->plater->set_plater_dirty(true);
+            p->plater->update_project_dirty_from_presets();
+            for (const auto &key : keys)
+                p->plater->config_change_notification(*plates.get_curr_plate()->config(), key);
+            p->plater->update();
+        });
         auto *section_sizer = new wxBoxSizer(wxVERTICAL);
         auto *header = new StaticBox(p->area_bindings_panel, wxID_ANY, wxDefaultPosition,
                                      wxDefaultSize, wxTAB_TRAVERSAL | wxBORDER_NONE);
@@ -18014,6 +18108,31 @@ void Plater::calib_flowrate(bool is_linear, int pass, InfillPattern pattern) {
     changed_objects(object_idx);
 }
 
+
+void Plater::calib_seams(int kind, double start, double step, int count)
+{
+    SeamCalibrationParams params;
+    params.kind = static_cast<SeamCalibrationKind>(kind);
+    params.start = start; params.step = step; params.count = count;
+    const auto &printer = wxGetApp().preset_bundle->printers.get_edited_preset().config;
+    params.nozzle = printer.option<ConfigOptionFloats>("nozzle_diameter")->get_at(0);
+    Model generated;
+    try {
+        make_seam_calibration(generated, wxGetApp().preset_bundle->prints.get_edited_preset().config, params);
+    } catch (const std::exception &error) {
+        wxMessageBox(from_u8(error.what()), _L("Seam calibration"), wxOK | wxICON_WARNING, this);
+        return;
+    }
+    if (new_project(false, false, _L("Seam calibration")) == wxID_CANCEL)
+        return;
+    auto *plate = p->partplate_list.get_curr_plate();
+    plate->set_print_seq(PrintSequence::ByLayer);
+    plate->set_spiral_vase_mode(false, false);
+    generated.center_instances_around_point(p->bed.build_volume().bed_center());
+    wxGetApp().mainframe->select_tab(TAB_ID_PREPARE);
+    const auto indices = p->load_model_objects(generated.objects);
+    changed_objects(indices);
+}
 
 void Plater::calib_temp(const Calib_Params& params) {
     constexpr double base_temp_tower_nozzle_diameter = 0.4;

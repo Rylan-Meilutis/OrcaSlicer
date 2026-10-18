@@ -743,6 +743,10 @@ private:
     //double                              m_volumetric_speed;
     // Support for the extrusion role markers. Which marker is active?
     ExtrusionRole                       m_last_extrusion_role;
+    // Filament id, normal temperature, active feature target.
+    std::optional<std::array<int, 3>>     m_feature_temperature;
+    std::string restore_feature_temperature();
+    std::string set_feature_temperature(int target, int normal);
     // To ignore gapfill role for retract_lift_enforce
     ExtrusionRole                       m_last_notgapfill_extrusion_role;
     // Last layer (inclusive) that retains arc-overhang stabilization settings.

@@ -1,8 +1,28 @@
 #include <catch2/catch_all.hpp>
 #include "libslic3r/GCode/ArcCooling.hpp"
+#include "libslic3r/GCode/FeatureTemperature.hpp"
 #include <limits>
 
 using namespace Slic3r;
+
+TEST_CASE("Feature temperature estimates respect opt in and spool limits", "[ArcThermal][FeatureTemperature]")
+{
+    CHECK(feature_temperature(false, true, "PLA", 220, 190, 190, 240) == 220);
+    CHECK(feature_temperature(true, false, "PLA", 220, 0, 190, 240) == 220);
+    CHECK(feature_temperature(true, true, "Unknown", 220, 0, 190, 240) == 220);
+    CHECK(feature_temperature(true, true, "PLA", 220, 0, 0, 0) == 220);
+    CHECK(feature_temperature(true, true, "PLA", 220, 205, 190, 240) == 205);
+    CHECK(feature_temperature(true, true, "PLA", 220, 0, 218, 240) == 218);
+    for (const auto material : {"PLA", "PETG", "HIPS", "PP", "PPS-CF"}) {
+        const int normal = std::string_view(material) == "PPS-CF" ? 320 : 240;
+        const int target = feature_temperature(true, true, material, normal, 200, 180, 350);
+        CHECK(target == 200);
+        const int automatic = feature_temperature(true, true, material, normal, 0, 180, 350);
+        CHECK(automatic < normal);
+        CHECK(automatic >= normal - 10);
+        CHECK(feature_temperature(true, true, material, normal, 0, 180, 350, true) >= automatic);
+    }
+}
 
 TEST_CASE("Arc thermal estimates respond to heat storage and cooling", "[ArcThermal]")
 {

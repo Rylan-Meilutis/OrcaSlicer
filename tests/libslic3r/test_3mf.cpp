@@ -75,6 +75,67 @@ namespace Catch {
 
 using namespace Slic3r;
 
+TEST_CASE("Brim brush operations and project adhesion overrides survive saving", "[3mf][Brim]")
+{
+    const bool legacy = GENERATE(false, true);
+    Model model;
+    REQUIRE(load_stl((std::string(TEST_DATA_DIR) + "/test_3mf/Prusa.stl").c_str(), &model));
+    model.add_default_instances();
+    ScopedSlic3rTemporaryDir backup("brim_project");
+    model.set_backup_path(backup.string());
+    for (int shape = 0; shape <= (legacy ? 0 : int(BrimPoint::Shape::EraseSquare)); ++shape) {
+        BrimPoint point(Vec3f(float(shape), 2.f, -0.0001f), 3.f);
+        point.shape = BrimPoint::Shape(shape);
+        model.objects.front()->brim_points.push_back(point);
+    }
+    DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+    const auto original_profile = config.option("brim_width")->serialize();
+    PlateData plate;
+    plate.plate_index = 0;
+    plate.config.set_deserialize_strict({{"brim_type", "painted"}, {"brim_width", 12.5},
+        {"brim_object_gap", 0.25}, {"raft_layers", 3}, {"brim_flow_ratio", 0.9},
+        {"raft_contact_distance", 0.15}, {"raft_expansion", 2.5},
+        {"raft_first_layer_expansion", 3.5}, {"raft_first_layer_density", "75%"}});
+    ScopedTemporaryFile file(".3mf");
+    StoreParams params;
+    params.path = file.string();
+    params.model = &model;
+    params.config = &config;
+    params.plate_data_list.push_back(&plate);
+    params.strategy = SaveStrategy::Zip64 | SaveStrategy::Silence;
+    REQUIRE(store_bbs_3mf(params));
+    Model loaded;
+    ScopedTemporaryDir loaded_backup("brim_loaded");
+    loaded.set_backup_path(loaded_backup.string());
+    DynamicPrintConfig loaded_config;
+    ConfigSubstitutionContext substitutions{ForwardCompatibilitySubstitutionRule::Enable};
+    PlateDataPtrs plates;
+    std::vector<Preset *> presets;
+    bool bbl = false, orca = false;
+    Semver version;
+    REQUIRE(load_bbs_3mf(params.path.c_str(), &loaded_config, &substitutions, &loaded, &plates,
+        &presets, &bbl, &orca, &version, nullptr, LoadStrategy::LoadModel | LoadStrategy::LoadConfig));
+    REQUIRE(loaded.objects.size() == 1);
+    const auto &points = loaded.objects.front()->brim_points;
+    REQUIRE(points.size() == model.objects.front()->brim_points.size());
+    for (size_t i = 0; i < points.size(); ++i) {
+        CHECK(points[i].shape == model.objects.front()->brim_points[i].shape);
+        CHECK_THAT(points[i].head_front_radius, Catch::Matchers::WithinAbs(3.f, 1e-6f));
+    }
+    REQUIRE(plates.size() == 1);
+    CHECK(plates.front()->config.opt_enum<BrimType>("brim_type") == btPainted);
+    CHECK_THAT(plates.front()->config.opt_float("brim_width"), Catch::Matchers::WithinAbs(12.5, 1e-6));
+    CHECK_THAT(plates.front()->config.opt_float("brim_object_gap"), Catch::Matchers::WithinAbs(0.25, 1e-6));
+    CHECK(plates.front()->config.opt_int("raft_layers") == 3);
+    for (const auto &key : plate.config.keys()) {
+        REQUIRE(plates.front()->config.has(key));
+        CHECK(plates.front()->config.option(key)->serialize() == plate.config.option(key)->serialize());
+    }
+    CHECK(config.option("brim_width")->serialize() == original_profile);
+    release_PlateData_list(plates);
+    for (Preset *preset : presets) delete preset;
+}
+
 
 SCENARIO("Reading 3mf file", "[3mf]") {
     GIVEN("umlauts in the path of the file") {

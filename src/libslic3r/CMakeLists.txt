@@ -92,6 +92,8 @@ set(lisbslic3r_sources
     BuildVolume.hpp
     calib.cpp
     calib.hpp
+    SeamCalibration.cpp
+    SeamCalibration.hpp
     Circle.cpp
     Circle.hpp
     clipper.cpp

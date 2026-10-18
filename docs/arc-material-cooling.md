@@ -50,6 +50,61 @@ on a physical coupon with both narrow and wide arc regions and measure dimension
 before applying them to tolerance-critical parts. No setting guarantees flatness
 for every geometry or material.
 
+## Fast-response feature temperatures
+
+Filament → Cooling → Fast-response feature temperatures is a separate opt-in
+control. Separate targets cover arc fill (including arc bridges), straight bridge
+fill, steep perimeters (at most 50% supported width), and same-filament top
+support contact interfaces. Support reduction requires its own opt-in; objects
+using other filaments or explicitly assigned different support filaments are
+excluded. The existing process-level top-interface temperature takes precedence.
+
+Zero targets use normal printing temperatures unless automatic estimates are
+enabled. Auto subtracts 4% of the difference between normal nozzle temperature
+and the table's transition/solidification proxy, or 2% for steep walls and support
+interfaces, rounded and bounded to 3–10°C. The filament's recommended minimum
+bounds the result. Missing material data, missing/invalid ranges, or a normal
+temperature outside that range disable estimation. These coefficients are tuning
+heuristics, not sourced material properties or predictions of melt viscosity.
+Positive explicit targets take precedence and require physical validation.
+
+Changes synchronize queued motion with M400, then issue a non-waiting nozzle
+target. The normal target is restored before ordinary paths, at layer completion,
+and before tool changes. Consecutive paths at the same target avoid duplicate
+commands. Induction heating alone does not guarantee fast cooling: no cooling
+dwell is inserted and short features may not reach their target. Planner flushes
+may increase print time. Calibration and first-layer paths are excluded.
+Custom temperature G-code must be reviewed for conflicts; restoration uses the
+filament's normal configured temperature.
+
+Lower temperatures can compromise bonding, not just improve breakaway.
+[Prusa's PETG guidance](https://help.prusa3d.com/article/petg_2059) describes this
+strength tradeoff; its [bridging guidance](https://help.prusa3d.com/article/poor-bridging_1802)
+also emphasizes cooling, speed and flow. Auto is not a substitute for testing.
+
+### INDX RME startup integration
+
+The bundled INDX RME printer and `resources/gcode/indx_rme_start.gcode` share
+the same startup template. `; RME_DEPOSITION_BOUNDS=1` enables replacement of
+startup M555 commands with final deposition bounds, including bead width and arc
+extrema. The last M555 is immediately before G29 P1, after PA and offset
+calibration. Model, support, adhesion and wipe-tower deposition contribute;
+startup/cleaning moves, travel and stationary purges do not. Unknown or out-of-bed
+bounds fall back to the full bed instead of retaining a stale local mesh area.
+This narrows the existing probe grid, not its spacing.
+
+`; RME_TEMPERATURE_ADAPTIVE_PA=0` preserves the legacy single-temperature M976 A
+command. Change this marker to `1` only on firmware implementing temperature-list
+Auto PA. Export then replaces that startup command with
+`M976 A physical:logical:material:initial/minimum/maximum/...` for depositing
+tools. Targets come from final emitted deposition, including temperature towers
+and feature overrides, not startup/probing/standby/cooldown heater commands.
+Duplicate targets are removed, with at most eight points per tool and initial,
+minimum and maximum retained. Invalid material names or unknown deposition
+temperatures stop export rather than silently supplying an incomplete PA plan.
+Measurement, cache validation and interpolation are firmware responsibilities;
+this marker does not add those capabilities to older firmware.
+
 ## Bundled reference table, version 5
 
 Only exact types `PLA`, `PETG`, `ABS`, `ASA`, `PC`, `HIPS`, `PMMA`, `PSU`

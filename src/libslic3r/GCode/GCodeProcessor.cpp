@@ -1031,6 +1031,35 @@ private:
 
 void GCodeProcessor::run_post_process()
 {
+    const std::string &start_code = m_print->config().machine_start_gcode.value;
+    const bool rme_bounds = start_code.find("; RME_DEPOSITION_BOUNDS=1") != std::string::npos;
+    const bool rme_auto_pa = start_code.find("; RME_TEMPERATURE_ADAPTIVE_PA=1") != std::string::npos;
+    std::string rme_mesh;
+    if (rme_bounds) {
+        const Polygon bed = Polygon::new_scale(m_print->config().printable_area.values);
+        const auto &plan = m_rme_output_plan;
+        rme_mesh = plan.mesh_command();
+        if (!rme_mesh.empty()) {
+            const Polygon bounds = Polygon::new_scale({Vec2d(plan.minimum[0], plan.minimum[1]),
+                Vec2d(plan.maximum[0], plan.minimum[1]), Vec2d(plan.maximum[0], plan.maximum[1]),
+                Vec2d(plan.minimum[0], plan.maximum[1])});
+            if (!diff(Polygons{bounds}, Polygons{bed}).empty()) rme_mesh.clear();
+        }
+        if (rme_mesh.empty() && !bed.points.empty()) {
+            // Reset any earlier local print area rather than retaining stale bounds.
+            const BoundingBox bed_box(bed.points);
+            RMEOutputPlan full_bed;
+            full_bed.minimum = {unscale<double>(bed_box.min.x()), unscale<double>(bed_box.min.y())};
+            full_bed.maximum = {unscale<double>(bed_box.max.x()), unscale<double>(bed_box.max.y())};
+            rme_mesh = full_bed.mesh_command();
+        }
+        if (rme_mesh.empty())
+            rme_mesh = "; RME deposition bounds unavailable; use normal meshing\n";
+    }
+    const std::string rme_pa = rme_auto_pa ? m_rme_output_plan.pa_command() : std::string();
+    bool rme_in_start = true;
+    if (rme_auto_pa && rme_pa.empty())
+        throw SlicingError("Cannot derive a valid RME temperature-adaptive PA plan from deposition. Check material names and printing temperatures.");
     FilePtr in{ boost::nowide::fopen(m_result.filename.c_str(), "rb") };
     if (in.f == nullptr)
         throw Slic3r::RuntimeError(std::string("GCode processor post process export failed.\nCannot open file for reading.\n"));
@@ -1698,6 +1727,16 @@ void GCodeProcessor::run_post_process()
 
                 if (eol) {
                     ++line_id;
+                    // Replace a single startup line in place, retaining line-id
+                    // accounting for preview and the remaining post-processors.
+                    if (gcode_line.rfind(";" + Machine_Start_GCode_End_Tag, 0) == 0)
+                        rme_in_start = false;
+                    if (rme_in_start) {
+                        if (rme_bounds && GCodeReader::GCodeLine::cmd_is(gcode_line, "M555"))
+                            gcode_line = rme_mesh;
+                        if (rme_auto_pa && gcode_line.rfind("M976 A ", 0) == 0)
+                            gcode_line = rme_pa;
+                    }
                     const unsigned int internal_g1_lines_counter = export_line.update(gcode_line, line_id, g1_lines_counter);
                     // Orca: track the current layer for preheat temperature selection.
                     // The line is ";" + reserved_tag(Layer_Change) + EOL; match it independent of
@@ -3631,6 +3670,7 @@ void GCodeProcessor::reset()
     m_temperature_targets_changed = true;
 
     m_extruded_last_z = 0.0f;
+    m_rme_output_plan = {};
     m_zero_layer_height = 0.0f;
     m_first_layer_height = 0.0f;
     m_processing_start_custom_gcode = false;
@@ -6031,6 +6071,10 @@ void GCodeProcessor::process_G2_G3(const GCodeReader::GCodeLine& line, bool cloc
         m_start_position = m_end_position; // this is required because we are skipping the call to process_gcode_line()
         internal_only_g1_line(adjust_target(end_position, prev_target), arc.delta_z() != 0.0, (segments == 1) ? feedrate : std::nullopt, extrusion);
     }
+    if (extrusion && *extrusion > 0. && m_extrusion_role != erCustom && m_extrusion_role != erNone &&
+        !m_processing_start_custom_gcode)
+        m_rme_output_plan.arc(arc.start.x(), arc.start.y(), arc.end.x(), arc.end.y(),
+                              arc.center.x(), arc.center.y(), clockwise, m_width);
 }
 
 //BBS
@@ -7123,6 +7167,16 @@ void GCodeProcessor::store_move_vertex(EMoveType type, EMovePathType path_type, 
     const bool has_y = delta_y > 0.0f;
     const bool has_z = delta_z > 0.0f;
     const bool has_e = delta_e > 0.0f;
+    if (type == EMoveType::Extrude && (has_x || has_y) && m_end_position[E] > m_start_position[E] &&
+        m_extrusion_role != erCustom && m_extrusion_role != erNone && !m_processing_start_custom_gcode) {
+        m_rme_output_plan.point(m_start_position[X], m_start_position[Y], m_width);
+        m_rme_output_plan.point(m_end_position[X], m_end_position[Y], m_width);
+        const int extruder = get_extruder_id();
+        const int physical = size_t(extruder) < m_physical_extruder_map.size() ?
+            m_physical_extruder_map[extruder] : extruder;
+        const std::string material = size_t(filament_id) < m_filament_types.size() ? m_filament_types[filament_id] : "";
+        m_rme_output_plan.temperature(filament_id, physical, material, m_extruder_temps[filament_id]);
+    }
     const float move_acceleration =
         (type == EMoveType::Travel) ? get_travel_acceleration(normal_mode) :
         ((type == EMoveType::Retract || type == EMoveType::Unretract) ? get_retract_acceleration(normal_mode) :

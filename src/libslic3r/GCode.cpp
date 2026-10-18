@@ -2,6 +2,7 @@
 #include "Config.hpp"
 #include "GCode/WipePathHelpers.hpp"
 #include "GCode/ArcCooling.hpp"
+#include "GCode/FeatureTemperature.hpp"
 #include "GCodeWriter.hpp"
 #include "Polygon.hpp"
 #include "PrintConfig.hpp"
@@ -3046,6 +3047,7 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
     m_is_role_based_fan_on.fill(false);
     m_role_based_fan_marker_layer.fill(-1);
     m_arc_overhang_stabilization_until.clear();
+    m_feature_temperature.reset();
     m_arc_overhang_overhang_start.clear();
     m_arc_overhang_bridge_start.clear();
     m_dissimilar_support_interface_start.clear();
@@ -3864,7 +3866,9 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
     // injector fleet (H2D/X2D/H2D-Pro/H2C) emits it; the byte-frozen fleet (X1/P1/A1/H2S, flag false) never
     // does, so their g-code is byte-identical. Without this marker handle_filament_change early-returns and
     // no blocks are built, so this line is what actually activates the pre-heat injector.
-    if (m_config.enable_pre_heating.value)
+    if (m_config.enable_pre_heating.value ||
+        m_config.machine_start_gcode.value.find("; RME_DEPOSITION_BOUNDS=1") != std::string::npos ||
+        m_config.machine_start_gcode.value.find("; RME_TEMPERATURE_ADAPTIVE_PA=1") != std::string::npos)
         file.write_format(";%s\n", GCodeProcessor::Machine_Start_GCode_End_Tag.c_str());
 
     //BBS: gcode writer doesn't know where the real position of extruder is after inserting custom gcode
@@ -6070,7 +6074,11 @@ LayerResult GCode::process_layer(
                 std::any_of(m_config.enable_overhang_bridge_fan.values.begin(),
                             m_config.enable_overhang_bridge_fan.values.end(),
                             [](unsigned char value) { return value != 0; });
-            if (enable_overhang_speed || enable_overhang_fan) {
+            const bool enable_overhang_temperature = has_extrusions &&
+                std::any_of(m_config.filament_fast_temperature_changes.values.begin(),
+                            m_config.filament_fast_temperature_changes.values.end(),
+                            [](unsigned char value) { return value != 0; });
+            if (enable_overhang_speed || enable_overhang_fan || enable_overhang_temperature) {
                 m_extrusion_quality_estimator.prepare_for_new_layer(layer_to_print.original_object,
                                                                     layer_to_print.object_layer);
             }
@@ -7507,6 +7515,7 @@ LayerResult GCode::process_layer(
         gcode += insert_timelapse_gcode();
     }
 
+    gcode += restore_feature_temperature();
     result.gcode = std::move(gcode);
     result.cooling_buffer_flush = object_layer || raft_layer || last_layer;
     return result;
@@ -9237,7 +9246,7 @@ std::string GCode::extrude_support(const ExtrusionEntityCollection &support_fill
         return small_perimeter_speed > 0 ? small_perimeter_speed : default_speed;
     };
 
-    std::string gcode;
+    std::string gcode = restore_feature_temperature();
     if (!support_fills.entities.empty()) {
         const SupportLayer *support_layer = dynamic_cast<const SupportLayer *>(m_layer);
         const int top_interface_temperature = m_config.support_interface_top_temperature.value;
@@ -9424,6 +9433,36 @@ double GCode::calc_max_volumetric_speed(const double layer_height, const double 
 
     double res = cs[0] * x * x + cs[1] * y * y + cs[2] * x * y + cs[3] * x + cs[4] * y + cs[5];
     return res;
+}
+
+std::string GCode::restore_feature_temperature()
+{
+    if (!m_feature_temperature)
+        return {};
+    const auto previous = *m_feature_temperature;
+    m_feature_temperature.reset();
+    return "M400 ; finish feature before restoring nozzle temperature\n" +
+        m_writer.set_temperature(previous[1], false, previous[0]);
+}
+
+std::string GCode::set_feature_temperature(int target, int normal)
+{
+    if (target <= 0 || normal <= 0 || m_writer.filament() == nullptr)
+        return restore_feature_temperature();
+    const int filament = int(m_writer.filament()->id());
+    if (m_feature_temperature && (*m_feature_temperature)[0] == filament &&
+        (*m_feature_temperature)[2] == target)
+        return {};
+    if (target == normal)
+        return restore_feature_temperature();
+    std::string result;
+    if (m_feature_temperature && (*m_feature_temperature)[0] != filament)
+        result = restore_feature_temperature();
+    m_feature_temperature = std::array<int, 3>{filament, normal, target};
+    // M104 can otherwise execute ahead of queued moves, changing the preceding
+    // wall's temperature instead. Do not add a cooling dwell over the part.
+    return result + "M400 ; synchronize feature nozzle temperature\n" +
+        m_writer.set_temperature(target, false, filament);
 }
 
 std::string GCode::_extrude(const ExtrusionPath &input_path, std::string description, double speed,
@@ -10158,7 +10197,14 @@ std::string GCode::_extrude(const ExtrusionPath &input_path, std::string descrip
     bool variable_speed = false;
     std::vector<ProcessedPoint> new_points {};
 
-    const bool need_overhang_detection = NOZZLE_CONFIG(enable_overhang_speed) ||
+    const GCodeFlavor flavor = m_config.gcode_flavor.value;
+    const bool supports_feature_temperature = flavor == gcfMarlinLegacy || flavor == gcfMarlinFirmware ||
+        flavor == gcfKlipper || flavor == gcfRepRapFirmware || flavor == gcfRepetier || flavor == gcfSmoothie;
+    const bool feature_temperatures = supports_feature_temperature && FILAMENT_CONFIG(filament_fast_temperature_changes) &&
+        !this->on_first_layer() && m_curr_print->calib_mode() == CalibMode::Calib_None;
+    const bool feature_overhang_detection = feature_temperatures &&
+        (FILAMENT_CONFIG(filament_auto_feature_temperature) || FILAMENT_CONFIG(filament_overhang_temperature) > 0);
+    const bool need_overhang_detection = feature_overhang_detection || NOZZLE_CONFIG(enable_overhang_speed) ||
         (FILAMENT_CONFIG(enable_overhang_bridge_fan) && m_enable_cooling_markers);
 
     // The extrusion-quality estimator rebuilds a path from planar overlap
@@ -10229,7 +10275,7 @@ std::string GCode::_extrude(const ExtrusionPath &input_path, std::string descrip
             }
             variable_speed = std::any_of(new_points.begin(), new_points.end(),
                                          [speed](const ProcessedPoint &p) { return fabs(double(p.speed) - speed) > 1; }); // Ignore small speed variations (under 1mm/sec)
-            if (FILAMENT_CONFIG(enable_overhang_bridge_fan) && m_enable_cooling_markers) {
+            if (feature_overhang_detection || (FILAMENT_CONFIG(enable_overhang_bridge_fan) && m_enable_cooling_markers)) {
                 if (!NOZZLE_CONFIG(enable_overhang_speed))
                     for (ProcessedPoint &point : new_points)
                         point.speed = speed;
@@ -10503,7 +10549,49 @@ std::string GCode::_extrude(const ExtrusionPath &input_path, std::string descrip
         }
     };
 
+    const auto apply_feature_temperature = [&](double overlap) {
+        if (!feature_temperatures) {
+            gcode += restore_feature_temperature();
+            return;
+        }
+        int override_temperature = 0;
+        bool selected = true;
+        bool gentle = false;
+        if (is_arc_fill(path.role()))
+            override_temperature = FILAMENT_CONFIG(filament_arc_temperature);
+        else if (path.role() == erBridgeInfill || path.role() == erInternalBridgeInfill)
+            override_temperature = FILAMENT_CONFIG(filament_bridge_temperature);
+        else if (is_perimeter(path.role()) && (path.role() == erOverhangPerimeter || overlap <= 0.5)) {
+            override_temperature = FILAMENT_CONFIG(filament_overhang_temperature);
+            gentle = true;
+        } else if (path.role() == erSupportMaterialInterface &&
+                   FILAMENT_CONFIG(filament_reduce_support_interface_temperature) &&
+                   m_config.support_interface_top_temperature.value == 0) {
+            const auto *support = dynamic_cast<const SupportLayer *>(m_layer);
+            selected = support != nullptr && support->has_top_interface_contact;
+            if (selected) {
+                const auto object_filaments = support->object()->object_extruders();
+                const int filament = int(m_writer.filament()->id());
+                selected = !object_filaments.empty() &&
+                    std::all_of(object_filaments.begin(), object_filaments.end(),
+                        [filament](unsigned int id) { return int(id) == filament; });
+                for (const int id : {support->object()->config().support_filament.value,
+                                     support->object()->config().support_interface_filament.value})
+                    selected = selected && (id == 0 || id - 1 == filament);
+            }
+            override_temperature = FILAMENT_CONFIG(filament_support_interface_temperature);
+            gentle = true;
+        } else selected = false;
+        const int normal = FILAMENT_CONFIG(nozzle_temperature);
+        const int target = selected ? feature_temperature(true,
+            FILAMENT_CONFIG(filament_auto_feature_temperature), FILAMENT_CONFIG(filament_type),
+            normal, override_temperature, FILAMENT_CONFIG(nozzle_temperature_range_low),
+            FILAMENT_CONFIG(nozzle_temperature_range_high), gentle) : normal;
+        gcode += set_feature_temperature(target, normal);
+    };
+
     if (!variable_speed) {
+        apply_feature_temperature(1.);
         // F is mm per minute.
         if( (std::abs(writer().get_current_speed() - F) > EPSILON) || (std::abs(_mm3_per_mm - m_last_mm3_mm) > EPSILON) ){
             // ORCA: Adaptive PA code segment when adjusting PA within the same feature
@@ -10741,6 +10829,7 @@ std::string GCode::_extrude(const ExtrusionPath &input_path, std::string descrip
             const double line_length = (p - prev).norm();
             if(line_length < EPSILON)
                 continue;
+            apply_feature_temperature(std::max(double(pre_processed_point.overlap), double(processed_point.overlap)));
             path_length += line_length;
             double new_speed = pre_processed_point.speed * 60.0;
             
@@ -11543,7 +11632,7 @@ std::string GCode::set_extruder(unsigned int new_filament_id, double print_z, bo
     m_toolchange_count++;
 
     // prepend retraction on the current extruder
-    std::string gcode = this->retract(true, false);
+    std::string gcode = restore_feature_temperature() + this->retract(true, false);
 
     // Always reset the extrusion path, even if the tool change retract is set to zero.
     m_wipe.reset_path();

@@ -1322,8 +1322,9 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, in
 
     bool use_beam_interlocking = config->opt_bool("interlocking_beam");
     const auto *rooting = config->option<ConfigOptionBool>("rooting");
+    const auto *rooting_xy = config->option<ConfigOptionBool>("rooting_xy");
     for (const char *key : {"rooting_depth", "rooting_width", "rooting_spacing", "rooting_skin"})
-        toggle_line(key, rooting != nullptr && rooting->value);
+        toggle_line(key, (rooting != nullptr && rooting->value) || (rooting_xy != nullptr && rooting_xy->value));
     toggle_line("mmu_segmented_region_interlocking_depth", !use_beam_interlocking);
     toggle_line("interlocking_beam_width", use_beam_interlocking);
     toggle_line("interlocking_orientation", use_beam_interlocking);

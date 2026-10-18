@@ -3047,12 +3047,27 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                 boost::split(object_data_points, object_data[1], boost::is_any_of(" "), boost::token_compress_off);
 
                 std::vector<BrimPoint> brim_ear_points;
-                if (version == 0) {
-                    for (unsigned int i=0; i<object_data_points.size(); i+=4)
+                if (version == 0 || version == 1) {
+                    const size_t stride = version == 0 ? 4 : 5;
+                    if (object_data_points.size() % stride != 0) {
+                        add_error("Invalid brim paint data");
+                        continue;
+                    }
+                    for (size_t i=0; i<object_data_points.size(); i+=stride) {
                     brim_ear_points.emplace_back(float(std::atof(object_data_points[i+0].c_str())),
                                                     float(std::atof(object_data_points[i+1].c_str())),
                                                     float(std::atof(object_data_points[i+2].c_str())),
                                                     float(std::atof(object_data_points[i+3].c_str())));
+                        if (version == 1) {
+                            const int shape = std::atoi(object_data_points[i+4].c_str());
+                            if (shape < 0 || shape > int(BrimPoint::Shape::EraseSquare)) {
+                                brim_ear_points.clear();
+                                add_error("Invalid brim brush shape");
+                                break;
+                            }
+                            brim_ear_points.back().shape = BrimPoint::Shape(shape);
+                        }
+                    }
                 }
 
                 if (!brim_ear_points.empty())
@@ -4493,6 +4508,11 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                 bool spiral_mode = false;
                 std::istringstream(value) >> std::boolalpha >> spiral_mode;
                 m_curr_plater->config.set_key_value("spiral_mode", new ConfigOptionBool(spiral_mode));
+            }
+            else if (key == "brim_type" || key == "brim_width" || key == "brim_object_gap" || key == "raft_layers" ||
+                     key == "brim_flow_ratio" || key == "raft_contact_distance" || key == "raft_expansion" ||
+                     key == "raft_first_layer_expansion" || key == "raft_first_layer_density") {
+                m_curr_plater->config.set_deserialize_strict(key, value);
             }
             else if (key == FILAMENT_MAP_MODE_ATTR)
             {
@@ -7753,6 +7773,10 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
     {
         std::string out = "";
         char buffer[1024];
+        int format_version = 0;
+        for (const ModelObject *object : model.objects)
+            for (const BrimPoint &point : object->brim_points)
+                if (point.shape != BrimPoint::Shape::Ear) format_version = 1;
 
         unsigned int count = 0;
         for (const ModelObject* object : model.objects) {
@@ -7766,6 +7790,8 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                 for (size_t i = 0; i < brim_points.size(); ++i) {
                     sprintf(buffer, (i==0 ? "%f %f %f %f" : " %f %f %f %f"),  brim_points[i].pos(0), brim_points[i].pos(1), brim_points[i].pos(2), brim_points[i].head_front_radius);
                     out += buffer;
+                    if (format_version == 1)
+                        out += " " + std::to_string(int(brim_points[i].shape));
                 }
                 out += "\n";
             }
@@ -7773,7 +7799,7 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
 
         if (!out.empty()) {
             // Adds version header at the beginning:
-            out = std::string("brim_points_format_version=") + std::to_string(brim_points_format_version) + std::string("\n") + out;
+            out = std::string("brim_points_format_version=") + std::to_string(format_version) + std::string("\n") + out;
 
             if (!mz_zip_writer_add_mem(&archive, BRIM_EAR_POINTS_FILE.c_str(), (const void*)out.data(), out.length(), MZ_DEFAULT_COMPRESSION)) {
                 add_error("Unable to add brim ear points file to archive");
@@ -8138,6 +8164,11 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                     stream << "    <" << METADATA_TAG << " " << KEY_ATTR << "=\"" << SPIRAL_VASE_MODE << "\" " << VALUE_ATTR << "=\"" << spiral_mode_opt->getBool() << "\"/>\n";
 
                 //filament map related
+                for (const char *key : {"brim_type", "brim_width", "brim_object_gap", "raft_layers", "brim_flow_ratio",
+                                       "raft_contact_distance", "raft_expansion", "raft_first_layer_expansion", "raft_first_layer_density"})
+                    if (const auto *option = plate_data->config.option(key))
+                        stream << "    <" << METADATA_TAG << " " << KEY_ATTR << "=\"" << key << "\" " << VALUE_ATTR << "=\"" << option->serialize() << "\"/>\n";
+
                 ConfigOption* filament_map_mode_opt = plate_data->config.option("filament_map_mode");
                 t_config_enum_names filament_map_mode_names = ConfigOptionEnum<FilamentMapMode>::get_enum_names();
                 if (filament_map_mode_opt != nullptr && filament_map_mode_names.size() > filament_map_mode_opt->getInt())

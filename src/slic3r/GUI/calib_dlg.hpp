@@ -18,6 +18,8 @@
 
 namespace Slic3r { namespace GUI {
 
+void show_seam_calibration_dialog(wxWindow *parent, Plater *plater);
+
 class PA_Calibration_Dlg : public DPIDialog
 {
 public:

@@ -7,6 +7,7 @@
 #include "libslic3r/PrintConfig.hpp"
 #include "libslic3r/CustomGCode.hpp"
 #include "libslic3r/MultiNozzleUtils.hpp"
+#include "RMEOutputPlan.hpp"
 
 #include <cstdint>
 #include <array>
@@ -1112,6 +1113,7 @@ class Print;
         // (both overloads) and cleared in reset(), so the PreCoolingInjector has its inputs in place.
         // Consumed only by the injector two-pass side-pass, gated on m_enable_pre_heating.
         std::vector<std::string> m_filament_types;
+        RMEOutputPlan m_rme_output_plan;
         std::vector<double> m_nozzle_diameter;
         std::vector<double> m_hotend_cooling_rate{ 2.f };
         std::vector<double> m_hotend_heating_rate{ 2.f };

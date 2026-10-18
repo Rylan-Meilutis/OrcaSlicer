@@ -270,9 +270,12 @@ TEST_CASE("Outer-only brim ears stay out of model holes", "[SkirtBrim]")
     }
 }
 
-TEST_CASE("Painted brim ear radius controls sliced size", "[SkirtBrim]")
+TEST_CASE("Painted brim radius and brush shape control sliced size", "[SkirtBrim]")
 {
     constexpr double ear_radius = 10.0;
+    const auto shape = GENERATE(BrimPoint::Shape::Ear, BrimPoint::Shape::Circle, BrimPoint::Shape::Square);
+    const double outward_offset = GENERATE(0.0, 6.0);
+    const bool efc_outline = GENERATE(false, true);
 
     DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
     config.set_deserialize_strict({
@@ -282,6 +285,9 @@ TEST_CASE("Painted brim ear radius controls sliced size", "[SkirtBrim]")
         { "brim_object_gap",            0.1 },
         { "brim_ears_outer_only",       true },
         { "initial_layer_line_width",   0.5 },
+        { "brim_use_efc_outline",       efc_outline },
+        { "elefant_foot_compensation",  0.2 },
+        { "elefant_foot_compensation_layers", 1 },
     });
 
     Print print;
@@ -291,7 +297,10 @@ TEST_CASE("Painted brim ear radius controls sliced size", "[SkirtBrim]")
 
     const PrintObject *object = print.get_object(0);
     REQUIRE(!object->layers().front()->lslices.empty());
-    const Point ear_center = object->layers().front()->lslices.front().contour.points.front();
+    const auto &contour = object->layers().front()->lslices.front().contour;
+    Point ear_center = contour.points.front();
+    const Vec2d outward = (ear_center - get_extents(contour).center()).cast<double>().normalized();
+    ear_center += Point::new_scale(outward * outward_offset);
 
     Transform3d model_transform = model.objects.front()->instances.front()->get_transformation().get_matrix_no_offset();
     const Point &center_offset = object->center_offset();
@@ -303,6 +312,7 @@ TEST_CASE("Painted brim ear radius controls sliced size", "[SkirtBrim]")
     model.objects.front()->brim_points = {
         BrimPoint(model_pos.cast<float>(), float(ear_radius)),
     };
+    model.objects.front()->brim_points.front().shape = shape;
 
     print.apply(model, config);
     print.process();
@@ -322,8 +332,9 @@ TEST_CASE("Painted brim ear radius controls sliced size", "[SkirtBrim]")
 
     REQUIRE(max_path_radius > 0.0);
     INFO("Outermost painted-ear path radius: " << max_path_radius << " mm");
-    CHECK(max_path_radius > ear_radius - 0.5);
-    CHECK(max_path_radius < ear_radius);
+    const double expected_radius = shape == BrimPoint::Shape::Square ? ear_radius * std::sqrt(2.) : ear_radius;
+    CHECK(max_path_radius > expected_radius - 0.5);
+    CHECK(max_path_radius < expected_radius + (efc_outline ? 0.3 : 0.0));
 }
 
 TEST_CASE("Outer-only painted brim ears stay out of model holes", "[SkirtBrim]")

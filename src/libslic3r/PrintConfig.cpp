@@ -4543,6 +4543,39 @@ void PrintConfigDef::init_fff_params()
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionFloats{ 0. });
 
+    def = this->add("filament_fast_temperature_changes", coBools);
+    def->label = L("Fast-response hotend temperature control");
+    def->tooltip = L("Enable feature-specific nozzle temperatures only for induction or similarly fast-response hotends. Commands are synchronized with motion but do not wait for cooling. Short features may not reach their target. Disabled during calibration and on the first layer. Test adhesion and extrusion before use.");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionBools{false});
+
+    def = this->add("filament_auto_feature_temperature", coBools);
+    def->label = L("Estimate feature temperatures");
+    def->tooltip = L("For zero-valued feature temperatures, estimate a conservative 3–10 degree reduction from the normal nozzle temperature and generic material thermal data, bounded by this filament's recommended temperature range. Unsupported materials or invalid ranges use the normal temperature. This is a tunable heuristic, not a calibrated thermal model. Positive temperatures override the estimate.");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionBools{false});
+
+    def = this->add("filament_reduce_support_interface_temperature", coBools);
+    def->label = L("Reduce same-material support interface temperature");
+    def->tooltip = L("Use the interface temperature only on top contact support interfaces when the object and its supports use the same filament. Multi-material supports are excluded. Requires fast-response hotend temperature control. A process top-interface temperature takes precedence.");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionBools{false});
+
+    for (const auto &setting : std::initializer_list<std::pair<const char *, const char *>>{
+        {"filament_arc_temperature", L("Arc overhang temperature")},
+        {"filament_bridge_temperature", L("Bridge temperature")},
+        {"filament_overhang_temperature", L("Steep overhang temperature")},
+        {"filament_support_interface_temperature", L("Same-material support interface temperature")}}) {
+        def = this->add(setting.first, coInts);
+        def->label = setting.second;
+        def->tooltip = L("Nozzle temperature for this feature. Zero uses the automatic estimate when enabled, otherwise the normal temperature. Steep overhangs have at most 50% supported line width. Arc overhangs and arc bridges use the arc setting. Requires a fast-response hotend. Explicit temperatures must be suitable for your filament; lowering temperature can reduce layer adhesion.");
+        def->sidetext = u8"°C";
+        def->min = 0;
+        def->max = 500;
+        def->mode = comAdvanced;
+        def->set_default_value(new ConfigOptionInts{0});
+    }
+
     def = this->add("filament_arc_auto_cooling", coBools);
     def->label = L("Automatic arc cooling estimates");
     def->tooltip = L("Estimate arc path time and covering speed from material type, density, temperature, cooling and bead size. "
@@ -5476,9 +5509,16 @@ void PrintConfigDef::init_fff_params()
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionBool(false));
 
+    def = this->add("rooting_xy", coBool);
+    def->label = L("XY rooting");
+    def->tooltip = L("Grow buried, recursively branching roots sideways across material boundaries, like roots entering a cliff. Uses the root depth, diameter, spacing and protective skin settings independently of vertical rooting. Only applies to different model filaments in one multipart or painted object, never supports or support interfaces. Preserves exposed skins and connected host material. Enables internal interface shells and may increase tool changes. Verify pull-out strength with a test print.");
+    def->category = L("Multimaterial");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionBool(false));
+
     def = this->add("rooting_depth", coFloat);
     def->label = L("Root depth");
-    def->tooltip = L("Maximum root depth below the material interface, or below the lowest beam-interlocking course when both features apply. The beam joint is preserved. Roots shorten and flatten vertically to fit the lower material while retaining lateral branches and protective skins. Roots are skipped if there is insufficient depth for connected branches.");
+    def->tooltip = L("Maximum root penetration below a vertical contact, or sideways into a neighboring material for XY rooting. With beam interlocking, roots attach beyond the beam band. Roots shorten to fit the host while preserving protective skins and connected branches.");
     def->sidetext = L("mm");
     def->min = 0.4;
     def->max = 20.;

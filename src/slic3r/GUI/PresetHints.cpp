@@ -2,6 +2,7 @@
 
 #include "libslic3r/Flow.hpp"
 #include "libslic3r/GCode/ArcCooling.hpp"
+#include "libslic3r/GCode/FeatureTemperature.hpp"
 #include "libslic3r/Slicing.hpp"
 #include "libslic3r/libslic3r.h"
 
@@ -90,6 +91,22 @@ std::string PresetHints::cooling_description(const Preset &preset)
                 out += "\n" + _u8L("PPS-CF uses a PPS matrix thermal proxy with your profile density. Fiber content and orientation are unknown; calibrate the manual cooling overrides for your spool.");
         } else
             out = _u8L("Auto estimate unavailable for this material or cooling conditions. Using process settings and any manual overrides.");
+    }
+    if (preset.config.opt_bool("filament_fast_temperature_changes", 0)) {
+        const auto &config = preset.config;
+        const int normal = config.opt_int("nozzle_temperature", 0);
+        const auto target = [&](const char *key, bool gentle) {
+            return feature_temperature(true, config.opt_bool("filament_auto_feature_temperature", 0),
+                config.opt_string("filament_type", 0), normal, config.opt_int(key, 0),
+                config.opt_int("nozzle_temperature_range_low", 0),
+                config.opt_int("nozzle_temperature_range_high", 0), gentle);
+        };
+        if (!out.empty()) out += "\n\n";
+        out += GUI::format(_L("Feature temperature targets: arcs %1% °C, bridges %2% °C, steep overhangs %3% °C, same-material interface %4% °C. Normal: %5% °C. Targets are not guaranteed actual temperatures; validate on a fast-response hotend."),
+            target("filament_arc_temperature", false), target("filament_bridge_temperature", false),
+            target("filament_overhang_temperature", true),
+            config.opt_bool("filament_reduce_support_interface_temperature", 0) ?
+                target("filament_support_interface_temperature", true) : normal, normal);
     }
     return out;
 }

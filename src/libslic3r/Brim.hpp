@@ -4,6 +4,7 @@
 #include "ExPolygon.hpp"
 #include "ObjectID.hpp"
 #include "Point.hpp"
+#include "BrimEarsPoint.hpp"
 
 #include<map>
 #include<vector>
@@ -13,6 +14,11 @@ namespace Slic3r {
 class Print;
 class ExtrusionEntityCollection;
 class PrintTryCancel;
+
+// Apply the editable paint operations in sequence, in transformed XY space.
+Polygon brim_point_footprint(const BrimPoint &point, const Transform3d &transform);
+ExPolygons painted_brim_area(const BrimPoints &points, const Transform3d &transform);
+ExPolygons connected_brim_paint(const ExPolygons &painted, const ExPolygons &first_layer);
 
 // Produce brim lines around those objects, that have the brim enabled.
 // Collect islands_area to be merged into the final 1st layer convex hull.

@@ -23,6 +23,53 @@
 using namespace Slic3r;
 using namespace Slic3r::Test;
 
+TEST_CASE("RME startup plans use deposition temperatures and local bounds", "[GCodeWriter][RMEOutput]")
+{
+    const bool adaptive_pa = GENERATE(false, true);
+    const bool inside_bed = GENERATE(false, true);
+    auto config = multifilament_config(1, {
+        {"filament_type", "HIPS"}, {"nozzle_temperature_initial_layer", "250"},
+        {"nozzle_temperature", "240"}, {"skirt_loops", 0}, {"brim_type", "no_brim"},
+        {"printable_area", "0x0,200x0,200x200,0x200"},
+        {"layer_height", 0.2}, {"initial_layer_print_height", 0.2}
+    });
+    config.set_key_value("machine_start_gcode", new ConfigOptionString(
+        std::string("; RME_DEPOSITION_BOUNDS=1\n; RME_TEMPERATURE_ADAPTIVE_PA=") +
+        (adaptive_pa ? "1" : "0") +
+        "\nM976 A 0:0:HIPS:250\nM104 S170\nM109 S250\nM555 X1 Y1 W1 H1\nG29 P1\n"));
+    auto mesh = cube(5.);
+    mesh.translate(inside_bed ? 80. : -20., 80., 0.);
+    Print print;
+    Model model;
+    std::vector<TriangleMesh> meshes;
+    meshes.push_back(std::move(mesh));
+    init_print(std::move(meshes), print, model, config, nullptr, false);
+    const std::string output = gcode(print);
+    CHECK(output.find(adaptive_pa ? "M976 A 0:0:HIPS:250/240\n" : "M976 A 0:0:HIPS:250\n") != std::string::npos);
+    CHECK(output.find("HIPS:250/170") == std::string::npos);
+    const auto probe = output.find("G29 P1\n");
+    REQUIRE(probe != std::string::npos);
+    const auto bounds = output.rfind("M555 ", probe);
+    REQUIRE(bounds != std::string::npos);
+    CHECK(output.find('\n', bounds) == probe - 1);
+    CHECK(output.substr(bounds, probe - bounds).find("X1 Y1 W1 H1") == std::string::npos);
+    GCodeReader reader;
+    reader.parse_buffer(output.substr(bounds, probe - bounds), [inside_bed](GCodeReader &, const GCodeReader::GCodeLine &line) {
+        float width = 0, height = 0;
+        REQUIRE(line.has_value('W', width));
+        REQUIRE(line.has_value('H', height));
+        if (inside_bed) {
+            CHECK(width >= 5.);
+            CHECK(width < 6.);
+            CHECK(height >= 5.);
+            CHECK(height < 6.);
+        } else {
+            CHECK_THAT(width, Catch::Matchers::WithinAbs(200., 1e-4));
+            CHECK_THAT(height, Catch::Matchers::WithinAbs(200., 1e-4));
+        }
+    });
+}
+
 TEST_CASE("Smart bed temperature ignores elevated interface material", "[GCodeWriter][BedTemperature]")
 {
     const std::string mode = GENERATE("by_highest_temp", "smart_bed_contact");

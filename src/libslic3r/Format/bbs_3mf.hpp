@@ -194,7 +194,8 @@ inline bool operator & (SaveStrategy & lhs, SaveStrategy rhs)
 }
 
 enum {
-    brim_points_format_version = 0
+    // v0: x y z radius; v1 adds the ordered paint/erase brush shape.
+    brim_points_format_version = 1
 };
 
 enum class LoadStrategy

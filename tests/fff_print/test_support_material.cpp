@@ -415,6 +415,47 @@ TEST_CASE("Support G-code emission survives a second slice in the same process",
     REQUIRE(! layers_with_role(second, "support").empty());
 }
 
+TEST_CASE("Fast hotend interface reduction is opt in and restores normal temperature", "[SupportMaterial][FeatureTemperature]")
+{
+    const bool enabled = GENERATE(false, true);
+    Print print;
+    init_and_process_print({TestMesh::overhang}, print, {
+        {"enable_support", 1},
+        {"support_interface_top_layers", 2},
+        {"filament_fast_temperature_changes", enabled},
+        {"filament_reduce_support_interface_temperature", true},
+        {"filament_support_interface_temperature", 200},
+        {"nozzle_temperature_initial_layer", 215},
+        {"nozzle_temperature", 215}
+    });
+    const std::string output = gcode(print);
+    CHECK((output.find("M104 S200") != std::string::npos) == enabled);
+    if (enabled) {
+        const auto reduced = output.find("M104 S200");
+        CHECK(output.find("M104 S215", reduced) != std::string::npos);
+        CHECK(output.find("M400 ; synchronize feature nozzle temperature") != std::string::npos);
+    }
+}
+
+TEST_CASE("Different support filaments do not use same-material interface temperature", "[SupportMaterial][FeatureTemperature]")
+{
+    auto config = multifilament_config(2, {
+        {"enable_support", true},
+        {"support_filament", 1},
+        {"support_interface_filament", 2},
+        {"support_interface_top_layers", 2},
+        {"filament_type", "PLA;PETG"},
+        {"filament_fast_temperature_changes", "1,1"},
+        {"filament_reduce_support_interface_temperature", "1,1"},
+        {"filament_support_interface_temperature", "201,201"},
+        {"nozzle_temperature", "215,240"},
+        {"nozzle_temperature_initial_layer", "215,240"}
+    });
+    Print print;
+    init_and_process_print({TestMesh::overhang}, print, config);
+    CHECK(gcode(print).find("M104 S201") == std::string::npos);
+}
+
 TEST_CASE("Top support interface uses and restores its temperature override", "[SupportMaterial][Regression]")
 {
     constexpr int interface_temperature = 150;

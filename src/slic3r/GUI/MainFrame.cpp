@@ -3454,6 +3454,10 @@ void MainFrame::init_menubar_as_editor()
         [this](wxCommandEvent&) { run_calibration(CalibKind::Temperature); }, "", nullptr,
         [this]() {return m_plater->is_view3D_shown();; }, this);
 
+    append_menu_item(m_topbar->GetCalibMenu(), wxID_ANY, _L("Seam calibration"), _L("Scarf sweeps and L-seam comparison"),
+        [this](wxCommandEvent&) { show_seam_calibration_dialog(this, m_plater); }, "", nullptr,
+        [this]() { return m_plater->is_view3D_shown(); }, this);
+
     // Max Volumetric Speed
     append_menu_item(m_topbar->GetCalibMenu(), wxID_ANY, _L("Max flowrate"), _L("Max flowrate"),
         [this](wxCommandEvent&) { run_calibration(CalibKind::MaxVolumetric); }, "", nullptr,
@@ -3558,6 +3562,10 @@ void MainFrame::init_menubar_as_editor()
     append_menu_item(calib_menu, wxID_ANY, _L("Temperature"), _L("Temperature"),
         [this](wxCommandEvent&) { run_calibration(CalibKind::Temperature); }, "", nullptr,
         [this]() {return m_plater->is_view3D_shown();; }, this);
+
+    append_menu_item(calib_menu, wxID_ANY, _L("Seam calibration"), _L("Scarf sweeps and L-seam comparison"),
+        [this](wxCommandEvent&) { show_seam_calibration_dialog(this, m_plater); }, "", nullptr,
+        [this]() { return m_plater->is_view3D_shown(); }, this);
 
     // Max Volumetric Speed
     append_menu_item(calib_menu, wxID_ANY, _L("Max flowrate"), _L("Max flowrate"),

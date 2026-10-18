@@ -4,6 +4,8 @@
 #include "libslic3r/GCodeReader.hpp"
 #include "libslic3r/Layer.hpp"
 #include "libslic3r/ClipperUtils.hpp"
+#include "libslic3r/Format/bbs_3mf.hpp"
+#include "libslic3r/Preset.hpp"
 
 #include "test_helpers.hpp"
 #include "test_utils.hpp"
@@ -25,6 +27,244 @@
 
 using namespace Slic3r;
 using namespace Slic3r::Test;
+
+// Opt-in local reproduction without checking private project geometry into the
+// repository. Synthetic cases below provide the portable regression coverage.
+TEST_CASE("A supplied rooting project gains buried material without changing its envelope", "[.RootingProject]")
+{
+    const char *path = std::getenv("ORCA_ROOTING_PROJECT");
+    if (path == nullptr) SKIP("Set ORCA_ROOTING_PROJECT to a multi-material 3MF with a qualifying root contact");
+    ScopedSlic3rTemporaryDir temporary_dir("rooting_project");
+    DynamicPrintConfig imported_config;
+    ConfigSubstitutionContext substitutions{ForwardCompatibilitySubstitutionRule::Enable};
+    PlateDataPtrs plates;
+    std::vector<Preset *> presets;
+    bool is_bbl = false;
+    Semver version;
+    auto model = Model::read_from_file(path, &imported_config, &substitutions,
+        LoadStrategy::LoadModel | LoadStrategy::LoadConfig | LoadStrategy::AddDefaultInstances,
+        &plates, &presets, &is_bbl, &version);
+    release_PlateData_list(plates);
+    for (Preset *preset : presets) delete preset;
+    auto config = DynamicPrintConfig::full_print_config();
+    config.apply(imported_config);
+    config.set_deserialize_strict("rooting", "0");
+    config.set_deserialize_strict("rooting_xy", "0");
+    Print baseline, rooted;
+    baseline.apply(model, config);
+    config.set_deserialize_strict("rooting", "1");
+    rooted.apply(model, config);
+    REQUIRE(rooted.objects().size() == baseline.objects().size());
+    double added_area = 0.;
+    for (size_t object = 0; object < rooted.objects().size(); ++object) {
+        baseline.get_object(object)->slice();
+        rooted.get_object(object)->slice();
+        const auto &before = baseline.objects()[object]->layers();
+        const auto &after = rooted.objects()[object]->layers();
+        REQUIRE(before.size() == after.size());
+        for (size_t z = 0; z < after.size(); ++z) {
+            ExPolygons old_all, new_all;
+            REQUIRE(before[z]->regions().size() == after[z]->regions().size());
+            for (size_t r = 0; r < after[z]->regions().size(); ++r) {
+                const auto old_region = to_expolygons(before[z]->get_region(r)->slices.surfaces);
+                const auto new_region = to_expolygons(after[z]->get_region(r)->slices.surfaces);
+                added_area += area(diff_ex(new_region, old_region));
+                append(old_all, old_region);
+                append(new_all, new_region);
+            }
+            // Re-clipping curved boundaries rounds to the integer polygon grid.
+            // Use the same 0.0001 mm² allowance as the rotated synthetic cases.
+            CHECK(area(diff_ex(union_ex(old_all), union_ex(new_all))) < scale_(0.01) * scale_(0.01));
+            CHECK(area(diff_ex(union_ex(new_all), union_ex(old_all))) < scale_(0.01) * scale_(0.01));
+        }
+    }
+    CHECK(added_area > scale_(0.001) * scale_(0.001));
+}
+
+TEST_CASE("XY roots branch into cliff contacts while preserving material skins", "[Multifilament][RootingXY]")
+{
+    const double angle = GENERATE(0., PI / 6., PI / 2.);
+    const std::string mode = GENERATE("plain", "beams", "elevated", "thin", "support", "same material", "large nozzle");
+    const bool expect_roots = mode == "plain" || mode == "beams" || mode == "elevated";
+    CAPTURE(angle, mode);
+    auto config = multifilament_config(2, {
+        {"rooting", false}, {"rooting_xy", false}, {"rooting_depth", 4.},
+        {"rooting_width", 1.2}, {"rooting_spacing", 6.}, {"rooting_skin", 0.8},
+        {"interlocking_beam", mode == "beams"}, {"interlocking_depth", 1},
+        {"interlocking_beam_width", 0.8}, {"interlocking_orientation", 22.5},
+        {"interlocking_beam_layer_count", 2},
+        {"layer_height", 0.2}, {"initial_layer_print_height", 0.2},
+        {"wall_loops", 3}, {"top_shell_layers", 3}, {"bottom_shell_layers", 3},
+        {"elefant_foot_compensation", 0.}, {"xy_contour_compensation", 0.},
+        {"xy_hole_compensation", 0.}, {"enable_prime_tower", false}});
+    if (mode == "support") config.set_deserialize_strict("filament_is_support", "0,1");
+    if (mode == "large nozzle") config.set_deserialize_strict("nozzle_diameter", "1.0");
+    const double height = mode == "thin" ? 1. : mode == "elevated" ? 18. : 10.;
+    Print baseline;
+    Model model;
+    auto base = make_cube(24., 32., height);
+    base.rotate_z(angle);
+    init_print({base}, baseline, model, config);
+    TriangleMesh cliff = make_cube(8., 16., mode == "elevated" ? 8. : height);
+    cliff.translate(24., 8., mode == "elevated" ? 10. : 0.);
+    cliff.rotate_z(angle);
+    auto *object = model.objects.front();
+    object->volumes.front()->config.set("extruder", 1);
+    object->add_volume(cliff)->config.set("extruder", mode == "same material" ? 1 : 2);
+    baseline.apply(model, config);
+    baseline.get_object(0)->slice();
+    Print native;
+    if (mode == "beams") {
+        auto native_config = config;
+        native_config.set_deserialize_strict("interlocking_beam", "0");
+        native.apply(model, native_config);
+        native.get_object(0)->slice();
+    }
+    Print rooted;
+    config.set_deserialize_strict("rooting_xy", "1");
+    rooted.apply(model, config);
+    rooted.set_status_silent();
+    rooted.get_object(0)->slice();
+    const auto material = [](const Layer *layer, unsigned tool) {
+        ExPolygons result;
+        for (const auto *region : layer->regions())
+            if (region->region().extruder(frExternalPerimeter) == tool)
+                append(result, to_expolygons(region->slices.surfaces));
+        return union_ex(result);
+    };
+    const auto &original = baseline.get_object(0)->layers();
+    const auto &actual = rooted.get_object(0)->layers();
+    REQUIRE(actual.size() == original.size());
+    size_t changed = 0;
+    double largest_added_area = 0.;
+    double widest_branch = 0.;
+    for (size_t z = 0; z < actual.size(); ++z) {
+        auto a = material(actual[z], 1), b = material(actual[z], 2);
+        const auto old_a = material(original[z], 1), old_b = material(original[z], 2);
+        const auto all = union_ex(old_a, old_b);
+        // Re-clipping rotated contours rounds intersections to the integer
+        // polygon grid. Allow 0.0001 mm², not a new printable gap or extrusion.
+        CHECK(area(diff_ex(all, union_ex(a, b))) < scale_(0.01) * scale_(0.01));
+        CHECK(area(diff_ex(union_ex(a, b), all)) < scale_(0.01) * scale_(0.01));
+        CHECK(area(intersection_ex(a, b)) <= area(intersection_ex(old_a, old_b)) + scale_(0.01) * scale_(0.01));
+        const auto added = union_ex(diff_ex(a, old_a), diff_ex(b, old_b));
+        if (area(added) < scale_(0.001) * scale_(0.001)) continue;
+        ++changed;
+        largest_added_area = std::max(largest_added_area, area(added));
+        const Vec2d tangent(-std::sin(angle), std::cos(angle));
+        for (const auto &part : diff_ex(b, old_b)) {
+            double low = std::numeric_limits<double>::max(), high = -low;
+            for (const auto &point : part.contour.points) {
+                const double projection = unscale(point).dot(tangent);
+                low = std::min(low, projection);
+                high = std::max(high, projection);
+            }
+            widest_branch = std::max(widest_branch, high - low);
+        }
+        CHECK(actual[z]->print_z >= 0.8);
+        CHECK(actual[z]->print_z <= height - 0.8 + EPSILON);
+        const auto envelope = mode == "beams" ? union_ex(material(native.get_object(0)->layers()[z], 1),
+                                                        material(native.get_object(0)->layers()[z], 2)) : all;
+        CHECK(area(diff_ex(added, offset2_ex(envelope, scale_(0.001), -scale_(0.791)))) < scale_(0.001) * scale_(0.001));
+        // No isolated host islands, including webs too thin to print.
+        CHECK(a.size() <= old_a.size());
+        CHECK(offset_ex(a, -scale_(0.4)).size() <= offset_ex(old_a, -scale_(0.4)).size());
+        if (mode == "beams") {
+            // XY roots must not replace the native alternating beam band.
+            const auto beam_changes = union_ex(diff_ex(old_a, material(native.get_object(0)->layers()[z], 1)),
+                                              diff_ex(old_b, material(native.get_object(0)->layers()[z], 2)));
+            CHECK(area(intersection_ex(added, beam_changes)) < scale_(0.001) * scale_(0.001));
+        }
+    }
+    if (expect_roots) {
+        CHECK(changed > 0);
+        CHECK(largest_added_area > scale_(2.) * scale_(2.));
+        CHECK(widest_branch > 3.6); // at least 50% wider than the 2.4mm trunk, even outside the beam band
+    } else CHECK(changed == 0);
+    config.set_deserialize_strict("rooting_xy", "0");
+    rooted.apply(model, config);
+    CHECK_FALSE(rooted.get_object(0)->is_step_done(posSlice));
+    rooted.get_object(0)->slice();
+    for (size_t z = 0; z < original.size(); ++z) {
+        CHECK(area(diff_ex(material(rooted.get_object(0)->layers()[z], 1), material(original[z], 1))) < scale_(0.001) * scale_(0.001));
+        CHECK(area(diff_ex(material(original[z], 1), material(rooted.get_object(0)->layers()[z], 1))) < scale_(0.001) * scale_(0.001));
+    }
+}
+
+TEST_CASE("Rooting fits printable trunks around screw-hole contacts", "[Multifilament][Rooting]")
+{
+    const bool beams = GENERATE(false, true);
+    CAPTURE(beams);
+    // Ring dimensions from the ValveBoard insert: the host's screw bore is
+    // slightly wider than the insert bore. After skins, the contact band is
+    // narrower than the preferred trunk, but wider than a printable branch.
+    const auto ring = [](double outer, double inner, double height) {
+        std::vector<Vec3f> vertices;
+        std::vector<Vec3i32> faces;
+        constexpr int sides = 96;
+        for (int i = 0; i < sides; ++i) {
+            const double angle = 2. * PI * i / sides;
+            for (const auto &rz : {Vec2d(outer, 0.), Vec2d(inner, 0.),
+                                   Vec2d(outer, height), Vec2d(inner, height)})
+                vertices.emplace_back(rz.x() * std::cos(angle), rz.x() * std::sin(angle), rz.y());
+        }
+        const auto quad = [&](int a, int b, int c, int d) {
+            faces.emplace_back(a, b, c);
+            faces.emplace_back(a, c, d);
+        };
+        for (int i = 0; i < sides; ++i) {
+            const int a = 4 * i, b = 4 * ((i + 1) % sides);
+            quad(a, b, b + 2, a + 2);
+            quad(a + 1, a + 3, b + 3, b + 1);
+            quad(a, a + 1, b + 1, b);
+            quad(a + 2, b + 2, b + 3, a + 3);
+        }
+        return TriangleMesh(std::move(vertices), std::move(faces));
+    };
+    auto config = multifilament_config(2, {
+        {"rooting", false}, {"rooting_depth", 5.}, {"rooting_width", 1.2},
+        {"rooting_skin", 0.8}, {"rooting_spacing", 4.}, {"interlocking_beam", beams},
+        {"interlocking_depth", 2}, {"interlocking_orientation", 22.5},
+        {"layer_height", 0.2}, {"initial_layer_print_height", 0.2},
+        {"elefant_foot_compensation", 0.}, {"xy_contour_compensation", 0.},
+        {"xy_hole_compensation", 0.}, {"enable_prime_tower", false}});
+    Print baseline, rooted;
+    Model model;
+    init_print({ring(12., 2.75, 8.)}, baseline, model, config);
+    auto insert = ring(6.375, 2.375, 3.);
+    insert.translate(0., 0., 8.);
+    model.objects.front()->volumes.front()->config.set("extruder", 1);
+    model.objects.front()->add_volume(insert)->config.set("extruder", 2);
+    baseline.apply(model, config);
+    baseline.get_object(0)->slice();
+    config.set_deserialize_strict("rooting", "1");
+    rooted.apply(model, config);
+    rooted.get_object(0)->slice();
+    const auto material = [](const Layer *layer, unsigned tool) {
+        ExPolygons result;
+        for (const auto *region : layer->regions())
+            if (region->region().extruder(frExternalPerimeter) == tool)
+                append(result, to_expolygons(region->slices.surfaces));
+        return union_ex(result);
+    };
+    size_t changed = 0;
+    for (size_t z = 0; z < baseline.get_object(0)->layers().size(); ++z) {
+        const Layer *before = baseline.get_object(0)->layers()[z];
+        const Layer *after = rooted.get_object(0)->layers()[z];
+        const auto old_host = material(before, 1), old_insert = material(before, 2);
+        const auto host = material(after, 1), roots = material(after, 2);
+        const auto added = diff_ex(roots, old_insert);
+        CHECK(area(diff_ex(union_ex(old_host, old_insert), union_ex(host, roots))) < scale_(0.01) * scale_(0.01));
+        CHECK(area(diff_ex(union_ex(host, roots), union_ex(old_host, old_insert))) < scale_(0.01) * scale_(0.01));
+        CHECK(area(diff_ex(intersection_ex(host, roots), intersection_ex(old_host, old_insert))) < scale_(0.001) * scale_(0.001));
+        if (added.empty()) continue;
+        ++changed;
+        CHECK(after->print_z <= 8. + EPSILON);
+        CHECK(after->print_z >= 0.8);
+        CHECK(diff_ex(added, offset_ex(old_host, -scale_(0.79))).empty());
+    }
+    CHECK(changed > 0);
+}
 
 TEST_CASE("Rooting embeds flared anchors without changing exposed surfaces", "[Multifilament][Rooting]")
 {
@@ -322,6 +562,7 @@ TEST_CASE("Shallow roots attach below beam interlocking without replacing its co
 
 TEST_CASE("Rooting leaves generated supports and interfaces unchanged", "[Multifilament][Rooting][Support]")
 {
+    const std::string option = GENERATE("rooting", "rooting_xy");
     TriangleMesh mesh = make_cube(10., 16., 5.);
     TriangleMesh roof = make_cube(26., 16., 1.);
     roof.translate(-8., 0., 5.);
@@ -334,7 +575,7 @@ TEST_CASE("Rooting leaves generated supports and interfaces unchanged", "[Multif
         {"initial_layer_print_height", 0.2}, {"enable_prime_tower", false},
         {"rooting", false}, {"interlocking_beam", false}});
     auto paths = [&](bool enabled) {
-        config.set_deserialize_strict("rooting", enabled ? "1" : "0");
+        config.set_deserialize_strict(option, enabled ? "1" : "0");
         Print print;
         init_and_process_print({mesh}, print, config);
         std::vector<Points> result;

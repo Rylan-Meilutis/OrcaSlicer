@@ -1395,6 +1395,7 @@ PRINT_CONFIG_CLASS_DEFINE(
 
     ((ConfigOptionBool, interlocking_beam))
     ((ConfigOptionBool, rooting))
+    ((ConfigOptionBool, rooting_xy))
     ((ConfigOptionFloat, rooting_depth))
     ((ConfigOptionFloat, rooting_width))
     ((ConfigOptionFloat, rooting_spacing))
@@ -2160,6 +2161,13 @@ PRINT_CONFIG_CLASS_DERIVED_DEFINE(
     ((ConfigOptionPercents,            arc_overhang_cooling))
     ((ConfigOptionFloats,              filament_arc_min_path_time))
     ((ConfigOptionBools,               filament_arc_auto_cooling))
+    ((ConfigOptionBools, filament_fast_temperature_changes))
+    ((ConfigOptionBools, filament_auto_feature_temperature))
+    ((ConfigOptionInts, filament_arc_temperature))
+    ((ConfigOptionInts, filament_bridge_temperature))
+    ((ConfigOptionInts, filament_overhang_temperature))
+    ((ConfigOptionInts, filament_support_interface_temperature))
+    ((ConfigOptionBools, filament_reduce_support_interface_temperature))
     ((ConfigOptionFloats,              filament_arc_cover_speed))
     ((ConfigOptionInts,                support_material_interface_fan_speed))
     ((ConfigOptionInts,                internal_bridge_fan_speed)) // ORCA: Add support for separate internal bridge fan speed control

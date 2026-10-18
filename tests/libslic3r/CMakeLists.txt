@@ -11,6 +11,7 @@ add_executable(${_TEST_NAME}_tests
     test_arrange.cpp
     test_bambu_networking.cpp
     test_buildvolume.cpp
+    test_brim.cpp
     test_calib.cpp
     test_octoprint_spool_cache.cpp
     test_indx_profile.cpp
