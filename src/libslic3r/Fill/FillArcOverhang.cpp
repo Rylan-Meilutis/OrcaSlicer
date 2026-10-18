@@ -153,7 +153,7 @@ public:
                 // Do not shrink the sides: that would reject valid adjacent
                 // rings at the user's configured centerline pitch.
                 support.corridor = union_ex(offset(body, float(path_reach),
-                    ClipperLib::jtRound, DefaultLineMiterLimit, ClipperLib::etOpenButt));
+                    Slic3r::jtRound, DefaultLineMiterLimit, Slic3r::etOpenButt));
                 support.reach = path_reach;
             }
             if (std::any_of(support.corridor.begin(), support.corridor.end(),
@@ -1690,7 +1690,7 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
                arc_lead_supported(path, true, supported_lead_length, support_sample_step, point_has_bonded_support);
     };
     const ExPolygons body_foundation = !require_child_body_support ? ExPolygons{} :
-        offset_ex(*params.arc_root_anchor_regions, float(0.4 * line_width), ClipperLib::jtRound, scale_(0.001));
+        offset_ex(*params.arc_root_anchor_regions, float(0.4 * line_width), Slic3r::jtRound, scale_(0.001));
     const auto point_has_body_support = [&](const Point &point) {
         // The interior may bond to the deposited cap of another path. Only
         // the two leads must exclude caps to prevent free tips walking out

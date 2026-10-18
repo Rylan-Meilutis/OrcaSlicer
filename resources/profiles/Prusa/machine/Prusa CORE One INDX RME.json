@@ -1,8 +1,8 @@
 {
 	"type": "machine_model",
 	"name": "Prusa CORE One INDX RME",
-	"bed_model": "coreone_indx.stl",
-	"bed_texture": "coreone_indx.svg",
+	"bed_model": "coreone_indx_rme.stl",
+	"bed_texture": "coreone_indx_rme.svg",
 	"default_materials": "Generic PLA @Prusa CORE One HF 0.4;Generic PETG @Prusa CORE One HF 0.4;Generic ABS @Prusa CORE One HF 0.4;Generic ASA @Prusa CORE One HF 0.4",
 	"family": "Prusa",
 	"hotend_model": "",

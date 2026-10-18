@@ -5,8 +5,10 @@
 #include "ObjectID.hpp"
 #include "Point.hpp"
 #include "BrimEarsPoint.hpp"
+#include "Polygon.hpp"
 
 #include<map>
+#include <utility>
 #include<vector>
 
 namespace Slic3r {

@@ -8,18 +8,27 @@ add_executable(${_TEST_NAME}_tests
 	test_extrusion_processor.cpp
 	test_fill.cpp
 	test_flow.cpp
+	test_gcode_processor.cpp
+	test_gcode_statistics.cpp
 	test_gcode_timing.cpp
+	test_gcode.cpp
 	test_gcodeprocessor.cpp
 	test_gcodewriter.cpp
+	test_imex_mode_gcode.cpp
+	test_imex_slice_offset.cpp
 	test_model.cpp
 	test_multifilament.cpp
 	test_perimeters.cpp
+	# Seam geometry and pipeline regressions share the existing Print fixtures.
+	test_precise_seam.cpp
 	test_print.cpp
 	test_printobject.cpp
 	test_mixed_filament.cpp
+	test_seam_placer.cpp
 	test_skirt_brim.cpp
 	test_slicing_pipeline_hook.cpp
 	test_support_material.cpp
+	test_texture_displacement.cpp
 	test_tree_support.cpp
 	test_trianglemesh.cpp
 	test_wipe.cpp
@@ -35,6 +44,7 @@ orcaslicer_discover_tests(${_TEST_NAME}_tests)
 # Exercise the emitted-G-code audit itself, including known-invalid controls.
 # A validator which silently accepts unsupported walls must fail the test run.
 add_test(NAME gcode_audit_regressions
-    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/test_audit_gcode_moves.py")
+    COMMAND cmake "-DTEST_SCRIPT=${CMAKE_SOURCE_DIR}/test_audit_gcode_moves.py"
+            -P "${CMAKE_SOURCE_DIR}/tests/run_python_test.cmake")
 set_tests_properties(gcode_audit_regressions PROPERTIES
     LABELS "GCode;NonplanarSurface;Regression" TIMEOUT 120)

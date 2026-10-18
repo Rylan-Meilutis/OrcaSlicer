@@ -591,7 +591,7 @@ TEST_CASE("Non-planar clearance detects a raised wall near a roof endpoint",
     const float half_width = float(scale_(0.38292 / 2.));
     const Polygons blunt_coverage = offset(offset(roof, half_width), float(scale_(0.05)));
     const Polygons rounded_coverage = offset(offset(roof, half_width,
-        ClipperLib::jtRound, scale_(0.005), ClipperLib::etOpenRound), float(scale_(0.05)));
+        Slic3r::jtRound, scale_(0.005), Slic3r::etOpenRound), float(scale_(0.05)));
     CHECK(intersection_pl(retained, blunt_coverage).empty());
     CHECK_FALSE(intersection_pl(retained, rounded_coverage).empty());
     const auto overlap = [&](Vec3d start, Vec3d end) {

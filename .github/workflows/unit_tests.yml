@@ -40,6 +40,9 @@ jobs:
       - name: Apt-Install Dependencies
         if: runner.os == 'Linux' && !vars.SELF_HOSTED
         uses: ./.github/actions/apt-install-deps
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
       - name: Restore Test Artifact
         uses: actions/download-artifact@v8
         with:

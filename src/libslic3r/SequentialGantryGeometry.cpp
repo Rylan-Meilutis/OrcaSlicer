@@ -624,7 +624,7 @@ ToolheadCollision check_toolhead_clearance_impl(
             continue;
         }
         const Polygons envelope = offset(centerline, float(scale_(radius)), jtRound,
-                                         DefaultLineMiterLimit, ClipperLib::etOpenRound);
+                                         DefaultLineMiterLimit, Slic3r::etOpenRound);
         if (!intersection(envelope, obstacle.footprint()).empty())
             return {ToolheadCollisionType::FallbackEnvelope, obstacle_idx, size_t(-1)};
     }
@@ -728,7 +728,7 @@ const Polygons &PrintedToolpathObstacle::footprint() const
 {
     if (polygons.empty() && centerline.points.size() >= 2 && line_width > 0.)
         polygons = offset_polyline_raw(centerline, float(scale_(0.5 * line_width)), jtRound,
-                                       DefaultLineMiterLimit, ClipperLib::etOpenRound);
+                                       DefaultLineMiterLimit, Slic3r::etOpenRound);
     return polygons;
 }
 

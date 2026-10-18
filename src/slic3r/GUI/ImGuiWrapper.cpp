@@ -1,6 +1,28 @@
 #include "ImGuiWrapper.hpp"
 
+#include <algorithm>
+#include <cstdint>
+#include <array>
+#include <cassert>
 #include <cstdio>
+#include "libslic3r/Technologies.hpp"
+#include <map>
+#include <string>
+#include <imgui.h>
+#include "libslic3r/GCode/ThumbnailData.hpp"
+#include <cstdlib>
+#include <utility>
+#include <string_view>
+#include <cstring>
+#include "libslic3r/Point.hpp"
+#include <functional>
+#include <optional>
+#include <limits>
+#include "libslic3r/Polygon.hpp"
+#include "libslic3r/BoundingBox.hpp"
+#include "slic3r/GUI/GUI_Utils.hpp"
+#include "libslic3r/Exception.hpp"
+#include <tuple>
 #include <vector>
 #include <cmath>
 #include <stdexcept>
@@ -8,6 +30,9 @@
 #include <boost/format.hpp>
 #include <boost/log/trivial.hpp>
 #include <boost/filesystem.hpp>
+#include <wx/colour.h>
+#include <wx/utils.h>
+#include <wx/dataobj.h>
 #if ENABLE_ENHANCED_IMGUI_SLIDER_FLOAT
 #include <boost/algorithm/string/predicate.hpp>
 #include <boost/nowide/convert.hpp>
@@ -37,12 +62,11 @@
 #include "Search.hpp"
 #include "BitmapCache.hpp"
 #include "GUI_App.hpp"
+#include "KeyChord.hpp"
 
-#include "../Utils/MacDarkMode.hpp"
 #include <nanosvg/nanosvg.h>
 #include <nanosvg/nanosvgrast.h>
 #include "OpenGLManager.hpp"
-#include "GUI_App.hpp"
 
 namespace Slic3r {
 namespace GUI {
@@ -482,10 +506,12 @@ bool ImGuiWrapper::update_mouse_data(wxMouseEvent& evt)
     io.MouseDown[0] = evt.LeftIsDown();
     io.MouseDown[1] = evt.RightIsDown();
     io.MouseDown[2] = evt.MiddleIsDown();
-    float wheel_delta = static_cast<float>(evt.GetWheelDelta());
-    if (wheel_delta != 0.0f) {
+    // Only a vertical wheel event with a direction is a wheel step. A macOS trackpad reports sideways motion
+    // as separate horizontal events, and its wheel events often carry a rotation of 0: wx truncates the
+    // sub-pixel deltas to whole ones and passes on events with no delta at all. Read as vertical steps,
+    // either kind scrolls against the gesture, and scrolling up bounces back and forth.
+    if (evt.GetWheelAxis() == wxMOUSE_WHEEL_VERTICAL && evt.GetWheelRotation() != 0)
         io.MouseWheel = evt.GetWheelRotation() > 0 ? 1.f : -1.f;
-    }
     unsigned buttons = (evt.LeftIsDown() ? 1 : 0) | (evt.RightIsDown() ? 2 : 0) | (evt.MiddleIsDown() ? 4 : 0);
     m_mouse_buttons = buttons;
 
@@ -2107,6 +2133,27 @@ bool ImGuiWrapper::want_any_input() const
 {
     const auto io = ImGui::GetIO();
     return io.WantCaptureMouse || io.WantCaptureKeyboard || io.WantTextInput;
+}
+
+bool ImGuiWrapper::text_input_active() const
+{
+    const ImGuiID id = ImGui::GetActiveID();
+    return id != 0 && ImGui::GetInputTextState(id) != nullptr;
+}
+
+bool ImGuiWrapper::modal_popup_open() const
+{
+    // A modal stays on the popup stack while its canvas is hidden, so it counts only if the last finished
+    // frame drew it, which NewFrame() moves from Active to WasActive.
+    const ImGuiWindow* modal = ImGui::GetTopMostPopupModal();
+    if (modal == nullptr)
+        return false;
+    return ImGui::GetCurrentContext()->WithinFrameScope ? modal->WasActive : modal->Active;
+}
+
+bool ImGuiWrapper::owns_key(const KeyChord& chord) const
+{
+    return modal_popup_open() || (chord.edits_text() && text_input_active());
 }
 
 ImFontAtlasCustomRect* ImGuiWrapper::GetTextureCustomRect(const wchar_t& tex_id)

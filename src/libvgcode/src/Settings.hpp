@@ -8,6 +8,8 @@
 #include "../include/Types.hpp"
 #include <bitset>
 
+#include <array>
+#include <cstddef>
 #include <map>
 
 namespace libvgcode {

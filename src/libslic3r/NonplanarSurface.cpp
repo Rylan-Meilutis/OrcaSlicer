@@ -3531,7 +3531,7 @@ bool patch_is_accessible(const NonplanarPatch &patch,
             if (radius <= 0)
                 continue;
             const ExPolygons envelope = offset_ex(surface_bands[low], radius,
-                ClipperLib::jtSquare, 100000.);
+                Slic3r::jtSquare, 100000.);
             const ExPolygons collisions = intersection_ex(
                 high_geometry, diff_ex(envelope, patch.projection));
             for (const ExPolygon &collision : collisions)
@@ -4596,8 +4596,8 @@ void collect_generated_material_at_z(
             if (clipped.polyline.length() > SCALED_EPSILON) {
                 if (round_caps)
                     polygons_append(coverage, offset(clipped.polyline.to_polyline(),
-                        float(scale_(path.width / 2.)), ClipperLib::jtRound,
-                        scale_(0.005), ClipperLib::etOpenRound));
+                        float(scale_(path.width / 2.)), Slic3r::jtRound,
+                        scale_(0.005), Slic3r::etOpenRound));
                 else
                     clipped.polygons_covered_by_width(coverage, 0.f);
             }

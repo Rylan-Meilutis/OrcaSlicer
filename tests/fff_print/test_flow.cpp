@@ -1,10 +1,13 @@
 #include <catch2/catch_all.hpp>
 
+#include <cmath>
 #include <numeric>
 #include <limits>
 #include <set>
 #include <sstream>
 
+#include <catch2/catch_test_macros.hpp>
+#include <catch2/catch_approx.hpp>
 #include "test_helpers.hpp" // get access to init_print, etc
 
 #include "libslic3r/Config.hpp"
@@ -20,7 +23,6 @@
 #include "libslic3r/libslic3r.h"
 #include "test_utils.hpp"
 
-using namespace Slic3r::Test;
 using namespace Slic3r;
 
 TEST_CASE("Feature flows use their selected tool nozzle diameters",
