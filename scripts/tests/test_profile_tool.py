@@ -181,7 +181,7 @@ class TestNormalize(TreeCase):
             with self.subTest(profile_type=sub):
                 expected = {"type": sub, "name": "A"}
                 self.t.write("V", f"{sub}/A.json", {
-                    **expected, "silent_mode": "", "adaptive_layer_height": "0",
+                    **expected, "overhang_totally_speed": "", "adaptive_layer_height": "0",
                     "anisotropic_surfaces": "1", "filament_load_time": ["0"],
                     "filament_unload_time": "0"})
                 rc, out = self.run_command("normalize")
@@ -192,6 +192,13 @@ class TestNormalize(TreeCase):
         self.assertEqual(rc, 0, out)
         self.assertIn("0 profile(s) normalized", out)
         self.assertEqual(self.t.bytes_map(), before)
+
+    def test_normalize_preserves_active_silent_mode(self):
+        self.t.write("V", "machine/A.json", {
+            "type": "machine", "name": "A", "silent_mode": "1"})
+        rc, out = self.run_command("normalize")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.t.read("V", "machine/A.json")["silent_mode"], "1")
 
     def test_the_larger_extruder_clearance_wins(self):
         # Keeping the smaller one would licence a toolhead collision.
@@ -583,7 +590,7 @@ class TestCheck(TreeCase):
 
     def test_obsolete_key_warnings_exclude_active_and_renamed_options(self):
         self.bundle().write("V", "filament/B.json", {
-            "type": "filament", "name": "B", "silent_mode": "0",
+            "type": "filament", "name": "B", "overhang_totally_speed": "0",
             "anisotropic_surfaces": "0", "extruder_type": ["Direct Drive"],
             "extruder_clearance_max_radius": "68"})
         buf = io.StringIO()
@@ -594,11 +601,11 @@ class TestCheck(TreeCase):
 
     def test_obsolete_key_warnings_run_without_a_flag(self):
         self.t.write("V", "filament/A.json", {
-            "type": "filament", "name": "A", "silent_mode": "0"})
+            "type": "filament", "name": "A", "overhang_totally_speed": "0"})
         self.run_command("update-index")
         rc, out = self.run_command("check")
         self.assertEqual(rc, 1, out)  # normalization also rejects the obsolete key
-        self.assertIn("Obsolete key: 'silent_mode' found in V/filament/A.json", out)
+        self.assertIn("Obsolete key: 'overhang_totally_speed' found in V/filament/A.json", out)
         self.assertIn("Files with warnings : 1", out)
 
     def test_a_default_material_must_exist_somewhere(self):

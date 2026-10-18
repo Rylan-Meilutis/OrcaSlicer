@@ -157,7 +157,7 @@ OBSOLETE_KEYS = {
     "retraction_distance_when_cut", "internal_bridge_support_thickness",
     "top_area_threshold", "reduce_wall_solid_infill",
     "filament_load_time", "filament_unload_time", "smooth_coefficient",
-    "overhang_totally_speed", "silent_mode", "overhang_speed_classic",
+    "overhang_totally_speed", "overhang_speed_classic",
     "anisotropic_surfaces",
 }
 
