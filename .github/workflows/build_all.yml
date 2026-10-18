@@ -4,6 +4,7 @@ on:
   push:
     branches:
      - main
+     - rme
      - release/*
      - belt-printer
     paths:
