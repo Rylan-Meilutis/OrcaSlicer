@@ -1442,6 +1442,8 @@ static std::vector<std::string> s_Preset_print_options{
     "interlocking_beam_width",
     "calib_flowrate_topinfill_special_order",
     "nonplanar_top_surface",
+    "nonplanar_selection_min_z",
+    "nonplanar_selection_max_z",
     "nonplanar_top_surface_max_angle",
     "nonplanar_top_surface_layers",
     "nonplanar_top_surface_resolution",
