@@ -301,6 +301,49 @@ TEST_CASE("Brick transition beads do not activate non-planar travel clearance",
 
     CHECK(gcode.find(";TYPE:Brick wall") != std::string::npos);
     CHECK(gcode.find("raise for non-planar toolhead clearance") == std::string::npos);
+    CHECK(gcode.find("non-planar transition") == std::string::npos);
+    CHECK(gcode.find("non-planar traverse") == std::string::npos);
+}
+
+TEST_CASE("Non-planar export accepts in-height paths and rejects paths above the printer ceiling",
+          "[Flow][NonplanarSurface][GCode][Regression]")
+{
+    const bool exceeds_height = GENERATE(false, true);
+    Print print;
+    Slic3r::Test::init_and_process_print({cube(2.)}, print, {
+        {"layer_height", 0.2}, {"initial_layer_print_height", 0.2},
+        {"wall_loops", 2}, {"printable_height", 10.}
+    });
+    bool marked = false;
+    const auto mark_path = [&](ExtrusionEntity &entity, const auto &self) -> void {
+        if (marked)
+            return;
+        if (auto *loop = dynamic_cast<ExtrusionLoop *>(&entity)) {
+            if (!loop->paths.empty()) {
+                ExtrusionPath &path = loop->paths.front();
+                path.nonplanar_surface = true;
+                path.z_contoured = true;
+                for (Point3 &point : path.polyline.points)
+                    point.z() = scale_(exceeds_height ? 11. : 0.);
+                marked = true;
+            }
+        } else if (auto *collection = dynamic_cast<ExtrusionEntityCollection *>(&entity)) {
+            for (ExtrusionEntity *child : collection->entities)
+                self(*child, self);
+        }
+    };
+    for (PrintObject *object : print.objects())
+        for (Layer *layer : object->layers())
+            for (LayerRegion *region : layer->regions())
+                mark_path(region->perimeters, mark_path);
+    REQUIRE(marked);
+    ScopedTemporaryFile output(".gcode");
+    if (exceeds_height) {
+        REQUIRE_THROWS_WITH(print.export_gcode(output.string(), nullptr, nullptr),
+            Catch::Matchers::ContainsSubstring("vertical build limits"));
+    } else {
+        REQUIRE_NOTHROW(print.export_gcode(output.string(), nullptr, nullptr));
+    }
 }
 
 TEST_CASE("Standard perimeter layering ignores a stale legacy brick flag",

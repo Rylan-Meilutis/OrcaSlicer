@@ -20,6 +20,9 @@
 #include "libslic3r/AABBTreeLines.hpp"
 #include "libslic3r/Fill/Fill.hpp"
 #include "libslic3r/Flow.hpp"
+#include "libslic3r/Format/DRC.hpp"
+#include "libslic3r/TriangleMesh.hpp"
+#include "libslic3r/TriangleMeshSlicer.hpp"
 #include "libslic3r/GCode/ArcCooling.hpp"
 #include "libslic3r/GCode/GCodeProcessor.hpp"
 #include "libslic3r/GCodeReader.hpp"
@@ -41,6 +44,72 @@
 #include "test_utils.hpp"
 
 using namespace Slic3r;
+
+TEST_CASE("Temperature tower arc bridges retain coherent supported courses", "[Fill][ArcOverhang][Tower]")
+{
+    TriangleMesh tower;
+    const std::string path = std::string(TEST_DATA_DIR) + "/../../resources/calib/temperature_tower/temperature_tower.drc";
+    REQUIRE(load_drc(path.c_str(), &tower));
+    // Each block repeats the bridge geometry; retain the first complete bridge.
+    indexed_triangle_set lower;
+    cut_mesh(tower.its, 10.f - float(EPSILON), nullptr, &lower);
+    const auto bridge_density = GENERATE("50%", "100%");
+    Print print;
+    Test::init_and_process_print({TriangleMesh(std::move(lower))}, print, {
+        {"arc_overhang_enabled", "1"}, {"arc_overhang_recursive_fill", "1"},
+        {"arc_overhang_bridge_distance", "0"}, {"arc_overhang_min_overhang_distance", "0"},
+        {"enable_support", "0"}, {"layer_height", "0.2"},
+        {"nozzle_diameter", "0.4"}, {"inner_wall_line_width", "0.45"},
+        {"resolution", "0.01"}, {"arc_overhang_overlap", "0"},
+        {"bridge_density", bridge_density}
+    });
+    size_t count = 0;
+    for (const Layer *layer : print.objects().front()->layers()) {
+        size_t arcs = 0, short_arcs = 0;
+        double length = 0.;
+        Polygons covered;
+        ExPolygons bridges;
+        for (const LayerRegion *region : layer->regions()) {
+            region->perimeters.polygons_covered_by_width(covered, 0.f);
+            for (const Surface &surface : region->fill_surfaces.surfaces)
+                if (surface.surface_type == stBottomBridge) bridges.push_back(surface.expolygon);
+            const auto flattened = region->fills.flatten();
+            for (const ExtrusionEntity *entity : flattened.entities) {
+                entity->polygons_covered_by_width(covered, 0.f);
+                if (entity->role() == erArcOverhang || entity->role() == erArcBridge) {
+                    CHECK_THAT(entity->min_mm3_per_mm(), Catch::Matchers::WithinRel(M_PI * 0.45 * 0.45 / 4., 1e-5));
+                    ++arcs;
+                    length += unscale<double>(entity->length());
+                    if (entity->length() < scale_(2.)) ++short_arcs;
+                }
+            }
+        }
+        if (arcs) {
+            CAPTURE(bridge_density, layer->print_z, arcs, short_arcs, length);
+            // Long courses must dominate, not a mosaic of nozzle-scale restarts.
+            CHECK(length / arcs > 6. * 0.45);
+            CHECK(short_arcs < 2. * arcs / 3.);
+            bridges = union_ex(bridges);
+            const auto total_area = [](const ExPolygons &regions) {
+                return std::accumulate(regions.begin(), regions.end(), 0.,
+                    [](double sum, const ExPolygon &region) { return sum + std::abs(region.area()); });
+            };
+            const double target_area = total_area(bridges);
+            REQUIRE(target_area > 0.);
+            const ExPolygons holes = diff_ex(bridges, union_ex(covered));
+            if (const char *diagnostic = std::getenv("ORCA_ARC_REGRESSION_SVG")) {
+                SVG svg(diagnostic, get_extents(bridges));
+                svg.draw(bridges, "white");
+                svg.draw(union_ex(covered), "blue");
+                svg.draw(holes, "red");
+            }
+            const double missing_area = total_area(holes);
+            CHECK(missing_area < 0.05 * target_area);
+        }
+        count += arcs;
+    }
+    REQUIRE(count > 0);
+}
 
 TEST_CASE("External bridge overlap replaces density without changing strand flow", "[Fill][BridgeOverlap]")
 {
@@ -2516,6 +2585,92 @@ TEST_CASE("Arc bodies grow from previously deposited material", "[Fill][ArcOverh
     CHECK(longest_unsupported < 0.05 * fill->spacing);
     CHECK(unsupported_length < 0.1 * fill->spacing);
     CHECK(short_restart_length < params.resolution);
+}
+
+TEST_CASE("Short recursive bridge arcs remain attached to the deposited prefix",
+          "[Fill][ArcOverhang][Narrow][SagRisk][Regression]")
+{
+    // A clipped can-cover bridge has small concave pockets between its main
+    // arches and retained walls. A rectangle alone does not exercise them.
+    const std::string fixture = GENERATE("arc_overhang_narrow_pocket.txt", "arc_overhang_narrow_pocket_2.txt");
+    CAPTURE(fixture);
+    std::ifstream input(std::string(TEST_DATA_DIR) + "/" + fixture);
+    REQUIRE(input.good());
+    double width = 0., angle = 0.;
+    ExPolygon region;
+    ExPolygons foundation;
+    Polylines walls;
+    std::string line;
+    while (std::getline(input, line)) {
+        std::istringstream fields(line);
+        std::string kind;
+        fields >> kind;
+        if (kind == "begin") {
+            fields >> width >> angle;
+            continue;
+        }
+        Points points;
+        double x, y;
+        while (fields >> x >> y) points.push_back(Point::new_scale(x, y));
+        if (kind == "region") region.contour = Polygon(std::move(points));
+        else if (kind == "hole") region.holes.emplace_back(std::move(points));
+        else if (kind == "root") foundation.emplace_back(std::move(points));
+        else if (kind == "root_hole") {
+            REQUIRE_FALSE(foundation.empty());
+            foundation.back().holes.emplace_back(std::move(points));
+        } else if (kind == "support") walls.emplace_back(std::move(points));
+    }
+    REQUIRE(width > 0.);
+    REQUIRE_FALSE(region.empty());
+    Surface surface(stBottomBridge, region);
+    surface.bridge_angle = angle - 0.5 * M_PI;
+    std::unique_ptr<Fill> fill(Fill::new_from_type("arc-overhang"));
+    fill->spacing = width;
+    fill->bounding_box = get_extents(region);
+    PrintRegionConfig config;
+    config.arc_overhang_recursive_fill.value = true;
+    config.arc_overhang_overlap.value = 25.;
+    FillParams params;
+    params.density = 1.f;
+    params.resolution = 0.003f;
+    params.config = &config;
+    params.arc_anchor_regions = &foundation;
+    params.arc_root_anchor_regions = &foundation;
+    params.arc_support_paths = &walls;
+    params.arc_obstacle_paths = &walls;
+    const Polylines paths = fill->fill_surface(&surface, params);
+    REQUIRE_FALSE(paths.empty());
+    // This tests a geometric sag risk, not a thermal prediction: a short
+    // restart must not borrow support from a later path or just its endpoints.
+    ExPolygons deposited = offset_ex(foundation, float(scale_(0.4 * width)),
+                                    ClipperLib::jtRound, scale_(0.0001));
+    append(deposited, union_ex(offset(walls,
+        float(scale_(width * (1. - config.arc_overhang_overlap.value / 200.) + params.resolution)),
+        ClipperLib::jtRound, scale_(0.0001), ClipperLib::etOpenRound)));
+    double longest_unsupported = 0.;
+    size_t short_paths = 0;
+    for (const Polyline &path : paths) {
+        if (path.length() < scale_(5. * width)) {
+            ++short_paths;
+            for (const Polyline &unsupported : diff_pl(Polylines{path}, deposited))
+                longest_unsupported = std::max(longest_unsupported, unscale<double>(unsupported.length()));
+        }
+        append(deposited, union_ex(offset(Polylines{path},
+            float(scale_(width * (1. - config.arc_overhang_overlap.value / 200.) + params.resolution)),
+            ClipperLib::jtRound, scale_(0.0001), ClipperLib::etOpenRound)));
+        deposited = union_ex(deposited);
+    }
+    CHECK(short_paths > 0);
+    CHECK(longest_unsupported < 0.05 * width);
+    CHECK_FALSE(arc_paths_have_proper_crossing(paths));
+    ExPolygons covered = union_ex(offset(paths, float(scale_(0.5 * width))));
+    append(covered, union_ex(offset(walls, float(scale_(0.5 * width)))));
+    append(covered, foundation);
+    const ExPolygons holes = opening_ex(diff_ex(ExPolygons{region}, union_ex(covered)),
+                                       float(scale_(0.75 * width)));
+    double missing = 0.;
+    for (const ExPolygon &hole : holes) missing += std::abs(hole.area());
+    CHECK(missing < 0.01 * std::abs(region.area()));
 }
 
 TEST_CASE("Narrow bridge grows tight arcs from available end foundations", "[Fill][ArcOverhang][Narrow]")
@@ -5303,6 +5458,26 @@ TEST_CASE("Horizontal top surfaces are not classified as non-planar", "[Fill][No
     CHECK(nonplanar_perimeter_paths(print).empty());
 }
 
+TEST_CASE("A non-planar selection outside the roof leaves the complete native paths",
+          "[Fill][NonplanarSurface][NonplanarSelection][Regression]")
+{
+    Print print;
+    Slic3r::Test::init_and_process_print(
+        {shallow_top_wedge(8.)}, print,
+        {{"top_surface_z_mode", "nonplanar_top_surface"},
+         {"nonplanar_selection_min_z", 1.},
+         {"nonplanar_selection_max_z", 5.},
+         {"layer_height", 0.2}});
+    CHECK(nonplanar_top_paths(print).empty());
+    CHECK(nonplanar_perimeter_paths(print).empty());
+    REQUIRE_FALSE(print.objects().empty());
+    size_t walls = 0;
+    for (const Layer *layer : print.objects().front()->layers())
+        for (const LayerRegion *region : layer->regions())
+            walls += region->perimeters.entities.size();
+    CHECK(walls > 0);
+}
+
 TEST_CASE("True non-planar top surfaces respect the configured surface angle", "[Fill][NonplanarSurface]")
 {
     Print accepted;
@@ -5436,6 +5611,19 @@ TEST_CASE("Compact wall-only slopes do not emit isolated non-planar loops",
             CHECK(radius + 0.5 * wall.width <= 3.05);
         }
 
+    // Geometry acceptance is not a travel-clearance certificate. The annulus
+    // can leave the upright nozzle touching raised material at departure.
+    // Refusing that transition is preferable to the former unchecked lift;
+    // only this explicit safety refusal is allowed, not arbitrary exceptions.
+    std::string emitted_gcode;
+    try {
+        emitted_gcode = Slic3r::Test::gcode(print);
+    } catch (const SlicingError &error) {
+        REQUIRE_THAT(std::string(error.what()),
+            Catch::Matchers::ContainsSubstring("No safe non-planar transition"));
+        return;
+    }
+
     // Keep the G-code support audit as a guard against a future implementation
     // reintroducing an unbonded partial wall while still satisfying the simple
     // entity-count assertion above.
@@ -5449,7 +5637,7 @@ TEST_CASE("Compact wall-only slopes do not emit isolated non-planar loops",
     std::optional<Vec3d> previous_extrusion_end;
     std::string type;
     GCodeReader reader;
-    reader.parse_buffer(Slic3r::Test::gcode(print),
+    reader.parse_buffer(emitted_gcode,
         [&](GCodeReader &self, const GCodeReader::GCodeLine &line) {
             const std::string comment(line.comment());
             if (comment.rfind("TYPE:", 0) == 0)

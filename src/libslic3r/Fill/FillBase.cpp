@@ -283,12 +283,10 @@ void Fill::fill_surface_extrusion(const Surface* surface, const FillParams& para
         // pattern generator)
         double flow_mm3_per_mm = params.flow.mm3_per_mm();
         double flow_width = params.flow.width();
-        if (params.using_internal_flow) {
-            // if we used the internal flow we're not doing a solid infill
-            // so we can safely ignore the slight variation that might have
-            // been applied to f->spacing
-        }
-        else {
+        // Internal flow ignores small spacing adjustments. Arc pitch controls
+        // contact, not diameter: converting it back through bridge spacing
+        // subtracts BRIDGE_EXTRA_SPACING and reintroduces an air gap.
+        if (!params.using_internal_flow && !is_arc_fill(params.extrusion_role)) {
             Flow new_flow = params.flow.with_spacing(this->spacing);
             flow_mm3_per_mm = new_flow.mm3_per_mm();
             flow_width = new_flow.width();

@@ -1182,7 +1182,11 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
                     params.role_speed = region_config.internal_solid_infill_speed.get_at(layer.get_extruder_id(params.extruder));
 				// Calculate flow spacing for infill pattern generation.
 		        if (surface.is_solid() || is_bridge) {
-		            params.spacing = params.flow.spacing();
+                    // Straight bridges intentionally separate their round strands.
+                    // Arc courses must touch the preceding course to grow from it;
+                    // BRIDGE_EXTRA_SPACING otherwise strands the primary family
+                    // and turns the residual into hundreds of tiny restarts.
+                    params.spacing = is_arc_fill(params.extrusion_role) ? params.flow.width() : params.flow.spacing();
 		            // Don't limit anchor length for solid or bridging infill.
 		            params.anchor_length = 1000.f;
 					params.anchor_length_max = 1000.f;
@@ -1847,10 +1851,15 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
 			f->spacing = surface_fill.params.spacing;
 			surface_fill.surface.expolygon = std::move(expoly);
 
-			if(surface_fill.params.bridge && surface_fill.surface.is_external() && surface_fill.params.density > 99.0){
-				params.density = layerm->region().config().bridge_density.get_abs_value(1.0);
+            if (is_arc_fill(params.extrusion_role)) {
+                // Arc overlap controls the bonding pitch independently of the
+                // density of straight bridges. Sparse arcs cannot support each other.
+                params.density = 1.f;
+                params.dont_adjust = true;
+            } else if(surface_fill.params.bridge && surface_fill.surface.is_external() && surface_fill.params.density > 99.0){
+                params.density = layerm->region().config().bridge_density.get_abs_value(1.0);
                 const double overlap = layerm->region().config().bridge_line_overlap.get_abs_value(1.0);
-                if (overlap > 0. && !is_arc_fill(params.extrusion_role))
+                if (overlap > 0.)
                     params.density = 1. / (1. - std::clamp(overlap, 0., 0.2));
 				params.dont_adjust = true;
 			}

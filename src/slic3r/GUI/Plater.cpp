@@ -460,7 +460,7 @@ public:
                     bundle.printers.get_edited_preset().config.opt_float("nozzle_diameter", tool),
                     spool.material.empty() ? _L("Unloaded") :
                     from_u8(spool.material + " / " + spool.name)), icon);
-                if (taken.count(int(tool)) || (inventory_error.empty() && spool.name.empty() &&
+                if (taken.count(int(tool)) || ((!spools.empty() || inventory_error.empty()) && spool.name.empty() &&
                         spool.material.empty() && spool.spool_id.empty()))
                     continue;
                 const double score = (normalized_mapping_key(material) == normalized_mapping_key(spool.material) ? 0. : 1.e6) +
@@ -544,7 +544,7 @@ public:
                     show_error(this, _L("Select a different printer tool for each project material."));
                     return;
                 }
-            if (inventory_error.empty()) {
+            if (!spools.empty() || inventory_error.empty()) {
                 for (int tool : mapping) {
                     if (size_t(tool) >= spools.size() || (spools[tool].name.empty() &&
                             spools[tool].material.empty() && spools[tool].spool_id.empty())) {
@@ -623,8 +623,10 @@ bool prepare_tool_dispatch(wxWindow *parent, const Print &source, const DynamicP
         !host_config.opt_string("print_host").empty()) {
         OctoPrint host(&host_config);
         wxBusyCursor busy;
-        if (!host.get_selected_filament_spools(spools, error))
-            spools.clear();
+        if (!host.get_selected_filament_spools(spools, error, true)) {
+            show_error(parent, error + "\n" + _L("No usable loaded-tool data is available. Connect to OctoPrint and retry before printing."));
+            return false;
+        }
     } else
         error = _L("Automatic loaded-material detection is not available for this connection. Select the physical tools loaded with these materials.");
     if (spools.empty() && error.empty())
@@ -14275,8 +14277,19 @@ void Plater::priv::on_process_completed(SlicingProcessCompletedEvent &evt)
     notification_manager->set_slicing_progress_export_possible();
 
     // Reset the "export G-code path" name, so that the automatic background processing will be enabled again.
-    const std::string lifecycle_job_name = this->background_process.fff_print() ?
-        this->background_process.fff_print()->output_filename() : std::string();
+    std::string lifecycle_job_name;
+    // A canceled/failed slice has no finalized statistics. In particular,
+    // initial_tool is still a string placeholder and cannot index filament_type.
+    // Optional lifecycle metadata must never prevent cancellation cleanup.
+    if (evt.success()) {
+        if (const Print *print = this->background_process.fff_print()) {
+            try {
+                lifecycle_job_name = print->output_filename();
+            } catch (const std::exception &ex) {
+                BOOST_LOG_TRIVIAL(warning) << "Could not resolve lifecycle job name: " << ex.what();
+            }
+        }
+    }
     this->background_process.reset_export();
     // This bool stops showing export finished notification even when process_completed_with_error is false
     bool has_error = false;
@@ -17494,6 +17507,9 @@ void Plater::calib_pa(const Calib_Params& params)
     switch (params.mode) {
         case CalibMode::Calib_PA_Line:
             add_model(false, Slic3r::resources_dir() + "/calib/pressure_advance/pressure_advance_test.drc");
+            disable_arc_overhangs_for_calibration(model());
+            if (!model().objects.empty())
+                changed_objects({ 0 });
             break;
         case CalibMode::Calib_PA_Pattern:
             _calib_pa_pattern(params);
@@ -17703,6 +17719,7 @@ void Plater::_calib_pa_pattern(const Calib_Params& params)
     }
 
     model().calib_pa_pattern = std::make_unique<CalibPressureAdvancePattern>(pa_pattern);
+    disable_arc_overhangs_for_calibration(model());
     changed_objects(object_idxs);
 }
 
@@ -17796,6 +17813,7 @@ void Plater::_calib_pa_tower(const Calib_Params& params) {
     obj_cfg.set_key_value("seam_slope_type", new ConfigOptionEnum<SeamScarfType>(SeamScarfType::None));
     print_config.set_key_value("max_volumetric_extrusion_rate_slope", new ConfigOptionFloat(0));
 
+    disable_arc_overhangs_for_calibration(model());
     changed_objects({ 0 });
     wxGetApp().get_tab(Preset::TYPE_PRINT)->update_dirty();
     wxGetApp().get_tab(Preset::TYPE_FILAMENT)->update_dirty();
@@ -17992,6 +18010,7 @@ void Plater::calib_flowrate(bool is_linear, int pass, InfillPattern pattern) {
 
     // Refresh object after scaling
     const std::vector<size_t> object_idx(boost::counting_iterator<size_t>(0), boost::counting_iterator<size_t>(model().objects.size()));
+    disable_arc_overhangs_for_calibration(model());
     changed_objects(object_idx);
 }
 
@@ -18070,6 +18089,7 @@ void Plater::calib_temp(const Calib_Params& params) {
         print_config->set_key_value("initial_layer_print_height", new ConfigOptionFloat(nozzle_diameter/2));
 
 
+    disable_arc_overhangs_for_calibration(model());
     changed_objects({ 0 });
     wxGetApp().get_tab(Preset::TYPE_PRINT)->update_dirty();
     wxGetApp().get_tab(Preset::TYPE_FILAMENT)->update_dirty();
@@ -18134,6 +18154,7 @@ void Plater::calib_max_vol_speed(const Calib_Params& params)
     print_config->set_key_value("max_volumetric_extrusion_rate_slope", new ConfigOptionFloat(0));
     print_config->set_key_value("enable_wrapping_detection", new ConfigOptionBool(false));
 
+    disable_arc_overhangs_for_calibration(model());
     changed_objects({ 0 });
     wxGetApp().get_tab(Preset::TYPE_PRINT)->update_dirty();
     wxGetApp().get_tab(Preset::TYPE_FILAMENT)->update_dirty();
@@ -18208,6 +18229,7 @@ void Plater::calib_retraction(const Calib_Params& params)
     obj->config.set_key_value("seam_slope_type", new ConfigOptionEnum<SeamScarfType>(SeamScarfType::None));
 
 
+    disable_arc_overhangs_for_calibration(model());
     changed_objects({ 0 });
 
     //  cut upper
@@ -18290,6 +18312,7 @@ void Plater::calib_VFA(const Calib_Params& params)
     model().objects[0]->config.set_key_value("brim_width", new ConfigOptionFloat(3.0));
     model().objects[0]->config.set_key_value("brim_object_gap", new ConfigOptionFloat(0.0));
 
+    disable_arc_overhangs_for_calibration(model());
     changed_objects({ 0 });
     wxGetApp().get_tab(Preset::TYPE_PRINT)->update_dirty();
     wxGetApp().get_tab(Preset::TYPE_FILAMENT)->update_dirty();
@@ -18360,6 +18383,7 @@ void Plater::calib_input_shaping_freq(const Calib_Params& params)
     model().objects[0]->config.set_key_value("brim_width", new ConfigOptionFloat(3.0));
     model().objects[0]->config.set_key_value("brim_object_gap", new ConfigOptionFloat(0.0));
 
+    disable_arc_overhangs_for_calibration(model());
     changed_objects({ 0 });
     wxGetApp().get_tab(Preset::TYPE_PRINT)->update_dirty();
     wxGetApp().get_tab(Preset::TYPE_FILAMENT)->update_dirty();
@@ -18425,6 +18449,7 @@ void Plater::calib_input_shaping_damp(const Calib_Params& params)
     model().objects[0]->config.set_key_value("brim_width", new ConfigOptionFloat(3.0));
     model().objects[0]->config.set_key_value("brim_object_gap", new ConfigOptionFloat(0.0));
 
+    disable_arc_overhangs_for_calibration(model());
     changed_objects({ 0 });
     wxGetApp().get_tab(Preset::TYPE_PRINT)->update_dirty();
     wxGetApp().get_tab(Preset::TYPE_FILAMENT)->update_dirty();
@@ -18494,6 +18519,7 @@ void Plater::Calib_Cornering(const Calib_Params& params)
     model().objects[0]->config.set_key_value("brim_width", new ConfigOptionFloat(3.0));
     model().objects[0]->config.set_key_value("brim_object_gap", new ConfigOptionFloat(0.0));
 
+    disable_arc_overhangs_for_calibration(model());
     changed_objects({ 0 });
     wxGetApp().get_tab(Preset::TYPE_PRINT)->update_dirty();
     wxGetApp().get_tab(Preset::TYPE_FILAMENT)->update_dirty();
@@ -21319,6 +21345,37 @@ void Plater::send_gcode_legacy(int plate_idx, Export3mfProgressFn proFn)
     if (!p->prepare_dispatch(dispatch, dispatch_spools))
         return;
 
+    // Single-nozzle jobs do not use the independent-tool mapping dialog, but
+    // must refresh the same snapshot before the destination dialog as well.
+    std::vector<SpoolManagerMetadata::Filament> selected_slots;
+    const auto *send_host_type = physical_printer_config->option<ConfigOptionEnum<PrintHostType>>("host_type");
+    if (send_host_type && send_host_type->value == htOctoPrint && !uses_independent_tool_dispatch()) {
+        auto *octoprint = dynamic_cast<OctoPrint *>(upload_job.printhost.get());
+        wxString error;
+        bool fetched = false;
+        {
+            wxBusyCursor wait;
+            fetched = octoprint && octoprint->get_selected_filament_spools(selected_slots, error, true);
+        }
+        if (!fetched) {
+            show_error(this, error + "\n" + _L("No usable loaded-tool data is available. Connect to OctoPrint and retry before printing."), false);
+            return;
+        }
+        if (!error.empty()) {
+            MessageDialog warning(this, error, _L("Last known loaded materials"),
+                                  wxOK | wxCANCEL | wxICON_WARNING);
+            if (warning.ShowModal() != wxID_OK)
+                return;
+        }
+        for (unsigned int tool : p->background_process.fff_print()->extruders(true)) {
+            if (tool >= selected_slots.size() || (selected_slots[tool].name.empty() &&
+                    selected_slots[tool].material.empty() && selected_slots[tool].spool_id.empty())) {
+                show_error(this, _L("A tool used by this job has no loaded spool assignment. Check the printer's loaded materials before printing."), false);
+                return;
+            }
+        }
+    }
+
     // Repetier specific: Query the server for the list of file groups.
     wxArrayString groups;
     {
@@ -21457,22 +21514,8 @@ void Plater::send_gcode_legacy(int plate_idx, Export3mfProgressFn proFn)
         if (host_type == htOctoPrint && sync_spools_opt != nullptr && sync_spools_opt->value &&
             embed_spool_names && (preset_bundle->get_printer_extruder_count() <= 1 ||
                                  physical_printer_config->opt_bool("single_extruder_multi_material"))) {
-            auto *octoprint = dynamic_cast<OctoPrint *>(upload_job.printhost.get());
-            if (octoprint == nullptr) {
-                show_error(this, _L("OctoPrint filament spool synchronization is not available for this print host."), false);
-                return;
-            }
-
-            std::vector<SpoolManagerMetadata::Filament> selected_slots;
-            wxString error;
-            {
-                wxBusyCursor wait;
-                if (!octoprint->get_selected_filament_spools(selected_slots, error)) {
-                    show_error(this, error, false);
-                    return;
-                }
-            }
-
+            // Reuse the snapshot confirmed before destination selection; do not
+            // perform a second query that could change the job's assignments.
             DynamicPrintConfig full_config = preset_bundle->full_config();
             const auto *filament_types = full_config.option<ConfigOptionStrings>("filament_type");
             if (filament_types == nullptr || filament_types->values.empty()) {

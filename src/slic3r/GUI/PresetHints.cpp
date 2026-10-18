@@ -82,6 +82,12 @@ std::string PresetHints::cooling_description(const Preset &preset)
                               std::round(std::max(minimum_speed, estimate->cover_speed) * 10.) / 10.);
             if (time_override > 0. || speed_override > 0.)
                 out += "\n" + _u8L("Manual arc cooling overrides are active.");
+            const auto material = arc_thermal_material(preset.config.opt_string("filament_type", 0),
+                preset.config.opt_int("nozzle_temperature", 0));
+            if (material && material->crystallization_heat > 0.)
+                out += "\n" + _u8L("Includes a conservative crystallization-heat allowance, not a prediction of crystallization rate or shrinkage. Measured XY/Z shrinkage compensation remains unchanged.");
+            if (material && material->matrix_proxy)
+                out += "\n" + _u8L("PPS-CF uses a PPS matrix thermal proxy with your profile density. Fiber content and orientation are unknown; calibrate the manual cooling overrides for your spool.");
         } else
             out = _u8L("Auto estimate unavailable for this material or cooling conditions. Using process settings and any manual overrides.");
     }

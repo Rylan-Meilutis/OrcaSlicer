@@ -288,7 +288,14 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
         std::clamp(params.config->arc_overhang_overlap.value, 0., 99.);
     const coord_t line_overlap = coord_t(std::lround(
         double(line_width) * overlap_percent / 100.));
-    const coord_t spacing = std::max<coord_t>(1, nominal_spacing - line_overlap);
+    // Polygonized circles lie inside their ideal radius. At exactly one bead
+    // width of pitch, the outer course can therefore lose contact with the
+    // chords of its predecessor. Reserve a small geometric allowance instead
+    // of weakening the physical support checks or spawning tiny replacements.
+    const coord_t tessellation_allowance = params.arc_root_anchor_regions != nullptr ?
+        std::min<coord_t>(coord_t(std::ceil(2. * scale_(std::max<double>(params.resolution, arc_fit_tolerance_mm)))),
+                         line_width / 20) : 0;
+    const coord_t spacing = std::max<coord_t>(1, nominal_spacing - std::max(line_overlap, tessellation_allowance));
     const Polylines *support_paths = params.arc_support_paths != nullptr ?
         params.arc_support_paths : params.arc_obstacle_paths;
     // Without explicit support geometry the legacy standalone filler assumes
@@ -1085,7 +1092,7 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
     // short endpoint contact needed to anchor one arc to another.
     const bool trim_interior_retraces = params.arc_root_anchor_regions != nullptr && !chained_primary;
     const auto trim_leading_sustained_retrace =
-        [line_width, spacing, narrow_region, trim_interior_retraces](Polyline &path,
+        [line_width, nominal_spacing, line_overlap, narrow_region, trim_interior_retraces](Polyline &path,
                               PrintedArcIndex &occupied_index) {
         if (path.points.size() < 2)
             return;
@@ -1099,12 +1106,15 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
         // Use the same fitting/rounding guard as terminal intersection
         // trimming. Microscopic gaps at the cutoff are not useful departures
         // from a bead and must not hide an otherwise sustained retrace.
+        // The tessellation allowance must not relax retrace rejection:
+        // it changes pitch, not deposited bead width.
+        const coord_t requested_spacing = std::max<coord_t>(1, nominal_spacing - line_overlap);
         const coord_t duplicate_clearance =
             std::max<coord_t>(
                 SCALED_EPSILON,
                 coord_t(std::lround(std::max(
                     0.20 * double(line_width),
-                    0.55 * double(spacing))))) +
+                    0.55 * double(requested_spacing))))) +
             (trim_interior_retraces ? scale_(2. * arc_fit_tolerance_mm + 0.002) : 0);
         const double sample_step =
             std::max<double>(SCALED_EPSILON, narrow_region ?
@@ -1665,6 +1675,10 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
     // unlike a concentric overhang front they need not have lateral contact
     // along their first span. Keep their existing bridge qualification.
     const bool require_body_support = params.arc_root_anchor_regions != nullptr && !chained_primary;
+    // Only the main translated arches may span between end anchors. A
+    // recursive restart must grow along deposited beads, even on a narrow
+    // bridge; endpoint contact alone leaves its small crown in free air.
+    const bool require_child_body_support = params.arc_root_anchor_regions != nullptr;
     const coord_t bonded_support_distance = line_width - line_overlap / 2;
     const auto point_has_bonded_support = [&](const Point &point) {
         return point_has_root_support(point) ||
@@ -1675,7 +1689,7 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
         return arc_lead_supported(path, false, supported_lead_length, support_sample_step, point_has_bonded_support) &&
                arc_lead_supported(path, true, supported_lead_length, support_sample_step, point_has_bonded_support);
     };
-    const ExPolygons body_foundation = !require_body_support ? ExPolygons{} :
+    const ExPolygons body_foundation = !require_child_body_support ? ExPolygons{} :
         offset_ex(*params.arc_root_anchor_regions, float(0.4 * line_width), ClipperLib::jtRound, scale_(0.001));
     const auto point_has_body_support = [&](const Point &point) {
         // The interior may bond to the deposited cap of another path. Only
@@ -2019,7 +2033,11 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
                 Polylines anchored_fragments = chained_primary ? Polylines{std::move(fragment)} :
                                                                  split_from_supported_point(std::move(fragment));
                 for (Polyline& anchored_fragment : anchored_fragments) {
-                    Polyline trimmed = trim_at_printed_path(anchored_fragment, validate_primary_anchors);
+                    // Native translated arches trim their terminal tips onto
+                    // bonded runways below. Checking the untrimmed endpoints
+                    // here rejects the course before that repair is possible.
+                    Polyline trimmed = trim_at_printed_path(anchored_fragment,
+                        validate_primary_anchors && !(chained_primary && params.arc_root_anchor_regions != nullptr));
                     if (trimmed.empty()) {
                         deferred.emplace_back(std::move(anchored_fragment));
                         continue;
@@ -2231,7 +2249,7 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
         size_t pass_start_count = 0;
         // Exhaust coherent concentric families before allowing shorter groups
         // to finish residual pockets. Failed trials must not become support.
-        size_t minimum_family_rings = require_body_support ? 12 : 1;
+        size_t minimum_family_rings = require_child_body_support ? 12 : 1;
         while (!parents.empty() && !remaining.empty() && child_path_count < max_child_paths) {
             if (parent_idx >= std::min(parents.size(), max_parents)) {
                 // A frontier rejected earlier may become printable once a
@@ -2319,18 +2337,18 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
                     // Start with the established 2 mm / bead-width / zero
                     // offsets. Full-body contact can require a different
                     // curvature at an edge; try additional radii only if all
-                    // three fail. Narrow bridge behavior is unchanged.
+                    // three fail, including recursive narrow-bridge pockets.
                     const std::array<double, 7> center_offsets = parents[parent_idx].foundation ?
                         std::array<double, 7>{0., double(line_width), scale_(2.), scale_(4.), scale_(8.), scale_(1.), 0.5 * line_width} :
                         std::array<double, 7>{scale_(2.), double(line_width), 0., scale_(4.), scale_(8.), scale_(1.), 0.5 * line_width};
-                    for (size_t offset_idx = 0; offset_idx < (require_body_support ? center_offsets.size() : 3); ++offset_idx) {
+                    for (size_t offset_idx = 0; offset_idx < (require_child_body_support ? center_offsets.size() : 3); ++offset_idx) {
                         const auto trial_start = printed_index.checkpoint();
                         size_t accepted_rings = 0;
                         const double center_offset = center_offsets[offset_idx];
                         child_center = child_anchor - Point(coord_t(std::lround(center_offset * remaining_direction.x())),
                                                            coord_t(std::lround(center_offset * remaining_direction.y())));
                         const double first_radius = center_offset + double(line_width) *
-                            (parents[parent_idx].foundation && require_body_support ? 0.35 : 1. / 1.5);
+                            (parents[parent_idx].foundation && require_child_body_support ? 0.35 : 1. / 1.5);
                         // The seed family's radius is not a limit on an
                         // already supported recursive front. Stopping every
                         // child at 15 mm creates artificial residual pockets
@@ -2338,7 +2356,7 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
                         // Native children retain full-body/lead contact and
                         // minimum-sagitta checks at every course; grow until
                         // those checks or the actual region stop the family.
-                        const double radius_limit = require_body_support ?
+                        const double radius_limit = require_child_body_support ?
                             bbox.size().cast<double>().norm() + center_offset + line_width :
                             (minimum_family_rings > 1 || parents[parent_idx].foundation ? scale_(max_family_radius_mm) :
                                 std::max(first_radius, std::min(scale_(max_family_radius_mm),
@@ -2363,7 +2381,7 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
                             Polylines candidate_group;
                             bool crossing_group = false;
                             for (size_t path_idx = 0; path_idx < child_arcs.size(); ++path_idx) {
-                                if (require_body_support) {
+                                if (require_child_body_support) {
                                     Polyline &arc = child_arcs[path_idx];
                                     // Extend only the ends of an existing new
                                     // arc, not the clipping region: expanding
@@ -2438,7 +2456,7 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
                                 }
                             }
                             if (candidate_group.empty()) {
-                                if (require_body_support && accepted_family.empty() && radius < first_radius + 2. * spacing)
+                                if (require_child_body_support && accepted_family.empty() && radius < first_radius + 2. * spacing)
                                     continue;
                                 break;
                             }
@@ -2502,9 +2520,9 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
                                     if (candidate_group[candidate_idx].length() <
                                             (require_body_support ? 2. * supported_lead_length : 0.75 * line_width) ||
                                         is_short_free_air_path(candidate_group[candidate_idx]) ||
-                                        (require_body_support ? !has_bonded_ends(candidate_group[candidate_idx]) :
+                                        (require_child_body_support ? !has_bonded_ends(candidate_group[candidate_idx]) :
                                                                 !has_supported_ends(candidate_group[candidate_idx])) ||
-                                        (require_body_support &&
+                                        (require_child_body_support &&
                                          !has_supported_body(candidate_group[candidate_idx])))
                                         continue;
                                     printed_index.add(candidate_group[candidate_idx]);
@@ -2517,7 +2535,7 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
                                     break;
                             }
                             if (accepted_group.empty()) {
-                                if (require_body_support && accepted_family.empty() && radius < first_radius + 2. * spacing)
+                                if (require_child_body_support && accepted_family.empty() && radius < first_radius + 2. * spacing)
                                     continue;
                                 break;
                             }
@@ -2594,7 +2612,7 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
         }
     }
     const auto emit_arcs = [&] {
-        if ((!frontier_growth || trim_interior_retraces) && (params.arc_root_anchor_regions != nullptr ||
+        if ((!frontier_growth || trim_interior_retraces || require_child_body_support) && (params.arc_root_anchor_regions != nullptr ||
             params.arc_anchor_regions != nullptr || params.arc_prior_paths != nullptr ||
             params.arc_obstacle_paths != nullptr)) {
             // Final trimming can remove a child's previously valid anchor.
@@ -2634,6 +2652,17 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
                 const size_t before = remaining;
                 for (Polyline &source : arcs) {
                     if (source.empty()) continue;
+                    // Preserve the main bridge arches, whose support was
+                    // checked during generation. Revalidate recursive paths
+                    // against the actual emitted prefix after trimming.
+                    if (chained_primary && size_t(&source - arcs.data()) < primary_arc_count) {
+                        committed.add(source);
+                        accepted_index.add(source);
+                        ordered.emplace_back(std::move(source));
+                        source.clear();
+                        --remaining;
+                        continue;
+                    }
                     report(FillProgressStage::ValidateArcs, ordered.size(), arcs.size());
                     Polyline candidate = source;
                     trim_sustained_retrace(candidate, accepted_index);
@@ -2642,7 +2671,7 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
                          !arc_lead_supported(candidate, false, candidate.length(), support_sample_step, supported)) ||
                         !arc_lead_supported(candidate, false, supported_lead_length, support_sample_step, supported) ||
                         !arc_lead_supported(candidate, true, supported_lead_length, support_sample_step, supported) ||
-                        (require_body_support && !arc_lead_supported(candidate, false, candidate.length(),
+                        (require_child_body_support && !arc_lead_supported(candidate, false, candidate.length(),
                                                                     support_sample_step, body_supported)))
                         continue;
                     const Point *previous = !ordered.empty() ? &ordered.back().last_point() :

@@ -117,6 +117,8 @@ std::map<std::string, std::vector<SimpleSettingData>> SettingsFactory::PART_CATE
        {"nonplanar_top_surface_max_angle", "", 6},
        {"nonplanar_top_surface_layers", "", 7},
        {"nonplanar_top_surface_resolution", "", 8},
+       {"nonplanar_selection_min_z", "", 10},
+       {"nonplanar_selection_max_z", "", 11},
        {"nonplanar_top_surface_min_height", "", 9}}},
      {L("Strength"),
       {{"wall_loops", "", 1},

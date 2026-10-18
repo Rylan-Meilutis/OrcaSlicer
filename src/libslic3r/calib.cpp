@@ -7,6 +7,20 @@
 
 namespace Slic3r {
 
+void disable_arc_overhangs_for_calibration(Model &model)
+{
+    for (ModelObject *object : model.objects) {
+        object->config.set_key_value("arc_overhang_enabled", new ConfigOptionBool(false));
+        // Explicit child overrides would otherwise win over the object setting.
+        for (ModelVolume *volume : object->volumes)
+            if (volume->config.has("arc_overhang_enabled"))
+                volume->config.set_key_value("arc_overhang_enabled", new ConfigOptionBool(false));
+        for (auto &range : object->layer_config_ranges)
+            if (range.second.has("arc_overhang_enabled"))
+                range.second.set_key_value("arc_overhang_enabled", new ConfigOptionBool(false));
+    }
+}
+
 // Calculate the optimal Pressure Advance speed
 float CalibPressureAdvance::find_optimal_PA_speed(const DynamicPrintConfig &config, double line_width, double layer_height, int extruder_id, int filament_idx)
 {

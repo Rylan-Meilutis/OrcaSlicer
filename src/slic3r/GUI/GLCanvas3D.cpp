@@ -1128,7 +1128,9 @@ GLCanvas3D::ArrangeSettings& GLCanvas3D::get_arrange_settings()
         ptr = &m_arrange_settings_sla;
     }
     else if (ptech == ptFFF) {
-        if (wxGetApp().global_print_sequence() == PrintSequence::ByObject)
+        const PartPlate *plate = wxGetApp().plater()->get_partplate_list().get_curr_plate();
+        const PrintSequence sequence = plate ? plate->get_real_print_seq() : wxGetApp().global_print_sequence();
+        if (sequence == PrintSequence::ByObject)
             ptr = &m_arrange_settings_fff_seq_print;
         else
             ptr = &m_arrange_settings_fff;
@@ -1235,7 +1237,10 @@ GLCanvas3D::~GLCanvas3D()
     }
     m_plate_shadow_mask_key.clear();
 
-    reset_volumes();
+    // wxWidgets destroys child canvases after Plater's private state (including
+    // its notification manager). Do not use reset_volumes() here: it updates
+    // warning notifications. The GL context was made current above.
+    m_volumes.clear();
 
     m_sel_plate_toolbar.del_all_item();
     m_sel_plate_toolbar.del_stats_item();
@@ -6065,7 +6070,7 @@ void GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
     if (ptech == ptSLA) {
         postfix      = "_sla";
     } else if (ptech == ptFFF) {
-        seq_print    = wxGetApp().global_print_sequence() == PrintSequence::ByObject;
+        seq_print    = settings_out.is_seq_print;
         postfix      = seq_print ? "_fff_seq_print" : "_fff";
     }
 

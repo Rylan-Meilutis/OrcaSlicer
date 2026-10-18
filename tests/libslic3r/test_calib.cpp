@@ -5,11 +5,54 @@
 #include <string>
 
 #include "libslic3r/calib.hpp"
+#include "libslic3r/TemperatureTowerPresets.hpp"
 #include "libslic3r/Model.hpp"
 #include "libslic3r/TriangleMesh.hpp"
 #include "libslic3r/PrintConfig.hpp"
 
 using namespace Slic3r;
+
+TEST_CASE("Temperature tower presets have unique materials and valid descending steps", "[Calib]")
+{
+    for (size_t i = 0; i < temperature_tower_presets.size(); ++i) {
+        const auto &preset = temperature_tower_presets[i];
+        INFO(preset.material);
+        CHECK(preset.start <= 500);
+        CHECK(preset.end >= 155);
+        CHECK(preset.start > preset.end);
+        CHECK(preset.start % 5 == 0);
+        CHECK(preset.end % 5 == 0);
+        for (size_t j = 0; j < i; ++j)
+            CHECK(std::string(preset.material) != temperature_tower_presets[j].material);
+    }
+    CHECK(std::string(temperature_tower_presets[5].material) == "PA-CF");
+    CHECK(temperature_tower_presets[5].start == 320);
+    CHECK(std::string(temperature_tower_presets[6].material) == "PET-CF");
+    CHECK(temperature_tower_presets[6].start == 320);
+}
+
+TEST_CASE("Calibration disables inherited and local arc overhangs without changing the preset", "[Calib][Regression]")
+{
+    DynamicPrintConfig preset;
+    preset.set_key_value("arc_overhang_enabled", new ConfigOptionBool(true));
+    Model model;
+    for (int i = 0; i < 2; ++i) {
+        ModelObject *object = model.add_object("cube", "", make_cube(20, 20, 20));
+        object->config.set_key_value("wall_loops", new ConfigOptionInt(3));
+        object->volumes.front()->config.set_key_value("arc_overhang_enabled", new ConfigOptionBool(true));
+        object->layer_config_ranges[{1., 2.}].set_key_value("arc_overhang_enabled", new ConfigOptionBool(true));
+    }
+    disable_arc_overhangs_for_calibration(model);
+    for (const ModelObject *object : model.objects) {
+        DynamicPrintConfig resolved = preset;
+        resolved.apply(object->config.get());
+        CHECK_FALSE(resolved.opt_bool("arc_overhang_enabled"));
+        CHECK_FALSE(object->volumes.front()->config.get().opt_bool("arc_overhang_enabled"));
+        CHECK_FALSE(object->layer_config_ranges.begin()->second.get().opt_bool("arc_overhang_enabled"));
+        CHECK(object->config.opt_int("wall_loops") == 3);
+    }
+    CHECK(preset.opt_bool("arc_overhang_enabled"));
+}
 
 namespace {
 

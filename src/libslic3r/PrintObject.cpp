@@ -1040,7 +1040,11 @@ void PrintObject::contour_z()
                                              nozzle_diameter * nozzle_diameter);
         selected_nonplanar_facets[region.print_region_id()] = select_nonplanar_surface_facets(
             imesh, config.nonplanar_top_surface_max_angle.value,
-            config.nonplanar_top_surface_min_height.value, minimum_area);
+            config.nonplanar_top_surface_min_height.value, minimum_area,
+            imesh.ground_level() - imesh.ground_level_offset() + config.nonplanar_selection_min_z.value,
+            config.nonplanar_selection_max_z.value > 0. ?
+                imesh.ground_level() - imesh.ground_level_offset() + config.nonplanar_selection_max_z.value :
+                std::numeric_limits<double>::infinity());
     }
     if (has_nonplanar_surfaces)
         m_print->set_status(41, L("Generating non-planar surface paths"));
@@ -1980,6 +1984,8 @@ bool PrintObject::invalidate_state_by_config_options(
             steps.emplace_back(posPerimeters);
             steps.emplace_back(posContouring);
         } else if (opt_key == "nonplanar_top_surface"
+                   || opt_key == "nonplanar_selection_min_z"
+                   || opt_key == "nonplanar_selection_max_z"
                    || opt_key == "nonplanar_top_surface_max_angle"
                    || opt_key == "nonplanar_top_surface_layers"
                    || opt_key == "nonplanar_top_surface_resolution"

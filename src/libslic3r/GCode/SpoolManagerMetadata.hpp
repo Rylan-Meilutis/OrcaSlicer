@@ -52,9 +52,10 @@ inline void from_json(const nlohmann::json &json, Filament &filament)
 // OctoPrint Spoolman plugin, or a provider implementing the generic
 // { data: { tools, spools } } compatibility response. Empty slots are
 // preserved so each vector index continues to match the OctoPrint tool index.
+// allow_empty distinguishes a valid unloaded snapshot from a failed refresh.
 bool parse_selected_spools(const std::string &response, std::vector<Filament> &slots,
                            std::string &error,
-                           const std::string &fallback_provider = {});
+                           const std::string &fallback_provider = {}, bool allow_empty = false);
 
 // Parses the complete roll inventory when the provider reports it. Unlike
 // parse_selected_spools(), this is independent of tool assignments and is used

@@ -8,6 +8,7 @@
 #include "libslic3r.h"
 #include "I18N.hpp"
 #include "GCode.hpp"
+#include "NonplanarSurface.hpp"
 #include "Exception.hpp"
 #include "LifecycleEvents.hpp"
 #include "ExtrusionEntity.hpp"
@@ -3050,13 +3051,18 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
     m_dissimilar_support_interface_start.clear();
     m_support_contact_filaments.clear();
     m_dissimilar_support_footprints.clear();
-    // Clearance validation needs ordered occupancy only on a variable-Z layer
+    m_nonplanar_transition_planning = false;
+    // Ordinary contouring needs ordered occupancy only on a variable-Z layer
     // and on the physical layer immediately below it. Building grids for every
     // extrusion on every other layer dominates export time on tall models.
     std::set<coord_t> all_layer_z;
     std::set<coord_t> variable_layer_z;
     for (const PrintObject *object : print.objects()) {
         for (const Layer *layer : object->layers()) {
+            for (const LayerRegion *region : layer->regions())
+                m_nonplanar_transition_planning |=
+                    has_nonplanar_surface_path(region->fills) ||
+                    has_nonplanar_surface_path(region->perimeters);
             const coord_t z = scale_(layer->print_z);
             all_layer_z.insert(z);
             if (std::any_of(layer->regions().begin(), layer->regions().end(),
@@ -3079,7 +3085,7 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
         if (layer != all_layer_z.begin())
             m_toolhead_clearance_record_layers.insert(*std::prev(layer));
     }
-    m_toolhead_clearance_enabled = !variable_layer_z.empty();
+    m_toolhead_clearance_enabled = !variable_layer_z.empty() || m_nonplanar_transition_planning;
     m_toolhead_clearance_geometry = m_toolhead_clearance_enabled ?
         load_sequential_gantry_geometry(print.config()) : SequentialGantryGeometry{};
     if (m_toolhead_clearance_enabled &&
@@ -5798,16 +5804,33 @@ LayerResult GCode::process_layer(
     // BBS: don't use lazy_raise when enable spiral vase
     gcode += this->change_layer(print_z);  // this will increase m_layer_index
     if (m_toolhead_clearance_enabled) {
-        m_toolhead_clearance_previous_obstacles = std::move(m_toolhead_clearance_obstacles);
+        // A curved course may rise above several later nominal layers. Keep
+        // its occupied volume until export ends, rather than forgetting it
+        // after one layer and allowing a later transition through it.
+        const size_t offset = m_toolhead_clearance_previous_obstacles.size();
+        if (m_nonplanar_transition_planning) {
+            for (auto &entry : m_toolhead_clearance_grid) {
+                auto &indices = m_toolhead_clearance_previous_grid[entry.first];
+                for (size_t index : entry.second)
+                    indices.push_back(offset + index);
+            }
+            for (auto &obstacle : m_toolhead_clearance_obstacles)
+                m_toolhead_clearance_previous_obstacles.emplace_back(std::move(obstacle));
+            m_toolhead_clearance_previous_top_z = std::max(
+                m_toolhead_clearance_previous_top_z, m_toolhead_clearance_top_z);
+        } else {
+            m_toolhead_clearance_previous_obstacles = std::move(m_toolhead_clearance_obstacles);
+            m_toolhead_clearance_previous_grid = std::move(m_toolhead_clearance_grid);
+            m_toolhead_clearance_previous_top_z = m_toolhead_clearance_top_z;
+        }
         m_toolhead_clearance_obstacles.clear();
-        m_toolhead_clearance_previous_grid = std::move(m_toolhead_clearance_grid);
         m_toolhead_clearance_grid.clear();
-        m_toolhead_clearance_previous_top_z = m_toolhead_clearance_top_z;
         m_toolhead_clearance_top_z = -std::numeric_limits<double>::max();
     }
-    m_toolhead_clearance_record_this_layer =
+    m_toolhead_clearance_record_this_layer = m_nonplanar_transition_planning ||
         m_toolhead_clearance_record_layers.count(scale_(print_z)) > 0;
-    m_nonplanar_clearance_active_this_layer = false;
+    if (!m_nonplanar_transition_planning)
+        m_nonplanar_clearance_active_this_layer = false;
     update_layer_related_config(m_layer_index);
     update_placeholder_parser_with_variant_params();
     m_layer = &layer;
@@ -7664,9 +7687,15 @@ std::string GCode::change_layer(coordf_t print_z)
     //BBS
     coordf_t z = print_z + m_config.z_offset.value;  // in unscaled coordinates
     if (FILAMENT_CONFIG(retract_when_changing_layer) && m_writer.will_move_z(z)) {
-        LiftType lift_type = this->to_lift_type(ZHopType(FILAMENT_CONFIG(z_hop_types)));
-        //BBS: force to use SpiralLift when change layer if lift type is auto
-        gcode += this->retract(false, false, ZHopType(FILAMENT_CONFIG(z_hop_types)) == ZHopType::zhtAuto ? LiftType::SpiralLift : lift_type);
+        if (m_nonplanar_transition_planning) {
+            // Leave XYZ untouched until the next path's checked transition.
+            m_wipe.reset_path();
+            gcode += m_writer.retract();
+        } else {
+            LiftType lift_type = this->to_lift_type(ZHopType(FILAMENT_CONFIG(z_hop_types)));
+            //BBS: force to use SpiralLift when change layer if lift type is auto
+            gcode += this->retract(false, false, ZHopType(FILAMENT_CONFIG(z_hop_types)) == ZHopType::zhtAuto ? LiftType::SpiralLift : lift_type);
+        }
     }
 
     m_writer.add_object_change_labels(gcode);
@@ -7681,7 +7710,10 @@ std::string GCode::change_layer(coordf_t print_z)
     m_need_change_layer_lift_z = true;
 
     m_nominal_z = z;
-    m_writer.get_position().z() = z;
+    // A nominal layer change is not a physical move. The non-planar travel
+    // planner must start at the last emitted XYZ, not an invented layer Z.
+    if (!m_nonplanar_transition_planning)
+        m_writer.get_position().z() = z;
 
     // forget last wiping path as wiping after raising Z is pointless
     // BBS. Dont forget wiping path to reduce stringing.
@@ -9408,6 +9440,11 @@ std::string GCode::_extrude(const ExtrusionPath &input_path, std::string descrip
         }
         return points;
     };
+    if (input_path.nonplanar_surface || input_path.nonplanar_schedule_owned) {
+        for (const Vec3d &point : machine_points(input_path, !input_path.z_contoured))
+            if (!point.allFinite() || point.z() < 0. || point.z() > m_config.printable_height.value)
+                throw SlicingError(_(L("Non-planar toolpath exceeds the printer's vertical build limits. Reduce the selected region or its height.")));
+    }
     auto toolpath_collision = [this, &machine_points](const ExtrusionPath &candidate,
                                                        bool planar) {
         const std::vector<Vec3d> points = machine_points(candidate, planar);
@@ -9652,9 +9689,14 @@ std::string GCode::_extrude(const ExtrusionPath &input_path, std::string descrip
     // path is 2D. But in slope lift case, lift z is done in travel_to function.
     // Add m_need_change_layer_lift_z when change_layer in case of no lift if m_last_pos is equal to path.first_point() by chance
     Point first_point = path.first_point();
+    const bool nonplanar_z_travel = m_last_pos_defined &&
+        (input_path.nonplanar_surface || m_nonplanar_clearance_active_this_layer) &&
+        std::abs(m_writer.get_position().z() - (m_nominal_z +
+            (path.z_contoured ? unscale_(path.polyline.points.front().z()) : 0.))) > 1e-6;
     if (!m_last_pos_defined || m_last_pos.to_point() != first_point || m_need_change_layer_lift_z ||
-        slope_need_z_travel) {
+        slope_need_z_travel || nonplanar_z_travel) {
         const bool _last_pos_undefined = !m_last_pos_defined;
+        bool validated_transition = false;
 
         double z = DBL_MAX;
         if (sloped != nullptr) {
@@ -9685,45 +9727,65 @@ std::string GCode::_extrude(const ExtrusionPath &input_path, std::string descrip
                     nonplanar_join_tolerance &&
                 std::abs(current_position.z() - target_z) <=
                     nonplanar_join_tolerance;
-            const std::vector<Vec3d> direct_travel{
-                current_position, Vec3d(target_xy.x(), target_xy.y(), target_z)};
-            ToolheadCollision travel_collision;
             if (!nearby_nonplanar_continuation) {
-                const auto previous_candidates = toolhead_clearance_candidates(
-                    direct_travel, m_toolhead_clearance_previous_obstacles,
-                    m_toolhead_clearance_previous_grid,
-                    m_toolhead_clearance_previous_top_z);
-                travel_collision = check_toolpath_clearance(
-                    direct_travel, m_toolhead_clearance_geometry,
-                    previous_candidates, m_toolhead_clearance_fallback);
-                if (!travel_collision) {
-                    const auto current_candidates = toolhead_clearance_candidates(
-                        direct_travel, m_toolhead_clearance_obstacles,
-                        m_toolhead_clearance_grid, m_toolhead_clearance_top_z);
-                    travel_collision = check_toolpath_clearance(
+                const auto is_clear = [&](const Vec3d &a, const Vec3d &b) {
+                    const std::vector<Vec3d> direct_travel{a, b};
+                    const auto previous_candidates = toolhead_clearance_candidates(
+                        direct_travel, m_toolhead_clearance_previous_obstacles,
+                        m_toolhead_clearance_previous_grid,
+                        m_toolhead_clearance_previous_top_z);
+                    ToolheadCollision travel_collision = check_toolpath_clearance(
                         direct_travel, m_toolhead_clearance_geometry,
-                        current_candidates, m_toolhead_clearance_fallback);
+                        previous_candidates, m_toolhead_clearance_fallback);
+                    if (!travel_collision) {
+                        const auto current_candidates = toolhead_clearance_candidates(
+                            direct_travel, m_toolhead_clearance_obstacles,
+                            m_toolhead_clearance_grid, m_toolhead_clearance_top_z);
+                        travel_collision = check_toolpath_clearance(
+                            direct_travel, m_toolhead_clearance_geometry,
+                            current_candidates, m_toolhead_clearance_fallback);
+                    }
+                    return !travel_collision;
+                };
+                const auto route = plan_nonplanar_transition(current_position,
+                    Vec3d(target_xy.x(), target_xy.y(), target_z),
+                    std::max(m_toolhead_clearance_previous_top_z, m_toolhead_clearance_top_z),
+                    m_config.printable_height.value, 0.05, is_clear);
+                if (route.empty()) {
+                    BOOST_LOG_TRIVIAL(warning) << "Non-planar transition rejected: from "
+                        << current_position.transpose() << " to " << target_xy.transpose()
+                        << " Z" << target_z << ", printed top "
+                        << std::max(m_toolhead_clearance_previous_top_z, m_toolhead_clearance_top_z);
+                    throw SlicingError(_(L("No safe non-planar transition fits within the printer height. The departure, traverse or approach is obstructed. Reduce the selected region or use planar slicing.")));
                 }
-            }
-            if (travel_collision) {
-                // The maxima are maintained as paths are recorded and when a
-                // physical layer rolls over. Re-scanning every emitted path
-                // here makes non-planar G-code export quadratic on detailed
-                // models while producing exactly the same clearance height.
-                const double clearance_z = std::max({m_writer.get_position().z(), target_z,
-                    m_toolhead_clearance_previous_top_z + 0.001,
-                    m_toolhead_clearance_top_z + 0.001});
-                gcode += m_writer.travel_to_z(
-                    clearance_z, "raise for non-planar toolhead clearance", true);
-                z = clearance_z;
+
+                // Emit exactly the checked route. Ordinary travel planning may
+                // add a wipe, spiral hop or XY detour which was not validated.
+                m_wipe.reset_path();
+                gcode += m_writer.retract();
+                gcode += m_writer.reset_e();
+                // Cancel existing lift bookkeeping without lowering the head.
+                gcode += m_writer.travel_to_z(current_position.z(), "non-planar transition", true);
+                gcode += m_writer.unlift();
+                m_writer.add_object_change_labels(gcode);
+                for (size_t i = 1; i < route.size(); ++i) {
+                    if (route[i].z() != route[i - 1].z())
+                        gcode += m_writer.travel_to_z(route[i].z(), "non-planar approach/departure", true);
+                    else
+                        gcode += m_writer.travel_to_xy(route[i].head<2>(), "non-planar traverse");
+                }
+                this->set_last_pos(first_point);
+                m_avoid_crossing_perimeters.reset_once_modifiers();
+                validated_transition = true;
             }
         }
 
-        gcode += this->travel_to(first_point, path.role(),
+        if (!validated_transition)
+            gcode += this->travel_to(first_point, path.role(),
                                  "move to first " + description + " point", z);
 
         // Orca: ensure Z matches planned layer height
-        if (!slope_need_z_travel && (_last_pos_undefined || m_need_change_layer_lift_z)) {
+        if (!validated_transition && !slope_need_z_travel && (_last_pos_undefined || m_need_change_layer_lift_z)) {
             const std::string z_sync_comment = _last_pos_undefined ?
                 "ensure Z matches planned layer height" : ""; // no comment for normal layer-Z lift
             gcode += this->writer().travel_to_z(m_nominal_z, z_sync_comment, true);

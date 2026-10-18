@@ -811,9 +811,9 @@ private:
 
     std::vector<const PrintObject*> m_printed_objects;
 
-    // Ordered occupancy for collision-checking variable-Z paths. It is reset
-    // at each physical layer and populated as extrusion is actually emitted,
-    // so same-layer walls, supports, and earlier contoured paths are included.
+    // Ordered occupancy for collision-checking variable-Z paths. Ordinary
+    // contouring keeps the preceding layer; non-planar jobs retain history
+    // because an earlier course can rise above subsequent nominal layers.
     SequentialGantryGeometry               m_toolhead_clearance_geometry;
     ToolheadClearanceFallback              m_toolhead_clearance_fallback;
     std::vector<PrintedToolpathObstacle>    m_toolhead_clearance_previous_obstacles;
@@ -827,6 +827,7 @@ private:
     std::vector<uint32_t>                   m_toolhead_clearance_candidate_marks;
     uint32_t                                m_toolhead_clearance_candidate_generation{0};
     bool                                    m_toolhead_clearance_enabled{false};
+    bool                                    m_nonplanar_transition_planning{false};
     bool                                    m_toolhead_clearance_record_this_layer{false};
     bool                                    m_nonplanar_clearance_active_this_layer{false};
 

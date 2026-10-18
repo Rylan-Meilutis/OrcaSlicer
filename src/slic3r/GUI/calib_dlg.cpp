@@ -12,6 +12,7 @@
 #include "libslic3r/PrintConfig.hpp"
 #include "libslic3r/Flow.hpp"
 #include "libslic3r/Utils.hpp"
+#include "libslic3r/TemperatureTowerPresets.hpp"
 
 namespace Slic3r { namespace GUI {
 
@@ -348,19 +349,6 @@ void PA_Calibration_Dlg::on_show(wxShowEvent& event) {
 
 // Temp calib dlg
 //
-enum FILAMENT_TYPE : int
-{
-    tPLA = 0,
-    tABS_ASA,
-    tPETG,
-    tPCTG,
-    tTPU,
-    tTPU_AMS,
-    tPA_CF,
-    tPET_CF,
-    tCustom
-};
-
 Temp_Calibration_Dlg::Temp_Calibration_Dlg(wxWindow* parent, wxWindowID id, Plater* plater)
     : DPIDialog(parent, id, _L("Temperature calibration"), wxDefaultPosition, wxDefaultSize, wxDEFAULT_DIALOG_STYLE), m_plater(plater)
 {
@@ -375,7 +363,11 @@ Temp_Calibration_Dlg::Temp_Calibration_Dlg(wxWindow* parent, wxWindowID id, Plat
     auto labeled_box_method = new LabeledStaticBox(this, _L("Filament type"));
     auto method_box = new wxStaticBoxSizer(labeled_box_method, wxHORIZONTAL);
 
-	m_rbFilamentType = new RadioGroup(this, { _L("PLA"), _L("ABS/ASA"), _L("PETG"), _L("PCTG"), _L("TPU"), _L("PA-CF"), _L("PET-CF"), _L("Custom") }, wxVERTICAL, 2);
+    std::vector<wxString> material_labels;
+    for (const auto &preset : temperature_tower_presets)
+        material_labels.emplace_back(wxString::FromUTF8(preset.material));
+    material_labels.emplace_back(_L("Custom"));
+    m_rbFilamentType = new RadioGroup(this, material_labels, wxVERTICAL, 3);
     method_box->Add(m_rbFilamentType, 0, wxALL | wxEXPAND, FromDIP(4));
     v_sizer->Add(method_box, 0, wxTOP | wxRIGHT | wxLEFT | wxEXPAND, FromDIP(10));
 
@@ -427,6 +419,10 @@ Temp_Calibration_Dlg::Temp_Calibration_Dlg(wxWindow* parent, wxWindowID id, Plat
     settings_sizer->AddSpacer(FromDIP(5));
 
     v_sizer->Add(settings_sizer, 0, wxTOP | wxRIGHT | wxLEFT | wxEXPAND, FromDIP(10));
+    auto range_note = new wxStaticText(this, wxID_ANY,
+        _L("Suggested ranges are editable. Check your filament manufacturer's recommendations and printer temperature limits before printing."));
+    range_note->Wrap(FromDIP(380));
+    v_sizer->Add(range_note, 0, wxALL | wxEXPAND, FromDIP(10));
     v_sizer->AddSpacer(FromDIP(5));
 
     auto dlg_btns = new DialogButtons(this, {"OK"});
@@ -466,12 +462,12 @@ Temp_Calibration_Dlg::Temp_Calibration_Dlg(wxWindow* parent, wxWindowID id, Plat
         ti->GetTextCtrl()->SetValue(std::to_string(t));
     };
 
-    m_tiStart->GetTextCtrl()->Bind(wxEVT_KILL_FOCUS, [&](wxFocusEvent &e) {
+    m_tiStart->GetTextCtrl()->Bind(wxEVT_KILL_FOCUS, [this, validate_text](wxFocusEvent &e) {
         validate_text(this->m_tiStart);
         e.Skip();
         });
 
-    m_tiEnd->GetTextCtrl()->Bind(wxEVT_KILL_FOCUS, [&](wxFocusEvent &e) {
+    m_tiEnd->GetTextCtrl()->Bind(wxEVT_KILL_FOCUS, [this, validate_text](wxFocusEvent &e) {
         validate_text(this->m_tiEnd);
         e.Skip();
         });
@@ -505,44 +501,13 @@ void Temp_Calibration_Dlg::on_start(wxCommandEvent& event) {
 }
 
 void Temp_Calibration_Dlg::on_filament_type_changed(wxCommandEvent& event) {
-    int selection = event.GetSelection();
-    unsigned long start = 0, end = 0;
-    switch(selection)
-    {
-        case tABS_ASA:
-            start = 270;
-            end = 230;
-            break;
-        case tPETG:
-            start = 250;
-            end = 230;
-            break;
-        case tPCTG:
-            start = 280;
-            end = 240;
-            break;
-        case tTPU:
-        case tTPU_AMS:
-            start = 240;
-            end = 210;
-            break;
-        case tPA_CF:
-            start = 320;
-            end = 280;
-            break;
-        case tPET_CF:
-            start = 320;
-            end = 280;
-            break;
-        case tPLA:
-        case tCustom:
-            start = 230;
-            end = 190;
-            break;
+    const int selection = event.GetSelection();
+    // Custom preserves the user's current range rather than resetting it to PLA.
+    if (selection >= 0 && size_t(selection) < temperature_tower_presets.size()) {
+        const auto &preset = temperature_tower_presets[size_t(selection)];
+        m_tiEnd->GetTextCtrl()->SetValue(std::to_string(preset.end));
+        m_tiStart->GetTextCtrl()->SetValue(std::to_string(preset.start));
     }
-
-    m_tiEnd->GetTextCtrl()->SetValue(std::to_string(end));
-    m_tiStart->GetTextCtrl()->SetValue(std::to_string(start));
     event.Skip();
 }
 

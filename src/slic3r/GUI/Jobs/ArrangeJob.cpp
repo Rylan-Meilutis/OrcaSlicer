@@ -193,9 +193,10 @@ void ArrangeJob::prepare_all() {
     PartPlateList& plate_list = m_plater->get_partplate_list();    
     for (size_t i = 0; i < plate_list.get_plate_count(); i++) {
         PartPlate* plate = plate_list.get_plate(i);
-        bool same_as_global_print_seq = true;
-        plate->get_real_print_seq(&same_as_global_print_seq);
-        if (plate->is_locked() == false && !same_as_global_print_seq) {
+        // Arrange plates compatible with the active plate, including a
+        // project/plate override of the process preset's print sequence.
+        const bool sequential = plate->get_real_print_seq() == PrintSequence::ByObject;
+        if (!plate->is_locked() && sequential != params.is_seq_print) {
             plate->lock(true);
             m_uncompatible_plates.push_back(i);
         }
@@ -788,17 +789,6 @@ arrangement::ArrangeParams init_arrange_params(Plater *p)
     params.is_seq_print                        = settings.is_seq_print;
     params.min_obj_distance                    = scaled(settings.distance);
     params.align_to_y_axis                     = settings.align_to_y_axis;
-
-    int state = p->get_prepare_state();
-    if (state == Job::JobPrepareState::PREPARE_STATE_MENU) {
-        PartPlateList &plate_list = p->get_partplate_list();
-        PartPlate *    plate      = plate_list.get_curr_plate();
-        bool plate_same_as_global = true;
-        params.is_seq_print       = plate->get_real_print_seq(&plate_same_as_global) == PrintSequence::ByObject;
-        // if plate's print sequence is not the same as global, the settings.distance is no longer valid, we set it to auto
-        if (!plate_same_as_global)
-            params.min_obj_distance = 0;
-    }
 
     if (params.is_seq_print) {
         // The background Print can still contain the previous preset when

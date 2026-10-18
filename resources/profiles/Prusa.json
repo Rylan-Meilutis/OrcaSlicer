@@ -1,6 +1,6 @@
 {
 	"name": "Prusa",
-	"version": "02.04.00.08",
+	"version": "02.04.00.09",
 	"force_update": "0",
 	"description": "Prusa configurations",
 	"machine_model_list": [
@@ -11,6 +11,10 @@
 		{
 			"name": "Prusa CORE One HF",
 			"sub_path": "machine/Prusa CORE One HF.json"
+		},
+		{
+			"name": "Prusa CORE One INDX RME",
+			"sub_path": "machine/Prusa CORE One INDX RME.json"
 		},
 		{
 			"name": "Prusa CORE One L",
@@ -3125,6 +3129,10 @@
 		{
 			"name": "Prusa CORE One HF 0.8 nozzle",
 			"sub_path": "machine/Prusa CORE One HF 0.8 nozzle.json"
+		},
+		{
+			"name": "Prusa CORE One INDX RME 0.4 nozzle",
+			"sub_path": "machine/Prusa CORE One INDX RME 0.4 nozzle.json"
 		},
 		{
 			"name": "Prusa CORE One L 0.4 nozzle",

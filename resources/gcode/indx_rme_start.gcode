@@ -30,7 +30,7 @@ M115 U6.6.0+15528
 
 M591 S0 ; disable stuck detection
 
-M555 X{(min(print_bed_max[0], first_layer_print_min[0] + 32) - 32)} Y{(max(0, first_layer_print_min[1]) - 4)} W{((min(print_bed_max[0], max(first_layer_print_min[0] + 32, first_layer_print_max[0])))) - ((min(print_bed_max[0], first_layer_print_min[0] + 32) - 32))} H{((first_layer_print_max[1])) - ((max(0, first_layer_print_min[1]) - 4))}
+M555 X{adaptive_bed_mesh_min[0]} Y{adaptive_bed_mesh_min[1]} W{adaptive_bed_mesh_max[0] - adaptive_bed_mesh_min[0]} H{adaptive_bed_mesh_max[1] - adaptive_bed_mesh_min[1]}
 
 ; inform about nozzle diameter
 {if (is_extruder_used[0])}M862.1 T0 P{nozzle_diameter[0]}{endif}
@@ -123,6 +123,8 @@ M104 S{if is_nil(idle_temperature[initial_tool])}100{else}{idle_temperature[init
 M190 R[first_layer_bed_temperature] ; wait for bed temp
 M107
 
+; Restore bounded mesh area after startup calibration.
+M555 X{adaptive_bed_mesh_min[0]} Y{adaptive_bed_mesh_min[1]} W{adaptive_bed_mesh_max[0] - adaptive_bed_mesh_min[0]} H{adaptive_bed_mesh_max[1] - adaptive_bed_mesh_min[1]}
 G29 G ; absorb heat
 
 M109 S{probe_temp} ; wait for temp
@@ -131,8 +133,9 @@ M109 S{probe_temp} ; wait for temp
 ; MBL
 ;
 M84 E ; turn off E motor
-G29 P1 ; invalidate mbl & probe print area
-;G29 P1 X150 Y0 W100 H20 C ; probe near purge place
+; Keep ordinary G29 P1 so RME Compatibility can supply file-derived bounds.
+M555 X{adaptive_bed_mesh_min[0]} Y{adaptive_bed_mesh_min[1]} W{adaptive_bed_mesh_max[0] - adaptive_bed_mesh_min[0]} H{adaptive_bed_mesh_max[1] - adaptive_bed_mesh_min[1]}
+G29 P1 ; probe bounded print area with native grid safety margins
 G29 P3.2 ; interpolate mbl probes
 G29 P3.13 ; extrapolate mbl outside probe area
 G29 A ; activate mbl

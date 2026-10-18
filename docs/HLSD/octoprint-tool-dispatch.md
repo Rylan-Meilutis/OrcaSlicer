@@ -38,7 +38,8 @@ explicit layer tool changes), not the whole project palette. Unused entries
 receive private, distinct filler assignments without generating tool use. It
 suggests distinct tools by material and color, with nozzle-size preference when
 the project has a manual nozzle assignment from sync; the user can change every
-assignment. Missing inventory permits explicitly verified manual assignment.
+assignment. Other hosts without automatic inventory permit explicitly verified
+manual assignment. OctoPrint requires a live or last-known loaded-tool snapshot.
 Known material mismatches require confirmation. Each dispatch prompts again,
 so changing loaded spools cannot silently reuse an old assignment. Multi-plate
 jobs are dispatched separately. Virtual mixed-material slots are not supported
@@ -52,7 +53,7 @@ list scrolls within a bounded viewport; the confirmation controls stay outside
 the scrolling area.
 
 Empty physical slots display as Unloaded and cannot be confirmed after a
-successful inventory read. The upstream mixed-filament add controls are hidden
+live or cached inventory read. The upstream mixed-filament add controls are hidden
 for independent-tool OctoPrint dispatch, while existing mixed entries remain
 editable for project compatibility. Sync from machine first presents a checklist
 of loaded tools using their original physical numbers, configured diameters,
@@ -72,6 +73,32 @@ profiles or colors remain separate slots for different nozzle sizes. Nozzle
 diameters stay in the printer profile; sync does not overwrite that geometry.
 Dispatch refreshes inventory and confirms assignments rather than treating this
 preference as permission to print on an unchecked tool.
+
+## Loaded-spool snapshots
+
+Print/Send refreshes OctoPrint assignments before asking for the upload location,
+independently of the manual Sync and metadata-embedding options. Independent
+tools use these assignments in the mapping dialog; single-nozzle jobs validate
+their used slot indices against the snapshot without replacing project profiles.
+The confirmed snapshot is reused for metadata rather than queried again after
+destination selection.
+
+Successful reads (including manual Sync) are saved immediately in AppConfig's
+`octoprint_loaded_spools` section. Versioned snapshots retain physical indices,
+unloaded slots, spool metadata and a timestamp. Cache keys hash the host URL and
+provider endpoint, so a different printer/provider does not inherit assignments
+and credentials are not stored in cache keys. A successful empty assignment
+replaces the old snapshot; an inventory-only or malformed response does not.
+
+A failed refresh can use the persisted snapshot after restarting Orca. The
+mapping dialog warns that these are last-known materials and shows the snapshot
+timestamp; single-nozzle dispatch requires acknowledgment of that warning.
+Known-unloaded tools remain invalid even when offline. Without usable live or
+cached assignments, dispatch stops with an error rather than inventing a tool
+mapping. The entire provider-probing sequence has a 15-second request budget.
+Manual Sync still requires a live reading, so it cannot silently replace a
+project palette with stale inventory. `[OctoPrintSpoolCache]` tests cover snapshot
+round trips, empty assignments, corrupt data and host/provider isolation.
 
 `PresetBundle::tool_mapped_config` composes an independent job from the current
 presets and plate overrides. It remaps colors, material profiles, purge tables,

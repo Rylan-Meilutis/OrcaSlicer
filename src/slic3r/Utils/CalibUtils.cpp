@@ -1633,6 +1633,7 @@ bool CalibUtils::process_and_store_3mf(Model *model, const DynamicPrintConfig &f
 
     // apply the new print config
     DynamicPrintConfig new_print_config = full_config;
+    disable_arc_overhangs_for_calibration(*model);
     print->apply(*model, new_print_config);
 
     Print *fff_print = dynamic_cast<Print *>(print);

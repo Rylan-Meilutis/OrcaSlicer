@@ -33,6 +33,41 @@
 
 namespace Slic3r {
 
+std::vector<Vec3d> plan_nonplanar_transition(
+    const Vec3d &start, const Vec3d &destination, double printed_top_z,
+    double maximum_z, double clearance,
+    const std::function<bool(const Vec3d &, const Vec3d &)> &is_clear)
+{
+    if (!start.allFinite() || !destination.allFinite() ||
+        !std::isfinite(maximum_z) || maximum_z <= 0. ||
+        !std::isfinite(clearance) || clearance < 0. ||
+        start.z() < 0. || destination.z() < 0. ||
+        start.z() > maximum_z || destination.z() > maximum_z)
+        return {};
+
+    const auto route_at = [&](double z) -> std::vector<Vec3d> {
+        if (!std::isfinite(z) || z > maximum_z)
+            return {};
+        std::vector<Vec3d> route{start};
+        for (const Vec3d &point : {Vec3d(start.x(), start.y(), z),
+                                  Vec3d(destination.x(), destination.y(), z), destination}) {
+            if ((point - route.back()).squaredNorm() < 1e-16)
+                continue;
+            if (!is_clear(route.back(), point))
+                return {};
+            route.push_back(point);
+        }
+        return route;
+    };
+    const double local_z = std::max(start.z(), destination.z());
+    auto route = route_at(local_z);
+    if (!route.empty())
+        return route;
+    if (!std::isfinite(printed_top_z))
+        return {};
+    return route_at(std::max(local_z, printed_top_z + clearance));
+}
+
 Polylines nonplanar_wall_centerlines(const ExtrusionEntity &entity, int inset)
 {
     Polylines result;
@@ -11185,7 +11220,8 @@ void consolidate_nonplanar_top_surfaces(
 
 std::vector<uint8_t> select_nonplanar_surface_facets(
     const sla::IndexedMesh &mesh, double maximum_angle_degrees,
-    double minimum_vertical_span, double minimum_projected_area)
+    double minimum_vertical_span, double minimum_projected_area,
+    double selection_min_z, double selection_max_z)
 {
     const indexed_triangle_set &its = *mesh.get_triangle_mesh();
     std::vector<uint8_t> candidates(its.indices.size(), 0);
@@ -11313,7 +11349,8 @@ std::vector<uint8_t> select_nonplanar_surface_facets(
         // a top. A sloped deck may legitimately be low while a bottom or side
         // facet cannot create eligible top-solid coverage.
         if (projected_area + EPSILON < minimum_projected_area ||
-            maximum_z - minimum_z + EPSILON < minimum_vertical_span)
+            maximum_z - minimum_z + EPSILON < minimum_vertical_span ||
+            minimum_z < selection_min_z || maximum_z > selection_max_z)
             continue;
         for (size_t face : component)
             selected[face] = 1;

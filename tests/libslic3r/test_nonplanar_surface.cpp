@@ -9,10 +9,60 @@
 #include "libslic3r/ExtrusionEntityCollection.hpp"
 #include "libslic3r/Flow.hpp"
 #include "libslic3r/NonplanarSurface.hpp"
+#include "libslic3r/SequentialGantryGeometry.hpp"
+#include "libslic3r/PrintConfig.hpp"
 #include "libslic3r/SLA/IndexedMesh.hpp"
 #include "libslic3r/TriangleMesh.hpp"
 
 using namespace Slic3r;
+
+TEST_CASE("Non-planar transitions validate all legs and obey the machine ceiling",
+          "[NonplanarSurface][NonplanarTransition][Regression]")
+{
+    const Vec3d start(0., 0., 1.), end(10., 0., 1.);
+    const auto obstacle = make_printed_toolpath_obstacle(
+        {Vec3d(5., -1., 3.), Vec3d(5., 1., 3.)}, 0.4);
+    const std::vector<PrintedToolpathObstacle> obstacles{obstacle};
+    const auto is_clear = [&](const Vec3d &a, const Vec3d &b) {
+        return !check_toolhead_clearance(a, b, {}, obstacles, {0.2, 5., 0.});
+    };
+    const auto route = plan_nonplanar_transition(start, end, 3., 10., 0.05, is_clear);
+    REQUIRE(route.size() == 4);
+    CHECK_THAT(route[1].z(), Catch::Matchers::WithinAbs(3.05, 1e-8));
+    for (size_t i = 1; i < route.size(); ++i)
+        CHECK(is_clear(route[i - 1], route[i]));
+    CHECK(plan_nonplanar_transition(start, end, 3., 3., 0.05, is_clear).empty());
+
+    // Raising the traverse must not conceal an obstructed vertical leg.
+    const bool block_departure = GENERATE(false, true);
+    const auto blocked_leg = [&](const Vec3d &a, const Vec3d &b) {
+        if (std::abs(a.z() - b.z()) > 1e-8 &&
+            std::abs(a.x() - (block_departure ? start.x() : end.x())) < 1e-8)
+            return false;
+        return is_clear(a, b);
+    };
+    CHECK(plan_nonplanar_transition(start, end, 3., 10., 0.05, blocked_leg).empty());
+}
+
+TEST_CASE("Non-planar transitions do not lift unnecessarily or accept invalid heights",
+          "[NonplanarSurface][NonplanarTransition]")
+{
+    const auto clear = [](const Vec3d &, const Vec3d &) { return true; };
+    const auto route = plan_nonplanar_transition({0., 0., 1.}, {10., 0., 1.}, 9., 10., 0.05, clear);
+    REQUIRE(route.size() == 2);
+    CHECK_THAT(route.back().z(), Catch::Matchers::WithinAbs(1., 1e-8));
+    for (double z : {-1., 11., std::numeric_limits<double>::quiet_NaN()})
+        CHECK(plan_nonplanar_transition({0., 0., 1.}, {10., 0., z}, 3., 10., 0.05, clear).empty());
+}
+
+TEST_CASE("Non-planar selection defaults remain unrestricted and disabled",
+          "[NonplanarSurface][NonplanarSelection]")
+{
+    PrintRegionConfig config;
+    CHECK_FALSE(nonplanar_perimeters_enabled(config));
+    CHECK_THAT(config.nonplanar_selection_min_z.value, Catch::Matchers::WithinAbs(0., 1e-8));
+    CHECK_THAT(config.nonplanar_selection_max_z.value, Catch::Matchers::WithinAbs(0., 1e-8));
+}
 
 TEST_CASE("Non-planar wall anchors retain native inset ownership and variable widths",
           "[NonplanarSurface][NativeWallAnchors][Regression]")
@@ -665,6 +715,22 @@ TEST_CASE("Non-planar finishing selects only the uppermost sloped surface",
     CHECK(selected[1] == 0);
     CHECK(selected[2] == 1);
     CHECK(selected[3] == 1);
+}
+
+TEST_CASE("Non-planar selection accepts complete patches rather than clipping their boundaries",
+          "[NonplanarSurface][NonplanarSelection][Regression]")
+{
+    indexed_triangle_set triangles;
+    append_sloped_plane(triangles, 5.f);
+    const TriangleMesh mesh(triangles);
+    const sla::IndexedMesh indexed(mesh);
+    const auto selected = select_nonplanar_surface_facets(indexed, 45., 0.2, 1., 5., 6.);
+    REQUIRE(selected.size() == 2);
+    CHECK(selected[0] == 1);
+    CHECK(selected[1] == 1);
+    CHECK(select_nonplanar_surface_facets(indexed, 45., 0.2, 1., 5.5, 6.).empty());
+    CHECK(select_nonplanar_surface_facets(indexed, 45., 0.2, 1., 5., 5.5).empty());
+    CHECK(select_nonplanar_surface_facets(indexed, 45., 0.2, 1., 6., 5.).empty());
 }
 
 TEST_CASE("Non-planar finishing joins a narrow flat roof crown but not a broad deck",

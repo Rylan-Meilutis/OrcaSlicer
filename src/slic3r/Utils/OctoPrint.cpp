@@ -18,6 +18,7 @@
 #include <nlohmann/json.hpp>
 
 #include <wx/progdlg.h>
+#include <wx/datetime.h>
 
 #include "slic3r/GUI/GUI.hpp"
 #include "slic3r/GUI/I18N.hpp"
@@ -25,6 +26,7 @@
 #include "slic3r/GUI/format.hpp"
 #include "Http.hpp"
 #include "libslic3r/AppConfig.hpp"
+#include "libslic3r/OctoPrintSpoolCache.hpp"
 #include "libslic3r/GCode/SpoolManagerMetadata.hpp"
 #include "Bonjour.hpp"
 #include "slic3r/GUI/BonjourDialog.hpp"
@@ -269,11 +271,36 @@ wxString OctoPrint::get_test_failed_msg (wxString &msg) const
 }
 
 bool OctoPrint::get_selected_filament_spools(
-    std::vector<SpoolManagerMetadata::Filament> &slots, wxString &error) const
+    std::vector<SpoolManagerMetadata::Filament> &slots, wxString &error, bool allow_cached) const
 {
+    slots.clear();
+    error.clear();
     std::vector<SpoolManagerMetadata::Filament> inventory;
-    if (!get_filament_spools(slots, inventory, error))
-        return false;
+    auto *app_config = GUI::wxGetApp().app_config;
+    const auto cache_key = OctoPrintSpoolCache::key(m_host, m_filament_plugin_endpoint);
+    if (get_filament_spools(slots, inventory, error, true)) {
+        error.clear();
+        if (app_config != nullptr) {
+            // Persist empty snapshots too: unloading all tools must invalidate
+            // older assignments, rather than resurrect them after a restart.
+            app_config->set("octoprint_loaded_spools", cache_key,
+                OctoPrintSpoolCache::encode(slots, GUI::into_u8(wxDateTime::Now().FormatISOCombined(' '))));
+            try {
+                app_config->save();
+            } catch (const std::exception &exception) {
+                BOOST_LOG_TRIVIAL(error) << "Could not persist OctoPrint spool snapshot: " << exception.what();
+                error = _L("Loaded materials were refreshed, but their offline snapshot could not be saved. Check available disk space and configuration-folder permissions.");
+            }
+        }
+    } else {
+        slots.clear();
+        std::string updated_at;
+        if (!allow_cached || app_config == nullptr || !OctoPrintSpoolCache::decode(
+                app_config->get("octoprint_loaded_spools", cache_key), slots, updated_at))
+            return false;
+        error = GUI::format_wxstr(_L("OctoPrint could not be refreshed. Using last known loaded spools from %1%. Verify the printer's loaded materials before continuing."),
+                                 GUI::from_u8(updated_at));
+    }
     if (slots.empty()) {
         error = _L("The OctoPrint filament provider has no spools assigned to its tools or slots.");
         return false;
@@ -284,15 +311,23 @@ bool OctoPrint::get_selected_filament_spools(
 bool OctoPrint::get_filament_spools(
     std::vector<SpoolManagerMetadata::Filament> &slots,
     std::vector<SpoolManagerMetadata::Filament> &inventory,
-    wxString &error) const
+    wxString &error, bool require_assignments) const
 {
-    const auto fetch = [this](const std::string &path, std::string &body, wxString &request_error,
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+    const auto fetch = [this, deadline](const std::string &path, std::string &body, wxString &request_error,
                               int attempts = 1) {
         for (int attempt = 1; attempt <= attempts; ++attempt) {
+            const auto remaining = std::chrono::duration_cast<std::chrono::seconds>(
+                deadline - std::chrono::steady_clock::now()).count();
+            if (remaining <= 0) {
+                request_error = _L("Timed out refreshing OctoPrint loaded materials.");
+                return false;
+            }
             bool success = false;
             wxString attempt_error;
             auto http = Http::get(make_url(path));
             set_auth(http);
+            http.timeout_connect(std::min<long>(3, remaining)).timeout_max(std::min<long>(5, remaining));
             http.on_complete([&body, &success](std::string response, unsigned) {
                     body = std::move(response);
                     success = true;
@@ -325,13 +360,13 @@ bool OctoPrint::get_filament_spools(
         }
         std::string selected_error;
         const bool selected_ok = SpoolManagerMetadata::parse_selected_spools(
-            body, slots, selected_error, fallback_provider);
+            body, slots, selected_error, fallback_provider, true);
         std::string inventory_error;
         const bool inventory_ok = SpoolManagerMetadata::parse_spool_inventory(
             body, inventory, inventory_error, fallback_provider);
         if (!inventory_ok && selected_ok)
             inventory.assign(slots.begin(), slots.end());
-        if (selected_ok || inventory_ok)
+        if (selected_ok || (!require_assignments && inventory_ok))
             return true;
         BOOST_LOG_TRIVIAL(debug) << "OctoPrint filament provider response was not usable at " << path
                                  << ": " << selected_error << "; " << inventory_error;
@@ -391,7 +426,8 @@ bool OctoPrint::get_filament_spools(
                 std::string inventory_parse_error;
                 const bool inventory_ok = SpoolManagerMetadata::parse_spool_inventory(
                     combined_text, inventory, inventory_parse_error, "Spoolman");
-                if (SpoolManagerMetadata::parse_selected_spools(combined_text, slots, parse_error) || inventory_ok)
+                if (SpoolManagerMetadata::parse_selected_spools(combined_text, slots, parse_error, {}, true) ||
+                    (!require_assignments && inventory_ok))
                     return true;
                 error = GUI::from_u8(parse_error);
             }

@@ -97,8 +97,10 @@ const nlohmann::json *find_spool(const nlohmann::json &spools, const std::string
     return nullptr;
 }
 
-bool finish_slots(std::vector<Filament> &slots, std::string &error)
+bool finish_slots(std::vector<Filament> &slots, std::string &error, bool allow_empty)
 {
+    if (allow_empty)
+        return true;
     if (!slots.empty() && std::any_of(slots.begin(), slots.end(), [](const Filament &filament) {
             return !filament.name.empty() || !filament.spool_id.empty();
         }))
@@ -199,7 +201,7 @@ std::pair<std::string, std::streamoff> read_tail(const fs::path &path)
 
 bool parse_selected_spools(const std::string &response, std::vector<Filament> &slots,
                            std::string &error,
-                           const std::string &fallback_provider)
+                           const std::string &fallback_provider, bool allow_empty)
 {
     try {
         const nlohmann::json root = nlohmann::json::parse(response);
@@ -232,7 +234,7 @@ bool parse_selected_spools(const std::string &response, std::vector<Filament> &s
             for (const nlohmann::json &entry : *selected)
                 slots.emplace_back(entry.is_null() ? Filament{} :
                     filament_from_spool(entry, provider_or("SpoolManager")));
-            return finish_slots(slots, error);
+            return finish_slots(slots, error, allow_empty);
         }
 
         // OllisGit FilamentManager returns one selection per tool and nests
@@ -254,7 +256,7 @@ bool parse_selected_spools(const std::string &response, std::vector<Filament> &s
                 slots[index] = filament_from_spool(
                     selection, provider_or("FilamentManager"));
             }
-            return finish_slots(slots, error);
+            return finish_slots(slots, error, allow_empty);
         }
 
         const auto spools_it = payload->find("spools");
@@ -287,7 +289,7 @@ bool parse_selected_spools(const std::string &response, std::vector<Filament> &s
                     slots[index].provider = provider_or("Spoolman");
                 }
             }
-            return finish_slots(slots, error);
+            return finish_slots(slots, error, allow_empty);
         }
 
         // Provider-neutral response for RME compatibility and third-party
@@ -328,7 +330,7 @@ bool parse_selected_spools(const std::string &response, std::vector<Filament> &s
                     catch (...) { continue; }
                 }
             }
-            return finish_slots(slots, error);
+            return finish_slots(slots, error, allow_empty);
         }
 
         error = "The OctoPrint filament provider response did not contain recognized tool assignments.";

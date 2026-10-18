@@ -16,6 +16,26 @@ Older firmware without this parameter may still calibrate all tools.
 These files do not overwrite saved or cloud printer presets. Copy each template
 into its corresponding preset field, save the preset, and re-slice the project.
 
+The bundled **Prusa CORE One INDX RME 0.4 nozzle** preset is based on the
+Cygnas X1 INDX profile, with eight independent tools and the 248 × 205 mm bed.
+It deliberately contains no OctoPrint address or API key. Select the model in
+the printer setup wizard and configure its connection separately.
+
+Its adaptive-mesh fallback uses Orca's first-layer bounds (including supports,
+brims and wipe towers), clamped to the bed with a 1 mm margin. Set **Bed mesh
+min** to **0,0**, **Bed mesh max** to **248,205**, and **Adaptive bed mesh margin**
+to **1 mm** when copying the standalone start template into another profile.
+The start sequence restores these bounds with M555 after calibration and
+immediately before ordinary G29 P1. Native probe spacing and safety margins
+remain in effect; small corner prints do not request a full-bed rectangle.
+
+RME Compatibility b118+ and firmware advertising mesh_area=1 can supply
+file-derived bounds through their capability-gated MESH service before P1.
+The preset intentionally does not embed serial-only @RME commands or explicit
+G29 XY/size arguments, so that host override remains available and file printing
+can use the M555 fallback. Verify the probe area on hardware after re-slicing;
+the slicer cannot guarantee a particular probe count.
+
 Bucket priming replaces a bed purge line. After purging, each sequence retracts,
 waits for motion completion, wipes with `G12 S1`, waits again, ejects the new
 pellet with `G12 S30`, and exits with `G12 S91`. Exit alone is not a wipe.

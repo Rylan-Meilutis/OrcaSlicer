@@ -2831,6 +2831,8 @@ void TabPrint::build()
         optgroup->append_single_option_line("nonplanar_top_surface_layers");
         optgroup->append_single_option_line("nonplanar_top_surface_resolution");
         optgroup->append_single_option_line("nonplanar_top_surface_min_height");
+        optgroup->append_single_option_line("nonplanar_selection_min_z");
+        optgroup->append_single_option_line("nonplanar_selection_max_z");
 
         optgroup = page->new_optgroup(L("Perimeter layering"), L"param_z_contouring");
         optgroup->append_single_option_line("perimeter_layering");

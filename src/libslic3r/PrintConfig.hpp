@@ -1651,6 +1651,8 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionInt,   nonplanar_top_surface_layers))
     ((ConfigOptionFloat, nonplanar_top_surface_resolution))
     ((ConfigOptionFloat, nonplanar_top_surface_min_height))
+    ((ConfigOptionFloat, nonplanar_selection_min_z))
+    ((ConfigOptionFloat, nonplanar_selection_max_z))
     )
 
 // Mesh-following top surfaces are independent of the underlying structural wall

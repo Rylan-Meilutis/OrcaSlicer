@@ -8,6 +8,7 @@
 	"filament_id": "OFY9muEs",
 	"instantiation": "true",
 	"compatible_printers": [
+		"Prusa CORE One INDX RME 0.4 nozzle",
 		"Prusa CORE One HF 0.4 nozzle"
 	],
 	"filament_max_volumetric_speed": [

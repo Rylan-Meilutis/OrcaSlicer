@@ -1134,6 +1134,7 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, in
         toggle_line(el, has_zaa);
 
     for (auto el : {"nonplanar_top_surface_max_angle", "nonplanar_top_surface_layers",
+                    "nonplanar_selection_min_z", "nonplanar_selection_max_z",
                     "nonplanar_top_surface_resolution", "nonplanar_top_surface_min_height"})
         toggle_line(el, use_nonplanar_top_surfaces);
 

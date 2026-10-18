@@ -7,18 +7,25 @@
 
 namespace Slic3r {
 
-// Version 2 reference data, not measured properties of the user's spool.
+// Version 5 reference data, not measured properties of the user's spool.
 // Sources, validity and model assumptions: docs/arc-material-cooling.md.
 struct ArcThermalMaterial {
     double density;       // g/cm^3
     double specific_heat; // J/(kg K), reference value, not a melt measurement
     double conductivity;  // W/(m K)
     double glass_transition; // degrees C; proxy, not a load-bearing criterion
+    // Semi-crystalline references use a solidification scheduling target instead
+    // of Tg (PP's Tg is below room temperature), and include latent heat.
+    double cooling_target = 0.;
+    double crystallization_heat = 0.; // J/kg; conservative fully crystalline reference
+    double crystallization_temperature = 0.; // C; lumped heat-release proxy
+    bool matrix_proxy = false; // Composite formulation/orientation is unknown.
 };
 
 inline std::optional<ArcThermalMaterial> arc_thermal_material(std::string_view type, double temperature)
 {
-    // Exact matches deliberately exclude filled/foamed blends and PET (not PETG).
+    // Exact matches exclude unspecified blends and PET (not PETG). PPS-CF is
+    // explicitly identified below as a matrix proxy, not a composite measurement.
     if (type == "PLA")
         return ArcThermalMaterial{1.24, 1800., 0.2, 62.8};
     // NETZSCH generic ranges: representative midpoints, using the rigid phase
@@ -29,6 +36,22 @@ inline std::optional<ArcThermalMaterial> arc_thermal_material(std::string_view t
         return ArcThermalMaterial{1.055, 1350., 0.18, 100.};
     if (type == "PC")
         return ArcThermalMaterial{1.22, 1335., 0.20, 145.};
+    if (type == "PMMA")
+        return ArcThermalMaterial{1.17, 1460., 0.205, 105.};
+    if (type == "PSU")
+        return ArcThermalMaterial{1.245, 1370., 0.15, 187.};
+    // The filament catalog uses PES for polyethersulfone (PESU).
+    if (type == "PES" || type == "PESU")
+        return ArcThermalMaterial{1.37, 1370., 0.18, 228.};
+    if (type == "PP")
+        return ArcThermalMaterial{0.905, 1800., 0.21, 0., 100., 208000., 120.};
+    if (type == "PPS" || type == "PPS-CF")
+        return ArcThermalMaterial{1.35, 1830., 0.30, 90., 90., 150400., 205., type == "PPS-CF"};
+    // HIPS-specific reference: FSRI solid-state cp (40 C) and k (45 C),
+    // with Impact 3450 density and the unfilled filament's measured matrix Tg.
+    // These are fixed reference values, not extrapolated melt measurements.
+    if (type == "HIPS")
+        return ArcThermalMaterial{1.04, 1351., 0.128, 101.1};
     if (type == "PETG") {
         // Eastar 6763 DSC data at 100/150/200/250 C. Clamp outside the data range.
         constexpr double cp[] = {1760., 1880., 1970., 2050.};
@@ -57,7 +80,8 @@ inline std::optional<ArcCoolingEstimate> estimate_arc_cooling(
         bead_diameter > 2. || fan_percent <= 0. || fan_percent > 100.)
         return std::nullopt;
     const double ambient = std::max(25., chamber_temperature);
-    if (ambient >= material->glass_transition - 5. || temperature <= material->glass_transition)
+    const double target = material->cooling_target > 0. ? material->cooling_target : material->glass_transition;
+    if (ambient >= target - 5. || temperature <= target)
         return std::nullopt;
     const double rho = 1000. * (density > 0. ? density : material->density);
     if (rho < 500. || rho > 2000.)
@@ -66,9 +90,14 @@ inline std::optional<ArcCoolingEstimate> estimate_arc_cooling(
     // Uncalibrated convection assumption, not a measured fan PWM -> airflow map.
     const double h = 20. + 80. * fan_percent / 100.;
     const double convection = rho * material->specific_heat * d / (4. * h) *
-        std::log((temperature - ambient) / (material->glass_transition - ambient));
+        std::log((temperature - ambient) / (target - ambient));
     const double diffusion = rho * material->specific_heat * d * d / (16. * material->conductivity);
-    const double time = convection + diffusion;
+    // Heat released during crystallization must also leave the strand. This is
+    // a lumped scheduling allowance, not a prediction of crystallization kinetics.
+    const double latent = material->crystallization_heat > 0. && temperature > material->crystallization_temperature ?
+        rho * material->crystallization_heat * d /
+            (4. * h * (material->crystallization_temperature - ambient)) : 0.;
+    const double time = convection + diffusion + latent;
     if (!std::isfinite(time) || time > 30.)
         return std::nullopt; // Out of model range; do not silently claim adequate cooling.
     const double bounded_time = std::max(1., time);

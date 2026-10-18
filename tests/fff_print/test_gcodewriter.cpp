@@ -184,6 +184,7 @@ TEST_CASE("Unused configured tools stay unused in exported startup metadata",
 
 TEST_CASE("INDX startup primes in the bucket and ejects before printing", "[GCodeWriter][INDX][Regression]")
 {
+    const bool bundled_profile = GENERATE(false, true);
     const bool tower = GENERATE(false, true);
     const bool heated_chamber = GENERATE(false, true);
     const unsigned int tool_mask = GENERATE(1u, 128u, 129u, 18u, 255u);
@@ -210,6 +211,8 @@ TEST_CASE("INDX startup primes in the bucket and ejects before printing", "[GCod
     parser.set("is_extruder_used", new ConfigOptionBools(used));
     parser.set("first_layer_print_min", new ConfigOptionFloats({100., 100.}));
     parser.set("first_layer_print_max", new ConfigOptionFloats({120., 120.}));
+    parser.set("adaptive_bed_mesh_min", new ConfigOptionFloats({99., 99.}));
+    parser.set("adaptive_bed_mesh_max", new ConfigOptionFloats({121., 121.}));
     parser.set("print_bed_max", new ConfigOptionFloats({250., 220.}));
     parser.set("first_layer_bed_temperature", new ConfigOptionInts(std::vector<int>(8, 60)));
     parser.set("filament_minimal_purge_on_wipe_tower", new ConfigOptionFloats(std::vector<double>(8, 15.)));
@@ -217,9 +220,14 @@ TEST_CASE("INDX startup primes in the bucket and ejects before printing", "[GCod
     outputs.set_key_value("e_retracted", new ConfigOptionFloats(std::vector<double>(8, 0.)));
     PlaceholderParser::ContextData context;
     context.global_config = std::make_unique<DynamicConfig>();
-    std::ifstream input(std::string(TEST_DATA_DIR) + "/../../resources/gcode/indx_rme_start.gcode");
+    const auto path = bundled_profile ?
+        boost::filesystem::path(PROFILES_DIR) / "Prusa" / "machine" / "Prusa CORE One INDX RME 0.4 nozzle.json" :
+        boost::filesystem::path(TEST_DATA_DIR) / "../../resources/gcode/indx_rme_start.gcode";
+    std::ifstream input(path.string());
     REQUIRE(input.good());
-    const std::string output = parser.process(std::string(std::istreambuf_iterator<char>(input), {}),
+    const std::string start = bundled_profile ? nlohmann::json::parse(input).at("machine_start_gcode").get<std::string>() :
+        std::string(std::istreambuf_iterator<char>(input), {});
+    const std::string output = parser.process(start,
                                              initial_tool, nullptr, &outputs, &context);
     CHECK(output.find('{') == std::string::npos);
     REQUIRE(output.find("\nG427 T" + tool_list + " R2 P3 ;") != std::string::npos);

@@ -1881,7 +1881,8 @@ void PrintConfigDef::init_fff_params()
     def->category = L("Quality");
     // xgettext:no-c-format, no-boost-format
     def->tooltip = L("Reduces the center-to-center spacing between adjacent arc-overhang lines so free-air extrusions overlap and bond. "
-                     "The percentage is relative to the arc line width. Use a small value to compensate for arc lines remaining round instead of being squished against a lower layer.");
+                     "The percentage is relative to the arc line width. Use a small value to compensate for arc lines remaining round instead of being squished against a lower layer. "
+                     "External bridge density does not apply to arcs. A small minimum tessellation allowance maintains contact between polygonized curves.");
     def->sidetext = "%";
     def->ratio_over = "bridge_line_width";
     def->min = 0;
@@ -4545,7 +4546,8 @@ void PrintConfigDef::init_fff_params()
     def = this->add("filament_arc_auto_cooling", coBools);
     def->label = L("Automatic arc cooling estimates");
     def->tooltip = L("Estimate arc path time and covering speed from material type, density, temperature, cooling and bead size. "
-                     "Uses generic PLA, PETG, ABS, ASA and PC reference properties and assumed airflow, not a calibrated thermal simulation. "
+                     "Uses generic PLA, PETG, ABS, ASA, PC, HIPS, PMMA, PSU, PES/PESU, PP and PPS reference properties and assumed airflow, not a calibrated thermal simulation. "
+                     "PP and PPS include a conservative crystallization-heat allowance. PPS-CF uses a PPS matrix proxy, not measured composite properties. "
                      "Unsupported materials or conditions fall back to process settings. Positive advanced overrides take precedence. "
                      "Does not change fan speed, temperature, flow or dimensions. Physical validation is required.");
     def->mode = comSimple;
@@ -5713,6 +5715,24 @@ void PrintConfigDef::init_fff_params()
     def->tooltip  = L("Legacy compatibility flag controlled by Top surface Z method.");
     def->mode     = comExpert;
     def->set_default_value(new ConfigOptionBool(false));
+
+    def = this->add("nonplanar_selection_min_z", coFloat);
+    def->label = L("Non-planar selection minimum height");
+    def->category = L("Quality");
+    def->tooltip = L("Select only complete connected top-surface patches within this height band, measured from the object's bottom. Use object or part overrides to limit the selection. Patches crossing either boundary remain planar; this does not cut a surface or enable non-planar printing.");
+    def->sidetext = L("mm");
+    def->min = 0;
+    def->mode = comExpert;
+    def->set_default_value(new ConfigOptionFloat(0));
+
+    def = this->add("nonplanar_selection_max_z", coFloat);
+    def->label = L("Non-planar selection maximum height");
+    def->category = L("Quality");
+    def->tooltip = L("Upper boundary of the non-planar surface selection, measured from the object's bottom. Zero means no upper boundary. A patch must fit completely inside the selection; its supporting transition layers may extend below it. Printer height and toolhead clearance limits still apply.");
+    def->sidetext = L("mm");
+    def->min = 0;
+    def->mode = comExpert;
+    def->set_default_value(new ConfigOptionFloat(0));
 
     def = this->add("nonplanar_top_surface_max_angle", coFloat);
     def->label    = L("Maximum non-planar surface angle");

@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <optional>
 #include <vector>
 
@@ -16,6 +17,14 @@ class LayerRegion;
 class SupportLayer;
 class ExtrusionPath;
 class ExtrusionEntity;
+
+// Absolute machine-space waypoints, including start and destination. Validate
+// departure, traverse and approach separately; a clear traverse alone is not
+// sufficient. Empty means that no safe, in-height transition was found.
+std::vector<Vec3d> plan_nonplanar_transition(
+    const Vec3d &start, const Vec3d &destination, double printed_top_z,
+    double maximum_z, double clearance,
+    const std::function<bool(const Vec3d &, const Vec3d &)> &is_clear);
 
 // Filter an aligned course without permitting removal of a dimensional wall.
 // On rejection the caller retains ownership of the unchanged complete course.
@@ -132,7 +141,9 @@ struct NonplanarProgress {
 // print as a coherent skin.
 std::vector<uint8_t> select_nonplanar_surface_facets(
     const sla::IndexedMesh &mesh, double maximum_angle_degrees,
-    double minimum_vertical_span, double minimum_projected_area);
+    double minimum_vertical_span, double minimum_projected_area,
+    double selection_min_z = -std::numeric_limits<double>::infinity(),
+    double selection_max_z = std::numeric_limits<double>::infinity());
 
 // Build a cheap XY query domain for each region and reachable layer Z band.
 // Candidate marking uses it to avoid mesh raycasts for ordinary paths which

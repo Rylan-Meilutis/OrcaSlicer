@@ -13,6 +13,9 @@ class GCode;
 class Model;
 class ModelObject;
 
+// Keep calibration bridges conventional without modifying the process preset.
+void disable_arc_overhangs_for_calibration(Model &model);
+
 enum class CalibMode : int {
     Calib_None = 0,
     Calib_PA_Line,

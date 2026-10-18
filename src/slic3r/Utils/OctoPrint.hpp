@@ -35,10 +35,13 @@ public:
     std::string get_host() const override { return m_host; }
     const std::string& get_apikey() const { return m_apikey; }
     const std::string& get_cafile() const { return m_cafile; }
-    bool get_selected_filament_spools(std::vector<SpoolManagerMetadata::Filament> &slots, wxString &error) const;
+    // Successful live reads are persisted. Cached fallback is opt-in; on a
+    // cached success, error contains a warning which the caller must display.
+    bool get_selected_filament_spools(std::vector<SpoolManagerMetadata::Filament> &slots, wxString &error,
+                                     bool allow_cached = false) const;
     bool get_filament_spools(std::vector<SpoolManagerMetadata::Filament> &slots,
                              std::vector<SpoolManagerMetadata::Filament> &inventory,
-                             wxString &error) const;
+                             wxString &error, bool require_assignments = false) const;
     bool get_spool_manager_selected_spools(std::vector<SpoolManagerMetadata::Filament> &slots, wxString &error) const
     { return get_selected_filament_spools(slots, error); }
 
