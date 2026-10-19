@@ -7,6 +7,7 @@
 #include <cassert>
 #include <cstdlib>
 #include <memory>
+#include <mutex>
 #include <math.h>
 #include <cmath>
 #include <iterator>
@@ -50,6 +51,43 @@
 #define L(s) Slic3r::I18N::translate(s)
 
 namespace Slic3r {
+
+// Slice preparation owns 5..15% of the pipeline. These are completed phase /
+// object milestones, not an elapsed-time estimate. Counters name real work units.
+static void report_slice_progress(const PrintObject &object, double phase, const std::string &message,
+                                  size_t completed = 0, size_t total = 0, unsigned flags = PrintBase::SlicingStatus::DEFAULT)
+{
+    const auto &objects = object.print()->objects();
+    const auto it = std::find(objects.begin(), objects.end(), &object);
+    const size_t index = size_t(it - objects.begin());
+    const size_t count = std::max(size_t(1), objects.size());
+    std::string text = object.model_object()->name + ": " + message;
+    if (total > 0)
+        text += " (" + std::to_string(completed) + "/" + std::to_string(total) + ")";
+    object.print()->set_status(5 + int((10. * std::min(index, count - 1) + phase) / count), text, flags);
+}
+
+// Serialize reports from layer workers and limit event traffic to ~100 updates
+// per phase. The count advances only after a worker has finished its layer.
+class SliceLayerProgress {
+public:
+    SliceLayerProgress(const PrintObject &object, double phase, std::string message) :
+        m_object(object), m_phase(phase), m_message(std::move(message)), m_total(object.layers().size()) {}
+    void complete()
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        ++m_completed;
+        if (m_completed == m_total || m_completed % std::max(size_t(1), (m_total + 99) / 100) == 0)
+            report_slice_progress(m_object, m_phase + 0.5 * double(m_completed) / m_total,
+                                  m_message, m_completed, m_total);
+    }
+private:
+    const PrintObject &m_object;
+    double m_phase;
+    std::string m_message;
+    size_t m_total, m_completed = 0;
+    std::mutex m_mutex;
+};
 
 bool PrintObject::clip_multipart_objects = true;
 bool PrintObject::infill_only_where_needed = false;
@@ -186,7 +224,8 @@ static std::vector<VolumeSlices> slice_volumes_inner(
     const std::vector<PrintObjectRegions::LayerRangeRegions> &layer_ranges,
     const std::vector<float>                                 &zs,
     const std::function<void()>                              &throw_on_cancel_callback,
-    double                                                   *out_belt_min_z = nullptr)
+    double                                                   *out_belt_min_z,
+    const std::function<void(size_t, size_t)>                  &progress)
 {
     model_volumes_sort_by_id(model_volumes);
 
@@ -224,6 +263,10 @@ static std::vector<VolumeSlices> slice_volumes_inner(
     //const auto   extra_offset  = is_mm_painted ? 0.f : std::max(0.f, float(print_object_config.xy_contour_compensation.value));
     const auto   extra_offset = 0.f;
 
+    size_t completed = 0;
+    const size_t total = std::count_if(model_volumes.begin(), model_volumes.end(),
+        [](const ModelVolume *volume) { return model_volume_needs_slicing(*volume); });
+    progress(0, total);
     for (const ModelVolume *model_volume : model_volumes)
         if (model_volume_needs_slicing(*model_volume)) {
             MeshSlicingParamsEx params { params_base };
@@ -261,6 +304,7 @@ static std::vector<VolumeSlices> slice_volumes_inner(
             }
             if (! out.empty() && out.back().slices.empty())
                 out.pop_back();
+            progress(++completed, total);
         }
 
     return out;
@@ -890,7 +934,7 @@ void PrintObject::slice()
     if (! this->set_started(posSlice))
         return;
     //BBS: add flag to reload scene for shell rendering
-    m_print->set_status(5, L("Slicing mesh"), PrintBase::SlicingStatus::RELOAD_SCENE);
+    report_slice_progress(*this, 0., L("Preparing layer heights"), 0, 0, PrintBase::SlicingStatus::RELOAD_SCENE);
     std::vector<coordf_t> layer_height_profile;
     this->update_layer_height_profile(*this->model_object(), m_slicing_params, layer_height_profile);
     m_print->throw_if_canceled();
@@ -937,15 +981,19 @@ void PrintObject::slice()
 #endif
 
     // Detect and process holes that should be converted to polyholes
+    report_slice_progress(*this, 8., L("Processing polyholes"));
     this->_transform_hole_to_polyholes();
 
     // BBS: the actual first layer slices stored in layers are re-sorted by volume group and will be used to generate brim
+    report_slice_progress(*this, 8.5, L("Grouping brim regions"));
     groupingVolumesForBrim(this, m_layers, firstLayerReplacedBy);
 
     // Update bounding boxes, back up raw slices of complex models.
+    report_slice_progress(*this, 9., L("Indexing and backing up layer slices"));
+    SliceLayerProgress indexing_progress(*this, 9., L("Indexing and backing up layer slices"));
     tbb::parallel_for(
         tbb::blocked_range<size_t>(0, m_layers.size()),
-        [this](const tbb::blocked_range<size_t>& range) {
+        [this, &indexing_progress](const tbb::blocked_range<size_t>& range) {
             for (size_t layer_idx = range.begin(); layer_idx < range.end(); ++ layer_idx) {
                 m_print->throw_if_canceled();
                 Layer &layer = *m_layers[layer_idx];
@@ -954,6 +1002,7 @@ void PrintObject::slice()
                 for (const ExPolygon &expoly : layer.lslices)
                 	layer.lslices_bboxes.emplace_back(get_extents(expoly));
                 layer.backup_untyped_slices();
+                indexing_progress.complete();
             }
         });
     if (m_layers.empty())
@@ -969,6 +1018,7 @@ void PrintObject::slice()
             << " belt_slice_rotation=" << int(pcfg.belt_slice_rotation.value)
             << " object=" << this->model_object()->name;
         if (pcfg.belt_printer.value) {
+            report_slice_progress(*this, 9.5, L("Adjusting belt layer heights"));
 
             Point inst_shift = this->instances().empty() ? Point(0, 0)
                 : this->instances().front().shift - this->center_offset();
@@ -1060,6 +1110,7 @@ void PrintObject::slice()
 
     // BBS
     this->set_done(posSlice);
+    report_slice_progress(*this, 10., L("Mesh preparation complete"), m_layers.size(), m_layers.size());
 }
 
 template<typename ThrowOnCancel>
@@ -1364,7 +1415,10 @@ void PrintObject::slice_volumes()
         objSliceByVolume = slice_volumes_inner(
             print->config(), this->config(), this->trafo_centered(),
             this->model_object()->volumes, m_shared_regions->layer_ranges, slice_zs, throw_on_cancel_callback,
-            &m_belt_min_z);
+            &m_belt_min_z, [this](size_t completed, size_t total) {
+                report_slice_progress(*this, 0.5 + double(completed) / std::max(size_t(1), total),
+                                      L("Slicing mesh volumes"), completed, total);
+            });
     }
 
     //BBS: "model_part" volumes are grouded according to their connections
@@ -1374,10 +1428,12 @@ void PrintObject::slice_volumes()
     //applyNegtiveVolumes(this->model_object()->volumes, objSliceByVolume, firstLayerObjSliceByGroups, scaled_resolution);
     firstLayerObjSliceByVolume = objSliceByVolume;
 
+    report_slice_progress(*this, 1.5, L("Clipping volumes and assigning material regions"));
     std::vector<std::vector<ExPolygons>> region_slices =
         slices_to_regions(print->config(), *this, this->model_object()->volumes, *m_shared_regions, slice_zs,
                           std::move(objSliceByVolume), PrintObject::clip_multipart_objects, throw_on_cancel_callback);
 
+    report_slice_progress(*this, 1.75, L("Building layer regions and removing empty layers"));
     for (size_t region_id = 0; region_id < region_slices.size(); ++ region_id) {
         std::vector<ExPolygons> &by_layer = region_slices[region_id];
         for (size_t layer_id = 0; layer_id < by_layer.size(); ++ layer_id)
@@ -1397,6 +1453,7 @@ void PrintObject::slice_volumes()
         m_layers.back()->upper_layer = nullptr;
     m_print->throw_if_canceled();
 
+    report_slice_progress(*this, 2., L("Processing conical overhangs"));
     this->apply_conical_overhang();
 
     // Is any ModelVolume multi-material painted?
@@ -1415,6 +1472,7 @@ void PrintObject::slice_volumes()
         }
 
         BOOST_LOG_TRIVIAL(debug) << "Slicing volumes - MMU segmentation";
+        report_slice_progress(*this, 2.5, L("Segmenting painted materials"));
         apply_mm_segmentation(*this, [print]() { print->throw_if_canceled(); });
     }
 
@@ -1431,13 +1489,30 @@ void PrintObject::slice_volumes()
         }
 
         BOOST_LOG_TRIVIAL(debug) << "Slicing volumes - Fuzzy skin segmentation";
+        report_slice_progress(*this, 3., L("Segmenting painted fuzzy skin"));
         apply_fuzzy_skin_segmentation(*this, [print]() { print->throw_if_canceled(); });
     }
 
     {
+        if (m_config.rooting || m_config.rooting_xy)
+            report_slice_progress(*this, 3.5, L("Preparing native rooting contacts"));
         const Rooting roots(*this);
+        if (m_config.interlocking_beam)
+            report_slice_progress(*this, 4., L("Generating beam interlocking"));
         InterlockingGenerator::generate_interlocking_structure(this, [print]() { print->throw_if_canceled(); });
-        const size_t root_count = roots.apply(*this, [print]() { print->throw_if_canceled(); });
+        if (m_config.rooting || m_config.rooting_xy)
+            report_slice_progress(*this, 4.5, L("Preparing root growth"));
+        int last_progress = -1;
+        const size_t root_count = roots.apply(*this, [print]() { print->throw_if_canceled(); },
+            [this, &last_progress](bool xy, size_t completed, size_t total) {
+                const double fraction = double(completed) / std::max(size_t(1), total);
+                const int progress = (xy ? 101 : 0) + int(100. * fraction);
+                if (progress == last_progress) return;
+                last_progress = progress;
+                report_slice_progress(*this, (xy ? 6. : 4.5) + fraction,
+                    xy ? L("Growing XY roots: material pairs completed") : L("Growing Z roots: contact layers completed"),
+                    completed, total);
+            });
         if ((m_config.rooting || m_config.rooting_xy) && num_printing_regions() > 1 && root_count == 0)
             this->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL,
                 L("Rooting could not place any roots. Check that different materials touch in an enabled rooting direction within one object, that each region uses one filament with walls and top/bottom shells, and that the root depth, diameter and protective skin fit inside the base."));
@@ -1445,6 +1520,8 @@ void PrintObject::slice_volumes()
     m_print->throw_if_canceled();
 
     BOOST_LOG_TRIVIAL(debug) << "Slicing volumes - make_slices in parallel - begin";
+    report_slice_progress(*this, 7., L("Compensating and merging layer slices"));
+    SliceLayerProgress compensation_progress(*this, 7., L("Compensating and merging layer slices"));
     {
         // Compensation value, scaled. Only applying the negative scaling here, as the positive scaling has already been applied during slicing.
         const size_t num_extruders = print->config().filament_diameter.size();
@@ -1460,7 +1537,7 @@ void PrintObject::slice_volumes()
         //BBS: this part has been changed a lot to support seperated contour and hole size compensation
 	    tbb::parallel_for(
 	        tbb::blocked_range<size_t>(0, m_layers.size()),
-			[this, xy_hole_scaled, xy_contour_scaled, elephant_foot_compensation_scaled, &lslices_elfoot_uncompensated](const tbb::blocked_range<size_t>& range) {
+			[this, xy_hole_scaled, xy_contour_scaled, elephant_foot_compensation_scaled, &lslices_elfoot_uncompensated, &compensation_progress](const tbb::blocked_range<size_t>& range) {
 	            for (size_t layer_id = range.begin(); layer_id < range.end(); ++ layer_id) {
 	                m_print->throw_if_canceled();
 	                Layer *layer = m_layers[layer_id];
@@ -1564,6 +1641,7 @@ void PrintObject::slice_volumes()
 	                }
 	                // Merge all regions' slices to get islands, chain them by a shortest path.
 	                layer->make_slices();
+	                compensation_progress.complete();
 	            }
 	        });
 	    if (elephant_foot_compensation_scaled > 0.f && ! m_layers.empty()) {

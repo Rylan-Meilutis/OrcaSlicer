@@ -9,6 +9,7 @@
 #include "libslic3r/ClipperUtils.hpp"
 #include <algorithm>
 #include <cmath>
+#include <tbb/parallel_for.h>
 
 namespace Slic3r {
 
@@ -87,7 +88,7 @@ double root_wall_clearance(const PrintObject &object, const PrintRegion &region,
 }
 }
 
-size_t Rooting::apply(PrintObject &object, const std::function<void()> &cancel) const
+size_t Rooting::apply(PrintObject &object, const std::function<void()> &cancel, const Progress &progress) const
 {
     if (m_slices.empty())
         return 0;
@@ -115,10 +116,11 @@ size_t Rooting::apply(PrintObject &object, const std::function<void()> &cancel) 
                 beams[z].push_back(diff_ex(to_expolygons(layers[z]->get_region(r)->slices.surfaces), m_slices[z][r]));
         }
     if (!config.rooting)
-        return apply_xy(object, cancel, beams);
+        return apply_xy(object, cancel, beams, progress);
     std::vector<ExPolygons> occupied(layers.size());
     for (size_t interface_top = 1; interface_top < layers.size(); ++interface_top) {
         cancel();
+        if (progress) progress(false, interface_top - 1, layers.size() - 1);
         for (size_t upper = 0; upper < object.num_printing_regions(); ++upper) {
             if (m_slices[interface_top][upper].empty() || !coherent_material(object.printing_region(upper), object.print()->config()))
                 continue;
@@ -212,7 +214,7 @@ size_t Rooting::apply(PrintObject &object, const std::function<void()> &cancel) 
                 // The collar stays under the upper part. Buried limbs may extend
                 // beyond it, but only where a full native top/bottom skin remains.
                 std::vector<ExPolygons> permitted(top - bottom);
-                for (size_t z = bottom; z < top; ++z) {
+                tbb::parallel_for(bottom, top, [&](size_t z) {
                     cancel();
                     ExPolygons &area = permitted[z - bottom];
                     area = offset_ex(m_slices[z][host], -scale_(host_clearance(z)));
@@ -225,7 +227,7 @@ size_t Rooting::apply(PrintObject &object, const std::function<void()> &cancel) 
                     for (size_t k = z + 1; k < layers.size() && layers[k - 1]->print_z < layers[z]->print_z + skin - EPSILON && !area.empty(); ++k)
                         area = intersection_ex(area, offset_ex(union_ex(m_slices[k][host], m_slices[k][upper]), -scale_(skin)));
                     area = diff_ex(area, offset_ex(other_material(z), scale_(skin)));
-                }
+                });
                 const auto fits = [&](const std::vector<Polygons> &sections) {
                     for (size_t z = 0; z < sections.size(); ++z)
                         if (!diff_ex(sections[z], permitted[z]).empty()) return false;
@@ -240,11 +242,12 @@ size_t Rooting::apply(PrintObject &object, const std::function<void()> &cancel) 
                 // catches connections that are only a hairline wide.
                 std::vector<ExPolygons> host_sections(top - bottom);
                 std::vector<std::vector<size_t>> host_core_counts(top - bottom);
-                for (size_t z = bottom; z < top; ++z) {
+                tbb::parallel_for(bottom, top, [&](size_t z) {
+                    cancel();
                     host_sections[z - bottom] = diff_ex(m_slices[z][host], occupied[z]);
                     for (const auto &part : host_sections[z - bottom])
                         host_core_counts[z - bottom].push_back(offset_ex(ExPolygons{part}, -scale_(web_radius)).size());
-                }
+                });
                 const auto preserves_host_webs = [&](const std::vector<Polygons> &tree,
                                                      const std::vector<Polygons> &branch) {
                     for (size_t z = bottom; z < top; ++z) {
@@ -452,11 +455,12 @@ size_t Rooting::apply(PrintObject &object, const std::function<void()> &cancel) 
             }
         }
     }
-    return count + apply_xy(object, cancel, beams);
+    if (progress) progress(false, layers.size() - 1, layers.size() - 1);
+    return count + apply_xy(object, cancel, beams, progress);
 }
 
 size_t Rooting::apply_xy(PrintObject &object, const std::function<void()> &cancel,
-                        const std::vector<std::vector<ExPolygons>> &beams) const
+                        const std::vector<std::vector<ExPolygons>> &beams, const Progress &progress) const
 {
     const auto &config = object.config();
     if (!config.rooting_xy) return 0;
@@ -471,6 +475,9 @@ size_t Rooting::apply_xy(PrintObject &object, const std::function<void()> &cance
         if (!coherent_material(object.printing_region(donor), print_config)) continue;
         const auto donor_tool = object.printing_region(donor).extruder(frExternalPerimeter);
         for (size_t host = 0; host < object.num_printing_regions(); ++host) {
+            cancel();
+            if (progress) progress(true, donor * object.num_printing_regions() + host,
+                                   object.num_printing_regions() * object.num_printing_regions());
             if (host == donor || !coherent_material(object.printing_region(host), print_config)) continue;
             const auto host_tool = object.printing_region(host).extruder(frExternalPerimeter);
             if (host_tool == donor_tool || width + EPSILON < 2. * std::max(
@@ -488,22 +495,30 @@ size_t Rooting::apply_xy(PrintObject &object, const std::function<void()> &cance
                 return offset2_ex(union_ex(m_slices[z][donor], m_slices[z][host]),
                     scale_(0.001), -scale_(clearance + 0.001));
             };
+            // Neighboring courses reuse the same clearance envelope. Compute it
+            // once per layer; each worker owns its output and reads native slices.
+            std::vector<ExPolygons> envelopes(layers.size());
+            tbb::parallel_for(size_t(0), layers.size(), [&](size_t z) {
+                cancel();
+                envelopes[z] = native_envelope(z);
+            });
             std::vector<ExPolygons> permitted(layers.size());
-            for (size_t z = 0; z < layers.size(); ++z) {
+            tbb::parallel_for(size_t(0), layers.size(), [&](size_t z) {
                 cancel();
                 const double low = layers[z]->print_z - layers[z]->height - skin;
                 const double high = layers[z]->print_z + skin;
                 if (low < layers.front()->print_z - layers.front()->height - EPSILON ||
-                    high > layers.back()->print_z + EPSILON) continue;
-                auto area = native_envelope(z);
+                    high > layers.back()->print_z + EPSILON) return;
+                auto area = envelopes[z];
                 // Require a complete native skin above and below each course,
                 // not merely clearance from the object's global bounding box.
                 for (size_t k = z; k-- > 0 && layers[k]->print_z > low + EPSILON && !area.empty();)
-                    area = intersection_ex(area, native_envelope(k));
+                    area = intersection_ex(area, envelopes[k]);
                 for (size_t k = z + 1; k < layers.size() && layers[k]->print_z - layers[k]->height < high - EPSILON && !area.empty(); ++k)
-                    area = intersection_ex(area, native_envelope(k));
+                    area = intersection_ex(area, envelopes[k]);
                 permitted[z] = std::move(area);
-            }
+            });
+            envelopes.clear(); // Do not retain the clearance cache while growing trees.
             double next_z = layers.front()->print_z - layers.front()->height + skin + radius;
             for (size_t center = 0; center < layers.size(); ++center) {
                 cancel();
@@ -730,6 +745,8 @@ size_t Rooting::apply_xy(PrintObject &object, const std::function<void()> &cance
             }
         }
     }
+    if (progress) progress(true, object.num_printing_regions() * object.num_printing_regions(),
+                           object.num_printing_regions() * object.num_printing_regions());
     return count;
 }
 }

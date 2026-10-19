@@ -30,6 +30,15 @@ otherwise that attachment is rejected. The swept tips stay within the selected
 penetration depth.
 Vertical and XY rooting can be enabled together.
 
+Layer clearance and host-core preparation run in parallel, with each worker
+owning a separate layer's output. XY clearance envelopes are cached once per
+material pair and layer, shared read-only while intersecting neighboring skins,
+then released before growing trees. Tree acceptance and material transfer stay
+ordered because each accepted root changes the remaining host-web constraints.
+Slicing progress identifies rooting separately from mesh intersection and beam
+interlocking, reporting completed Z contact layers or XY material pairs. These
+are work counters, not estimates of remaining time; contact complexity varies.
+
 The controls are root depth, base diameter, tip diameter, spacing and protective skin. Old
 profiles and projects default to rooting disabled; no existing keys change meaning.
 The tip retains the `rooting_width` key and existing saved values. The independent

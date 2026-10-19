@@ -44,9 +44,66 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+#include <tbb/task_arena.h>
 
 using namespace Slic3r;
 using namespace Slic3r::Test;
+
+TEST_CASE("Root preparation reports real phases and is deterministic across worker counts", "[Multifilament][Rooting][SliceProgress]")
+{
+    auto config = multifilament_config(2, {
+        {"rooting", true}, {"rooting_xy", true}, {"rooting_depth", 3.},
+        {"rooting_width", 1.2}, {"rooting_base_width", 3.}, {"rooting_skin", 0.8},
+        {"layer_height", 0.2}, {"initial_layer_print_height", 0.2},
+        {"elefant_foot_compensation", 0.}, {"enable_prime_tower", false}});
+    Print serial, parallel;
+    Model model;
+    init_print({make_cube(20., 20., 6.)}, serial, model, config);
+    auto upper = make_cube(10., 10., 4.);
+    upper.translate(5., 5., 6.);
+    model.objects.front()->volumes.front()->config.set("extruder", 1);
+    model.objects.front()->add_volume(upper)->config.set("extruder", 2);
+    serial.apply(model, config);
+    parallel.apply(model, config);
+    serial.set_status_silent();
+    std::vector<PrintBase::SlicingStatus> events;
+    parallel.set_status_callback([&](const PrintBase::SlicingStatus &status) {
+        if (status.percent >= 0) events.push_back(status);
+    });
+    tbb::task_arena one_worker(1);
+    one_worker.execute([&] { serial.get_object(0)->slice(); });
+    tbb::task_arena four_workers(4);
+    four_workers.execute([&] { parallel.get_object(0)->slice(); });
+    REQUIRE_FALSE(events.empty());
+    CHECK(events.front().percent == 5);
+    CHECK(events.back().percent == 15);
+    for (size_t i = 1; i < events.size(); ++i)
+        CHECK(events[i].percent >= events[i - 1].percent);
+    for (const std::string phase : {"Slicing mesh volumes", "Clipping volumes", "Growing Z roots",
+                                  "Growing XY roots", "Compensating", "Processing polyholes", "Grouping brim",
+                                  "Indexing", "Mesh preparation complete"})
+        CHECK(std::any_of(events.begin(), events.end(), [&](const auto &event) { return event.text.find(phase) != std::string::npos; }));
+    const auto &a = serial.get_object(0)->layers(), &b = parallel.get_object(0)->layers();
+    REQUIRE(a.size() == b.size());
+    bool has_buried_roots = false;
+    for (size_t z = 0; z < a.size(); ++z)
+        for (size_t r = 0; r < a[z]->regions().size(); ++r) {
+            const auto x = to_expolygons(a[z]->get_region(r)->slices.surfaces);
+            const auto y = to_expolygons(b[z]->get_region(r)->slices.surfaces);
+            if (a[z]->print_z < 6. - EPSILON && a[z]->get_region(r)->region().extruder(frExternalPerimeter) == 2 && !x.empty())
+                has_buried_roots = true;
+            CHECK(diff_ex(x, y).empty());
+            CHECK(diff_ex(y, x).empty());
+        }
+    CHECK(has_buried_roots);
+    Print canceled;
+    canceled.apply(model, config);
+    canceled.set_status_callback([&](const PrintBase::SlicingStatus &status) {
+        if (status.text.find("Growing Z roots") != std::string::npos) canceled.cancel();
+    });
+    REQUIRE_THROWS_AS(canceled.get_object(0)->slice(), CanceledException);
+    CHECK_FALSE(canceled.get_object(0)->is_step_done(posSlice));
+}
 
 // Opt-in local reproduction without checking private project geometry into the
 // repository. Synthetic cases below provide the portable regression coverage.
