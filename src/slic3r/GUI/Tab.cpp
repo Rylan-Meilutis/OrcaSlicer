@@ -3330,7 +3330,7 @@ void TabPrint::build()
         optgroup->append_single_option_line("interlocking_boundary_avoidance", "multimaterial_settings_advanced#interlocking-boundary-avoidance");
 
         optgroup = page->new_optgroup(L("Rooting"), L"rooting");
-        for (const char *key : {"rooting", "rooting_xy", "rooting_depth", "rooting_width", "rooting_spacing", "rooting_skin"})
+        for (const char *key : {"rooting", "rooting_xy", "rooting_depth", "rooting_base_width", "rooting_width", "rooting_spacing", "rooting_skin"})
             optgroup->append_single_option_line(key);
 
     page = add_options_page(L("Others"), "custom-gcode_other"); // ORCA: icon only visible on placeholders

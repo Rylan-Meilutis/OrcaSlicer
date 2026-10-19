@@ -5799,14 +5799,24 @@ void PrintConfigDef::init_fff_params()
     def->set_default_value(new ConfigOptionFloat(3.));
 
     def = this->add("rooting_width", coFloat);
-    def->label = L("Root branch diameter");
-    def->tooltip = L("Minimum terminal branch width in XY, before its rounded end cap. Must be at least twice the larger nozzle diameter of the two materials. Parent limbs are thicker and grow recursively smaller side branches. Shallow roots flatten vertically without reducing this width; the attachment follows the upper model's shape.");
+    def->label = L("Root tip diameter");
+    def->tooltip = L("Terminal branch diameter before the rounded end cap. Branches taper from the base diameter to this value as they spread. Must be at least twice the larger nozzle diameter of the two materials. Shallow vertical roots flatten in Z; protected walls may trim the obstructed side of a root.");
     def->sidetext = L("mm");
     def->min = 0.4;
     def->max = 10.;
     def->category = L("Multimaterial");
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionFloat(1.2));
+
+    def = this->add("rooting_base_width", coFloat);
+    def->label = L("Root base diameter");
+    def->tooltip = L("Diameter of the main root limbs beneath the model-shaped attachment. Each generation tapers toward the root tip diameter. A base value smaller than the tip diameter uses the tip diameter instead. Narrow contacts may limit the attachment size without reducing the diameter of the buried limbs.");
+    def->sidetext = L("mm");
+    def->min = 0.4;
+    def->max = 10.;
+    def->category = L("Multimaterial");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(3.));
 
     def = this->add("rooting_spacing", coFloat);
     def->label = L("Root spacing");

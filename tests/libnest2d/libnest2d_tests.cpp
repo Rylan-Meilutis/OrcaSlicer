@@ -1,4 +1,8 @@
 #include <catch2/catch_all.hpp>
+#define NANOSVG_IMPLEMENTATION
+#include "nanosvg/nanosvg.h"
+#define NANOSVGRAST_IMPLEMENTATION
+#include "nanosvg/nanosvgrast.h"
 #include "libnest2d/libnest2d.hpp"
 #include <vector>
 #include <cstddef>

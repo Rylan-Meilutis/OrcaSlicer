@@ -1500,6 +1500,41 @@ private:
     bool                  m_enabled{false};
 };
 
+// Keep collapsible project/tool sections consistent with the sidebar title bars.
+static void style_sidebar_section_toggle(Button *toggle)
+{
+    toggle->SetStyle(ButtonStyle::Regular, ButtonType::Icon);
+    toggle->SetCornerRadius(0);
+    toggle->SetBorderWidth(0);
+    toggle->SetBackgroundColor(0xF8F8F8);
+    toggle->SetBackgroundColor2(0xF1F1F1);
+}
+
+static StaticBox *create_sidebar_section_header(wxWindow *parent, const wxString &title, Button *&toggle)
+{
+    auto *header = new StaticBox(parent, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxTAB_TRAVERSAL | wxBORDER_NONE);
+    header->SetBackgroundColor(0xF8F8F8);
+    header->SetBackgroundColor2(0xF1F1F1);
+    auto *label = new Label(header, title, LB_PROPAGATE_MOUSE_EVENT);
+    toggle = new Button(header, wxEmptyString, "expand_btn", 0, 16);
+    style_sidebar_section_toggle(toggle);
+    toggle->SetToolTip(title);
+    auto *row = new wxBoxSizer(wxHORIZONTAL);
+    row->Add(label, 1, wxALIGN_CENTER_VERTICAL | wxLEFT, parent->FromDIP(SidebarProps::TitlebarMargin()));
+    row->Add(toggle, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, parent->FromDIP(SidebarProps::TitlebarMargin()));
+    row->SetMinSize(-1, parent->FromDIP(30));
+    header->SetSizer(row);
+    header->Bind(wxEVT_LEFT_UP, [toggle](wxMouseEvent &event) {
+        event.Skip();
+        toggle->CallAfter([toggle] {
+            wxCommandEvent click(wxEVT_BUTTON, toggle->GetId());
+            click.SetEventObject(toggle);
+            toggle->ProcessWindowEvent(click);
+        });
+    });
+    return header;
+}
+
 // The nozzle rows are set in the small body font their "T1" prefix and diameter readout use, so the
 // combos of a row drop from the Body_14 they are created with to match, instead of towering over
 // the labels next to them.
@@ -1611,6 +1646,7 @@ struct ExtruderGroup : StaticBox
         btn_down->msw_rescale();
         combo_diameter->Rescale();
         nozzle_toggle->Rescale();
+        style_sidebar_section_toggle(nozzle_toggle);
         for (const NozzleRow &row : rows) {
             row.prefix->SetFont(NozzleRow::prefix_font());
             row.diameter_label->SetFont(NozzleRow::diameter_font());
@@ -1625,6 +1661,8 @@ struct ExtruderGroup : StaticBox
     {
         if (hover_label)
             hover_label->sys_color_changed();
+        nozzle_toggle->Rescale();
+        style_sidebar_section_toggle(nozzle_toggle);
         if (btn_edit)
             btn_edit->SetBackgroundColour(extruder_group_chip_bg());
         for (const NozzleRow &row : rows) {
@@ -2432,10 +2470,7 @@ ExtruderGroup::ExtruderGroup(wxWindow * parent, int index, wxString const &title
     // individually; a multi-extruder printer grows one row per tool (see SetNozzleRowCount).
     // The rows are dealt into two columns, which halves the height of a long tool list; the second
     // column empties itself when there is a single row, so a one-row card still spans the width.
-    nozzle_toggle = new Button(this, _L("Nozzle sizes"), "expand_btn", 0, 16);
-    nozzle_toggle->SetStyle(ButtonStyle::Regular, ButtonType::Compact);
-    nozzle_toggle->SetCenter(false);
-    vsizer->Add(nozzle_toggle, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, FromDIP(5));
+    vsizer->Add(create_sidebar_section_header(this, _L("Nozzle sizes"), nozzle_toggle), 0, wxEXPAND);
     nozzle_content = new wxPanel(this);
     nozzle_content->SetBackgroundColour(StateColor::darkModeColorFor(*wxWHITE));
     combo_diameter->Reparent(nozzle_content);
@@ -4366,10 +4401,8 @@ Sidebar::Sidebar(Plater *parent)
     }
 
     {
-        p->project_settings_toggle = new Button(p->scrolled, _L("Project settings"), "expand_btn", 0, 16);
-        p->project_settings_toggle->SetStyle(ButtonStyle::Regular, ButtonType::Compact);
-        p->project_settings_toggle->SetCenter(false);
-        scrolled_sizer->Add(p->project_settings_toggle, 0, wxEXPAND | wxALL, FromDIP(8));
+        scrolled_sizer->Add(create_sidebar_section_header(p->scrolled, _L("Project settings"), p->project_settings_toggle),
+                            0, wxEXPAND);
         auto *project_content = new wxPanel(p->scrolled);
         project_content->SetBackgroundColour(StateColor::darkModeColorFor(*wxWHITE));
         auto *project_sizer = new wxBoxSizer(wxVERTICAL);
@@ -6601,6 +6634,7 @@ void Sidebar::msw_rescale()
     p->right_extruder->Rescale();
     p->single_extruder->Rescale();
     p->project_settings_toggle->Rescale();
+    style_sidebar_section_toggle(p->project_settings_toggle);
 
     //p->btn_sync_printer->SetPaddingSize({FromDIP(6), FromDIP(12)});
     //p->btn_sync_printer->SetMinSize(BTN_SYNC_SIZE);
@@ -6714,6 +6748,8 @@ void Sidebar::sys_color_changed()
     for (ExtruderGroup *ext : {p->left_extruder, p->right_extruder, p->single_extruder})
         if (ext)
             ext->sys_color_changed();
+    p->project_settings_toggle->Rescale();
+    style_sidebar_section_toggle(p->project_settings_toggle);
 
     // call a kill focus event to ensure new colors applied
     for (ComboBox* combo : std::vector<ComboBox*>{p->combo_printer, p->combo_nozzle_dia, p->combo_printer_bed}){
@@ -8525,6 +8561,15 @@ void Sidebar::update_printer_thumbnail()
 {
     auto& preset_bundle = wxGetApp().preset_bundle;
     Preset & selected_preset = preset_bundle->printers.get_edited_preset();
+    // Use the resolved profile, not its display name: cloud/user copies can
+    // be renamed while retaining the RME firmware's G-code contract.
+    const auto *model = selected_preset.config.option<ConfigOptionString>("printer_model");
+    const auto *start = selected_preset.config.option<ConfigOptionString>("machine_start_gcode");
+    const bool rme = (model && boost::algorithm::ends_with(model->value, " RME")) ||
+                    (start && (start->value.find("; RME_DEPOSITION_BOUNDS=1") != std::string::npos ||
+                               start->value.find("; RME_TEMPERATURE_ADAPTIVE_PA=1") != std::string::npos));
+    p->m_printer_icon->SetBitmap_(rme ? "printer_rme" : "printer");
+    p->m_printer_icon->SetToolTip(rme ? _L("RME firmware profile: uses RME-specific G-code and capabilities.") : wxString());
     std::string printer_type    = selected_preset.get_current_printer_type(preset_bundle);
     if (printer_thumbnails.find(printer_type) != printer_thumbnails.end()) // Use known cache first
         p->image_printer->SetBitmap(create_scaled_bitmap(printer_thumbnails[printer_type], this, PRINTER_THUMBNAIL_SIZE.GetHeight()));

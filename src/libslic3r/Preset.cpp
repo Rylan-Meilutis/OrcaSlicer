@@ -1555,6 +1555,7 @@ static std::vector<std::string> s_Preset_print_options{
     "rooting_xy",
     "rooting_depth",
     "rooting_width",
+    "rooting_base_width",
     "rooting_spacing",
     "rooting_skin",
     "interlocking_orientation",

@@ -337,6 +337,74 @@ TEST_CASE("Rooting fits printable trunks around screw-hole contacts", "[Multifil
     CHECK(changed > 0);
 }
 
+TEST_CASE("Root base diameter changes buried limbs independently of the tip", "[Multifilament][Rooting][RootingWidth]")
+{
+    auto config = multifilament_config(2, {
+        {"rooting", true}, {"rooting_xy", false}, {"rooting_depth", 3.},
+        {"rooting_width", 1.2}, {"rooting_spacing", 100.}, {"rooting_skin", 0.4},
+        {"wall_loops", 2}, {"interlocking_beam", false},
+        {"layer_height", 0.2}, {"initial_layer_print_height", 0.2},
+        {"elefant_foot_compensation", 0.}, {"enable_prime_tower", false}});
+    CHECK_THAT(config.opt_float("rooting_base_width"), Catch::Matchers::WithinAbs(3., EPSILON));
+    CHECK_THAT(config.opt_float("rooting_width"), Catch::Matchers::WithinAbs(1.2, EPSILON));
+    Print print;
+    Model model;
+    init_print({make_cube(40., 40., 6.)}, print, model, config);
+    auto upper = make_cube(20., 20., 2.);
+    upper.translate(10., 10., 6.);
+    model.objects.front()->volumes.front()->config.set("extruder", 1);
+    model.objects.front()->add_volume(upper)->config.set("extruder", 2);
+    double previous_area = 0.;
+    for (double base : {3., 6.}) {
+        config.set_key_value("rooting_base_width", new ConfigOptionFloat(base));
+        print.apply(model, config);
+        print.get_object(0)->slice();
+        double buried_area = 0.;
+        for (const Layer *layer : print.get_object(0)->layers()) {
+            if (layer->print_z >= 5.4 - EPSILON) continue;
+            for (const LayerRegion *region : layer->regions())
+                if (region->region().extruder(frExternalPerimeter) == 2)
+                    buried_area += area(to_expolygons(region->slices.surfaces));
+        }
+        CAPTURE(base);
+        CHECK(buried_area > previous_area);
+        previous_area = buried_area;
+    }
+}
+
+TEST_CASE("Wide roots remain usable in shallow bases", "[Multifilament][Rooting][RootingWidth]")
+{
+    const double width = GENERATE(1.2, 2.4, 4.);
+    CAPTURE(width);
+    auto config = multifilament_config(2, {
+        {"rooting", true}, {"rooting_xy", false}, {"rooting_depth", 1.4},
+        {"rooting_width", width}, {"rooting_spacing", 100.}, {"rooting_skin", 0.4},
+        {"wall_loops", 2}, {"interlocking_beam", false},
+        {"layer_height", 0.2}, {"initial_layer_print_height", 0.2},
+        {"elefant_foot_compensation", 0.}, {"enable_prime_tower", false}});
+    Print print;
+    Model model;
+    init_print({make_cube(40., 40., 2.4)}, print, model, config);
+    auto upper = make_cube(20., 20., 2.);
+    upper.translate(10., 10., 2.4);
+    model.objects.front()->volumes.front()->config.set("extruder", 1);
+    model.objects.front()->add_volume(upper)->config.set("extruder", 2);
+    print.apply(model, config);
+    print.get_object(0)->slice();
+    double buried_area = 0.;
+    for (const Layer *layer : print.get_object(0)->layers()) {
+        // Exclude the model-shaped collar: this checks actual buried branches.
+        if (layer->print_z >= 2.0 - EPSILON) continue;
+        for (const LayerRegion *region : layer->regions()) {
+            if (region->region().extruder(frExternalPerimeter) != 2) continue;
+            const auto roots = to_expolygons(region->slices.surfaces);
+            buried_area += area(roots);
+            if (!roots.empty()) CHECK(layer->print_z - layer->height >= 1.0 - EPSILON);
+        }
+    }
+    CHECK(buried_area > scale_(width) * scale_(width));
+}
+
 TEST_CASE("Rooting embeds flared anchors without changing exposed surfaces", "[Multifilament][Rooting]")
 {
     const std::string shape = GENERATE("stacked", "dense", "shallow", "spreading", "small contact", "deep request", "deep roots", "L contact", "ring contact", "thin", "same filament", "side by side", "narrow", "cavity", "large nozzle", "no shells", "support filament", "soluble host");

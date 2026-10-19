@@ -1556,6 +1556,7 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionBool, rooting_xy))
     ((ConfigOptionFloat, rooting_depth))
     ((ConfigOptionFloat, rooting_width))
+    ((ConfigOptionFloat, rooting_base_width))
     ((ConfigOptionFloat, rooting_spacing))
     ((ConfigOptionFloat, rooting_skin))
     ((ConfigOptionFloat,interlocking_beam_width))

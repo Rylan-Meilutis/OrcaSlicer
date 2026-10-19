@@ -2019,6 +2019,7 @@ bool PrintObject::invalidate_state_by_config_options(
             || opt_key == "rooting_xy"
             || opt_key == "rooting_depth"
             || opt_key == "rooting_width"
+            || opt_key == "rooting_base_width"
             || opt_key == "rooting_spacing"
             || opt_key == "rooting_skin"
             || opt_key == "interlocking_orientation"

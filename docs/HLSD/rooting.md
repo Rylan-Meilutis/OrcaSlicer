@@ -18,8 +18,9 @@ sideways penetration, while spacing separates both attachment sites and Z bands.
 Two primary limbs produce recursive side branches, with three generations and
 six shortening attempts per limb. Exposed side, top and bottom skins, third
 materials and printable host webs constrain the complete swept geometry.
-Roots that cannot fit or connect to their owning material are rejected rather
-than clipped into floating fragments. Connectivity may pass through adjacent
+The swept trunk and limbs are trimmed at the protected envelope. The remaining
+geometry must preserve host webs and connect to its owning material; floating
+fragments reject the attachment. Connectivity may pass through adjacent
 courses, allowing attachment to alternating beam teeth. Existing beam additions
 are preserved; sideways growth starts at the outside of their attachment band.
 At beam joints, the neck fits the beam tooth and widens behind the neighboring
@@ -29,9 +30,14 @@ otherwise that attachment is rejected. The swept tips stay within the selected
 penetration depth.
 Vertical and XY rooting can be enabled together.
 
-The controls are root depth, branch diameter, spacing and protective skin. Old
+The controls are root depth, base diameter, tip diameter, spacing and protective skin. Old
 profiles and projects default to rooting disabled; no existing keys change meaning.
-The options serialize as normal process/object settings. Any change invalidates
+The tip retains the `rooting_width` key and existing saved values. The independent
+`rooting_base_width` defaults to 3 mm, while the tip defaults to 1.2 mm. A missing
+base key uses that default; a base smaller than the tip uses the tip diameter.
+Both vertical and XY branches interpolate from the base diameter toward the tip
+across their branching generations, rather than repeatedly clamping a tapered
+parent to one common width. The options serialize as normal process/object settings. Any change invalidates
 slicing, since rooting changes material ownership before perimeter generation.
 
 Only contacts between different filament regions within one multipart or painted
@@ -59,8 +65,11 @@ is preserved instead. Buried branches may extend
 beyond the contact patch only where a full protective top skin remains.
 Per-course clearance checks include host side walls, native material above and
 below the branch, and third-material regions. This preserves ledges, holes,
-cavities and bottom skin. A branch that does not fit is shortened or stopped;
-it is never clipped into disconnected pieces. Narrow
+cavities and bottom skin. Vertical roots trim the obstructed side of a branch
+to this protected interior rather than discarding its unobstructed side. Clipped
+components and subsequent offshoots must remain connected upward to the tree;
+floating fragments are discarded. Growth is shortened or stopped if the host
+web or attachment cannot be preserved. Narrow
 contacts and bases too shallow for connected branches can therefore receive no roots.
 
 Depth shortens to the available host material above a complete protective floor,
@@ -75,8 +84,10 @@ Those branches recursively grow their own side branches, with at most three
 generations (28 limbs) per seed. The trunk's fit is not tied to the sum of all
 terminal cross-sectional areas, which would suppress branching at small contacts.
 Radii taper to the printable minimum. Small/shallow contacts use fewer generations.
-Narrow annular contacts use smaller trunks down to the configured branch
-diameter, retaining the model-shaped collar and the full protective skin. Seed
+Narrow annular contacts allow a locally smaller attachment down to two nozzle
+diameters, retaining the model-shaped collar and the full protective skin.
+This attachment allowance does not reduce the requested terminal branch diameter;
+only the side meeting a protected boundary is trimmed. Seed
 search includes their inset contours instead of relying on a bounding-box center
 that may lie inside a screw hole.
 Tapered sphere sweeps produce connected, rounded junctions and long horizontal
