@@ -1,4 +1,14 @@
 #include <catch2/catch_all.hpp>
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
+#include "libslic3r/Point.hpp"
+#include "libslic3r/Polygon.hpp"
+#include "libslic3r/Polyline.hpp"
+#include "libslic3r/libslic3r.h"
+#include <limits>
+#include <utility>
+#include <vector>
 
 #include <algorithm>
 #include <array>

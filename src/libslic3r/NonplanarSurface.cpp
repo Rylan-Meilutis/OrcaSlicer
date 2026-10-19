@@ -1,4 +1,10 @@
 #include "ClipperUtils.hpp"
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <iterator>
+#include <utility>
+#include <vector>
 #include "Arachne/WallToolPaths.hpp"
 #include "ExtrusionEntity.hpp"
 #include "ExtrusionEntityCollection.hpp"

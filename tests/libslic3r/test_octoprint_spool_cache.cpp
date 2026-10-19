@@ -1,4 +1,7 @@
 #include <catch2/catch_all.hpp>
+#include "libslic3r/GCode/SpoolManagerMetadata.hpp"
+#include "libslic3r/Utils.hpp"
+#include <vector>
 #include "libslic3r/OctoPrintSpoolCache.hpp"
 #include "libslic3r/AppConfig.hpp"
 #include "libslic3r/Thread.hpp"

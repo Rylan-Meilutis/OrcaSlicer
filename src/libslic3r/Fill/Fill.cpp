@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <functional>
 #include <assert.h>
 #include <regex>
 #include <cstdlib>

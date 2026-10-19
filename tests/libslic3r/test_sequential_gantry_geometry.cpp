@@ -1,4 +1,11 @@
 #include <catch2/catch_all.hpp>
+#include <array>
+#include <boost/filesystem/path.hpp>
+#include <cmath>
+#include "libslic3r/Polygon.hpp"
+#include "libslic3r/libslic3r.h"
+#include <string>
+#include <vector>
 
 #include <boost/filesystem.hpp>
 

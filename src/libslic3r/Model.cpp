@@ -1,4 +1,5 @@
 #include "Model.hpp"
+#include <stdexcept>
 #include "calib.hpp"
 #include "Format/STEP.hpp"
 #include "TriangleMesh.hpp"

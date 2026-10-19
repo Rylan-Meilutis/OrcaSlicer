@@ -1,4 +1,9 @@
 #include <catch2/catch_all.hpp>
+#include <array>
+#include <boost/filesystem/operations.hpp>
+#include <boost/filesystem/path.hpp>
+#include "libslic3r/TriangleMesh.hpp"
+#include "libslic3r/libslic3r.h"
 
 #include <algorithm>
 

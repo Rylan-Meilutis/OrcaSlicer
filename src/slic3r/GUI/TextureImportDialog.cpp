@@ -1,4 +1,5 @@
 #include <array>
+#include "slic3r/GUI/Widgets/Button.hpp"
 #include <cstdlib>
 #include <functional>
 #include <glad/gl.h>

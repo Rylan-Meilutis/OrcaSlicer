@@ -1,4 +1,7 @@
 #include <boost/filesystem/operations.hpp>
+#include <boost/filesystem/path.hpp>
+#include <iterator>
+#include "libslic3r/PlaceholderParser.hpp"
 #include <catch2/catch_all.hpp>
 
 #include <algorithm>

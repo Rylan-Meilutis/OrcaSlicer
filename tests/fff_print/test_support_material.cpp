@@ -1,4 +1,6 @@
 #include <algorithm>
+#include "libslic3r/ExtrusionEntity.hpp"
+#include "libslic3r/ExtrusionEntityCollection.hpp"
 #include <catch2/catch_all.hpp>
 
 #include <algorithm>

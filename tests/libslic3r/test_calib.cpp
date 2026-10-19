@@ -1,4 +1,10 @@
 #include <catch2/catch_all.hpp>
+#include <cstddef>
+#include <iterator>
+#include "libslic3r/Config.hpp"
+#include <map>
+#include <stdexcept>
+#include <utility>
 
 #include <algorithm>
 #include "libslic3r/CustomGCode.hpp"

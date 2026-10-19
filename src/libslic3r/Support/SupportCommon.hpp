@@ -2,6 +2,7 @@
 #define slic3r_SupportCommon_hpp_
 
 #include "../Polygon.hpp"
+#include <cstddef>
 #include "../Print.hpp"
 #include "libslic3r/PrintConfig.hpp"
 #include "libslic3r/ExtrusionEntity.hpp"

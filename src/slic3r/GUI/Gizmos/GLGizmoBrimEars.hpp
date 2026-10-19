@@ -2,6 +2,7 @@
 #define slic3r_GLGizmoBrimEars_hpp_
 
 #include "GLGizmoBase.hpp"
+#include "slic3r/GUI/GLModel.hpp"
 #include "slic3r/GUI/GLSelectionRectangle.hpp"
 #include "slic3r/GUI/I18N.hpp"
 #include "libslic3r/BrimEarsPoint.hpp"

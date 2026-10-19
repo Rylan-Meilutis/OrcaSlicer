@@ -1,4 +1,11 @@
 #include "Plater.hpp"
+#include <boost/algorithm/string/case_conv.hpp>
+#include <boost/algorithm/string/constants.hpp>
+#include <boost/algorithm/string/replace.hpp>
+#include <boost/algorithm/string/trim.hpp>
+#include <cctype>
+#include <stdexcept>
+#include <wx/dialog.h>
 #include "../Utils/NetworkAgent.hpp"
 #include "IPrinterAgent.hpp"
 #include "CalibUtils.hpp"
@@ -1555,6 +1562,8 @@ struct ExtruderGroup : StaticBox
     wxString          diameter;
 
     std::vector<NozzleRow> rows;                  // rows[0] always exists, one row per extruder when multi
+    wxPanel *             nozzle_content = nullptr;
+    Button *              nozzle_toggle = nullptr;
     size_t                 nozzle_row_count = 0;  // rows currently shown
     wxBoxSizer *           row_columns[2]   = {}; // row i is dealt into column i % 2
     int                    group_index      = -1; // ctor index, the extruder a single-row group edits
@@ -1601,6 +1610,7 @@ struct ExtruderGroup : StaticBox
         btn_up->msw_rescale();
         btn_down->msw_rescale();
         combo_diameter->Rescale();
+        nozzle_toggle->Rescale();
         for (const NozzleRow &row : rows) {
             row.prefix->SetFont(NozzleRow::prefix_font());
             row.diameter_label->SetFont(NozzleRow::diameter_font());
@@ -1677,6 +1687,7 @@ struct Sidebar::priv
     wxBoxSizer *sizer_filaments = nullptr;
     wxPanel *area_bindings_panel = nullptr;
     ComboBox *project_print_order = nullptr;
+    Button *project_settings_toggle = nullptr;
     wxPanel *area_bindings_content = nullptr;
     bool area_bindings_collapsed = false;
     std::vector<wxPanel *> area_binding_rows;
@@ -2421,12 +2432,32 @@ ExtruderGroup::ExtruderGroup(wxWindow * parent, int index, wxString const &title
     // individually; a multi-extruder printer grows one row per tool (see SetNozzleRowCount).
     // The rows are dealt into two columns, which halves the height of a long tool list; the second
     // column empties itself when there is a single row, so a one-row card still spans the width.
+    nozzle_toggle = new Button(this, _L("Nozzle sizes"), "expand_btn", 0, 16);
+    nozzle_toggle->SetStyle(ButtonStyle::Regular, ButtonType::Compact);
+    nozzle_toggle->SetCenter(false);
+    vsizer->Add(nozzle_toggle, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, FromDIP(5));
+    nozzle_content = new wxPanel(this);
+    nozzle_content->SetBackgroundColour(StateColor::darkModeColorFor(*wxWHITE));
+    combo_diameter->Reparent(nozzle_content);
     auto rows_sizer = new wxBoxSizer(wxHORIZONTAL);
     for (wxBoxSizer *&column : row_columns) {
         column = new wxBoxSizer(wxVERTICAL);
         rows_sizer->Add(column, 1, wxEXPAND | wxLEFT , FromDIP(5));
     }
-    vsizer->Add(rows_sizer, 0, wxEXPAND | wxRIGHT, FromDIP(5));
+    nozzle_content->SetSizer(rows_sizer);
+    nozzle_content->Hide();
+    vsizer->Add(nozzle_content, 0, wxEXPAND | wxRIGHT, FromDIP(5));
+    nozzle_toggle->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
+        CallAfter([this] {
+            const bool expanded = !nozzle_content->IsShown();
+            nozzle_content->Show(expanded);
+            nozzle_toggle->SetIcon(expanded ? "collapse_btn" : "expand_btn");
+            for (wxWindow *window = this; window && !window->IsTopLevel(); window = window->GetParent()) {
+                window->Layout();
+                window->FitInside();
+            }
+        });
+    });
     sizer = vsizer; // the floating filament-switch icon positions itself against this card
     SetSizer(vsizer);
     SetNozzleRowCount(1);
@@ -2441,16 +2472,16 @@ ExtruderGroup::NozzleRow ExtruderGroup::create_nozzle_row()
     const size_t row_index = rows.size();
     NozzleRow row;
 
-    row.prefix = new Label(this, NozzleRow::prefix_font());
+    row.prefix = new Label(nozzle_content, NozzleRow::prefix_font());
     row.prefix->SetForegroundColour(StateColor::darkModeColorFor(wxColour("#363636")));
     row.prefix->SetLabelText(wxString::Format("T%d", int(row_index) + 1));
     row.prefix->Hide();
 
-    row.diameter_label = new Label(this, NozzleRow::diameter_font());
+    row.diameter_label = new Label(nozzle_content, NozzleRow::diameter_font());
     row.diameter_label->SetForegroundColour(StateColor::darkModeColorFor(wxColour("#363636")));
     row.diameter_label->Hide();
 
-    auto combo_flow = new ComboBox(this, wxID_ANY, wxString(""), wxDefaultPosition, wxDefaultSize, 0, nullptr, wxCB_READONLY);
+    auto combo_flow = new ComboBox(nozzle_content, wxID_ANY, wxString(""), wxDefaultPosition, wxDefaultSize, 0, nullptr, wxCB_READONLY);
     combo_flow->GetDropDown().SetUseContentWidth(true);
     combo_flow->Bind(wxEVT_COMBOBOX, [this, row_index, combo_flow](wxCommandEvent &evt) {
         // A one-row card edits the extruder it was created for, a multi-row card one extruder per row.
@@ -4335,16 +4366,36 @@ Sidebar::Sidebar(Plater *parent)
     }
 
     {
+        p->project_settings_toggle = new Button(p->scrolled, _L("Project settings"), "expand_btn", 0, 16);
+        p->project_settings_toggle->SetStyle(ButtonStyle::Regular, ButtonType::Compact);
+        p->project_settings_toggle->SetCenter(false);
+        scrolled_sizer->Add(p->project_settings_toggle, 0, wxEXPAND | wxALL, FromDIP(8));
+        auto *project_content = new wxPanel(p->scrolled);
+        project_content->SetBackgroundColour(StateColor::darkModeColorFor(*wxWHITE));
+        auto *project_sizer = new wxBoxSizer(wxVERTICAL);
+        project_content->SetSizer(project_sizer);
+        project_content->Hide();
+        scrolled_sizer->Add(project_content, 0, wxEXPAND);
+        p->project_settings_toggle->Bind(wxEVT_BUTTON, [this, project_content](wxCommandEvent &) {
+            project_content->CallAfter([this, project_content] {
+                const bool expanded = !project_content->IsShown();
+                project_content->Show(expanded);
+                p->project_settings_toggle->SetIcon(expanded ? "collapse_btn" : "expand_btn");
+                p->scrolled->Layout();
+                p->scrolled->FitInside();
+                Layout();
+            });
+        });
         auto *order_row = new wxBoxSizer(wxHORIZONTAL);
-        order_row->Add(new wxStaticText(p->scrolled, wxID_ANY, _L("Project print order")),
+        order_row->Add(new wxStaticText(project_content, wxID_ANY, _L("Project print order")),
                        1, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(8));
-        p->project_print_order = new ComboBox(p->scrolled, wxID_ANY, wxEmptyString, wxDefaultPosition,
+        p->project_print_order = new ComboBox(project_content, wxID_ANY, wxEmptyString, wxDefaultPosition,
                                              wxDefaultSize, 0, nullptr, wxCB_READONLY);
         for (const auto &label : {_L("Use profile"), _L("By layer"), _L("By object"), _L("Custom per plate")})
             p->project_print_order->Append(label);
         p->project_print_order->SetToolTip(_L("Override the print order for all existing plates in this project without changing the process profile. Saved with the 3MF project."));
         order_row->Add(p->project_print_order, 1, wxEXPAND);
-        scrolled_sizer->Add(order_row, 0, wxEXPAND | wxALL, FromDIP(8));
+        project_sizer->Add(order_row, 0, wxEXPAND | wxALL, FromDIP(8));
         p->project_print_order->Bind(wxEVT_COMBOBOX, [this](wxCommandEvent &) {
             const int selected = p->project_print_order->GetSelection();
             if (selected < 0 || selected > 2) return;
@@ -4360,8 +4411,8 @@ Sidebar::Sidebar(Plater *parent)
             p->plater->update();
         });
         p->area_bindings_panel = new wxPanel(p->scrolled);
-        auto *adhesion = new wxButton(p->scrolled, wxID_ANY, _L("Project raft and brim…"));
-        scrolled_sizer->Add(adhesion, 0, wxEXPAND | wxALL, FromDIP(8));
+        auto *adhesion = new wxButton(project_content, wxID_ANY, _L("Project raft and brim…"));
+        project_sizer->Add(adhesion, 0, wxEXPAND | wxALL, FromDIP(8));
         adhesion->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
             auto &plates = p->plater->get_partplate_list();
             const auto &profile = wxGetApp().preset_bundle->prints.get_edited_preset().config;
@@ -6549,6 +6600,7 @@ void Sidebar::msw_rescale()
     p->left_extruder->Rescale();
     p->right_extruder->Rescale();
     p->single_extruder->Rescale();
+    p->project_settings_toggle->Rescale();
 
     //p->btn_sync_printer->SetPaddingSize({FromDIP(6), FromDIP(12)});
     //p->btn_sync_printer->SetMinSize(BTN_SYNC_SIZE);

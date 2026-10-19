@@ -1,6 +1,9 @@
 #pragma once
 
 #include "ArcCooling.hpp"
+#include <algorithm>
+#include <cmath>
+#include <string_view>
 
 namespace Slic3r {
 

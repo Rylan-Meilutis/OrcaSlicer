@@ -8,6 +8,11 @@
 #include <Windows.h>
 #endif
 
+#include <functional>
+#include "libslic3r/Flow.hpp"
+#include <miniz.h>
+#include <set>
+
 #include <catch2/catch_test_macros.hpp>
 #include <string>
 #include <catch2/generators/catch_generators.hpp>

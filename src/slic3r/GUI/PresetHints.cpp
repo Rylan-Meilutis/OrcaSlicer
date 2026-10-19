@@ -1,4 +1,6 @@
 #include <cassert>
+#include <algorithm>
+#include <cmath>
 
 #include "libslic3r/Flow.hpp"
 #include "libslic3r/GCode/ArcCooling.hpp"

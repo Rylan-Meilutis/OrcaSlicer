@@ -1,6 +1,8 @@
 #pragma once
 
 #include <algorithm>
+#include <cstddef>
+#include <ios>
 #include <array>
 #include <cmath>
 #include <iomanip>

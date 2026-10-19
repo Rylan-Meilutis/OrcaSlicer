@@ -1,4 +1,10 @@
 #include "FillArcOverhang.hpp"
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
+#include <math.h>
+#include <utility>
+#include <vector>
 
 #include "../AABBTreeLines.hpp"
 #include "../ClipperUtils.hpp"

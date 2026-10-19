@@ -1,4 +1,5 @@
 #include "calib_dlg.hpp"
+#include <wx/msgdlg.h>
 #include "GUI_App.hpp"
 #include "MsgDialog.hpp"
 #include "I18N.hpp"

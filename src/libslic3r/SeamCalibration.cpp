@@ -1,4 +1,7 @@
 #include "SeamCalibration.hpp"
+#include <algorithm>
+#include <utility>
+#include <vector>
 #include "Model.hpp"
 #include "PrintConfig.hpp"
 #include "TriangleMesh.hpp"

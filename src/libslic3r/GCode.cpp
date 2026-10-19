@@ -1,4 +1,6 @@
 #include "ArcFitter.hpp"
+#include <array>
+#include <boost/algorithm/string/trim.hpp>
 #include "BoundingBox.hpp"
 #include "Circle.hpp"
 #include "Config.hpp"

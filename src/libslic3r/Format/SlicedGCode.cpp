@@ -1,4 +1,7 @@
 #include "SlicedGCode.hpp"
+#include <boost/filesystem/operations.hpp>
+#include <cstddef>
+#include <string>
 #include "bbs_3mf.hpp"
 #include "libslic3r/Print.hpp"
 #include "libslic3r/ProjectTask.hpp"

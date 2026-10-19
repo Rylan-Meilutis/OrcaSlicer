@@ -1,4 +1,5 @@
 #include "Layer.hpp"
+#include <cstdlib>
 #include "ClipperUtils.hpp"
 #include "Polygon.hpp"
 #include "Point.hpp"

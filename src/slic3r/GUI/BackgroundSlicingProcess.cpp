@@ -1,4 +1,5 @@
 #include "BackgroundSlicingProcess.hpp"
+#include "libslic3r/GCode/SpoolManagerMetadata.hpp"
 #include "libslic3r/Format/SlicedGCode.hpp"
 #include "GUI_App.hpp"
 #include "GUI.hpp"

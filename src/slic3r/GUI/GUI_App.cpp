@@ -1,4 +1,5 @@
 #include "CloudProvider.hpp"
+#include <stdexcept>
 #include "ExportPresetBundleDialog.hpp"
 #include "ICloudServiceAgent.hpp"
 #include "IPrinterAgent.hpp"

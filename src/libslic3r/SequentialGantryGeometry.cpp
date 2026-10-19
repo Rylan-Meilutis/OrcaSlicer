@@ -1,4 +1,11 @@
 #include "SequentialGantryGeometry.hpp"
+#include <boost/filesystem/operations.hpp>
+#include <boost/filesystem/path.hpp>
+#include <boost/log/trivial.hpp>
+#include <exception>
+#include <string>
+#include <utility>
+#include <vector>
 
 #include <algorithm>
 #include <cmath>

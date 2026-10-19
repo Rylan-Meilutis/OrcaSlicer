@@ -1,4 +1,14 @@
 #include "SpoolManagerMetadata.hpp"
+#include <boost/filesystem/operations.hpp>
+#include <boost/filesystem/path.hpp>
+#include <cstddef>
+#include <exception>
+#include <initializer_list>
+#include <ios>
+#include <string>
+#include <system_error>
+#include <utility>
+#include <vector>
 
 #include <algorithm>
 #include <cctype>

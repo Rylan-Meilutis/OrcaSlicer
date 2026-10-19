@@ -1,4 +1,9 @@
 #include <catch2/catch_all.hpp>
+#include <algorithm>
+#include <boost/filesystem/path.hpp>
+#include <iterator>
+#include "libslic3r/Config.hpp"
+#include <string>
 #include <boost/filesystem.hpp>
 #include <fstream>
 #include <sstream>

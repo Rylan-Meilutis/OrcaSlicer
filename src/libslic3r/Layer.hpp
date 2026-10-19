@@ -2,6 +2,7 @@
 #define slic3r_Layer_hpp_
 
 #include "Polyline.hpp"
+#include <cstdint>
 #include "Polygon.hpp"
 #include "Line.hpp"
 #include "libslic3r.h"

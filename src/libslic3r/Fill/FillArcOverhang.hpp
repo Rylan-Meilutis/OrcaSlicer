@@ -1,6 +1,8 @@
 #pragma once
 
 #include "FillBase.hpp"
+#include <cstddef>
+#include <utility>
 
 namespace Slic3r {
 

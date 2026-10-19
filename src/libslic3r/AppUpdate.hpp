@@ -1,6 +1,9 @@
 #pragma once
 
 #include "Semver.hpp"
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <string>
 #include <regex>
 
 namespace Slic3r {

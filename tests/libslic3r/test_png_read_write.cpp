@@ -1,4 +1,8 @@
 #include <catch2/catch_all.hpp>
+#include <boost/filesystem/operations.hpp>
+#include <boost/filesystem/path.hpp>
+#include <cstddef>
+#include <ios>
 
 #include <cstdint>
 #include <fstream>

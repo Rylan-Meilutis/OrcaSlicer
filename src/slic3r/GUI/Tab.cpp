@@ -1,5 +1,8 @@
 //#include "slic3r/Utils/Serial.hpp"
 #include "Tab.hpp"
+#include <boost/filesystem/operations.hpp>
+#include <stdexcept>
+#include <wx/busycursor.h>
 #include "PresetHints.hpp"
 #include "libslic3r/IMEXHelpers.hpp"
 #include "libslic3r/PresetBundle.hpp"

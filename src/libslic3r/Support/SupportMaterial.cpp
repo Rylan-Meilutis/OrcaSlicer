@@ -1,4 +1,6 @@
 #include "ClipperUtils.hpp"
+#include "libslic3r/I18N.hpp"
+#include <string>
 #include "libslic3r/ExPolygon.hpp"
 #include "ExtrusionEntity.hpp"
 #include "ExtrusionEntityCollection.hpp"
@@ -46,6 +48,7 @@
 #include <tuple>
 
 #define SUPPORT_USE_AGG_RASTERIZER
+#define L(s) Slic3r::I18N::translate(s)
 
 #ifdef SUPPORT_USE_AGG_RASTERIZER
     #include <agg/agg_pixfmt_gray.h>

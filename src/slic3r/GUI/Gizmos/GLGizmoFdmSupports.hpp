@@ -2,6 +2,7 @@
 #define slic3r_GLGizmoFdmSupports_hpp_
 
 #include "GLGizmoPainterBase.hpp"
+#include "libslic3r/TriangleSelector.hpp"
 //BBS
 #include "libslic3r/Print.hpp"
 #include "libslic3r/ObjectID.hpp"

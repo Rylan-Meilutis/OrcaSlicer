@@ -1,4 +1,8 @@
 #include <catch2/catch_test_macros.hpp>
+#include <boost/filesystem/operations.hpp>
+#include <cstddef>
+#include <string>
+#include <vector>
 
 #include "slic3r/Utils/ProfileSourceManager.hpp"
 

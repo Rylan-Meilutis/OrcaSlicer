@@ -1,6 +1,11 @@
 #include "Rooting.hpp"
+#include <cstddef>
+#include <functional>
+#include <utility>
+#include <vector>
 #include "libslic3r/Print.hpp"
 #include "libslic3r/Layer.hpp"
+#include "libslic3r/Flow.hpp"
 #include "libslic3r/ClipperUtils.hpp"
 #include <algorithm>
 #include <cmath>
@@ -70,6 +75,16 @@ bool coherent_material(const PrintRegion &region, const PrintConfig &config)
            region.config().wall_loops.value > 0 && region.config().top_shell_layers.value > 0 &&
            region.config().bottom_shell_layers.value > 0;
 }
+
+double root_wall_clearance(const PrintObject &object, const PrintRegion &region, const Layer &layer)
+{
+    const Flow outer = region.flow(object, frExternalPerimeter, layer.height, layer.id() == 0);
+    const Flow inner = region.flow(object, frPerimeter, layer.height, layer.id() == 0);
+    // Keep the native wall stack plus a printable host web. A fixed rooting
+    // skin alone can put another material inside thick perimeter stacks.
+    return std::max(object.config().rooting_skin.value,
+        double(outer.width()) + std::max(0, region.config().wall_loops.value - 1) * inner.spacing() + inner.spacing());
+}
 }
 
 size_t Rooting::apply(PrintObject &object, const std::function<void()> &cancel) const
@@ -116,6 +131,11 @@ size_t Rooting::apply(PrintObject &object, const std::function<void()> &cancel) 
                     !coherent_material(object.printing_region(host), object.print()->config()))
                     continue;
                 const auto &nozzles = object.print()->config().nozzle_diameter;
+                const double minimum_radius = std::min(0.5 * width,
+                    std::max(nozzles.get_at(upper_tool - 1), nozzles.get_at(host_tool - 1)));
+                const auto host_clearance = [&](size_t z) {
+                    return root_wall_clearance(object, object.printing_region(host), *layers[z]);
+                };
                 if (width + EPSILON < 2. * std::max(nozzles.get_at(upper_tool - 1), nozzles.get_at(host_tool - 1)))
                     continue;
                 ExPolygons contact = intersection_ex(new_material, m_slices[top - 1][host]);
@@ -164,7 +184,7 @@ size_t Rooting::apply(PrintObject &object, const std::function<void()> &cancel) 
                 // or cavity limits depth instead of rejecting all shorter roots.
                 for (size_t z = top; z-- > 0 && !available.empty();) {
                     cancel();
-                    available = intersection_ex(available, offset_ex(m_slices[z][host], -scale_(skin)));
+                    available = intersection_ex(available, offset_ex(m_slices[z][host], -scale_(host_clearance(z))));
                     available = diff_ex(available, offset_ex(other_material(z), scale_(skin)));
                     if (available.empty()) break;
                     const double floor_z = layers[z]->print_z - layers[z]->height;
@@ -191,13 +211,13 @@ size_t Rooting::apply(PrintObject &object, const std::function<void()> &cancel) 
                 for (size_t z = bottom; z < top; ++z) {
                     cancel();
                     ExPolygons &area = permitted[z - bottom];
-                    area = offset_ex(m_slices[z][host], -scale_(skin));
+                    area = offset_ex(m_slices[z][host], -scale_(host_clearance(z)));
                     size_t lower = z;
                     const double course_bottom = layers[z]->print_z - layers[z]->height;
                     while (lower > 0 && course_bottom - (layers[lower]->print_z - layers[lower]->height) < skin - EPSILON)
                         --lower;
                     for (size_t k = lower; k < z && !area.empty(); ++k)
-                        area = intersection_ex(area, offset_ex(m_slices[k][host], -scale_(skin)));
+                        area = intersection_ex(area, offset_ex(m_slices[k][host], -scale_(host_clearance(k))));
                     for (size_t k = z + 1; k < layers.size() && layers[k - 1]->print_z < layers[z]->print_z + skin - EPSILON && !area.empty(); ++k)
                         area = intersection_ex(area, offset_ex(union_ex(m_slices[k][host], m_slices[k][upper]), -scale_(skin)));
                     area = diff_ex(area, offset_ex(other_material(z), scale_(skin)));
@@ -259,7 +279,7 @@ size_t Rooting::apply(PrintObject &object, const std::function<void()> &cancel) 
                             candidates.emplace_back(scale_(cx + ix * pitch), scale_(cy + iy * pitch));
                     // A concave or annular contact need not contain its bounding
                     // box center. Probe a bounded set of interior contour seeds.
-                    for (double seed_radius : {width, 0.5 * width})
+                    for (double seed_radius : {width, 0.5 * width, minimum_radius})
                         for (const ExPolygon &interior : offset_ex(ExPolygons{island}, -scale_(seed_radius + 0.02))) {
                             const Points &points = interior.contour.points;
                             const size_t stride = std::max(size_t(1), (points.size() + 7) / 8);
@@ -284,9 +304,9 @@ size_t Rooting::apply(PrintObject &object, const std::function<void()> &cancel) 
                             // printable branch but not the preferred broad
                             // trunk. Retain the conformal collar and shorten
                             // the trunk radius, never below the tip diameter.
-                            while (radius > 0.5 * width + EPSILON &&
+                            while (radius > minimum_radius + EPSILON &&
                                    (!fits(tree) || !preserves_host_webs(empty_tree, tree))) {
-                                radius = std::max(0.5 * width, radius * 0.75);
+                                radius = std::max(minimum_radius, radius * 0.75);
                                 tree = root_branch(origin, origin, radius, radius,
                                     layers, bottom, top, contact_z, cancel, vertical_scale);
                             }
@@ -294,7 +314,7 @@ size_t Rooting::apply(PrintObject &object, const std::function<void()> &cancel) 
                             std::function<bool(const Vec3d &, double, double, int)> grow;
                             grow = [&](const Vec3d &parent, double parent_radius, double heading, int level) {
                                 cancel();
-                                const double child_radius = std::max(0.5 * width, parent_radius * 0.65);
+                                const double child_radius = std::max(minimum_radius, parent_radius * 0.65);
                                 const double vertical_radius = child_radius * vertical_scale;
                                 const double descent = std::min(taper_height - vertical_radius,
                                     skin + vertical_radius + std::max(0., taper_height - skin - 2. * vertical_radius) * (level + 1.) / levels);
@@ -327,7 +347,9 @@ size_t Rooting::apply(PrintObject &object, const std::function<void()> &cancel) 
                             int limbs = 0;
                             for (int direction = 0; direction < 4; ++direction)
                                 limbs += grow(origin, radius, direction * PI / 2., 0);
-                            if (limbs < 2) continue;
+                            // A wall may block some directions without invalidating
+                            // the printable, connected limbs growing away from it.
+                            if (limbs == 0) continue;
                             for (size_t z = 0; z < tree.size(); ++z) append(additions[z], std::move(tree[z]));
                             placed_centers.push_back(candidate);
                             for (const ExPolygon &part : contact_collar)
@@ -415,12 +437,15 @@ size_t Rooting::apply_xy(PrintObject &object, const std::function<void()> &cance
                 print_config.nozzle_diameter.get_at(host_tool - 1))) continue;
             const double web_radius = 0.5 * std::max(skin, 2. * print_config.nozzle_diameter.get_at(host_tool - 1));
             const auto native_envelope = [&](size_t z) {
+                const double clearance = std::max(
+                    root_wall_clearance(object, object.printing_region(host), *layers[z]),
+                    root_wall_clearance(object, object.printing_region(donor), *layers[z]));
                 // Independently transformed meshes can leave sub-micron cracks
                 // at a shared contact. Close only rounding-scale gaps before
                 // erosion so they are not inflated into a full skin-width void.
                 // Transfers remain clipped to actual host material below.
                 return offset2_ex(union_ex(m_slices[z][donor], m_slices[z][host]),
-                    scale_(0.001), -scale_(skin + 0.001));
+                    scale_(0.001), -scale_(clearance + 0.001));
             };
             std::vector<ExPolygons> permitted(layers.size());
             for (size_t z = 0; z < layers.size(); ++z) {
@@ -547,9 +572,10 @@ size_t Rooting::apply_xy(PrintObject &object, const std::function<void()> &cance
                                 const double depth = config.rooting_depth.value * std::pow(0.75, attempt);
                                 if (depth < 2. * width) break;
                                 const Vec2d root_start = p - normal * (0.25 * width);
-                                // Leave a connected host web behind the beam
-                                // teeth before spreading the buried fan out.
-                                double trunk_length = 0.5 * (depth - radius);
+                                // Reach inside the host before spreading sideways.
+                                // Near a corner, a fan starting halfway down the
+                                // trunk can hit the wall even on its open side.
+                                double trunk_length = depth - radius;
                                 // The fan must clear neighboring teeth as well
                                 // as the one carrying its attachment. Otherwise
                                 // its shoulders cut pockets off between teeth.
@@ -603,7 +629,7 @@ size_t Rooting::apply_xy(PrintObject &object, const std::function<void()> &cance
                                 };
                                 const bool left = grow(trunk, radius * 0.8, -1., 0);
                                 const bool right = grow(trunk, radius * 0.8, 1., 0);
-                                if (!left || !right) continue;
+                                if (!left && !right) continue;
                                 std::vector<ExPolygons> additions(tree.size());
                                 std::vector<std::vector<bool>> connected(tree.size());
                                 size_t pieces = 0;

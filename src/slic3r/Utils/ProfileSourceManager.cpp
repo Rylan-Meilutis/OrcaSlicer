@@ -1,4 +1,21 @@
 #include "ProfileSourceManager.hpp"
+#include <boost/algorithm/string/case_conv.hpp>
+#include <boost/algorithm/string/classification.hpp>
+#include <boost/algorithm/string/constants.hpp>
+#include <boost/algorithm/string/join.hpp>
+#include <boost/algorithm/string/predicate.hpp>
+#include <boost/algorithm/string/replace.hpp>
+#include <boost/algorithm/string/split.hpp>
+#include <boost/algorithm/string/trim.hpp>
+#include <boost/filesystem/directory.hpp>
+#include <boost/filesystem/operations.hpp>
+#include <boost/filesystem/path.hpp>
+#include <exception>
+#include <initializer_list>
+#include <ios>
+#include <string>
+#include <utility>
+#include <vector>
 
 #include "Http.hpp"
 #include "libslic3r/AppConfig.hpp"

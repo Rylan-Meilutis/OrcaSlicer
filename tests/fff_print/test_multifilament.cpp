@@ -1,4 +1,12 @@
 #include <catch2/catch_all.hpp>
+#include "libslic3r/ExPolygon.hpp"
+#include "libslic3r/ExtrusionEntity.hpp"
+#include "libslic3r/Flow.hpp"
+#include "libslic3r/Point.hpp"
+#include "libslic3r/Polyline.hpp"
+#include "libslic3r/Semver.hpp"
+#include "libslic3r/Surface.hpp"
+#include "libslic3r/libslic3r.h"
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
@@ -96,8 +104,8 @@ TEST_CASE("A supplied rooting project gains buried material without changing its
 TEST_CASE("XY roots branch into cliff contacts while preserving material skins", "[Multifilament][RootingXY]")
 {
     const double angle = GENERATE(0., PI / 6., PI / 2.);
-    const std::string mode = GENERATE("plain", "beams", "elevated", "thin", "support", "same material", "large nozzle");
-    const bool expect_roots = mode == "plain" || mode == "beams" || mode == "elevated";
+    const std::string mode = GENERATE("plain", "beams", "elevated", "edge contact", "thin", "support", "same material", "large nozzle");
+    const bool expect_roots = mode == "plain" || mode == "beams" || mode == "elevated" || mode == "edge contact";
     CAPTURE(angle, mode);
     auto config = multifilament_config(2, {
         {"rooting", false}, {"rooting_xy", false}, {"rooting_depth", 4.},
@@ -117,8 +125,8 @@ TEST_CASE("XY roots branch into cliff contacts while preserving material skins",
     auto base = make_cube(24., 32., height);
     base.rotate_z(angle);
     init_print({base}, baseline, model, config);
-    TriangleMesh cliff = make_cube(8., 16., mode == "elevated" ? 8. : height);
-    cliff.translate(24., 8., mode == "elevated" ? 10. : 0.);
+    TriangleMesh cliff = make_cube(8., mode == "edge contact" ? 6. : 16., mode == "elevated" ? 8. : height);
+    cliff.translate(24., mode == "edge contact" ? 0. : 8., mode == "elevated" ? 10. : 0.);
     cliff.rotate_z(angle);
     auto *object = model.objects.front();
     object->volumes.front()->config.set("extruder", 1);
@@ -178,6 +186,14 @@ TEST_CASE("XY roots branch into cliff contacts while preserving material skins",
         const auto envelope = mode == "beams" ? union_ex(material(native.get_object(0)->layers()[z], 1),
                                                         material(native.get_object(0)->layers()[z], 2)) : all;
         CHECK(area(diff_ex(added, offset2_ex(envelope, scale_(0.001), -scale_(0.791)))) < scale_(0.001) * scale_(0.001));
+        double wall_clearance = 0.;
+        for (const auto *layer_region : original[z]->regions()) {
+            const auto &region = layer_region->region();
+            const auto outer = region.flow(*baseline.get_object(0), frExternalPerimeter, original[z]->height, z == 0);
+            const auto inner = region.flow(*baseline.get_object(0), frPerimeter, original[z]->height, z == 0);
+            wall_clearance = std::max(wall_clearance, double(outer.width()) + 3. * inner.spacing());
+        }
+        CHECK(area(diff_ex(added, offset2_ex(envelope, scale_(0.001), -scale_(wall_clearance - 0.001)))) < scale_(0.001) * scale_(0.001));
         // No isolated host islands, including webs too thin to print.
         CHECK(a.size() <= old_a.size());
         CHECK(offset_ex(a, -scale_(0.4)).size() <= offset_ex(old_a, -scale_(0.4)).size());
@@ -203,10 +219,53 @@ TEST_CASE("XY roots branch into cliff contacts while preserving material skins",
     }
 }
 
+TEST_CASE("Roots preserve the native perimeter stack and a host web", "[Multifilament][Rooting][RootingWalls]")
+{
+    const int walls = GENERATE(2, 6);
+    auto config = multifilament_config(2, {
+        {"rooting", false}, {"rooting_xy", false}, {"rooting_depth", 3.},
+        {"rooting_width", 1.2}, {"rooting_spacing", 6.}, {"rooting_skin", 0.4},
+        {"wall_loops", walls}, {"outer_wall_line_width", 0.6}, {"inner_wall_line_width", 0.6},
+        {"interlocking_beam", false}, {"layer_height", 0.2}, {"initial_layer_print_height", 0.2},
+        {"elefant_foot_compensation", 0.}, {"enable_prime_tower", false}});
+    Print baseline, rooted;
+    Model model;
+    init_print({make_cube(24., 24., 6.)}, baseline, model, config);
+    auto top = make_cube(24., 24., 2.);
+    top.translate(0., 0., 6.);
+    model.objects.front()->volumes.front()->config.set("extruder", 1);
+    model.objects.front()->add_volume(top)->config.set("extruder", 2);
+    baseline.apply(model, config);
+    baseline.get_object(0)->slice();
+    config.set_deserialize_strict("rooting", "1");
+    rooted.apply(model, config);
+    rooted.get_object(0)->slice();
+    double removed_area = 0.;
+    const auto &before = baseline.get_object(0)->layers();
+    const auto &after = rooted.get_object(0)->layers();
+    REQUIRE(before.size() == after.size());
+    for (size_t z = 0; z < before.size(); ++z) {
+        for (size_t r = 0; r < before[z]->regions().size(); ++r) {
+            const auto &region = before[z]->get_region(r)->region();
+            if (region.extruder(frExternalPerimeter) != 1) continue;
+            const auto native = to_expolygons(before[z]->get_region(r)->slices.surfaces);
+            const auto removed = diff_ex(native, to_expolygons(after[z]->get_region(r)->slices.surfaces));
+            if (removed.empty()) continue;
+            removed_area += area(removed);
+            const auto outer = region.flow(*baseline.get_object(0), frExternalPerimeter, before[z]->height, z == 0);
+            const auto inner = region.flow(*baseline.get_object(0), frPerimeter, before[z]->height, z == 0);
+            const double clearance = outer.width() + walls * inner.spacing();
+            CHECK(area(diff_ex(removed, offset_ex(native, -scale_(clearance - 0.001)))) < scale_(0.001) * scale_(0.001));
+        }
+    }
+    CHECK(removed_area > scale_(1.) * scale_(1.));
+}
+
 TEST_CASE("Rooting fits printable trunks around screw-hole contacts", "[Multifilament][Rooting]")
 {
     const bool beams = GENERATE(false, true);
-    CAPTURE(beams);
+    const double root_width = GENERATE(1.2, 2.4);
+    CAPTURE(beams, root_width);
     // Ring dimensions from the ValveBoard insert: the host's screw bore is
     // slightly wider than the insert bore. After skins, the contact band is
     // narrower than the preferred trunk, but wider than a printable branch.
@@ -234,7 +293,7 @@ TEST_CASE("Rooting fits printable trunks around screw-hole contacts", "[Multifil
         return TriangleMesh(std::move(vertices), std::move(faces));
     };
     auto config = multifilament_config(2, {
-        {"rooting", false}, {"rooting_depth", 5.}, {"rooting_width", 1.2},
+        {"rooting", false}, {"rooting_depth", 5.}, {"rooting_width", root_width},
         {"rooting_skin", 0.8}, {"rooting_spacing", 4.}, {"interlocking_beam", beams},
         {"interlocking_depth", 2}, {"interlocking_orientation", 22.5},
         {"layer_height", 0.2}, {"initial_layer_print_height", 0.2},

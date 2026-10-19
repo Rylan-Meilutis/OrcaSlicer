@@ -1,4 +1,9 @@
 #include <catch2/catch_all.hpp>
+#include <cstddef>
+#include "libslic3r/CustomGCode.hpp"
+#include "libslic3r/PrintConfig.hpp"
+#include "libslic3r/TriangleSelector.hpp"
+#include <stdexcept>
 #include <algorithm>
 #include <utility>
 #include <vector>

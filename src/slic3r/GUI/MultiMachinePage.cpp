@@ -1,4 +1,5 @@
 #include "MultiMachinePage.hpp"
+#include "slic3r/GUI/Plater.hpp"
 #include "GUI_App.hpp"
 #include "MainFrame.hpp"
 

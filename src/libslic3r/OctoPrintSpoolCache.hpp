@@ -1,6 +1,10 @@
 #pragma once
 
 #include "GCode/SpoolManagerMetadata.hpp"
+#include <ios>
+#include <string>
+#include <utility>
+#include <vector>
 #include <boost/uuid/detail/sha1.hpp>
 #include <iomanip>
 #include <sstream>

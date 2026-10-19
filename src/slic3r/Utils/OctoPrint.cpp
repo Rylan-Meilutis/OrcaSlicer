@@ -1,4 +1,5 @@
 #include "OctoPrint.hpp"
+#include <boost/algorithm/string/trim.hpp>
 
 #include <algorithm>
 #include <chrono>

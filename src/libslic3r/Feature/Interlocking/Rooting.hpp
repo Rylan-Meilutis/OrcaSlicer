@@ -1,6 +1,8 @@
 #pragma once
 
 #include "libslic3r/ExPolygon.hpp"
+#include <cstddef>
+#include <vector>
 #include <functional>
 
 namespace Slic3r {

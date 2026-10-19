@@ -1,4 +1,6 @@
 #include <catch2/catch_all.hpp>
+#include <algorithm>
+#include <cmath>
 #include "libslic3r/GCode/ArcCooling.hpp"
 #include "libslic3r/GCode/FeatureTemperature.hpp"
 #include <limits>

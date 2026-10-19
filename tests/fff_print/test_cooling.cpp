@@ -1,4 +1,6 @@
 #include <catch2/catch_all.hpp>
+#include "libslic3r/Print.hpp"
+#include "libslic3r/calib.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include "test_helpers.hpp"

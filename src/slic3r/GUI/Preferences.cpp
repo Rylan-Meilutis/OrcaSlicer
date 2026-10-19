@@ -1,4 +1,12 @@
 #include "Preferences.hpp"
+#include <boost/algorithm/string/predicate.hpp>
+#include <ctime>
+#include <wx/busycursor.h>
+#include <wx/datetime.h>
+#include <wx/dialog.h>
+#include <wx/listbase.h>
+#include <wx/msgdlg.h>
+#include <wx/toplevel.h>
 #include "CloudProvider.hpp"
 #include "OptionsGroup.hpp"
 #include "GUI_App.hpp"

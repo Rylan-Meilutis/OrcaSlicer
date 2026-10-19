@@ -1,4 +1,12 @@
 #include <catch2/catch_all.hpp>
+#include <algorithm>
+#include "libslic3r/ExtrusionEntity.hpp"
+#include "libslic3r/ExtrusionEntityCollection.hpp"
+#include "libslic3r/Point.hpp"
+#include "libslic3r/Polygon.hpp"
+#include <string>
+#include <utility>
+#include <vector>
 
 #include <cmath>
 #include <numeric>
@@ -24,6 +32,7 @@
 #include "test_utils.hpp"
 
 using namespace Slic3r;
+using namespace Slic3r::Test;
 
 TEST_CASE("Feature flows use their selected tool nozzle diameters",
           "[Flow][MultiNozzle][FeatureTools]")

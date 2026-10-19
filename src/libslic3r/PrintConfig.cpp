@@ -1,4 +1,6 @@
 #include "PrintConfig.hpp"
+#include <boost/lexical_cast/bad_lexical_cast.hpp>
+#include <initializer_list>
 #include "CommonDefs.hpp"
 #include "Point.hpp"
 #include "Polygon.hpp"
