@@ -1,4 +1,5 @@
 #include <array>
+#include <wx/defs.h>
 #include "slic3r/GUI/Widgets/Button.hpp"
 #include <cstdlib>
 #include <functional>

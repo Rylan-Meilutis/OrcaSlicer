@@ -1,4 +1,6 @@
 #include <catch2/catch_all.hpp>
+#include <catch2/catch_message.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <cstddef>
 #include <iterator>
 #include "libslic3r/Config.hpp"

@@ -1,4 +1,6 @@
 #include <catch2/catch_all.hpp>
+#include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include "libslic3r/GCode/SpoolManagerMetadata.hpp"
 #include "libslic3r/Utils.hpp"
 #include <vector>

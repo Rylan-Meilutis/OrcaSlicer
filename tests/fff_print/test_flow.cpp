@@ -1,4 +1,12 @@
 #include <catch2/catch_all.hpp>
+#include "libslic3r/ExPolygon.hpp"
+#include "libslic3r/Surface.hpp"
+#include <catch2/catch_message.hpp>
+#include <catch2/generators/catch_generators.hpp>
+#include <catch2/matchers/catch_matchers.hpp>
+#include <catch2/matchers/catch_matchers_floating_point.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
+#include <cstddef>
 #include <algorithm>
 #include "libslic3r/ExtrusionEntity.hpp"
 #include "libslic3r/ExtrusionEntityCollection.hpp"

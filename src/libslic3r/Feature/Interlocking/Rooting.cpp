@@ -1,4 +1,12 @@
 #include "Rooting.hpp"
+#include "libslic3r/BoundingBox.hpp"
+#include "libslic3r/ExPolygon.hpp"
+#include "libslic3r/Line.hpp"
+#include "libslic3r/Point.hpp"
+#include "libslic3r/Polygon.hpp"
+#include "libslic3r/Surface.hpp"
+#include "libslic3r/libslic3r.h"
+#include <limits>
 #include <cstddef>
 #include <functional>
 #include <utility>

@@ -1,4 +1,5 @@
 #include "SlicedGCode.hpp"
+#include "libslic3r/Config.hpp"
 #include <boost/filesystem/operations.hpp>
 #include <cstddef>
 #include <string>

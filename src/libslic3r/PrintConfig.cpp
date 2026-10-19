@@ -1,4 +1,5 @@
 #include "PrintConfig.hpp"
+#include "libslic3r/LocalesUtils.hpp"
 #include <boost/lexical_cast/bad_lexical_cast.hpp>
 #include <initializer_list>
 #include "CommonDefs.hpp"

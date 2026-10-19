@@ -1,4 +1,6 @@
 #include <catch2/catch_all.hpp>
+#include <catch2/catch_message.hpp>
+#include <catch2/catch_test_macros.hpp>
 #include "libslic3r/AppUpdate.hpp"
 
 using namespace Slic3r;

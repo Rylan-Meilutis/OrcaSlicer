@@ -1,4 +1,5 @@
 #include <algorithm>
+#include "libslic3r/Fill/FillProgress.hpp"
 #include <functional>
 #include <assert.h>
 #include <regex>

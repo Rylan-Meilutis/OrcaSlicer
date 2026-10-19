@@ -1,4 +1,7 @@
 #include "ProfileSourceManager.hpp"
+#include "libslic3r/Semver.hpp"
+#include <boost/optional/optional.hpp>
+#include <iterator>
 #include <boost/algorithm/string/case_conv.hpp>
 #include <boost/algorithm/string/classification.hpp>
 #include <boost/algorithm/string/constants.hpp>

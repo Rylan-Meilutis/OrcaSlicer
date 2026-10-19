@@ -1,4 +1,5 @@
 #include "ExPolygon.hpp"
+#include "libslic3r/Fill/FillProgress.hpp"
 #include "Config.hpp"
 #include "Exception.hpp"
 #include "Line.hpp"

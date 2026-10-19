@@ -1,4 +1,5 @@
 #include <catch2/catch_all.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 #include <exception>
 #include "libslic3r/ArcFitter.hpp"
 #include "libslic3r/Exception.hpp"

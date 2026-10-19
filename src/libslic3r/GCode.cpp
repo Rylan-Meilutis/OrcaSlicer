@@ -1,4 +1,6 @@
 #include "ArcFitter.hpp"
+#include "libslic3r/SequentialGantryGeometry.hpp"
+#include "libslic3r/Surface.hpp"
 #include <array>
 #include <boost/algorithm/string/trim.hpp>
 #include "BoundingBox.hpp"

@@ -1,4 +1,5 @@
 #include <boost/filesystem/path.hpp>
+#include <catch2/catch_approx.hpp>
 #include <stdexcept>
 #include <boost/filesystem/operations.hpp>
 #include <boost/filesystem/directory.hpp>

@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <string>
 #include <boost/log/trivial.hpp>
 #include <limits>
 

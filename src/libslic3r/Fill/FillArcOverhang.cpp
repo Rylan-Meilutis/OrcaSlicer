@@ -1,7 +1,18 @@
 #include "FillArcOverhang.hpp"
+#include "libslic3r/ArcFitter.hpp"
+#include "libslic3r/BoundingBox.hpp"
+#include "libslic3r/ExPolygon.hpp"
+#include "libslic3r/Fill/FillBase.hpp"
+#include "libslic3r/Fill/FillProgress.hpp"
+#include "libslic3r/Line.hpp"
+#include "libslic3r/Point.hpp"
+#include "libslic3r/Polygon.hpp"
+#include "libslic3r/Polyline.hpp"
+#include "libslic3r/libslic3r.h"
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <math.h>
 #include <utility>
 #include <vector>
@@ -877,9 +888,16 @@ void FillArcOverhang::_fill_surface_single(const FillParams              &params
                 append(arcs, std::move(translated_arcs));
         }
     } else {
-        // Outside narrow spans, one complete directly anchored family supplies
-        // the large-arc backbone before any recursive detail is considered.
-        generate_family(anchor, center, spacing, recursive_fill ? scale_(max_family_radius_mm) : 0., expolygon,
+        // Convex regions can continue the primary family without a restart.
+        // Only bound it when an explicitly supported, concave region needs
+        // frontier branches around corners; truncating convex spans leaves
+        // coverage gaps, while unrestricted concave families fragment those
+        // branches into short courses. Legacy callers without a support map
+        // retain their complete primary family in recursive mode as well.
+        const bool bounded_primary = recursive_fill && explicit_support &&
+            (!expolygon.holes.empty() || !polygon_is_convex(expolygon.contour));
+        generate_family(anchor, center, spacing,
+                        bounded_primary ? scale_(max_family_radius_mm) : 0., expolygon,
                         std::numeric_limits<size_t>::max(), false, arcs,
                         nullptr, nullptr);
     }
