@@ -3079,9 +3079,9 @@ void TabPrint::build()
         optgroup->append_single_option_line("nonplanar_infill_amplitude");
         optgroup->append_single_option_line("nonplanar_infill_wavelength");
         optgroup->append_single_option_line("nonplanar_infill_resolution");
-        optgroup->append_single_option_line("tpms_adaptive", "strength_settings_patterns#adaptive-density");
-        optgroup->append_single_option_line("tpms_interior_density", "strength_settings_patterns#interior-density");
-        optgroup->append_single_option_line("tpms_adaptive_gradient", "strength_settings_patterns#adaptive-gradient");
+        optgroup->append_single_option_line("adaptive_infill_mode", "strength_settings_patterns#adaptive-density");
+        optgroup->append_single_option_line("adaptive_infill_interior_density", "strength_settings_patterns#interior-density");
+        optgroup->append_single_option_line("adaptive_infill_gradient", "strength_settings_patterns#adaptive-gradient");
         optgroup->append_single_option_line("gyroid_optimized", "strength_settings_patterns#gyroid-optimized");
         optgroup->append_single_option_line("sparse_infill_smooth_factor", "strength_settings_infill#sparse-infill-smooth-factor");
         optgroup->append_single_option_line("infill_direction", "strength_settings_infill#direction");
@@ -3392,6 +3392,7 @@ void TabPrint::build()
         optgroup->append_single_option_line("gcode_comments", "others_settings_g_code_output#verbose-g-code");
         optgroup->append_single_option_line("gcode_label_objects", "others_settings_g_code_output#label-objects");
         optgroup->append_single_option_line("exclude_object", "others_settings_g_code_output#exclude-objects");
+        optgroup->append_single_option_line("exclude_object_tolerance", "others_settings_g_code_output#outline-tolerance");
         option = optgroup->get_option("filename_format");
         // option.opt.full_width = true;
         option.opt.is_code = true;
@@ -5473,7 +5474,7 @@ void TabPrinter::build_fff()
                 option.opt.width = Field::def_width_wider();
                 option.opt.tooltip = L("Select the network agent implementation for printer communication. "
                     "Available agents are registered at startup.");
-                optgroup->append_single_option_line(option);
+                optgroup->append_single_option_line(option, "printer_basic_information_advanced#printer-agent");
             }
         }
 
