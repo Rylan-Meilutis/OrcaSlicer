@@ -5604,6 +5604,33 @@ DynamicPrintConfig PresetBundle::tool_mapped_config(Model &job_model, const std:
     for (const std::string &key : mapped_roles)
         result.set_key_value(key, job.prints.get_edited_preset().config.option(key)->clone());
 
+    // Dispatch re-slices in physical-slot space. The preview's plate sequences
+    // still name logical materials, so relocate them along with the geometry.
+    // Otherwise a letters-first sequence can become a base-first sequence when
+    // the selected spools are not in project order.
+    const auto map_sequence_slot = [&](int slot) {
+        if (slot < 0 || slot > int(count))
+            throw std::invalid_argument("A print sequence refers to an unavailable project filament.");
+        return slot > 0 ? tools[slot - 1] + 1 : slot; // Preserve automatic-order sentinel.
+    };
+    if (const auto *sequence = roles.option<ConfigOptionInts>("first_layer_print_sequence")) {
+        auto values = sequence->values;
+        for (int &slot : values) slot = map_sequence_slot(slot);
+        result.set_key_value("first_layer_print_sequence", new ConfigOptionInts(values));
+    }
+    const int sequence_count = roles.opt_int("other_layers_print_sequence_nums");
+    if (sequence_count > 0) {
+        auto values = roles.option<ConfigOptionInts>("other_layers_print_sequence")->values;
+        if (values.size() % size_t(sequence_count) != 0 || values.size() / size_t(sequence_count) <= 2)
+            throw std::invalid_argument("Invalid layer-range print sequence.");
+        const size_t stride = values.size() / size_t(sequence_count);
+        for (size_t start = 0; start < values.size(); start += stride)
+            for (size_t i = start + 2; i < start + stride; ++i)
+                values[i] = map_sequence_slot(values[i]); // First two entries are layer bounds.
+        result.set_key_value("other_layers_print_sequence_nums", new ConfigOptionInt(sequence_count));
+        result.set_key_value("other_layers_print_sequence", new ConfigOptionInts(values));
+    }
+
     std::map<int, int> relocations;
     for (size_t i = 0; i < count; ++i)
         relocations.emplace(int(i), tools[i]);

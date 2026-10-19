@@ -176,7 +176,14 @@ TEST_CASE("Dispatch mapping preserves the project and binds roles to physical to
     Model job(project);
     DynamicPrintConfig plate;
     plate.set_key_value("outer_wall_filament_id", new ConfigOptionInt(2));
+    plate.set_key_value("first_layer_print_sequence", new ConfigOptionInts{1, 2});
+    plate.set_key_value("other_layers_print_sequence_nums", new ConfigOptionInt(2));
+    plate.set_key_value("other_layers_print_sequence", new ConfigOptionInts{2, 5, 2, 1, 6, 10, 1, 2});
     const auto config = bundle.tool_mapped_config(job, {7, 0}, plate);
+    CHECK(config.option<ConfigOptionInts>("first_layer_print_sequence")->values == std::vector<int>{8, 1});
+    CHECK(config.option<ConfigOptionInts>("other_layers_print_sequence")->values == std::vector<int>{2, 5, 1, 8, 6, 10, 8, 1});
+    CHECK(config.opt_int("other_layers_print_sequence_nums") == 2);
+    CHECK(plate.option<ConfigOptionInts>("first_layer_print_sequence")->values == std::vector<int>{1, 2});
     CHECK(job.objects.front()->config.extruder() == 8);
     CHECK_FALSE(project.objects.front()->config.has("extruder"));
     CHECK(bundle.filament_presets.size() == 2);

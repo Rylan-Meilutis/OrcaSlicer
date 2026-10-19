@@ -17,6 +17,7 @@
 #include "libslic3r/ClipperUtils.hpp"
 #include "libslic3r/Format/bbs_3mf.hpp"
 #include "libslic3r/Preset.hpp"
+#include "libslic3r/PresetBundle.hpp"
 
 #include "test_helpers.hpp"
 #include "test_utils.hpp"
@@ -48,6 +49,46 @@
 
 using namespace Slic3r;
 using namespace Slic3r::Test;
+
+TEST_CASE("Mapped exports print the requested first material before a larger base", "[Multifilament][ToolMapping]")
+{
+    PresetBundle bundle;
+    auto &printer = bundle.printers.get_edited_preset().config;
+    printer.set_key_value("host_type", new ConfigOptionEnum<PrintHostType>(htOctoPrint));
+    printer.set_deserialize_strict("single_extruder_multi_material", "0");
+    printer.set_deserialize_strict("nozzle_diameter", "0.4,0.4,0.4,0.4,0.4,0.4,0.4,0.4");
+    bundle.set_num_filaments(2);
+    Model model;
+    auto *object = model.add_object();
+    object->add_volume(make_cube(2., 2., 0.4))->config.set("extruder", 1);
+    auto base = make_cube(10., 10., 0.4);
+    base.translate(5., 0., 0.);
+    object->add_volume(base)->config.set("extruder", 2);
+    object->add_instance();
+    DynamicPrintConfig plate;
+    plate.set_key_value("first_layer_print_sequence", new ConfigOptionInts{1, 2});
+    auto config = bundle.tool_mapped_config(model, {7, 0}, plate);
+    config.set_deserialize_strict("enable_prime_tower", "0");
+    config.set_deserialize_strict("skirt_loops", "0");
+    config.set_deserialize_strict("brim_type", "no_brim");
+    config.set_deserialize_strict("machine_start_gcode", "");
+    config.set_deserialize_strict("change_filament_gcode", "");
+    config.set_deserialize_strict("layer_height", "0.2");
+    config.set_deserialize_strict("initial_layer_print_height", "0.2");
+    Print print;
+    print.apply(model, config);
+    const auto output = gcode(print);
+    int tool = -1, first_depositing_tool = -1;
+    GCodeReader reader;
+    reader.parse_buffer(output, [&](GCodeReader &self, const GCodeReader::GCodeLine &line) {
+        const std::string cmd(line.cmd());
+        if (cmd.size() > 1 && cmd.front() == 'T' && std::isdigit(static_cast<unsigned char>(cmd[1])))
+            tool = std::stoi(cmd.substr(1));
+        if (first_depositing_tool < 0 && line.extruding(self) && (line.has_x() || line.has_y()))
+            first_depositing_tool = tool;
+    });
+    CHECK(first_depositing_tool == 7);
+}
 
 TEST_CASE("Root preparation reports real phases and is deterministic across worker counts", "[Multifilament][Rooting][SliceProgress]")
 {
