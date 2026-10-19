@@ -658,7 +658,7 @@ protected:
     bool            is_nonplanar_leveling_course(const std::vector<ObjectByExtruder::Island::Region>& by_region,
                                                  bool before_current_layer, size_t feature_course) const;
     std::string     extrude_entity_nonplanar_filtered(const ExtrusionEntity& entity, const std::string& description,
-                                                      bool nonplanar, const ExtrusionEntitiesPtr& region_perimeters = {},
+                                                      bool nonplanar, const std::vector<const ExtrusionEntity *>& region_perimeters = {},
                                                       std::optional<bool> before_current_layer = std::nullopt,
                                                       std::optional<bool> feature_transition = std::nullopt,
                                                       std::optional<size_t> feature_course = std::nullopt);

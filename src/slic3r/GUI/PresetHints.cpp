@@ -4,9 +4,12 @@
 #include "libslic3r/GCode/ArcCooling.hpp"
 #include "libslic3r/GCode/FeatureTemperature.hpp"
 #include "libslic3r/Slicing.hpp"
+#include "libslic3r/Preset.hpp"
 #include "libslic3r/libslic3r.h"
 
 #include "PresetHints.hpp"
+#include "I18N.hpp"
+#include "format.hpp"
 
 #include <string>
 #include "libslic3r/Config.hpp"

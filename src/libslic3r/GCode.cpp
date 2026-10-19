@@ -9692,7 +9692,7 @@ std::string GCode::extrude_entity(const ExtrusionEntity&                     ent
 
 std::string GCode::extrude_entity_nonplanar_filtered(
     const ExtrusionEntity &entity, const std::string &description,
-    bool nonplanar, const ExtrusionEntitiesPtr &region_perimeters,
+    bool nonplanar, const std::vector<const ExtrusionEntity *> &region_perimeters,
     std::optional<bool> before_current_layer,
     std::optional<bool> feature_transition,
     std::optional<size_t> feature_course)
@@ -10648,7 +10648,7 @@ std::string GCode::_extrude(const ExtrusionPath &input_path, const std::string &
                 // Every run was checked immediately above. Rechecking it here
                 // makes clearance generation quadratic for heavily segmented
                 // non-planar skins and cannot change the result.
-                gcode += this->_extrude(run, description, speed, false);
+                gcode += this->_extrude(run, path_description, speed, false);
             }
             return gcode;
         }

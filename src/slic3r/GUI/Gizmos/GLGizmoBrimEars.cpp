@@ -870,7 +870,7 @@ void GLGizmoBrimEars::on_render_input_window(float x, float y, float bottom_limi
     ImGui::SameLine(caption_size);
     ImGui::SetNextItemWidth(list_width);
     if (ImGui::SliderFloat("##section_view", &clp_dist, 0.f, 1.f, "%.2f")) {
-        m_c->object_clipper()->set_position_by_ratio(clp_dist, false, true);
+        m_c->object_clipper()->set_position_by_ratio(clp_dist, Vec3d::UnitZ());
     }
 
     ImGui::Separator();
