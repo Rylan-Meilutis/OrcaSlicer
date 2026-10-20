@@ -51,6 +51,7 @@
 		"70%"
 	],
 	"compatible_printers": [
+		"Prusa CORE One INDX RME 0.4 nozzle",
 		"Prusa CORE One INDX 4T HF 0.4 nozzle",
 		"Prusa CORE One INDX 8T HF 0.4 nozzle"
 	],

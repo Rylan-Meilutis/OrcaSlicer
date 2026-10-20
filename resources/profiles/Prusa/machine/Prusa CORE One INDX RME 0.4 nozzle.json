@@ -10,7 +10,7 @@
 	"cooling_tube_length": "20",
 	"cooling_tube_retraction": "45",
 	"default_filament_profile": [
-		"Prusament PLA @CORE One HF 0.4"
+		"Prusament PLA @Prusa CORE One INDX"
 	],
 	"default_nozzle_volume_type": [
 		"Standard",

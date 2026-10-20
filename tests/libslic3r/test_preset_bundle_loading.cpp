@@ -90,6 +90,25 @@ TEST_CASE("Legacy CORE One HF user tunes remain available on RME INDX without ad
     filament.is_system = true;
     CHECK_FALSE(is_compatible_with_printer(PresetWithVendorProfile(filament, nullptr), PresetWithVendorProfile(printer, nullptr)));
 }
+
+TEST_CASE("RME hardware aliases preserve library fallback exclusions", "[PresetBundle][RmeCompatibility]")
+{
+    using namespace Slic3r;
+    Preset printer(Preset::TYPE_PRINTER, "Custom RME printer");
+    printer.config = *std::unique_ptr<DynamicPrintConfig>(DynamicPrintConfig::new_from_defaults_keys(Preset::printer_options()));
+    printer.config.set_key_value("printer_model", new ConfigOptionString("Prusa CORE One INDX RME"));
+    printer.config.set_key_value("printer_variant", new ConfigOptionString("0.4"));
+    printer.inherits() = "Prusa CORE One INDX RME 0.4 nozzle";
+    Preset filament(Preset::TYPE_FILAMENT, "Generic TPU @System");
+    filament.is_system = true;
+    VendorProfile vendor;
+    vendor.name = PresetBundle::ORCA_FILAMENT_LIBRARY;
+    const auto excluded_name = GENERATE(std::string("Custom RME printer"), std::string("Prusa CORE One INDX RME 0.4 nozzle"));
+    filament.m_excluded_from.insert(excluded_name);
+    CHECK_FALSE(is_compatible_with_printer(PresetWithVendorProfile(filament, &vendor), PresetWithVendorProfile(printer, nullptr)));
+    filament.m_excluded_from.clear();
+    CHECK(is_compatible_with_printer(PresetWithVendorProfile(filament, &vendor), PresetWithVendorProfile(printer, nullptr)));
+}
 #include <initializer_list>
 #include <vector>
 #include <string>

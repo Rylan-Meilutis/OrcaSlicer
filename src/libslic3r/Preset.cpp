@@ -945,15 +945,6 @@ static bool is_compatible_with_printer_identity(const PresetWithVendorProfile &p
 	// 	// The current profile has a vendor assigned and it is different from the active print's vendor.
 	// 	return false;
 
-    // Orca: check excluded printers
-    if (preset.vendor != nullptr && preset.preset.type == Preset::TYPE_FILAMENT) {
-        const auto& excluded_printers = preset.preset.m_excluded_from;
-        const auto  excluded         = preset.vendor->name == PresetBundle::ORCA_FILAMENT_LIBRARY &&
-                              (excluded_printers.find(active_printer.preset.name) != excluded_printers.end() ||
-                               excluded_printers.find(active_printer.preset.inherits()) != excluded_printers.end());
-        if (excluded)
-            return false;
-    }
     auto &condition               = preset.preset.compatible_printers_condition();
     auto *compatible_printers     = dynamic_cast<const ConfigOptionStrings*>(preset.preset.config.option("compatible_printers"));
     bool  has_compatible_printers = compatible_printers != nullptr && ! compatible_printers->values.empty();
@@ -990,6 +981,14 @@ static bool is_compatible_with_printer_identity(const PresetWithVendorProfile &p
 
 bool is_compatible_with_printer(const PresetWithVendorProfile &preset, const PresetWithVendorProfile &active_printer, const DynamicPrintConfig *extra_config)
 {
+    // Hardware aliases must not re-enable a library fallback shadowed by a
+    // printer-specific tune on the actual printer.
+    if (preset.vendor != nullptr && preset.preset.type == Preset::TYPE_FILAMENT &&
+        preset.vendor->name == PresetBundle::ORCA_FILAMENT_LIBRARY) {
+        const auto &excluded = preset.preset.m_excluded_from;
+        if (excluded.count(active_printer.preset.name) || excluded.count(active_printer.preset.inherits()))
+            return false;
+    }
     if (is_compatible_with_printer_identity(preset, active_printer, extra_config))
         return true;
 
