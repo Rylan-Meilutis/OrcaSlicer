@@ -2160,6 +2160,7 @@ PRINT_CONFIG_CLASS_DERIVED_DEFINE(
     PrintConfig,
     (MachineEnvelopeConfig, GCodeConfig),
 
+    ((ConfigOptionBool,                automatic_warp_mitigation))
     // Build plate tilt for off-axis gravity support generation (printer-level setting).
     ((ConfigOptionFloat,               build_plate_tilt_x))
     ((ConfigOptionFloat,               build_plate_tilt_y))

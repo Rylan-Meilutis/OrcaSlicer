@@ -16,6 +16,7 @@
 #include "libslic3r/Flow.hpp"
 #include "libslic3r/ClipperUtils.hpp"
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <tbb/parallel_for.h>
 
@@ -258,11 +259,18 @@ size_t Rooting::apply(PrintObject &object, const std::function<void()> &cancel, 
                 });
                 const auto preserves_host_webs = [&](const std::vector<Polygons> &tree,
                                                      const std::vector<Polygons> &branch) {
-                    for (size_t z = bottom; z < top; ++z) {
+                    // Each course reads the same candidate and native host.
+                    // Keep candidate acceptance serial, but check independent
+                    // courses in parallel: full-host erosion dominates on large
+                    // contacts. Workers never modify tree/additions or report UI
+                    // progress, and cancellation still propagates through TBB.
+                    std::atomic<bool> valid{true};
+                    tbb::parallel_for(bottom, top, [&](size_t z) {
+                        if (!valid.load(std::memory_order_relaxed)) return;
                         cancel();
                         // The model-shaped attachment is intentionally a plate;
                         // enforce webs in the load-bearing root network below it.
-                        if (contact_z - layers[z]->print_z <= collar_depth + EPSILON) continue;
+                        if (contact_z - layers[z]->print_z <= collar_depth + EPSILON) return;
                         const size_t i = z - bottom;
                         Polygons proposed = additions[i];
                         append(proposed, tree[i]);
@@ -272,12 +280,18 @@ size_t Rooting::apply(PrintObject &object, const std::function<void()> &cancel, 
                             const auto &host_part = host_sections[i][h];
                             if (intersection_ex(ExPolygons{host_part}, roots).empty()) continue;
                             const auto remaining = diff_ex(ExPolygons{host_part}, roots);
-                            if (remaining.size() > 1 || remaining.empty()) return false;
+                            if (remaining.size() > 1 || remaining.empty()) {
+                                valid.store(false, std::memory_order_relaxed);
+                                return;
+                            }
                             const auto core = offset_ex(remaining, -scale_(web_radius));
-                            if (core.empty() || core.size() > host_core_counts[i][h]) return false;
+                            if (core.empty() || core.size() > host_core_counts[i][h]) {
+                                valid.store(false, std::memory_order_relaxed);
+                                return;
+                            }
                         }
-                    }
-                    return true;
+                    });
+                    return valid.load(std::memory_order_relaxed);
                 };
                 const ExPolygons contact_collar = offset_ex(contact, -scale_(skin));
                 ExPolygons collar;

@@ -58,6 +58,7 @@
 #include "IMEXHelpers.hpp"
 #include "IMEXZones.hpp"
 #include "Print.hpp"
+#include "WarpMitigation.hpp"
 #include "BoundingBox.hpp"
 #include "Brim.hpp"
 #include "ClipperUtils.hpp"
@@ -1912,6 +1913,24 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
 
     if (m_objects.empty())
         return {std::string()};
+
+    // Screen materials used by model geometry, not unused or support-only slots.
+    const auto warp_risk = assess_warp_risk(m_ori_full_print_config, m_model);
+    if (warp_risk.elevated()) {
+        const bool sparse_adhesion = std::any_of(m_objects.begin(), m_objects.end(),
+            [&](const PrintObject *object) {
+                const auto &cfg = object->config();
+                return cfg.raft_layers.value == 0 &&
+                    ((cfg.brim_type.value != btOuterOnly && cfg.brim_type.value != btOuterAndInner) ||
+                     cfg.brim_width.value < warp_risk.brim_mm() || cfg.brim_object_gap.value > 0.1);
+            });
+        if (sparse_adhesion && !m_config.belt_printer.value)
+            warn(L("Warp-prone material detected with limited continuous bed adhesion. In Others, use Warp and curl risk to apply a continuous outer brim and curled-perimeter slowdown. Check enclosure conditions and build-plate preparation. These measures reduce risk but cannot guarantee that the print stays attached."),
+                 "automatic_warp_mitigation");
+        else
+            warn(L("Warp-prone material detected. Adhesion measures do not eliminate warping or curling. Check enclosure conditions, drafts and build-plate preparation before printing. Review Warp and curl risk in Others; the slicer cannot verify actual bed adhesion."),
+                 "automatic_warp_mitigation");
+    }
 
     const std::string &model_override = m_config.gcode_printer_model.value;
     if (std::any_of(model_override.begin(), model_override.end(),

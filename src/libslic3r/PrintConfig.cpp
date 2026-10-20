@@ -1811,6 +1811,13 @@ void PrintConfigDef::init_fff_params()
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionBool(false));
 
+    def = this->add("automatic_warp_mitigation", coBool);
+    def->label = L("Automatic warp and curl mitigation");
+    def->category = L("Quality");
+    def->tooltip = L("Screen model materials for bed-lift risk when slicing. For susceptible materials, use a continuous outer brim instead of sparse painted coverage or ears, reduce its gap, and enable curled-overhang slowdown. Existing inner brims, rafts, belt-printer adhesion and object overrides remain authoritative. Painting is retained in the model. This does not detect actual deformation or guarantee adhesion. Temperatures and cooling are not changed. Use a suitable enclosure and prepared build surface.");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionBool(false));
+
     def = this->add("localized_shrinkage_strategy", coEnum);
     def->label = L("Localized shrinkage strategy");
     def->category = L("Quality");

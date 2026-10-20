@@ -7,6 +7,7 @@
 #include "libslic3r/IMEXHelpers.hpp"
 #include "libslic3r/PresetBundle.hpp"
 #include "libslic3r/PrintConfig.hpp"
+#include "libslic3r/WarpMitigation.hpp"
 #include "libslic3r/BeltTransform.hpp"
 #include "libslic3r/FilamentMixer.hpp"
 #include "libslic3r/Utils.hpp"
@@ -3345,6 +3346,37 @@ void TabPrint::build()
         optgroup->append_single_option_line("draft_shield", "others_settings_skirt#shield");
         optgroup->append_single_option_line("single_loop_draft_shield", "others_settings_skirt#single-loop-after-first-layer");
 
+        if (m_type == Preset::TYPE_PRINT) {
+            optgroup = page->new_optgroup(L("Warp and curl risk"), L"param_adhension");
+            optgroup->append_single_option_line("automatic_warp_mitigation");
+            Line risk_line{"", ""};
+            risk_line.full_width = 1;
+            risk_line.widget = [this](wxWindow *parent) {
+                auto *sizer = new wxBoxSizer(wxVERTICAL);
+                sizer->Add(description_line_widget(parent, &m_warp_risk_description), 0, wxEXPAND);
+                auto *apply = new Button(parent, _L("Apply recommended adhesion and curl settings"));
+                apply->SetStyle(ButtonStyle::Regular, ButtonType::Parameter);
+                apply->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
+                    CallAfter([this] {
+                        if (wxGetApp().is_closing() || !wxGetApp().plater()) return;
+                        try {
+                            auto full = m_preset_bundle->full_config();
+                            full.apply(*m_config);
+                            const auto risk = assess_warp_risk(full, wxGetApp().plater()->model());
+                            DynamicPrintConfig recommended = *m_config;
+                            apply_warp_mitigations(recommended, risk);
+                            m_config_manipulation.apply(m_config, &recommended);
+                            update_description_lines();
+                        } catch (const std::exception &error) {
+                            show_error(this, from_u8(error.what()));
+                        }
+                    });
+                });
+                sizer->Add(apply, 0, wxTOP, parent->FromDIP(6));
+                return sizer;
+            };
+            optgroup->append_line(risk_line);
+        }
         optgroup = page->new_optgroup(L("Brim"), L"param_adhension");
         optgroup->append_single_option_line("brim_type", "others_settings_brim#type");
         optgroup->append_single_option_line("brim_width", "others_settings_brim#width");
@@ -3469,6 +3501,25 @@ void TabPrint::update_description_lines()
     if (m_preset_bundle->printers.get_selected_preset().printer_technology() == ptSLA)
         return;
 
+    if (m_active_page && m_active_page->title() == "Others" && m_warp_risk_description && wxGetApp().plater()) {
+        auto full = m_preset_bundle->full_config();
+        full.apply(*m_config);
+        const auto risk = assess_warp_risk(full, wxGetApp().plater()->model());
+        wxString text;
+        if (risk.elevated()) {
+            std::string materials;
+            for (const auto &material : risk.materials) {
+                if (!materials.empty()) materials += ", ";
+                materials += material;
+            }
+            text = format_wxstr(_L("Elevated bed-lift/curl risk: %1%. Recommended outer brim: at least %2% mm, with a gap no greater than 0.1 mm, plus curled-overhang slowdown."),
+                                from_u8(materials), risk.brim_mm());
+            text += "\n" + _L("Applying uses a continuous outer brim instead of painted coverage or ears; painting is retained in the model. Rafts, belt-printer adhesion and object overrides are preserved. Use a stable enclosure, avoid drafts, and prepare the build surface. Keep bridge/arc cooling appropriate for unsupported paths. This screening cannot measure adhesion or guarantee a successful print.");
+        } else {
+            text = _L("No recognized warp-prone model material detected. Unknown materials and poor bed adhesion can still warp. This is not a guarantee.");
+        }
+        m_warp_risk_description->SetText(text);
+    }
     if (m_active_page && m_active_page->title() == "Layers and perimeters" &&
         m_recommended_thin_wall_thickness_description_line && m_top_bottom_shell_thickness_explanation)
     {
@@ -3641,6 +3692,7 @@ void TabPrint::clear_pages()
 
     m_recommended_thin_wall_thickness_description_line = nullptr;
     m_top_bottom_shell_thickness_explanation = nullptr;
+    m_warp_risk_description = nullptr;
 }
 
 //BBS: GUI refactor

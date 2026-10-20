@@ -112,6 +112,10 @@ host web. The web check erodes the remaining base by half the larger of the
 protective-skin width and two host-nozzle diameters. The model-shaped attachment
 plate is exempt; the constraint applies to the buried branching network below it.
 Same-material branches may merge only while preserving these host connections.
+Host-web checks run independently across layers using TBB; a shared rejection
+flag only short-circuits work, never changes acceptance. Candidates and limbs
+are still accepted serially in their deterministic order. Geometry workers poll
+cancellation but do not emit progress callbacks.
 Material polygons are transferred, not
 overlaid: the combined model volume remains unchanged and material regions stay
 disjoint. Standard slicing, tool ordering and G-code export handle the new regions.

@@ -119,6 +119,7 @@
 #include <boost/uuid/uuid_io.hpp>
 
 #include <wx/colour.h>
+#include <wx/image.h>
 #include <wx/font.h>
 #include <wx/aui/framemanager.h>
 #include <wx/gdicmn.h>
@@ -12835,8 +12836,10 @@ void Plater::priv::update_print_volume_state()
 
 void Plater::priv::process_validation_warning(StringObjectException const &warning) const
 {
-    if (warning.string.empty())
+    if (warning.string.empty()) {
         notification_manager->close_notification_of_type(NotificationType::ValidateWarning);
+        notification_manager->close_notification_of_type(NotificationType::WarpRiskWarning);
+    }
     else {
         std::string text = warning.string;
         auto po = dynamic_cast<PrintObjectBase const *>(warning.object);
@@ -12928,7 +12931,8 @@ void Plater::priv::process_validation_warning(StringObjectException const &warni
         //}
 
         notification_manager->push_notification(
-            NotificationType::ValidateWarning,
+            warning.opt_key == "automatic_warp_mitigation" ?
+                NotificationType::WarpRiskWarning : NotificationType::ValidateWarning,
             NotificationManager::NotificationLevel::WarningNotificationLevel,
             _u8L("WARNING:") + "\n" + text, hypertext, action_fn
         );
@@ -12939,6 +12943,7 @@ void Plater::priv::process_validation_warnings(const std::vector<StringObjectExc
 {
     // ValidateWarning stacks by text (m_multiple_types), so clear the stale set before re-adding.
     notification_manager->close_notification_of_type(NotificationType::ValidateWarning);
+    notification_manager->close_notification_of_type(NotificationType::WarpRiskWarning);
     for (const StringObjectException &warning : warnings)
         if (!warning.string.empty())
             process_validation_warning(warning);

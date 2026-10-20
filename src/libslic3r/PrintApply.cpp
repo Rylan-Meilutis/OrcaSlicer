@@ -12,6 +12,7 @@
 #include "Slicing.hpp"
 #include "libslic3r.h"
 #include "PrintConfig.hpp"
+#include "WarpMitigation.hpp"
 #include "PrintBase.hpp"
 #include "libslic3r_version.h"
 #include "TriangleSelector.hpp"
@@ -1342,6 +1343,9 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(", Line %1%: enter")%__LINE__;
     // Normalize the config.
     resolve_project_filament_bindings(new_full_config, project_default_filament(model));
+    if (const auto *automatic = new_full_config.option<ConfigOptionBool>("automatic_warp_mitigation");
+        automatic && automatic->value)
+        apply_warp_mitigations(new_full_config, assess_warp_risk(new_full_config, model));
 	new_full_config.option("print_settings_id",            true);
 	new_full_config.option("filament_settings_id",         true);
 	new_full_config.option("printer_settings_id",          true);

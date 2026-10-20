@@ -92,6 +92,8 @@ enum class NotificationType
 	ValidateError,
 	// Notification emitted by Print::validate
 	ValidateWarning,
+	// Material risk remains relevant in Preview, unlike preparation-only warnings.
+	WarpRiskWarning,
 	// Slicing error produced by BackgroundSlicingProcess::validate() or by the BackgroundSlicingProcess background
 	// thread thowing a SlicingError exception.
 	SlicingError,

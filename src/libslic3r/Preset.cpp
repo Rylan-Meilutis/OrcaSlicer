@@ -1503,6 +1503,7 @@ static std::vector<std::string> s_Preset_print_options{
     "staggered_perimeter_offset",
     "fuzzy_skin_top_surface",
     "localized_shrinkage_strategy",
+    "automatic_warp_mitigation",
     "hull_line_extra_perimeters",
     "hull_line_perimeter_expansion",
     "localized_shrinkage_infill_wall_gap",
