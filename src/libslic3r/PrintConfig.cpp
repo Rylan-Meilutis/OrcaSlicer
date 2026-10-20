@@ -1167,6 +1167,13 @@ void PrintConfigDef::init_common_params()
     def->gui_type = ConfigOptionDef::GUIType::one_string;
     def->set_default_value(new ConfigOptionPoints{ Vec2d(0, 0) });
 
+    def = this->add("printer_custom_thumbnail", coString);
+    def->label = L("Printer image");
+    def->tooltip = L("Custom PNG or SVG image for this printer. Leave empty to use the bundled printer image. Saving the preset copies the image into its assets folder.");
+    def->mode = comSimple;
+    def->gui_type = ConfigOptionDef::GUIType::one_string;
+    def->set_default_value(new ConfigOptionString());
+
     def = this->add("bed_custom_texture", coString);
     def->label = L("Bed custom texture");
     def->mode = comAdvanced;

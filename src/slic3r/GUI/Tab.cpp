@@ -5428,6 +5428,46 @@ void TabPrinter::build_fff()
             static_cast<const ConfigOptionFloats*>(parent_preset->config.option("nozzle_diameter"))->values.size();
 
     auto page = add_options_page(L("Basic information"), "custom-gcode_object-info"); // ORCA: icon only visible on placeholders
+    {
+        auto images = page->new_optgroup(L("Printer image"), "printer");
+        images->append_single_option_line("printer_custom_thumbnail");
+        Line controls{"", ""};
+        controls.full_width = 1;
+        controls.append_widget([this](wxWindow *parent) {
+            auto *sizer = new wxBoxSizer(wxHORIZONTAL);
+            auto *select = new Button(parent, _L("Choose image…"));
+            auto *reset = new Button(parent, _L("Use default image"));
+            for (auto *button : {select, reset}) {
+                button->SetStyle(ButtonStyle::Regular, ButtonType::Parameter);
+                sizer->Add(button, 0, wxRIGHT, parent->FromDIP(8));
+            }
+            select->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
+                wxFileDialog dialog(this, _L("Select printer image"),
+                                    from_u8(wxGetApp().app_config->get_last_dir()), wxEmptyString,
+                                    file_wildcards(FT_TEX), wxFD_OPEN | wxFD_FILE_MUST_EXIST);
+                if (dialog.ShowModal() != wxID_OK) return;
+                const std::string path = into_path(dialog.GetPath()).string();
+                try {
+                    // Decode before changing the preset, so invalid images never replace its cover.
+                    auto bitmap_path = boost::filesystem::path(path);
+                    if (bitmap_path.extension() == ".svg") bitmap_path.replace_extension();
+                    create_scaled_bitmap(bitmap_path.string(), this, 48);
+                    load_key_value("printer_custom_thumbnail", path);
+                    update_changed_ui();
+                    on_presets_changed();
+                } catch (const std::exception &error) {
+                    show_error(this, from_u8(error.what()));
+                }
+            });
+            reset->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
+                load_key_value("printer_custom_thumbnail", std::string());
+                update_changed_ui();
+                on_presets_changed();
+            });
+            return sizer;
+        });
+        images->append_line(controls);
+    }
     auto optgroup = page->new_optgroup(L("Printable space"), "param_printable_space");
 
         create_line_with_widget(optgroup.get(), "printable_area", "custom-svg-and-png-bed-textures_124612", [this](wxWindow* parent) {

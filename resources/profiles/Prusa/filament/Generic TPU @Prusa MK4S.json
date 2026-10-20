@@ -13,7 +13,8 @@
 		"Prusa MK4S 0.4 nozzle",
 		"Prusa MK4S 0.5 nozzle",
 		"Prusa MK4S HF0.4 nozzle",
-		"Prusa MK4S HF0.5 nozzle"
+		"Prusa MK4S HF0.5 nozzle",
+		"Prusa MK4S RME 0.4 nozzle"
 	],
 	"default_filament_colour": "#008000",
 	"fan_max_speed": "50",

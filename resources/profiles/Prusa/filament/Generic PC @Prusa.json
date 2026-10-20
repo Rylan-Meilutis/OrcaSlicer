@@ -34,7 +34,8 @@
 		"Prusa CORE One MMU3 0.4 nozzle",
 		"Prusa CORE One MMU3 0.25 nozzle",
 		"Prusa CORE One MMU3 0.3 nozzle",
-		"Prusa CORE One MMU3 0.6 nozzle"
+		"Prusa CORE One MMU3 0.6 nozzle",
+		"Prusa MK4 RME 0.4 nozzle"
 	],
 	"supertack_plate_temp": [
 		"35"

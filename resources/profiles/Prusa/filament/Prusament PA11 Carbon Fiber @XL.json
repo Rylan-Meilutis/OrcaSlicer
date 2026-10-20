@@ -82,7 +82,9 @@
 		"Prusa XL 5T 0.4 nozzle",
 		"Prusa XL 5T 0.5 nozzle",
 		"Prusa XL 5T 0.6 nozzle",
-		"Prusa XL 5T 0.8 nozzle"
+		"Prusa XL 5T 0.8 nozzle",
+		"Prusa XL RME 0.4 nozzle",
+		"Prusa XL 5T RME 0.4 nozzle"
 	],
 	"filament_multitool_ramming_volume": [
 		"5"

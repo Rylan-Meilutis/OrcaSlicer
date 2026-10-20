@@ -38,6 +38,58 @@
 #include "test_utils.hpp"
 
 #include <iostream>
+
+TEST_CASE("RME printers retain their hardware's filament and process compatibility", "[PresetBundle][RmeCompatibility]")
+{
+    using namespace Slic3r;
+    const auto type = GENERATE(Preset::TYPE_FILAMENT, Preset::TYPE_PRINT);
+    const bool system = GENERATE(false, true);
+    const auto model = GENERATE(std::string("Prusa MK4"), std::string("Prusa MK4S"),
+                               std::string("Prusa CORE One"), std::string("Prusa CORE One L"),
+                               std::string("Prusa XL"), std::string("Prusa XL 5T"), std::string("Prusa CORE One INDX"));
+    Preset printer(Preset::TYPE_PRINTER, "Renamed cloud printer");
+    printer.config = *std::unique_ptr<DynamicPrintConfig>(DynamicPrintConfig::new_from_defaults_keys(Preset::printer_options()));
+    printer.config.set_key_value("printer_model", new ConfigOptionString(model + " RME"));
+    printer.config.set_key_value("printer_variant", new ConfigOptionString("0.4"));
+    printer.config.set_key_value("nozzle_diameter", new ConfigOptionFloats({0.4}));
+    Preset material(type, "Existing cloud preset");
+    material.is_system = system;
+    const std::string stock = model == "Prusa CORE One INDX" ? model + " 8T HF" : model;
+    material.config.set_key_value("compatible_printers", new ConfigOptionStrings({stock + " 0.4 nozzle"}));
+    auto compatible = [&] { return is_compatible_with_printer(PresetWithVendorProfile(material, nullptr),
+                                                             PresetWithVendorProfile(printer, nullptr)); };
+    CHECK(compatible());
+    CHECK(printer.config.opt_string("printer_model") == model + " RME");
+    CHECK(printer.name == "Renamed cloud printer");
+    printer.config.set_key_value("printer_variant", new ConfigOptionString("0.6"));
+    printer.config.set_key_value("nozzle_diameter", new ConfigOptionFloats({0.6}));
+    CHECK_FALSE(compatible());
+    printer.config.set_key_value("printer_variant", new ConfigOptionString("0.4"));
+    printer.config.set_key_value("nozzle_diameter", new ConfigOptionFloats({0.4}));
+    material.config.set_key_value("compatible_printers", new ConfigOptionStrings({"Unrelated printer 0.4 nozzle"}));
+    CHECK_FALSE(compatible());
+    material.config.set_key_value("compatible_printers", new ConfigOptionStrings());
+    const std::string stock_model = model == "Prusa CORE One INDX" ? model + " 8T" : model;
+    material.config.set_key_value("compatible_printers_condition", new ConfigOptionString(
+        "printer_model == \"" + stock_model + "\" and nozzle_diameter[0] == 0.4"));
+    CHECK(compatible());
+    printer.config.set_key_value("nozzle_diameter", new ConfigOptionFloats({0.6}));
+    CHECK_FALSE(compatible());
+}
+
+TEST_CASE("Legacy CORE One HF user tunes remain available on RME INDX without adding system duplicates", "[PresetBundle][RmeCompatibility]")
+{
+    using namespace Slic3r;
+    Preset printer(Preset::TYPE_PRINTER, "Cygnas X1 Indx");
+    printer.config = *std::unique_ptr<DynamicPrintConfig>(DynamicPrintConfig::new_from_defaults_keys(Preset::printer_options()));
+    printer.config.set_key_value("printer_model", new ConfigOptionString("Prusa CORE One INDX RME"));
+    printer.config.set_key_value("printer_variant", new ConfigOptionString("0.4"));
+    Preset filament(Preset::TYPE_FILAMENT, "Sunlu TPU");
+    filament.config.set_key_value("compatible_printers", new ConfigOptionStrings({"Prusa CORE One HF 0.4 nozzle"}));
+    CHECK(is_compatible_with_printer(PresetWithVendorProfile(filament, nullptr), PresetWithVendorProfile(printer, nullptr)));
+    filament.is_system = true;
+    CHECK_FALSE(is_compatible_with_printer(PresetWithVendorProfile(filament, nullptr), PresetWithVendorProfile(printer, nullptr)));
+}
 #include <initializer_list>
 #include <vector>
 #include <string>
@@ -89,6 +141,37 @@ TEST_CASE("Imported gantry meshes are owned by the saved printer profile", "[Pre
     preset.config.set_key_value("sequential_print_gantry_model", new ConfigOptionString("builtin:prusa3d_coreone_indx_gantry.stl"));
     preset.save(nullptr);
     CHECK(preset.config.opt_string("sequential_print_gantry_model") == "builtin:prusa3d_coreone_indx_gantry.stl");
+}
+
+TEST_CASE("Printer images are owned by the saved preset and survive Save As", "[PresetBundle][PrinterImage]")
+{
+    ScopedTemporaryDir directory;
+    const auto source = directory.path() / "source.png";
+    { std::ofstream stream(source.string(), std::ios::binary); stream << "image asset bytes"; }
+    Preset preset(Preset::TYPE_PRINTER, "Image asset test");
+    const std::unique_ptr<DynamicPrintConfig> defaults(DynamicPrintConfig::new_from_defaults_keys(Preset::printer_options()));
+    preset.config = *defaults;
+    CHECK(preset.config.opt_string("printer_custom_thumbnail").empty());
+    preset.file = (directory.path() / "printer.json").string();
+    preset.config.set_key_value("printer_custom_thumbnail", new ConfigOptionString(source.string()));
+    REQUIRE(preset.save(nullptr));
+    const auto saved = preset.config.opt_string("printer_custom_thumbnail");
+    CHECK(boost::filesystem::path(saved).parent_path() == directory.path() / "printer.assets");
+    REQUIRE(boost::filesystem::exists(saved));
+    boost::filesystem::remove(source);
+    REQUIRE(preset.save(nullptr));
+    CHECK(preset.config.opt_string("printer_custom_thumbnail") == saved);
+    preset.file = (directory.path() / "copy.json").string();
+    REQUIRE(preset.save(nullptr));
+    const auto copied = preset.config.opt_string("printer_custom_thumbnail");
+    CHECK(copied != saved);
+    REQUIRE(boost::filesystem::exists(copied));
+    std::ifstream contents(copied, std::ios::binary);
+    CHECK(std::string(std::istreambuf_iterator<char>(contents), {}) == "image asset bytes");
+    preset.config.set_key_value("printer_custom_thumbnail", new ConfigOptionString());
+    REQUIRE(preset.save(nullptr));
+    CHECK(preset.config.opt_string("printer_custom_thumbnail").empty());
+    CHECK(boost::filesystem::exists(saved));
 }
 
 TEST_CASE("Project material count may be below printer capacity", "[PresetBundle][Regression]")

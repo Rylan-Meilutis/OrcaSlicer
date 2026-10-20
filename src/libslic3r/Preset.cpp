@@ -777,6 +777,17 @@ bool Preset::save(DynamicPrintConfig* parent_config)
     // copies into the new preset's assets directory; subsequent saves reuse it.
     // Built-in identifiers stay portable and do not duplicate bundled assets.
     if (type == TYPE_PRINTER) {
+        auto *thumbnail = config.option<ConfigOptionString>("printer_custom_thumbnail");
+        if (thumbnail && !thumbnail->value.empty()) {
+            const fs::path source(thumbnail->value);
+            const fs::path assets = fs::absolute(fs::path(file).parent_path() / (fs::path(file).stem().string() + ".assets"));
+            if (fs::is_regular_file(source) && fs::absolute(source).parent_path() != assets) {
+                fs::create_directories(assets);
+                const fs::path target = assets / fs::unique_path("printer-%%%%%%%%" + source.extension().string());
+                fs::copy_file(source, target);
+                thumbnail->value = target.string();
+            }
+        }
         auto *gantry = config.option<ConfigOptionString>("sequential_print_gantry_model");
         if (gantry != nullptr && !gantry->value.empty() && gantry->value.compare(0, 8, "builtin:") != 0) {
             fs::path source(gantry->value);
@@ -927,7 +938,7 @@ bool is_compatible_with_parent_printer(const PresetWithVendorProfile& preset, co
                compatible_printers->values.end();
 }
 
-bool is_compatible_with_printer(const PresetWithVendorProfile &preset, const PresetWithVendorProfile &active_printer, const DynamicPrintConfig *extra_config)
+static bool is_compatible_with_printer_identity(const PresetWithVendorProfile &preset, const PresetWithVendorProfile &active_printer, const DynamicPrintConfig *extra_config)
 {
     // Orca: we allow cross vendor compatibility
 	// if (preset.vendor != nullptr && preset.vendor != active_printer.vendor)
@@ -975,6 +986,48 @@ bool is_compatible_with_printer(const PresetWithVendorProfile &preset, const Pre
            std::find(compatible_printers->values.begin(), compatible_printers->values.end(), active_printer.preset.name) !=
                compatible_printers->values.end() ||
            (!active_printer.preset.is_system && is_compatible_with_parent_printer(preset, active_printer));
+}
+
+bool is_compatible_with_printer(const PresetWithVendorProfile &preset, const PresetWithVendorProfile &active_printer, const DynamicPrintConfig *extra_config)
+{
+    if (is_compatible_with_printer_identity(preset, active_printer, extra_config))
+        return true;
+
+    // RME changes firmware, not the corresponding printer hardware. Evaluate
+    // legacy compatibility lists/conditions without rewriting cloud presets or
+    // replacing the actual printer configuration used for slicing.
+    const auto *model = active_printer.preset.config.option<ConfigOptionString>("printer_model");
+    const auto *variant = active_printer.preset.config.option<ConfigOptionString>("printer_variant");
+    if (!model || !variant || variant->value.empty()) return false;
+    static const std::map<std::string, std::vector<std::pair<std::string, std::string>>> hardware = {
+        {"Prusa CORE One INDX RME", {{"Prusa CORE One INDX 8T", "Prusa CORE One INDX 8T HF"},
+                                    {"Prusa CORE One INDX 4T", "Prusa CORE One INDX 4T HF"}}},
+        {"Prusa CORE One RME", {{"Prusa CORE One", "Prusa CORE One"}}},
+        {"Prusa CORE One L RME", {{"Prusa CORE One L", "Prusa CORE One L"}}},
+        {"Prusa MK4 RME", {{"Prusa MK4", "Prusa MK4"}}},
+        {"Prusa MK4S RME", {{"Prusa MK4S", "Prusa MK4S"}}},
+        {"Prusa XL RME", {{"Prusa XL", "Prusa XL"}}},
+        {"Prusa XL 5T RME", {{"Prusa XL 5T", "Prusa XL 5T"}}}
+    };
+    const auto found = hardware.find(model->value);
+    if (found == hardware.end()) return false;
+    auto identities = found->second;
+    // Early user INDX presets were based on CORE One HF. Keep those user
+    // tunes available, but do not introduce competing system filament tunes.
+    if (!preset.preset.is_system && model->value == "Prusa CORE One INDX RME")
+        identities.emplace_back("Prusa CORE One", "Prusa CORE One HF");
+    for (const auto &identity : identities) {
+        Preset printer = active_printer.preset;
+        printer.name = identity.second + " " + variant->value + " nozzle";
+        printer.config.set_key_value("printer_model", new ConfigOptionString(identity.first));
+        printer.inherits().clear();
+        DynamicPrintConfig extra;
+        if (extra_config) extra = *extra_config;
+        extra.set_key_value("printer_preset", new ConfigOptionString(printer.name));
+        if (is_compatible_with_printer_identity(preset, PresetWithVendorProfile(printer, active_printer.vendor), &extra))
+            return true;
+    }
+    return false;
 }
 
 bool is_compatible_with_printer(const PresetWithVendorProfile &preset, const PresetWithVendorProfile &active_printer)
@@ -1678,6 +1731,7 @@ static std::vector<std::string> s_Preset_machine_limits_options {
 
 static std::vector<std::string> s_Preset_printer_options {
     "printer_technology",
+    "printer_custom_thumbnail",
     "printable_area", "extruder_printable_area", "support_parallel_printheads", "parallel_printheads_count", "parallel_printheads_bed_exclude_areas", "bed_exclude_area","bed_custom_texture", "bed_custom_model", "build_plate_tilt_x", "build_plate_tilt_y", "belt_printer", "belt_printer_infinite_y",
     "belt_slice_rotation", "belt_slice_rotation_angle",
     "gcode_remap_x", "gcode_remap_y", "gcode_remap_z",
@@ -3567,8 +3621,9 @@ void PresetCollection::save_current_preset(const std::string &new_name, bool det
     else
         this->get_selected_preset().save(nullptr);
     if (m_type == Preset::TYPE_PRINTER)
-        if (const auto *model = get_selected_preset().config.option<ConfigOptionString>("sequential_print_gantry_model"))
-            m_edited_preset.config.set_key_value("sequential_print_gantry_model", model->clone());
+        for (const char *key : {"sequential_print_gantry_model", "printer_custom_thumbnail"})
+            if (const auto *asset = get_selected_preset().config.option<ConfigOptionString>(key))
+                m_edited_preset.config.set_key_value(key, asset->clone());
 
     {
         LifecycleEventContext ctx;

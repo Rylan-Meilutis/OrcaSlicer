@@ -8556,8 +8556,6 @@ std::string& Sidebar::get_search_line()
     return p->searcher.search_string();
 }
 
-static std::map<std::string, std::string> printer_thumbnails = {};
-
 void Sidebar::update_printer_thumbnail()
 {
     auto& preset_bundle = wxGetApp().preset_bundle;
@@ -8571,44 +8569,56 @@ void Sidebar::update_printer_thumbnail()
                                start->value.find("; RME_TEMPERATURE_ADAPTIVE_PA=1") != std::string::npos));
     p->m_printer_icon->SetBitmap_(rme ? "printer_rme" : "printer");
     p->m_printer_icon->SetToolTip(rme ? _L("RME firmware profile: uses RME-specific G-code and capabilities.") : wxString());
-    std::string printer_type    = selected_preset.get_current_printer_type(preset_bundle);
-    if (printer_thumbnails.find(printer_type) != printer_thumbnails.end()) // Use known cache first
-        p->image_printer->SetBitmap(create_scaled_bitmap(printer_thumbnails[printer_type], this, PRINTER_THUMBNAIL_SIZE.GetHeight()));
-    else {
-        /* ORCA this part check images folder for BBL covers but not checks file existence and causes crash on Linux
-        *       BBL covers already exist on profile folder so no need to use this section
+    // BitmapCache already caches decoded images. Do not cache failed model lookups:
+    // installing a vendor bundle or editing a preset must immediately update its cover.
+    wxBitmap cover;
+    auto load_cover = [this, &cover](const std::string &path) {
+        if (!boost::filesystem::is_regular_file(path)) return false;
         try {
-            // No cache, try dedicated printer preview
-            p->image_printer->SetBitmap(create_scaled_bitmap("printer_preview_" + printer_type, this, 48));
-            // Success, cache it
-            printer_thumbnails[printer_type] = "printer_preview_" + printer_type;
-            return;
-        } catch (...) {}
-        */
-
-        // Orca: try to use the printer model cover as the thumbnail
-        const auto model_name = selected_preset.config.opt_string("printer_model");
-        std::string cover_file = model_name + "_cover.png";
-        for (auto vendor_profile : preset_bundle->vendors) {
-            for (auto vendor_model : vendor_profile.second.models) {
-                if (vendor_model.name == model_name) {
-                    // Try to find the printer cover
-                    boost::filesystem::path cover_path = boost::filesystem::absolute(boost::filesystem::path(resources_dir()) /
-                                                                                     "/profiles/" / vendor_profile.second.id / cover_file)
-                                                             .make_preferred();
-                    if (boost::filesystem::exists(cover_path)) {
-                        try {
-                            p->image_printer->SetBitmap(create_scaled_bitmap(cover_path.string(), this, PRINTER_THUMBNAIL_SIZE.GetHeight()));
-                            printer_thumbnails[printer_type] = cover_path.string(); // Cache the path so we don't look up again
-                            return;
-                        } catch (...) {}
-                    }
-                }
+            auto bitmap_path = boost::filesystem::path(path);
+            if (bitmap_path.extension() == ".svg") bitmap_path.replace_extension();
+            cover = create_scaled_bitmap(bitmap_path.string(), this, PRINTER_THUMBNAIL_SIZE.GetHeight());
+            return cover.IsOk();
+        } catch (const std::exception &) { return false; }
+    };
+    const auto *custom = selected_preset.config.option<ConfigOptionString>("printer_custom_thumbnail");
+    if (custom && !custom->value.empty()) load_cover(custom->value);
+    const auto model_name = selected_preset.config.opt_string("printer_model");
+    if (!cover.IsOk()) {
+        for (const auto &vendor : preset_bundle->vendors) {
+            for (const auto &candidate : vendor.second.models) {
+                if (candidate.name != model_name) continue;
+                const auto root = boost::filesystem::path(resources_dir()) / "profiles" / vendor.second.id;
+                if (!load_cover((root / (model_name + "_cover.png")).string()) && rme &&
+                    boost::algorithm::ends_with(model_name, " RME"))
+                    load_cover((root / (model_name.substr(0, model_name.size() - 4) + "_cover.png")).string());
+                break;
             }
+            if (cover.IsOk()) break;
         }
-        p->image_printer->SetBitmap(create_scaled_bitmap("printer_placeholder", this, PRINTER_THUMBNAIL_SIZE.GetHeight()));
-        printer_thumbnails[printer_type] = "printer_placeholder"; // Avoid unnecessary try
     }
+    if (!cover.IsOk())
+        cover = create_scaled_bitmap("printer_placeholder", this, PRINTER_THUMBNAIL_SIZE.GetHeight());
+    if (rme) {
+        // Keep the printer recognizable, with the same indigo firmware badge on
+        // bundled and custom covers. Never mutate BitmapCache's shared bitmap.
+        // Compose alpha directly: clearing a memory DC with the control's
+        // background makes the transparent area around the printer opaque.
+        wxImage image = cover.ConvertToImage();
+        const auto badge = create_scaled_bitmap("printer_rme", this, 16);
+        // PNG covers and SVG badges can have different backing scales on macOS.
+        const auto badge_size = badge.GetLogicalSize();
+        const auto cover_size = cover.GetLogicalSize();
+        wxImage overlay = badge.ConvertToImage().Scale(
+            std::max(1, badge_size.x * image.GetWidth() / cover_size.x),
+            std::max(1, badge_size.y * image.GetHeight() / cover_size.y), wxIMAGE_QUALITY_HIGH);
+        image.Paste(overlay, std::max(0, image.GetWidth() - overlay.GetWidth()),
+                    std::max(0, image.GetHeight() - overlay.GetHeight()), wxIMAGE_ALPHA_BLEND_COMPOSE);
+        const double scale = cover.GetScaleFactor();
+        cover = wxBitmap(image, -1, scale);
+        cover.SetScaleFactor(scale);
+    }
+    p->image_printer->SetBitmap(cover);
 }
 
 void Sidebar::auto_calc_flushing_volumes(const int filament_idx, const int extruder_id) {
@@ -9480,7 +9490,7 @@ Plater::priv::priv(Plater *q, MainFrame *main_frame)
     , config(Slic3r::DynamicPrintConfig::new_from_defaults_keys({
         "printable_area", "bed_exclude_area", "wrapping_exclude_area", "extruder_printable_area", "bed_custom_texture", "bed_custom_model", "print_sequence",
         "extruder_clearance_radius",
-        "sequential_print_gantry_model", "sequential_print_gantry_geometry", "printer_notes",
+        "sequential_print_gantry_model", "sequential_print_gantry_geometry", "printer_notes", "printer_custom_thumbnail",
         "extruder_clearance_height_to_lid", "extruder_clearance_height_to_rod",
 		"nozzle_height", "skirt_type", "skirt_loops", "skirt_speed","min_skirt_length", "skirt_distance", "skirt_start_angle",
         "brim_width", "brim_object_gap", "brim_flow_ratio", "brim_use_efc_outline", "combine_brims", "brim_type", "nozzle_diameter", "single_extruder_multi_material", "preferred_orientation",
@@ -23393,6 +23403,10 @@ void Plater::on_config_change(const DynamicPrintConfig &config)
         }
 
         p->config->set_key_value(opt_key, config.option(opt_key)->clone());
+        if (opt_key == "printer_custom_thumbnail") {
+            p->sidebar->update_printer_thumbnail();
+            continue;
+        }
         if (opt_key == "sequential_print_gantry_model" || opt_key == "sequential_print_gantry_geometry" || opt_key == "printer_notes") {
             p->view3D->get_canvas3d()->reset_sequential_print_clearance();
             update_scheduled = true;

@@ -1,6 +1,6 @@
 {
 	"name": "Prusa",
-	"version": "02.04.00.18",
+	"version": "02.04.00.19",
 	"force_update": "0",
 	"description": "Prusa configurations",
 	"machine_model_list": [
@@ -33,8 +33,16 @@
 			"sub_path": "machine/Prusa CORE One L HF.json"
 		},
 		{
+			"name": "Prusa CORE One L RME",
+			"sub_path": "machine/Prusa CORE One L RME.json"
+		},
+		{
 			"name": "Prusa CORE One MMU3",
 			"sub_path": "machine/Prusa CORE One MMU3.json"
+		},
+		{
+			"name": "Prusa CORE One RME",
+			"sub_path": "machine/Prusa CORE One RME.json"
 		},
 		{
 			"name": "Prusa MINI",
@@ -65,6 +73,10 @@
 			"sub_path": "machine/Prusa MK4 MMU3 HF.json"
 		},
 		{
+			"name": "Prusa MK4 RME",
+			"sub_path": "machine/Prusa MK4 RME.json"
+		},
+		{
 			"name": "Prusa MK4S",
 			"sub_path": "machine/Prusa MK4S.json"
 		},
@@ -73,12 +85,24 @@
 			"sub_path": "machine/Prusa MK4S HF.json"
 		},
 		{
+			"name": "Prusa MK4S RME",
+			"sub_path": "machine/Prusa MK4S RME.json"
+		},
+		{
 			"name": "Prusa XL",
 			"sub_path": "machine/Prusa XL.json"
 		},
 		{
 			"name": "Prusa XL 5T",
 			"sub_path": "machine/Prusa XL 5T.json"
+		},
+		{
+			"name": "Prusa XL 5T RME",
+			"sub_path": "machine/Prusa XL 5T RME.json"
+		},
+		{
+			"name": "Prusa XL RME",
+			"sub_path": "machine/Prusa XL RME.json"
 		}
 	],
 	"process_list": [
@@ -3179,6 +3203,10 @@
 			"sub_path": "machine/fdm_machine_common_xl_5t.json"
 		},
 		{
+			"name": "Prusa CORE One L RME 0.4 nozzle",
+			"sub_path": "machine/Prusa CORE One L RME 0.4 nozzle.json"
+		},
+		{
 			"name": "Prusa CORE One L 0.5 nozzle",
 			"sub_path": "machine/Prusa CORE One L 0.5 nozzle.json"
 		},
@@ -3223,12 +3251,20 @@
 			"sub_path": "machine/fdm_machine_common_coreone_indx.json"
 		},
 		{
+			"name": "Prusa MK4 RME 0.4 nozzle",
+			"sub_path": "machine/Prusa MK4 RME 0.4 nozzle.json"
+		},
+		{
 			"name": "fdm_machine_common_mk4_mmu3",
 			"sub_path": "machine/fdm_machine_common_mk4_mmu3.json"
 		},
 		{
 			"name": "Prusa MK4S 0.4 nozzle",
 			"sub_path": "machine/Prusa MK4S 0.4 nozzle.json"
+		},
+		{
+			"name": "Prusa XL RME 0.4 nozzle",
+			"sub_path": "machine/Prusa XL RME 0.4 nozzle.json"
 		},
 		{
 			"name": "Prusa XL 5T 0.25 nozzle",
@@ -3257,6 +3293,10 @@
 		{
 			"name": "Prusa CORE One MMU3 0.4 nozzle",
 			"sub_path": "machine/Prusa CORE One MMU3 0.4 nozzle.json"
+		},
+		{
+			"name": "Prusa CORE One RME 0.4 nozzle",
+			"sub_path": "machine/Prusa CORE One RME 0.4 nozzle.json"
 		},
 		{
 			"name": "Prusa CORE One 0.5 nozzle",
@@ -3313,6 +3353,14 @@
 		{
 			"name": "Prusa MK4S HF0.4 nozzle",
 			"sub_path": "machine/Prusa MK4S HF0.4 nozzle.json"
+		},
+		{
+			"name": "Prusa MK4S RME 0.4 nozzle",
+			"sub_path": "machine/Prusa MK4S RME 0.4 nozzle.json"
+		},
+		{
+			"name": "Prusa XL 5T RME 0.4 nozzle",
+			"sub_path": "machine/Prusa XL 5T RME 0.4 nozzle.json"
 		},
 		{
 			"name": "Prusa CORE One MMU3 0.25 nozzle",
