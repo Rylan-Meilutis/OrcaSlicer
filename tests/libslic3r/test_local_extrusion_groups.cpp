@@ -7,6 +7,42 @@
 
 using namespace Slic3r;
 
+TEST_CASE("Local grouping exposes nested sortable branches but preserves ordered paths", "[LocalExtrusionGroups]")
+{
+    ExtrusionEntityCollection branches;
+    branches.append(ExtrusionPath(erPerimeter));
+    branches.append(ExtrusionPath(erExternalPerimeter));
+    ExtrusionEntityCollection ordered = branches;
+    ordered.no_sort = true;
+    ExtrusionEntityCollection root;
+    root.append(branches);
+    root.append(ordered);
+    std::vector<const ExtrusionEntity *> entities;
+    append_local_extrusion_entities(root, entities);
+    REQUIRE(entities.size() == 3);
+    CHECK(entities[0]->role() == erPerimeter);
+    CHECK(entities[1]->role() == erExternalPerimeter);
+    CHECK(entities[2] == root.entities[1]);
+    CHECK_FALSE(entities[2]->can_sort());
+}
+
+TEST_CASE("Mixed bridge fill remains local while nested arcs preserve global order", "[LocalExtrusionGroups]")
+{
+    ExtrusionEntityCollection mixed;
+    mixed.no_sort = true;
+    mixed.append(ExtrusionPath(erSolidInfill));
+    mixed.append(ExtrusionPath(erBridgeInfill));
+    CHECK_FALSE(local_extrusion_requires_global_order(mixed));
+    CHECK(mixed.no_sort);
+    ExtrusionEntityCollection nested;
+    nested.append(mixed);
+    CHECK_FALSE(local_extrusion_requires_global_order(nested));
+    nested.append(ExtrusionPath(erArcOverhang));
+    mixed.append(nested);
+    CHECK(local_extrusion_requires_global_order(mixed));
+    CHECK(local_extrusion_requires_global_order(ExtrusionPath(erArcBridge)));
+}
+
 TEST_CASE("Local extrusion groups keep walls and enclosed fill together", "[LocalExtrusionGroups]")
 {
     const std::vector<BoundingBox> boxes = {

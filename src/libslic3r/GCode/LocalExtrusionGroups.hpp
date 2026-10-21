@@ -1,12 +1,40 @@
 #pragma once
 
 #include "../BoundingBox.hpp"
+#include "../ExtrusionEntityCollection.hpp"
 #include <algorithm>
 #include <cstddef>
 #include <numeric>
 #include <vector>
 
 namespace Slic3r {
+
+// A sortable wrapper may contain several disconnected root branches. Expose
+// whole paths/loops for spatial grouping; preserve explicitly ordered wrappers.
+// Overlapping wall stacks are regrouped in their original order below.
+inline void append_local_extrusion_entities(const ExtrusionEntity &entity,
+                                            std::vector<const ExtrusionEntity *> &entities)
+{
+    const auto *collection = dynamic_cast<const ExtrusionEntityCollection *>(&entity);
+    if (collection && collection->can_sort()) {
+        for (const auto *child : collection->entities)
+            append_local_extrusion_entities(*child, entities);
+    } else
+        entities.push_back(&entity);
+}
+
+// Arc collections can share previously generated paths across local footprints.
+// Ordinary bridges do not: keep their spanning bounds and local wall/fill order,
+// but do not disable locality merely because a collection mixes fill roles.
+inline bool local_extrusion_requires_global_order(const ExtrusionEntity &entity)
+{
+    if (is_arc_fill(entity.role())) return true;
+    if (entity.role() != erMixed) return false;
+    if (const auto *collection = dynamic_cast<const ExtrusionEntityCollection *>(&entity))
+        return std::any_of(collection->entities.begin(), collection->entities.end(),
+            [](const ExtrusionEntity *child) { return local_extrusion_requires_global_order(*child); });
+    return true; // Unknown mixed entity: preserve the original ordering.
+}
 
 // Conservative spatial components: overlapping path bounds must stay together.
 // Inputs are whole ordered extrusion entities, never individual wall segments.

@@ -30,6 +30,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <functional>
 #include "libslic3r/PrintConfig.hpp"
 #include "libslic3r/Config.hpp"
 #include "libslic3r/Model.hpp"
@@ -806,14 +807,17 @@ TEST_CASE("Rooting embeds flared anchors without changing exposed surfaces", "[M
         }
 }
 
-TEST_CASE("Root material islands finish locally without changing deposition", "[Multifilament][Rooting][GCode]")
+TEST_CASE("Root material islands finish locally without changing deposition", "[Multifilament][Rooting][GCode][RootTravel]")
 {
+    const std::string fill_kind = GENERATE("ordinary", "bridge", "mixed", "brick", "nested brick");
+    CAPTURE(fill_kind);
     struct Metrics { double extrusion = 0.; size_t crossings = 0; };
-    auto measure = [](bool enabled) {
+    auto measure = [&](bool enabled) {
         auto config = multifilament_config(2, {
             {"rooting", enabled}, {"rooting_xy", false},
             {"layer_height", 0.2}, {"initial_layer_print_height", 0.2},
             {"wall_loops", 3}, {"top_shell_layers", 3}, {"bottom_shell_layers", 3},
+            {"perimeter_layering", fill_kind.find("brick") != std::string::npos ? "brick" : "standard"},
             {"enable_prime_tower", false}, {"skirt_loops", 0}, {"brim_type", "no_brim"}});
         Print print;
         Model model;
@@ -825,6 +829,32 @@ TEST_CASE("Root material islands finish locally without changing deposition", "[
             model.objects.front()->add_volume(insert)->config.set("extruder", 2);
         }
         print.apply(model, config);
+        if (fill_kind == "nested brick") {
+            print.process();
+            for (auto *layer : print.get_object(0)->layers())
+                for (auto *region : layer->regions()) {
+                    auto *branches = new ExtrusionEntityCollection(std::move(region->perimeters));
+                    region->perimeters.entities.push_back(branches);
+                }
+        }
+        if (fill_kind == "bridge" || fill_kind == "mixed") {
+            // Isolate scheduling from bridge generation: keep identical geometry
+            // and flow, including ordered collections, while varying fill roles.
+            print.process();
+            size_t paths = 0;
+            std::function<void(ExtrusionEntity &)> change_role = [&](ExtrusionEntity &entity) {
+                if (auto *collection = dynamic_cast<ExtrusionEntityCollection *>(&entity))
+                    for (auto *child : collection->entities) change_role(*child);
+                else if (auto *path = dynamic_cast<ExtrusionPath *>(&entity)) {
+                    path->set_extrusion_role(fill_kind == "mixed" && paths % 2 ? erSolidInfill : erBridgeInfill);
+                    ++paths;
+                }
+            };
+            for (auto *layer : print.get_object(0)->layers())
+                for (auto *region : layer->regions())
+                    if (region->region().extruder(frSolidInfill) == 2) change_role(region->fills);
+            REQUIRE(paths > 0);
+        }
         GCodeReader reader;
         Metrics metrics;
         int tool = 0;
@@ -842,6 +872,7 @@ TEST_CASE("Root material islands finish locally without changing deposition", "[
     };
     const auto ordinary = measure(false);
     const auto local = measure(true);
+    CAPTURE(ordinary.crossings, local.crossings);
     CHECK(local.crossings < ordinary.crossings);
     CHECK_THAT(local.extrusion, Catch::Matchers::WithinRel(ordinary.extrusion, 0.001));
 }

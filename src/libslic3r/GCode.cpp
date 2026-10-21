@@ -7873,12 +7873,16 @@ LayerResult GCode::process_layer(
                         struct Entry { size_t region; bool infill; const ExtrusionEntity *entity; };
                         std::vector<Entry> entries;
                         std::vector<BoundingBox> boxes;
-                        bool spanning_fill = false;
+                        bool global_fill_order = false;
                         for (size_t r = 0; r < source_regions.size(); ++r) {
                             for (bool infill : {false, true}) {
-                                for (const auto *entity : infill ? source_regions[r].infills : source_regions[r].perimeters) {
-                                    // Arc/bridge anchor scheduling remains island-wide.
-                                    spanning_fill |= infill && (is_bridge_or_arc_fill(entity->role()) || entity->role() == erMixed);
+                                std::vector<const ExtrusionEntity *> local_entities;
+                                for (const auto *entity : infill ? source_regions[r].infills : source_regions[r].perimeters)
+                                    append_local_extrusion_entities(*entity, local_entities);
+                                for (const auto *entity : local_entities) {
+                                    // Arc dependencies remain island-wide. A bridge
+                                    // joins all local groups crossed by its bounds.
+                                    global_fill_order |= infill && local_extrusion_requires_global_order(*entity);
                                     BoundingBox box;
                                     for (const auto &line : entity->as_polylines()) box.merge(line.points);
                                     entries.push_back({r, infill, entity});
@@ -7886,7 +7890,7 @@ LayerResult GCode::process_layer(
                                 }
                             }
                         }
-                        if (!spanning_fill) {
+                        if (!global_fill_order) {
                             for (const auto &group : local_extrusion_groups(boxes)) {
                                 auto &regions = local_regions.emplace_back(source_regions.size());
                                 for (size_t i : group) {
