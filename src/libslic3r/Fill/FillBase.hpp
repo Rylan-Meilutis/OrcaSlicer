@@ -27,6 +27,7 @@
 #include "../ExtrusionEntityCollection.hpp"
 #include "../ShortestPath.hpp"
 #include "FillProgress.hpp"
+#include "FillCornerSmoothing.hpp"
 #include "libslic3r/Polyline.hpp"
 #include "libslic3r/Polygon.hpp"
 #include "libslic3r/Point.hpp"
@@ -102,6 +103,8 @@ struct FillParams
 
     // Orca: corner smoothing factor in the range [0, 1].
     double      smooth_factor { 0. };
+    // The corner smoothing in scaled coordinates.
+    CornerSmoothing corner_smoothing() const { return CornerSmoothing{smooth_factor, scaled<double>(resolution)}; }
 
     // For Lateral lattice
     coordf_t    lateral_lattice_angle_1    { 0.f };

@@ -2168,6 +2168,7 @@ wxMenu* MenuFactory::multi_selection_menu()
         menu->AppendSeparator();
 
         append_menu_items_convert_unit(menu);
+        append_menu_item_reload_from_disk(menu);
         append_menu_item_replace_all_with_stl(menu);
         //BBS
         append_menu_item_change_filament(menu);
@@ -2183,6 +2184,7 @@ wxMenu* MenuFactory::multi_selection_menu()
         //append_menu_item_simplify(menu);
         append_menu_item_delete(menu);
         append_menu_items_convert_unit(menu);
+        append_menu_item_reload_from_disk(menu);
         append_menu_item_replace_all_with_stl(menu);
         append_menu_item_change_filament(menu);
         wxMenu* split_menu = new wxMenu();
