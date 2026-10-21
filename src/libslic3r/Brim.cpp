@@ -868,7 +868,6 @@ static Polylines connect_brim_lines(Polylines &&polylines, const Polygons &brim_
 //BBS: generate out brim by offseting ExPolygons 'islands_area_ex'
 Polygons tryExPolygonOffset(const ExPolygons& islandAreaEx, const Print& print)
 {
-    const auto scaled_resolution = scaled<double>(print.config().resolution.value);
     Polygons   loops;
     ExPolygons islands_ex;
     Flow       flow = print.brim_flow();
@@ -878,14 +877,16 @@ Polygons tryExPolygonOffset(const ExPolygons& islandAreaEx, const Print& print)
     for (ExPolygon& poly_ex : islands_ex)
         poly_ex.douglas_peucker(resolution);
     islands_ex = offset_ex(std::move(islands_ex), -0.5f * float(flow.scaled_spacing()), jtRound, resolution);
-    for (size_t i = 0; !islands_ex.empty(); ++i) {
+    // Keep the boundary pass (and therefore the object separation) unchanged.
+    // A little extra overlap belongs between brim lines, not at the part-facing
+    // edge. Do not erode farther and then grow back: that opening deletes narrow
+    // necks which the next brim line could still occupy.
+    const float line_step = float(1. - std::clamp(print.config().brim_line_overlap.value, 0., 25.) / 100.) * float(flow.scaled_spacing());
+    while (!islands_ex.empty()) {
         for (ExPolygon& poly_ex : islands_ex)
             poly_ex.douglas_peucker(resolution);
         polygons_append(loops, to_polygons(islands_ex));
-        islands_ex = offset_ex(std::move(islands_ex), -1.3f*float(flow.scaled_spacing()), jtRound, resolution);
-        for (ExPolygon& poly_ex : islands_ex)
-            poly_ex.douglas_peucker(resolution);
-        islands_ex = offset_ex(std::move(islands_ex), 0.3f*float(flow.scaled_spacing()), jtRound, resolution);
+        islands_ex = offset_ex(std::move(islands_ex), -line_step, jtRound, resolution);
     }
     return loops;
 }

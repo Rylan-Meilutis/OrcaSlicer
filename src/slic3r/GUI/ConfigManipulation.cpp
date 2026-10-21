@@ -1109,6 +1109,7 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, in
     // configured width, so the width field has to stay live for them too.
     toggle_field("brim_width", have_brim_width || (have_brim && is_belt_tilted));
     toggle_field("brim_flow_ratio", have_brim);
+    toggle_field("brim_line_overlap", have_brim);
     // Paired toggle_line + toggle_field: cb_toggle_line is null in the per-object
     // override panel, so the row cannot be hidden there and greying out is the
     // fallback.  Both extras are belt-only: one extends the brim ahead along the belt,

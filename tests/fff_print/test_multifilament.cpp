@@ -52,6 +52,45 @@
 using namespace Slic3r;
 using namespace Slic3r::Test;
 
+TEST_CASE("Dissimilar model contact speed only limits the contacting course", "[Multifilament][MaterialContactSpeed]")
+{
+    const bool enabled = GENERATE(false, true);
+    const bool dissimilar = GENERATE(false, true);
+    const bool stacked = GENERATE(false, true);
+    CAPTURE(enabled, dissimilar, stacked);
+    auto config = multifilament_config(2, {
+        {"filament_type", dissimilar ? "PLA;PETG" : "PLA;PLA"},
+        {"dissimilar_material_contact_speed", enabled ? 12. : 0.},
+        {"layer_height", 0.2}, {"initial_layer_print_height", 0.2},
+        {"outer_wall_speed", 60}, {"inner_wall_speed", 60},
+        {"internal_solid_infill_speed", 60}, {"top_surface_speed", 60},
+        {"filament_max_volumetric_speed", "100,100"},
+        {"slow_down_for_layer_cooling", "0,0"},
+        {"enable_prime_tower", false}, {"skirt_loops", 0}, {"brim_type", "no_brim"}
+    });
+    Print print;
+    Model model;
+    init_print({make_cube(12., 12., 2.)}, print, model, config);
+    auto upper = make_cube(10., 10., 2.);
+    upper.translate(stacked ? 1. : 16., 1., stacked ? 2. : 0.);
+    model.objects.front()->volumes.front()->config.set("extruder", 1);
+    model.objects.front()->add_volume(upper)->config.set("extruder", 2);
+    print.apply(model, config);
+    const auto output = gcode(print);
+    size_t slowed_contact = 0, later_normal = 0, slowed_elsewhere = 0;
+    GCodeReader reader;
+    reader.parse_buffer(output, [&](GCodeReader &self, const GCodeReader::GCodeLine &line) {
+        if (!line.extruding(self) || line.dist_XY(self) <= 0.) return;
+        const double z = line.new_Z(self), speed = line.new_F(self) / 60.;
+        if (std::abs(z - 2.2) < 0.001 && std::abs(speed - 12.) < 0.01) ++slowed_contact;
+        if (std::abs(z - 2.2) >= 0.001 && std::abs(speed - 12.) < 0.01) ++slowed_elsewhere;
+        if (z > 2.21 && speed > 12.) ++later_normal;
+    });
+    CHECK((slowed_contact > 0) == (enabled && dissimilar && stacked));
+    CHECK(slowed_elsewhere == 0);
+    if (stacked) CHECK(later_normal > 0);
+}
+
 TEST_CASE("Mapped exports print the requested first material before a larger base", "[Multifilament][ToolMapping]")
 {
     PresetBundle bundle;
@@ -90,6 +129,92 @@ TEST_CASE("Mapped exports print the requested first material before a larger bas
             first_depositing_tool = tool;
     });
     CHECK(first_depositing_tool == 7);
+}
+
+TEST_CASE("Bed supported materials do not attempt Z roots or report failed roots", "[Multifilament][Rooting][RootingBedContact]")
+{
+    auto config = multifilament_config(2, {
+        {"rooting", false}, {"rooting_xy", false}, {"interlocking_beam", false},
+        {"layer_height", 0.2}, {"initial_layer_print_height", 0.2},
+        {"elefant_foot_compensation", 0.}, {"enable_prime_tower", false}});
+    Print baseline, rooted;
+    Model model;
+    init_print({make_cube(10., 20., 2.)}, baseline, model, config);
+    auto body = make_cube(10., 20., 2.);
+    body.translate(10., 0., 0.);
+    auto cap = make_cube(20., 20., 2.);
+    cap.translate(0., 0., 2.);
+    body.merge(cap);
+    model.objects.front()->volumes.front()->config.set("extruder", 1);
+    model.objects.front()->add_volume(body)->config.set("extruder", 2);
+    baseline.apply(model, config);
+    baseline.get_object(0)->slice();
+    config.set_deserialize_strict("rooting", "1");
+    rooted.apply(model, config);
+    rooted.get_object(0)->slice();
+    CHECK(rooted.get_object(0)->step_state_with_warnings(posSlice).warnings.empty());
+    const auto &a = baseline.get_object(0)->layers(), &b = rooted.get_object(0)->layers();
+    REQUIRE(a.size() == b.size());
+    for (size_t z = 0; z < a.size(); ++z)
+        for (size_t r = 0; r < a[z]->regions().size(); ++r) {
+            const auto x = to_expolygons(a[z]->get_region(r)->slices.surfaces);
+            const auto y = to_expolygons(b[z]->get_region(r)->slices.surfaces);
+            CHECK(diff_ex(x, y).empty());
+            CHECK(diff_ex(y, x).empty());
+        }
+}
+
+TEST_CASE("A successful root contact does not hide another part's failure", "[Multifilament][Rooting][RootingDiagnostics]")
+{
+    auto config = multifilament_config(2, {
+        {"rooting", true}, {"rooting_xy", false}, {"interlocking_beam", false},
+        {"rooting_depth", 3.}, {"rooting_width", 1.2}, {"rooting_base_width", 3.},
+        {"rooting_skin", 0.4}, {"wall_loops", 2},
+        {"layer_height", 0.2}, {"initial_layer_print_height", 0.2},
+        {"elefant_foot_compensation", 0.}, {"enable_prime_tower", false}});
+    Print print;
+    Model model;
+    // The host's raw mesh overlaps the inserts. Diagnostics must follow native
+    // region ownership, not blame every raw volume intersecting the contact.
+    init_print({make_cube(40., 40., 8.)}, print, model, config);
+    auto *object = model.objects.front();
+    object->name = "Assembly";
+    object->volumes.front()->config.set("extruder", 1);
+    auto upper = make_cube(12., 12., 1.);
+    upper.translate(4., 4., 6.);
+    // Sub-resolution changes on continuing courses are not fresh contacts.
+    auto cap = make_cube(12.01, 12.01, 1.);
+    cap.translate(3.995, 3.995, 7.);
+    upper.merge(cap);
+    auto *good = object->add_volume(upper);
+    good->config.set("extruder", 2);
+    good->name = "Rootable part";
+    auto narrow = make_cube(0.6, 0.6, 2.);
+    narrow.translate(30., 30., 6.);
+    auto *bad = object->add_volume(narrow);
+    bad->config.set("extruder", 2);
+    bad->name = "Narrow part";
+    // A bed-supported part sharing tool 2 must not suppress the elevated parts.
+    auto lettering = make_cube(2., 2., 0.4);
+    lettering.translate(45., 0., 0.);
+    object->add_volume(lettering)->config.set("extruder", 2);
+    print.apply(model, config);
+    print.get_object(0)->slice();
+    const auto warnings = print.get_object(0)->step_state_with_warnings(posSlice).warnings;
+    REQUIRE(warnings.size() == 1);
+    CHECK(warnings.front().volume_id == bad->id());
+    CHECK(warnings.front().message.find(bad->name) != std::string::npos);
+    double buried_area = 0.;
+    for (const auto *layer : print.get_object(0)->layers())
+        if (layer->print_z > 0.4 + EPSILON && layer->print_z < 5.4 - EPSILON)
+            for (const auto *region : layer->regions())
+                if (region->region().extruder(frExternalPerimeter) == 2)
+                    buried_area += area(to_expolygons(region->slices.surfaces));
+    CHECK(buried_area > 0.);
+    config.set_deserialize_strict("rooting", "0");
+    print.apply(model, config);
+    print.get_object(0)->slice();
+    CHECK(print.get_object(0)->step_state_with_warnings(posSlice).warnings.empty());
 }
 
 TEST_CASE("Root preparation reports real phases and is deterministic across worker counts", "[Multifilament][Rooting][SliceProgress]")
@@ -150,7 +275,7 @@ TEST_CASE("Root preparation reports real phases and is deterministic across work
 
 // Opt-in local reproduction without checking private project geometry into the
 // repository. Synthetic cases below provide the portable regression coverage.
-TEST_CASE("A supplied rooting project gains buried material without changing its envelope", "[.RootingProject]")
+TEST_CASE("A supplied valid rooting project gains buried material without warnings or envelope changes", "[.RootingProject]")
 {
     const char *path = std::getenv("ORCA_ROOTING_PROJECT");
     if (path == nullptr) SKIP("Set ORCA_ROOTING_PROJECT to a multi-material 3MF with a qualifying root contact");
@@ -179,6 +304,12 @@ TEST_CASE("A supplied rooting project gains buried material without changing its
     for (size_t object = 0; object < rooted.objects().size(); ++object) {
         baseline.get_object(object)->slice();
         rooted.get_object(object)->slice();
+        const auto warnings = rooted.get_object(object)->step_state_with_warnings(posSlice).warnings;
+        CAPTURE(object, rooted.get_object(object)->model_object()->name);
+        std::string warning_text;
+        for (const auto &warning : warnings) warning_text += warning.message + "\n";
+        INFO(warning_text);
+        CHECK(warnings.empty());
         const auto &before = baseline.objects()[object]->layers();
         const auto &after = rooted.objects()[object]->layers();
         REQUIRE(before.size() == after.size());
@@ -673,6 +804,46 @@ TEST_CASE("Rooting embeds flared anchors without changing exposed surfaces", "[M
             CHECK(diff_ex(expected, restored).empty());
             CHECK(diff_ex(restored, expected).empty());
         }
+}
+
+TEST_CASE("Root material islands finish locally without changing deposition", "[Multifilament][Rooting][GCode]")
+{
+    struct Metrics { double extrusion = 0.; size_t crossings = 0; };
+    auto measure = [](bool enabled) {
+        auto config = multifilament_config(2, {
+            {"rooting", enabled}, {"rooting_xy", false},
+            {"layer_height", 0.2}, {"initial_layer_print_height", 0.2},
+            {"wall_loops", 3}, {"top_shell_layers", 3}, {"bottom_shell_layers", 3},
+            {"enable_prime_tower", false}, {"skirt_loops", 0}, {"brim_type", "no_brim"}});
+        Print print;
+        Model model;
+        init_print({make_cube(80., 20., 1.2)}, print, model, config);
+        model.objects.front()->volumes.front()->config.set("extruder", 1);
+        for (double x : {5., 65.}) {
+            TriangleMesh insert = make_cube(8., 8., 1.2);
+            insert.translate(x, 6., 0.);
+            model.objects.front()->add_volume(insert)->config.set("extruder", 2);
+        }
+        print.apply(model, config);
+        GCodeReader reader;
+        Metrics metrics;
+        int tool = 0;
+        reader.parse_buffer(gcode(print), [&](GCodeReader &self, const GCodeReader::GCodeLine &line) {
+            const std::string cmd(line.cmd());
+            if (cmd.size() > 1 && cmd.front() == 'T' && std::isdigit(static_cast<unsigned char>(cmd[1])))
+                tool = std::stoi(cmd.substr(1));
+            if (tool != 1) return;
+            if (line.extruding(self) && (line.has_x() || line.has_y()))
+                metrics.extrusion += line.dist_E(self);
+            else if (line.has_x() && std::abs(line.new_X(self) - self.x()) > 40.)
+                ++metrics.crossings;
+        });
+        return metrics;
+    };
+    const auto ordinary = measure(false);
+    const auto local = measure(true);
+    CHECK(local.crossings < ordinary.crossings);
+    CHECK_THAT(local.extrusion, Catch::Matchers::WithinRel(ordinary.extrusion, 0.001));
 }
 
 TEST_CASE("Rooting reaches emitted toolpaths below the original interface", "[Multifilament][Rooting][GCode]")

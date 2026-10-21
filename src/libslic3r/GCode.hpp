@@ -883,6 +883,8 @@ protected:
     // Actual selected slots, including automatic support-tool assignments.
     std::map<std::pair<const SupportLayer*, ExtrusionRole>, unsigned int> m_support_contact_filaments;
     std::map<std::pair<const SupportLayer*, unsigned int>, Polygons> m_dissimilar_support_footprints;
+    const Layer* m_dissimilar_model_contact_layer = nullptr;
+    std::map<unsigned int, Polygons> m_dissimilar_model_footprints;
     // Support for G-Code Processor
     float                               m_last_height{ 0.0f };
     float                               m_last_layer_z{ 0.0f };

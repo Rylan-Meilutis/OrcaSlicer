@@ -30,6 +30,7 @@ add_executable(${_TEST_NAME}_tests
     test_locales_utils.cpp
     test_drc.cpp
     test_gcodereader.cpp
+    test_local_extrusion_groups.cpp
     test_toolordering_nozzle_group.cpp
     test_parallel_resolve.cpp
     test_preset_bundle_loading.cpp

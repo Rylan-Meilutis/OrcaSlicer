@@ -3318,6 +3318,7 @@ void TabPrint::build()
         optgroup->append_single_option_line("flush_into_support", "multimaterial_settings_flush_options#flush-into-objects-support");
         optgroup = page->new_optgroup(L("Advanced"), L"advanced");
         optgroup->append_single_option_line("interlocking_beam", "multimaterial_settings_advanced#interlocking-beam");
+        optgroup->append_single_option_line("dissimilar_material_contact_speed");
         optgroup->append_single_option_line("toolchange_ordering", "multimaterial_settings_advanced#toolchange-ordering");
         optgroup->append_single_option_line("toolchange_cyclic_order", "multimaterial_settings_advanced#toolchange-order");
         optgroup->append_single_option_line("toolchange_cyclic_first_layer", "multimaterial_settings_advanced#toolchange-order");
@@ -3353,13 +3354,16 @@ void TabPrint::build()
             risk_line.full_width = 1;
             risk_line.widget = [this](wxWindow *parent) {
                 auto *sizer = new wxBoxSizer(wxVERTICAL);
-                sizer->Add(description_line_widget(parent, &m_warp_risk_description), 0, wxEXPAND);
-                auto *apply = new Button(parent, _L("Apply recommended adhesion and curl settings"));
+                auto *apply = new Button(parent, _L("View warp assessment…"));
                 apply->SetStyle(ButtonStyle::Regular, ButtonType::Parameter);
                 apply->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
                     CallAfter([this] {
                         if (wxGetApp().is_closing() || !wxGetApp().plater()) return;
                         try {
+                            MessageDialog dialog(this, warp_risk_description(), _L("Warp and curl risk"), wxOK | wxCANCEL | wxICON_INFORMATION);
+                            dialog.SetButtonLabel(wxID_OK, _L("Apply recommended settings"));
+                            dialog.SetButtonLabel(wxID_CANCEL, _L("Close"));
+                            if (dialog.ShowModal() != wxID_OK || wxGetApp().is_closing()) return;
                             auto full = m_preset_bundle->full_config();
                             full.apply(*m_config);
                             const auto risk = assess_warp_risk(full, wxGetApp().plater()->model());
@@ -3384,6 +3388,7 @@ void TabPrint::build()
         optgroup->append_single_option_line("extra_brim_width", "others_settings_brim#extra-width");
         optgroup->append_single_option_line("brim_object_gap", "others_settings_brim#brim-object-gap");
         optgroup->append_single_option_line("brim_flow_ratio", "others_settings_brim#brim-flow-ratio");
+        optgroup->append_single_option_line("brim_line_overlap");
         optgroup->append_single_option_line("brim_use_efc_outline", "others_settings_brim#brim-use-efc-outline");
         optgroup->append_single_option_line("combine_brims", "others_settings_brim#combine-brims");
         optgroup->append_single_option_line("brim_ears_max_angle", "others_settings_brim#ear-max-angle");
@@ -3494,14 +3499,9 @@ void TabPrint::reload_config()
     Tab::reload_config();
 }
 
-void TabPrint::update_description_lines()
+wxString TabPrint::warp_risk_description() const
 {
-    Tab::update_description_lines();
-
-    if (m_preset_bundle->printers.get_selected_preset().printer_technology() == ptSLA)
-        return;
-
-    if (m_active_page && m_active_page->title() == "Others" && m_warp_risk_description && wxGetApp().plater()) {
+    if (wxGetApp().plater()) {
         auto full = m_preset_bundle->full_config();
         full.apply(*m_config);
         const auto risk = assess_warp_risk(full, wxGetApp().plater()->model());
@@ -3512,14 +3512,44 @@ void TabPrint::update_description_lines()
                 if (!materials.empty()) materials += ", ";
                 materials += material;
             }
-            text = format_wxstr(_L("Elevated bed-lift/curl risk: %1%. Recommended outer brim: at least %2% mm, with a gap no greater than 0.1 mm, plus curled-overhang slowdown."),
+            text = format_wxstr(_L("Thermal bow potential exceeds one layer: %1%. Suggested outer brim: %2% mm. This is an adhesion precaution, not a calculated guarantee against detachment."),
                                 from_u8(materials), risk.brim_mm());
             text += "\n" + _L("Applying uses a continuous outer brim instead of painted coverage or ears; painting is retained in the model. Rafts, belt-printer adhesion and object overrides are preserved. Use a stable enclosure, avoid drafts, and prepare the build surface. Keep bridge/arc cooling appropriate for unsupported paths. This screening cannot measure adhesion or guarantee a successful print.");
         } else {
-            text = _L("No recognized warp-prone model material detected. Unknown materials and poor bed adhesion can still warp. This is not a guarantee.");
+            text = _L("No thermal bow above one layer was estimated for the assessed geometry. This does not establish that unassessed materials or unsupported edges are safe.");
         }
-        m_warp_risk_description->SetText(text);
+        text += "\n" + format_wxstr(_L("Thermal screening scenario: free contraction %1% mm; free base bow %2% mm. These assume a linear temperature gradient and no stress relaxation, not measured print deformation or guaranteed upper bounds for your filament."),
+            double_to_string(risk.free_contraction_mm, 2), double_to_string(risk.free_bow_mm, 2));
+        if (risk.crystallization_contraction_mm > 0.)
+            text += "\n" + format_wxstr(_L("Crystallization: additional isotropic contraction from 0 to %1% mm between the published amorphous and fully crystalline resin states. Actual crystallinity and its distribution are unknown. This range is not added to base bow or used alone to apply a brim; nonuniform crystallization can cause additional curl."),
+                double_to_string(risk.crystallization_contraction_mm, 2));
+        if (!risk.resin_screened_materials.empty()) {
+            std::string materials;
+            for (const auto &material : risk.resin_screened_materials) {
+                if (!materials.empty()) materials += ", ";
+                materials += material;
+            }
+            text += "\n" + format_wxstr(_L("Filled-material screening: %1%. Uses the unfilled resin scenario without assuming a benefit from reinforcement. Fiber loading, orientation and composite stiffness are unknown; these are not measured composite properties or bounds on directional curl."), materials);
+        }
+        if (!risk.family_screened_materials.empty())
+            text += "\n" + _L("Generic nylon uses the envelope of PA6, PA11 and PA12 reference properties, not a specific grade. Moisture swelling, aromatic nylons and proprietary blends are not characterized by that envelope.");
+        text += "\n" + _L("Bed detachment: unknown without plate-bond measurements. Unsupported-edge curl: assessed separately during toolpath generation; the base-bow model does not predict it.");
+        if (!risk.unknown_materials.empty() || risk.geometry_unknown)
+            text += "\n" + _L("Assessment incomplete: some materials, temperatures or contact geometry lack applicable model data. No automatic adhesion change is inferred from missing data.");
+        if (risk.estimated_ambient)
+            text += "\n" + _L("No chamber target is set; the estimate assumes 20 C ambient. Actual chamber and bed temperatures may differ from their targets.");
+        return text;
     }
+    return {};
+}
+
+void TabPrint::update_description_lines()
+{
+    Tab::update_description_lines();
+
+    if (m_preset_bundle->printers.get_selected_preset().printer_technology() == ptSLA)
+        return;
+
     if (m_active_page && m_active_page->title() == "Layers and perimeters" &&
         m_recommended_thin_wall_thickness_description_line && m_top_bottom_shell_thickness_explanation)
     {
@@ -3692,7 +3722,6 @@ void TabPrint::clear_pages()
 
     m_recommended_thin_wall_thickness_description_line = nullptr;
     m_top_bottom_shell_thickness_explanation = nullptr;
-    m_warp_risk_description = nullptr;
 }
 
 //BBS: GUI refactor

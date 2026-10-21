@@ -1626,7 +1626,11 @@ bool ViewerImpl::is_filament_visible(uint8_t filament_id) const
 void ViewerImpl::toggle_filament_visibility(uint8_t filament_id)
 {
     m_settings.hidden_filaments.flip(filament_id);
-    refresh_visibility();
+    // Filament visibility is a rendering filter, not a change of playback time.
+    // Rebuilding the move range here can select shutdown moves and replace the
+    // deposition temperatures with zero targets merely by hiding a filament.
+    m_settings.update_enabled_entities = true;
+    m_settings.update_colors = true;
 }
 
 void ViewerImpl::refresh_visibility()
@@ -1935,8 +1939,8 @@ size_t ViewerImpl::get_used_gpu_memory() const
 
 static bool is_visible(const PathVertex& v, const Settings& settings)
 {
-    if (settings.hidden_filaments[v.extruder_id])
-        return false;
+    // Keep the timeline independent of filament filters. Actual drawing filters
+    // every role (including adhesion and support) in update_enabled_entities().
     const EOptionType option_type = move_type_to_option(v.type);
     try
     {

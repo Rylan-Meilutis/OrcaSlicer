@@ -281,13 +281,15 @@ void PrinterWebView::SendAPIKey()
                                        m_apikey);
     m_browser->RemoveAllUserScripts();
     
-    // RemoveAllUserScripts causes WebView to forget about our script message handler, 
-    // so re-add it here.
-    m_browser->RemoveScriptMessageHandler("wx");
-    if (m_browser->AddScriptMessageHandler("wx"))
-        WebView::MarkScriptMessageHandlerAdded(m_browser);
-    else
-        wxLogError("Could not add script message handler");
+    // Clearing user scripts removes the JS alias, not the native message handler.
+    // CreateWebView owns that registration: re-adding it here yields on WebKit and
+    // can run its deferred registration inside ours, throwing on the duplicate.
+    // Restore only the alias for the reload (also avoids duplicate GTK signals).
+#ifdef __WIN32__
+    m_browser->AddUserScript("window.wx = window.chrome.webview;");
+#else
+    m_browser->AddUserScript("window.wx = window.webkit.messageHandlers.wx;");
+#endif
 
 #ifdef __linux__
     // Re-inject the vue-resize/WebKitGTK workaround that RemoveAllUserScripts just cleared.

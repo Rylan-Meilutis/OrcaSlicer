@@ -12,6 +12,9 @@
 #include "libslic3r/Preset.hpp"
 #include "../test_utils.hpp"
 #include <cstdlib>
+#include <cmath>
+#include <limits>
+#include <string>
 #include <vector>
 #include <boost/filesystem/operations.hpp>
 #include <boost/filesystem/path.hpp>
@@ -19,13 +22,149 @@
 using namespace Slic3r;
 using Catch::Matchers::WithinAbs;
 
-TEST_CASE("Warp screening recognizes susceptible material families", "[WarpMitigation]")
+TEST_CASE("Warp material coverage distinguishes resin screening from composite properties", "[WarpMitigation]")
 {
-    const auto material = GENERATE("ABS", "ASA", "PC", "PA12", "PP", "PPS-CF", "HIPS");
-    CHECK(warp_prone_material(material));
-    CHECK_FALSE(warp_prone_material("PLA"));
-    CHECK_FALSE(warp_prone_material("TPU"));
-    CHECK_FALSE(warp_prone_material("unknown"));
+    const auto type = GENERATE("ABS", "ASA", "PC", "HIPS", "PETG", "PMMA", "PLA", "PP", "PA", "PA6", "PA11", "PA12", "POM", "PPS", "PEEK");
+    const auto material = warp_material(type);
+    REQUIRE(material.has_value());
+    CHECK_FALSE(material->resin_screening);
+    CHECK(material->cte_min > 0.);
+    CHECK(material->cte_max >= material->cte_min);
+    CHECK(material->modulus_max > 0.);
+    for (const std::string suffix : {"-CF", "-GF"}) {
+        const auto filled = warp_material(std::string(type) + suffix);
+        REQUIRE(filled.has_value());
+        CHECK(filled->resin_screening);
+        WarpRisk risk;
+        assess_thermal_strip(risk, *filled, 100., 1., 100., 20., 400.);
+        CHECK(risk.elevated());
+        // Matrix stiffness must never be reported as composite stored energy.
+        CHECK_THAT(risk.restrained_energy_j_m2, WithinAbs(0., 1e-12));
+    }
+    CHECK_FALSE(warp_material("unknown").has_value());
+    CHECK_FALSE(warp_material("unknown-CF").has_value());
+    CHECK_FALSE(warp_material("PLA-AERO").has_value());
+}
+
+TEST_CASE("Additional amorphous materials retain geometry and temperature dependent screening", "[WarpMitigation]")
+{
+    const auto type = GENERATE("HIPS", "PETG", "PMMA");
+    const auto material = *warp_material(type);
+    WarpRisk small, large, uniform;
+    assess_thermal_strip(small, material, 5., 1., 100., 20., 250.);
+    assess_thermal_strip(large, material, 100., 1., 100., 20., 250.);
+    assess_thermal_strip(uniform, material, 100., 1., 20., 20., 250.);
+    CHECK_FALSE(small.elevated());
+    CHECK(large.elevated());
+    CHECK_FALSE(uniform.elevated());
+    CHECK(uniform.free_contraction_mm > 0.);
+    CHECK_THAT(large.free_bow_mm, WithinAbs(400. * small.free_bow_mm, 1e-9));
+    CHECK(warp_material(std::string(type) + "-CF")->resin_screening);
+    CHECK(warp_material(std::string(type) + "-GF")->resin_screening);
+}
+
+TEST_CASE("Semicrystalline shrinkage has separate thermal and phase contributions", "[WarpMitigation]")
+{
+    const auto type = GENERATE("PLA", "PP", "PA6", "PA11", "PA12", "POM", "PPS", "PEEK");
+    const auto material = *warp_material(type);
+    REQUIRE(material.melting_max > material.tg_max);
+    REQUIRE(material.phase_contraction_bound() > 0.);
+    CHECK(material.phase_contraction_bound() < 0.1);
+    WarpRisk reference, uniform, wider, hotter;
+    assess_thermal_strip(reference, material, 100., 1., 100., 20., 400.);
+    assess_thermal_strip(uniform, material, 100., 1., 20., 20., 400.);
+    assess_thermal_strip(wider, material, 200., 1., 100., 20., 400.);
+    assess_thermal_strip(hotter, material, 100., 1., 100., 20., 500.);
+    CHECK(reference.free_bow_mm > 0.);
+    CHECK(reference.free_contraction_mm > 0.);
+    CHECK_THAT(reference.crystallization_contraction_mm,
+        WithinAbs(100. * (1. - std::cbrt(material.amorphous_density / material.crystalline_density)), 1e-9));
+    CHECK_THAT(wider.crystallization_contraction_mm, WithinAbs(2. * reference.crystallization_contraction_mm, 1e-9));
+    CHECK_THAT(wider.free_bow_mm, WithinAbs(4. * reference.free_bow_mm, 1e-9));
+    CHECK_THAT(hotter.free_contraction_mm, WithinAbs(reference.free_contraction_mm, 1e-9));
+    CHECK(uniform.crystallization_contraction_mm > 0.);
+    CHECK_FALSE(uniform.elevated()); // Uniform phase contraction is not a curvature measurement.
+}
+
+TEST_CASE("Material spelling aliases retain explicit grade uncertainty", "[WarpMitigation]")
+{
+    const auto type = GENERATE("pps-cf", "PPSCF", " PPS_CF ", "pps cf");
+    const auto material = warp_material(type);
+    REQUIRE(material.has_value());
+    CHECK(material->resin_screening);
+    CHECK_THAT(material->melting_max, WithinAbs(290., 1e-12));
+    CHECK(warp_material("nylon")->family_screening);
+    CHECK_FALSE(warp_material("nylon-12")->family_screening);
+    CHECK(warp_material("nylon-cf")->family_screening);
+    CHECK_FALSE(warp_material("PA-unknown").has_value());
+}
+
+TEST_CASE("Invalid thermal strip geometry never creates a numerical risk", "[WarpMitigation]")
+{
+    const auto value = GENERATE(0., -1., std::numeric_limits<double>::infinity(), std::numeric_limits<double>::quiet_NaN());
+    WarpRisk risk;
+    assess_thermal_strip(risk, *warp_material("PPS"), 100., value, 100., 20., 320.);
+    CHECK_FALSE(risk.elevated());
+    CHECK_THAT(risk.free_contraction_mm, WithinAbs(0., 1e-12));
+    CHECK_THAT(risk.crystallization_contraction_mm, WithinAbs(0., 1e-12));
+}
+
+TEST_CASE("Thermal bow follows span squared and inverse solid thickness", "[WarpMitigation]")
+{
+    const auto material = *warp_material("ASA");
+    WarpRisk reference, wider, thicker, isothermal;
+    assess_thermal_strip(reference, material, 20., 1., 100., 50., 250.);
+    assess_thermal_strip(wider, material, 40., 1., 100., 50., 250.);
+    assess_thermal_strip(thicker, material, 20., 2., 100., 50., 250.);
+    assess_thermal_strip(isothermal, material, 20., 1., 50., 50., 250.);
+    CHECK_THAT(reference.free_bow_mm, WithinAbs(105e-6 * 50. * 400. / 8., 1e-9));
+    CHECK_THAT(wider.free_bow_mm, WithinAbs(4. * reference.free_bow_mm, 1e-9));
+    CHECK_THAT(thicker.free_bow_mm, WithinAbs(0.5 * reference.free_bow_mm, 1e-9));
+    CHECK_THAT(isothermal.free_bow_mm, WithinAbs(0., 1e-9));
+    CHECK(isothermal.free_contraction_mm > 0.);
+    CHECK_THAT(reference.restrained_energy_j_m2,
+        WithinAbs(0.5 * 2.9e9 * std::pow(105e-6 * 55., 2) * 0.001, 1e-9));
+}
+
+TEST_CASE("Small ABS contacts do not acquire risk from empty space between them", "[WarpMitigation]")
+{
+    auto config = DynamicPrintConfig::full_print_config();
+    config.set_key_value("filament_type", new ConfigOptionStrings({"ABS"}));
+    config.set_key_value("curr_bed_type", new ConfigOptionEnum<BedType>(btPEI));
+    config.set_key_value("hot_plate_temp", new ConfigOptionInts({100}));
+    config.set_key_value("chamber_temperature", new ConfigOptionInts({50}));
+    config.set_key_value("nozzle_temperature", new ConfigOptionInts({250}));
+    config.set_key_value("bottom_shell_layers", new ConfigOptionInt(5));
+    config.set_key_value("bottom_shell_thickness", new ConfigOptionFloat(1.));
+    config.set_key_value("layer_height", new ConfigOptionFloat(0.2));
+    Model model;
+    auto *object = model.add_object();
+    object->add_volume(make_cube(5., 5., 5.));
+    auto second = make_cube(5., 5., 5.);
+    second.translate(100., 0., 0.);
+    object->add_volume(second);
+    object->add_instance();
+    const auto small = assess_warp_risk(config, model);
+    CHECK_FALSE(small.elevated());
+    CHECK(small.span_mm < 8.);
+    const auto original = config;
+    apply_warp_mitigations(config, small);
+    CHECK(config.diff(original).empty());
+    object->add_volume(make_cube(100., 20., 1.));
+    const auto large = assess_warp_risk(config, model);
+    CHECK(large.elevated());
+    object->instances.front()->set_rotation(Z, 0.7);
+    const auto rotated = assess_warp_risk(config, model);
+    CHECK_THAT(rotated.free_bow_mm, WithinAbs(large.free_bow_mm, 1e-5));
+    config.set_key_value("chamber_temperature", new ConfigOptionInts({100}));
+    const auto warm = assess_warp_risk(config, model);
+    CHECK_FALSE(warm.elevated());
+    CHECK(warm.free_contraction_mm > 0.);
+    config.set_key_value("filament_type", new ConfigOptionStrings({"ABS-CF"}));
+    const auto filled = assess_warp_risk(config, model);
+    CHECK_FALSE(filled.elevated());
+    CHECK(filled.unknown_materials.empty());
+    CHECK(filled.resin_screened_materials.count("ABS-CF") == 1);
 }
 
 TEST_CASE("Bed lift mitigation replaces painted-only adhesion with a continuous brim", "[WarpMitigation][Regression]")
@@ -39,6 +178,7 @@ TEST_CASE("Bed lift mitigation replaces painted-only adhesion with a continuous 
     WarpRisk risk;
     risk.materials.insert("ASA");
     risk.span_mm = 120.;
+    risk.free_bow_mm = 6.;
     apply_warp_mitigations(config, risk);
     CHECK(config.option<ConfigOptionEnum<BrimType>>("brim_type")->value == btOuterOnly);
     CHECK_THAT(config.opt_float("brim_width"), WithinAbs(10., 1e-6));
@@ -56,6 +196,7 @@ TEST_CASE("Warp mitigation preserves stronger adhesion and raft choices", "[Warp
     config.set_key_value("brim_object_gap", new ConfigOptionFloat(0.05));
     WarpRisk risk;
     risk.materials.insert("PC");
+    risk.free_bow_mm = 1.;
     apply_warp_mitigations(config, risk);
     CHECK(config.option<ConfigOptionEnum<BrimType>>("brim_type")->value == btOuterAndInner);
     CHECK_THAT(config.opt_float("brim_width"), WithinAbs(15., 1e-6));
@@ -89,7 +230,9 @@ TEST_CASE("Warp screening follows model and feature material assignments", "[War
     auto *volume = object->add_volume(make_cube(80., 70., 2.));
     object->add_instance();
     volume->config.set_key_value("extruder", new ConfigOptionInt(1));
-    CHECK_FALSE(assess_warp_risk(config, model).elevated());
+    const auto initial = assess_warp_risk(config, model);
+    CHECK(initial.materials.count("PLA") == 1);
+    CHECK(initial.materials.count("ASA") == 0);
 
     const auto key = GENERATE("extruder", "outer_wall_filament_id",
         "inner_wall_filament_id", "sparse_infill_filament_id",

@@ -1504,6 +1504,7 @@ static std::vector<std::string> s_Preset_print_options{
     "fuzzy_skin_top_surface",
     "localized_shrinkage_strategy",
     "automatic_warp_mitigation",
+    "brim_line_overlap",
     "hull_line_extra_perimeters",
     "hull_line_perimeter_expansion",
     "localized_shrinkage_infill_wall_gap",
@@ -1627,6 +1628,7 @@ static std::vector<std::string> s_Preset_print_options{
     "nonplanar_top_surface_min_height",
     "slow_down_layer_above_dissimilar_support_interface",
     "dissimilar_support_interface_speed",
+    "dissimilar_material_contact_speed",
     "dissimilar_support_interface_speed_layers",
     // IDEX/IQEX parallel print mode (per-print selection)
     "imex_parallel_mode",

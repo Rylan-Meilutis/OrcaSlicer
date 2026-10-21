@@ -1512,20 +1512,29 @@ static void style_sidebar_section_toggle(Button *toggle)
     toggle->SetBackgroundColor2(0xF1F1F1);
 }
 
-static StaticBox *create_sidebar_section_header(wxWindow *parent, const wxString &title, Button *&toggle)
+static StaticBox *create_sidebar_section_header(wxWindow *parent, const wxString &title, Button *&toggle,
+                                                const std::string &icon_name)
 {
     auto *header = new StaticBox(parent, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxTAB_TRAVERSAL | wxBORDER_NONE);
     header->SetBackgroundColor(0xF8F8F8);
     header->SetBackgroundColor2(0xF1F1F1);
     auto *label = new Label(header, title, LB_PROPAGATE_MOUSE_EVENT);
+    auto *icon = new Button(header, wxEmptyString, icon_name, 0, 16);
+    style_sidebar_section_toggle(icon);
     toggle = new Button(header, wxEmptyString, "expand_btn", 0, 16);
     style_sidebar_section_toggle(toggle);
     toggle->SetToolTip(title);
     auto *row = new wxBoxSizer(wxHORIZONTAL);
-    row->Add(label, 1, wxALIGN_CENTER_VERTICAL | wxLEFT, parent->FromDIP(SidebarProps::TitlebarMargin()));
+    row->Add(icon, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, parent->FromDIP(SidebarProps::TitlebarMargin()));
+    row->Add(label, 1, wxALIGN_CENTER_VERTICAL | wxLEFT | wxRIGHT, parent->FromDIP(SidebarProps::ElementSpacing()));
     row->Add(toggle, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, parent->FromDIP(SidebarProps::TitlebarMargin()));
     row->SetMinSize(-1, parent->FromDIP(30));
     header->SetSizer(row);
+    icon->Bind(wxEVT_BUTTON, [toggle](wxCommandEvent &) {
+        wxCommandEvent click(wxEVT_BUTTON, toggle->GetId());
+        click.SetEventObject(toggle);
+        toggle->ProcessWindowEvent(click);
+    });
     header->Bind(wxEVT_LEFT_UP, [toggle](wxMouseEvent &event) {
         event.Skip();
         toggle->CallAfter([toggle] {
@@ -2472,7 +2481,7 @@ ExtruderGroup::ExtruderGroup(wxWindow * parent, int index, wxString const &title
     // individually; a multi-extruder printer grows one row per tool (see SetNozzleRowCount).
     // The rows are dealt into two columns, which halves the height of a long tool list; the second
     // column empties itself when there is a single row, so a one-row card still spans the width.
-    vsizer->Add(create_sidebar_section_header(this, _L("Nozzle sizes"), nozzle_toggle), 0, wxEXPAND);
+    vsizer->Add(create_sidebar_section_header(this, _L("Nozzle sizes"), nozzle_toggle, "monitor_nozzle_temp"), 0, wxEXPAND);
     nozzle_content = new wxPanel(this);
     nozzle_content->SetBackgroundColour(StateColor::darkModeColorFor(*wxWHITE));
     combo_diameter->Reparent(nozzle_content);
@@ -4403,7 +4412,7 @@ Sidebar::Sidebar(Plater *parent)
     }
 
     {
-        scrolled_sizer->Add(create_sidebar_section_header(p->scrolled, _L("Project settings"), p->project_settings_toggle),
+        scrolled_sizer->Add(create_sidebar_section_header(p->scrolled, _L("Project settings"), p->project_settings_toggle, "plate_settings"),
                             0, wxEXPAND);
         auto *project_content = new wxPanel(p->scrolled);
         project_content->SetBackgroundColour(StateColor::darkModeColorFor(*wxWHITE));
@@ -4539,21 +4548,10 @@ Sidebar::Sidebar(Plater *parent)
             p->plater->update();
         });
         auto *section_sizer = new wxBoxSizer(wxVERTICAL);
-        auto *header = new StaticBox(p->area_bindings_panel, wxID_ANY, wxDefaultPosition,
-                                     wxDefaultSize, wxTAB_TRAVERSAL | wxBORDER_NONE);
-        header->SetBackgroundColor(title_bg);
-        header->SetBackgroundColor2(0xF1F1F1);
-        auto *header_sizer = new wxBoxSizer(wxHORIZONTAL);
-        auto *icon = new ScalableButton(header, wxID_ANY, "filament");
-        auto *title = new Label(header, _L("Filament Bindings"), LB_PROPAGATE_MOUSE_EVENT);
-        auto *toggle = new ScalableButton(header, wxID_ANY,
-            p->area_bindings_collapsed ? "expand_btn" : "collapse_btn");
+        Button *toggle = nullptr;
+        auto *header = create_sidebar_section_header(p->area_bindings_panel, _L("Filament Bindings"), toggle, "filament");
+        toggle->SetIcon(p->area_bindings_collapsed ? "expand_btn" : "collapse_btn");
         toggle->SetToolTip(_L("Expand or collapse Filament Bindings"));
-        header_sizer->Add(icon, 0, wxALIGN_CENTER | wxLEFT, FromDIP(SidebarProps::TitlebarMargin()));
-        header_sizer->Add(title, 1, wxALIGN_CENTER_VERTICAL | wxLEFT | wxRIGHT, FromDIP(SidebarProps::ElementSpacing()));
-        header_sizer->Add(toggle, 0, wxALIGN_CENTER | wxRIGHT, FromDIP(SidebarProps::TitlebarMargin()));
-        header_sizer->SetMinSize(-1, FromDIP(30));
-        header->SetSizerAndFit(header_sizer);
         section_sizer->Add(header, 0, wxEXPAND);
         p->area_bindings_content = new wxPanel(p->area_bindings_panel);
         wxWindow *content = p->area_bindings_content;
@@ -4592,15 +4590,13 @@ Sidebar::Sidebar(Plater *parent)
         const auto toggle_bindings = [this, toggle] {
             p->area_bindings_collapsed = !p->area_bindings_collapsed;
             p->area_bindings_content->Show(!p->area_bindings_collapsed);
-            toggle->SetBitmap(create_scaled_bitmap(p->area_bindings_collapsed ? "expand_btn" : "collapse_btn", toggle));
+            toggle->SetIcon(p->area_bindings_collapsed ? "expand_btn" : "collapse_btn");
             p->area_bindings_panel->InvalidateBestSize();
             p->area_bindings_panel->Layout();
             p->scrolled->Layout();
             p->scrolled->FitInside();
         };
-        header->Bind(wxEVT_LEFT_UP, [toggle_bindings](wxMouseEvent &) { toggle_bindings(); });
-        toggle->Bind(wxEVT_BUTTON, [toggle_bindings](wxCommandEvent &) { toggle_bindings(); });
-        icon->Bind(wxEVT_BUTTON, [toggle_bindings](wxCommandEvent &) { toggle_bindings(); });
+        toggle->Bind(wxEVT_BUTTON, [toggle, toggle_bindings](wxCommandEvent &) { toggle->CallAfter(toggle_bindings); });
         scrolled_sizer->Add(p->area_bindings_panel, 0, wxEXPAND);
         p->area_bindings_panel->Hide();
     }
@@ -12930,11 +12926,13 @@ void Plater::priv::process_validation_warning(StringObjectException const &warni
         //    };
         //}
 
+        const bool warp_note = warning.opt_key == "automatic_warp_mitigation" && !warning.is_warning;
         notification_manager->push_notification(
             warning.opt_key == "automatic_warp_mitigation" ?
                 NotificationType::WarpRiskWarning : NotificationType::ValidateWarning,
-            NotificationManager::NotificationLevel::WarningNotificationLevel,
-            _u8L("WARNING:") + "\n" + text, hypertext, action_fn
+            warp_note ? NotificationManager::NotificationLevel::RegularNotificationLevel :
+                        NotificationManager::NotificationLevel::WarningNotificationLevel,
+            warp_note ? text : _u8L("WARNING:") + "\n" + text, hypertext, action_fn
         );
     }
 }
@@ -14818,7 +14816,7 @@ void Plater::priv::on_slicing_update(SlicingStatusEvent &evt)
                 if (evt.status.message_type == PrintStateBase::SlicingNotificationType::SlicingReplaceInitEmptyLayers || evt.status.message_type == PrintStateBase::SlicingNotificationType::SlicingEmptyGcodeLayers) {
                     notif_level = NotificationManager::NotificationLevel::SeriousWarningNotificationLevel;
                 }
-                notification_manager->push_slicing_warning_notification(warning.message, false, model_object, object_id, warning_step, warning.message_id, notif_level);
+                notification_manager->push_slicing_warning_notification(warning.message, false, model_object, object_id, warning_step, warning.message_id, notif_level, warning.volume_id);
                 add_warning(warning, object_id.id);
             }
         }
@@ -14882,7 +14880,7 @@ void Plater::priv::on_slicing_began()
 void Plater::priv::add_warning(const Slic3r::PrintStateBase::Warning& warning, size_t oid)
 {
     for (auto& it : current_warnings) {
-        if (warning.message_id == it.first.message_id) {
+        if (oid == it.second && warning.volume_id == it.first.volume_id && warning.message_id == it.first.message_id) {
             if (warning.message_id != 0 || (warning.message_id == 0 && warning.message == it.first.message))
             {
                 if (warning.message_id != 0)

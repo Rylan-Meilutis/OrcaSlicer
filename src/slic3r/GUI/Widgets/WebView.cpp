@@ -374,17 +374,17 @@ wxWebView* WebView::CreateWebView(wxWindow * parent, wxString const & url)
         Slic3r::GUI::WKWebView_setTransparentBackground(wkWebView);
 #endif
         auto addScriptMessageHandler = [] (wxWebView *webView) {
-            // Skip if SendAPIKey() already registered "wx"; a duplicate add throws an
-            // uncatchable NSException on WKWebView, killing the app at startup.
+            // Registration yields on WebKit. Claim it before entering wx so nested
+            // events cannot register the same native handler again.
             WebViewRef *ref = webview_ref(webView);
             if (ref && ref->m_script_handler_added)
                 return;
+            if (ref)
+                ref->m_script_handler_added = true;
             BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": begin to add script message handler for wx.";
             Slic3r::GUI::wxGetApp().set_adding_script_handler(true);
             if (!webView->AddScriptMessageHandler("wx"))
                 wxLogError("Could not add script message handler");
-            else if (ref)
-                ref->m_script_handler_added = true;
             Slic3r::GUI::wxGetApp().set_adding_script_handler(false);
             BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": finished add script message handler for wx.";
         };

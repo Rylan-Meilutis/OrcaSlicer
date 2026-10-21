@@ -369,6 +369,7 @@ bool Print::invalidate_state_by_config_options(const ConfigOptionResolver & /* n
             // These steps have no influence on the G-code whatsoever. Just ignore them.
         } else if (
                opt_key == "skirt_type"
+            || opt_key == "brim_line_overlap"
             || opt_key == "skirt_loops"
             || opt_key == "skirt_speed"
             || opt_key == "skirt_height"
@@ -1919,17 +1920,25 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
     if (warp_risk.elevated()) {
         const bool sparse_adhesion = std::any_of(m_objects.begin(), m_objects.end(),
             [&](const PrintObject *object) {
+                if (warp_risk.elevated_objects.count(object->model_object()->id()) == 0)
+                    return false;
                 const auto &cfg = object->config();
                 return cfg.raft_layers.value == 0 &&
                     ((cfg.brim_type.value != btOuterOnly && cfg.brim_type.value != btOuterAndInner) ||
                      cfg.brim_width.value < warp_risk.brim_mm() || cfg.brim_object_gap.value > 0.1);
             });
         if (sparse_adhesion && !m_config.belt_printer.value)
-            warn(L("Warp-prone material detected with limited continuous bed adhesion. In Others, use Warp and curl risk to apply a continuous outer brim and curled-perimeter slowdown. Check enclosure conditions and build-plate preparation. These measures reduce risk but cannot guarantee that the print stays attached."),
+            warn(L("The geometry and temperature model estimates potential base bow greater than one layer, with limited continuous bed adhesion. In Others, review Warp and curl risk and its assumptions. A continuous brim is a precaution; bed detachment cannot be predicted without plate-bond data."),
                  "automatic_warp_mitigation");
-        else
-            warn(L("Warp-prone material detected. Adhesion measures do not eliminate warping or curling. Check enclosure conditions, drafts and build-plate preparation before printing. Review Warp and curl risk in Others; the slicer cannot verify actual bed adhesion."),
-                 "automatic_warp_mitigation");
+        else if (warnings != nullptr) {
+            StringObjectException note;
+            note.string = L("Warp mitigations applied. Review and validate the changes before printing.");
+            note.opt_key = "automatic_warp_mitigation";
+            // Keep this in the validation result so revalidation clears it, but
+            // do not present an already mitigated condition as an action warning.
+            note.is_warning = false;
+            warnings->push_back(std::move(note));
+        }
     }
 
     const std::string &model_override = m_config.gcode_printer_model.value;

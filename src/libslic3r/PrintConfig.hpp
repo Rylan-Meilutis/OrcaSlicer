@@ -1448,6 +1448,7 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionInt,                 support_interface_top_temperature))
     ((ConfigOptionBool,                slow_down_layer_above_dissimilar_support_interface))
     ((ConfigOptionFloatOrPercent,      dissimilar_support_interface_speed))
+    ((ConfigOptionFloat,               dissimilar_material_contact_speed))
     ((ConfigOptionInt,                 dissimilar_support_interface_speed_layers))
     // Spacing between interface lines (the hatching distance). Set zero to get a solid interface.
     ((ConfigOptionFloat,               support_interface_spacing))
@@ -2161,6 +2162,7 @@ PRINT_CONFIG_CLASS_DERIVED_DEFINE(
     (MachineEnvelopeConfig, GCodeConfig),
 
     ((ConfigOptionBool,                automatic_warp_mitigation))
+    ((ConfigOptionPercent,             brim_line_overlap))
     // Build plate tilt for off-axis gravity support generation (printer-level setting).
     ((ConfigOptionFloat,               build_plate_tilt_x))
     ((ConfigOptionFloat,               build_plate_tilt_y))

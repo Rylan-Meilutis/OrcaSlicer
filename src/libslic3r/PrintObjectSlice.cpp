@@ -1504,6 +1504,7 @@ void PrintObject::slice_volumes()
         if (m_config.rooting || m_config.rooting_xy)
             report_slice_progress(*this, 4.5, L("Preparing root growth"));
         int last_progress = -1;
+        std::vector<Rooting::ContactResult> root_contacts;
         const size_t root_count = roots.apply(*this, [print]() { print->throw_if_canceled(); },
             [this, &last_progress](bool xy, size_t completed, size_t total) {
                 const double fraction = double(completed) / std::max(size_t(1), total);
@@ -1513,10 +1514,47 @@ void PrintObject::slice_volumes()
                 report_slice_progress(*this, (xy ? 6. : 4.5) + fraction,
                     xy ? L("Growing XY roots: material pairs completed") : L("Growing Z roots: contact layers completed"),
                     completed, total);
-            });
-        if ((m_config.rooting || m_config.rooting_xy) && num_printing_regions() > 1 && root_count == 0)
+            }, &root_contacts);
+        // Resolve failed native contacts to actual model parts, even when several
+        // parts share one PrintRegion. A successful neighbor cannot mask failure.
+        std::map<ObjectID, std::vector<ExPolygons>> volume_slices;
+        for (const auto &contact : root_contacts) {
+            if (contact.placed) continue;
+            const auto &range = *layer_range_first(m_shared_regions->layer_ranges, m_layers[contact.layer]->slice_z);
+            std::set<const PrintRegion *> owners{&printing_region(contact.region)};
+            for (const auto &fuzzy : range.fuzzy_skin_painted_regions)
+                if (owners.count(fuzzy.region)) owners.insert(fuzzy.parent_print_object_region(range));
+            for (const auto &painted : range.painted_regions)
+                if (owners.count(painted.region)) owners.insert(range.volume_regions[painted.parent].region);
+            std::set<const ModelVolume *> parts;
+            for (const auto &region : range.volume_regions) {
+                if (!owners.count(region.region)) continue;
+                const auto *source = &region;
+                while (!source->model_volume->is_model_part() && source->parent >= 0)
+                    source = &range.volume_regions[source->parent];
+                if (source->model_volume->is_model_part()) parts.insert(source->model_volume);
+            }
+            bool identified = false;
+            for (const auto *volume : model_object()->volumes) {
+                if (!parts.count(volume)) continue;
+                auto it = volume_slices.find(volume->id());
+                if (it == volume_slices.end())
+                    it = volume_slices.emplace(volume->id(), slice_single_volume_regions(volume)).first;
+                if (contact.layer >= it->second.size() ||
+                    intersection_ex(ExPolygons{contact.contact}, it->second[contact.layer]).empty()) continue;
+                identified = true;
+                this->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL,
+                    L("Z roots could not fit at a material contact. Check root thickness, depth and protective walls.") +
+                    std::string("\n") + model_object()->name + " / " + volume->name,
+                    PrintStateBase::SlicingDefaultNotification, volume->id());
+            }
+            if (!identified)
+                this->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL,
+                    L("Z roots could not fit at a material contact. Check root thickness, depth and protective walls."));
+        }
+        if (m_config.rooting_xy && num_printing_regions() > 1 && root_count == 0 && root_contacts.empty())
             this->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL,
-                L("Rooting could not place any roots. Check that different materials touch in an enabled rooting direction within one object, that each region uses one filament with walls and top/bottom shells, and that the root depth, diameter and protective skin fit inside the base."));
+                L("No roots fit in this object with the current settings. Roots in other objects are unaffected. Check material contact, enabled rooting directions, and space for root thickness and protective walls."));
     }
     m_print->throw_if_canceled();
 

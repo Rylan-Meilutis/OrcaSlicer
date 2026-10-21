@@ -2348,6 +2348,7 @@ bool PrintObject::invalidate_state_by_config_options(
             || opt_key == "support_flow_ratio"
             || opt_key == "support_interface_flow_ratio"
             || opt_key == "support_interface_top_temperature"
+            || opt_key == "dissimilar_material_contact_speed"
             || opt_key == "arc_overhang_speed"
             || opt_key == "arc_overhang_min_path_time"
             || opt_key == "arc_overhang_stabilization_speed"

@@ -2064,22 +2064,37 @@ void NotificationManager::push_slicing_error_notification(const std::string &tex
 	push_notification_data({ NotificationType::SlicingError, NotificationLevel::ErrorNotificationLevel, 0,  _u8L("Error:") + "\n" + text, link, callback }, 0);
 	set_slicing_progress_hidden();
 }
-void NotificationManager::push_slicing_warning_notification(const std::string& text, bool gray, ModelObject const * obj, ObjectID oid, int warning_step, int warning_msg_id, NotificationLevel level/* = NotificationLevel::WarningNotificationLevel*/)
+void NotificationManager::push_slicing_warning_notification(const std::string& text, bool gray, ModelObject const * obj, ObjectID oid, int warning_step, int warning_msg_id, NotificationLevel level, ObjectID volume_id)
 {
 	std::function<bool(wxEvtHandler*)> callback;
 	if (obj) {
-		callback = [id = obj->id()](wxEvtHandler*) {
-			auto& objects = wxGetApp().model().objects;
-			auto iter = std::find_if(objects.begin(), objects.end(), [id](auto o) { return o->id() == id; });
-			if (iter != objects.end()) {
-				wxGetApp().mainframe->select_tab(TAB_ID_PREPARE);
-				wxGetApp().obj_list()->select_items({ {*iter, nullptr} });
-			}
+		callback = [id = obj->id(), volume_id](wxEvtHandler*) {
+			if (!wxTheApp || wxGetApp().is_closing()) return false;
+			wxGetApp().CallAfter([id, volume_id] {
+				if (wxGetApp().is_closing() || !wxGetApp().plater() || !wxGetApp().mainframe) return;
+				auto& objects = wxGetApp().model().objects;
+				auto iter = std::find_if(objects.begin(), objects.end(), [id](auto o) { return o->id() == id; });
+				if (iter != objects.end()) {
+					wxGetApp().mainframe->select_tab(TAB_ID_PREPARE);
+					ModelVolume *part = nullptr;
+					for (auto *volume : (*iter)->volumes)
+						if (volume->id() == volume_id) { part = volume; break; }
+					auto *list = wxGetApp().obj_list();
+					if (part) list->Expand(list->GetModel()->GetObjectItem(*iter));
+					list->select_items({ {*iter, part} });
+					if (const auto item = list->GetSelection()) list->EnsureVisible(item);
+				}
+			});
 			return false;
 		};
 	}
     auto link = callback ? _u8L("Jump to") : "";
-    if (obj) link += std::string(" [") + obj->name + "]";
+    if (obj) {
+        link += std::string(" [") + obj->name;
+        for (const auto *volume : obj->volumes)
+            if (volume->id() == volume_id) { link += " / " + volume->name; break; }
+        link += "]";
+    }
 	NotificationData data { NotificationType::SlicingWarning, level, 0,  _u8L("Warning:") + "\n" + text, link, callback };
 
 	data.sub_msg_id = warning_msg_id;
@@ -2087,6 +2102,7 @@ void NotificationManager::push_slicing_warning_notification(const std::string& t
 
 	auto notification = std::make_unique<NotificationManager::ObjectIDNotification>(data, m_id_provider, m_evt_handler);
 	notification->object_id = oid;
+	notification->volume_id = volume_id;
 	notification->warning_step = warning_step;
 	if (push_notification_data(std::move(notification), 0)) {
 		m_pop_notifications.back()->set_gray(gray);
@@ -3295,11 +3311,9 @@ bool NotificationManager::activate_existing(const NotificationManager::PopNotifi
 				if (w1 != nullptr && w2 != nullptr) {
 					const NotificationData& data1 = w1->get_data();
 					const NotificationData& data2 = w2->get_data();
-					if (data1.sub_msg_id != data2.sub_msg_id)
+					if (data1.sub_msg_id != data2.sub_msg_id || w1->object_id != w2->object_id || w1->volume_id != w2->volume_id ||
+						(data1.sub_msg_id == 0 && !(*it)->compare_text(new_text)))
 						continue;
-					//if (!(*it)->compare_text(new_text) || w1->object_id != w2->object_id) {
-					//	continue;
-					//}
 				} else {
 					continue;
 				}

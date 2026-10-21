@@ -268,6 +268,7 @@ set(lisbslic3r_sources
     GCode/CoolingBuffer.cpp
     GCode/CoolingBuffer.hpp
     GCode/ArcCooling.hpp
+    GCode/LocalExtrusionGroups.hpp
     GCode/TimelapsePosPicker.cpp
     GCode/TimelapsePosPicker.hpp
     GCode.cpp

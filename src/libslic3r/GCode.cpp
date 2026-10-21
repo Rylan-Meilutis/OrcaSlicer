@@ -20,6 +20,7 @@
 #include "ExPolygon.hpp"
 #include "GCode/WipePathHelpers.hpp"
 #include "GCode/ArcCooling.hpp"
+#include "GCode/LocalExtrusionGroups.hpp"
 #include "GCode/FeatureTemperature.hpp"
 #include "GCodeReader.hpp"
 #include "GCodeWriter.hpp"
@@ -3389,6 +3390,8 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
     m_dissimilar_support_interface_start.clear();
     m_support_contact_filaments.clear();
     m_dissimilar_support_footprints.clear();
+    m_dissimilar_model_contact_layer = nullptr;
+    m_dissimilar_model_footprints.clear();
     m_nonplanar_transition_planning = false;
     // Ordinary contouring needs ordered occupancy only on a variable-Z layer
     // and on the physical layer immediately below it. Building grids for every
@@ -7851,7 +7854,7 @@ LayerResult GCode::process_layer(
 
                 for (size_t island_idx : island_order) {
                     ObjectByExtruder::Island &island = islands[island_idx];
-                    const auto& by_region_specific = is_anything_overridden ? island.by_region_per_copy(by_region_per_copy_cache, static_cast<unsigned int>(instance_to_print.instance_id), extruder_id, print_wipe_extrusions != 0) : island.by_region;
+                    const auto& source_regions = is_anything_overridden ? island.by_region_per_copy(by_region_per_copy_cache, static_cast<unsigned int>(instance_to_print.instance_id), extruder_id, print_wipe_extrusions != 0) : island.by_region;
                     // When starting a new object, use the external motion planner for the first travel move.
                     const Point& offset = instance_to_print.print_object.instances()[instance_to_print.instance_id].shift;
                     std::pair<const PrintObject*, Point> this_object_copy(&instance_to_print.print_object, offset);
@@ -7860,129 +7863,177 @@ LayerResult GCode::process_layer(
                     m_last_obj_copy = this_object_copy;
                     this->set_origin(unscale(offset));
                     this->on_set_origin(&instance_to_print.print_object, offset);
-                    //FIXME the following code prints regions in the order they are defined, the path is not optimized in any way.
-
-                    auto has_infill = [](const std::vector<ObjectByExtruder::Island::Region> &by_region) {
-                        for (auto region : by_region) {
-                            if (!region.infills.empty())
-                                return true;
-                        }
-                        return false;
-                    };
-                    const bool has_arc_overhang = std::any_of(
-                        by_region_specific.begin(), by_region_specific.end(),
-                        [](const ObjectByExtruder::Island::Region &region) {
-                            return std::any_of(region.infills.begin(), region.infills.end(),
-                                [](const ExtrusionEntity *entity) { return is_arc_fill(entity->role()); });
-                        });
-                    bool bridge_overhang_before_walls = false;
-                    for (size_t region_id = 0; region_id < by_region_specific.size(); ++region_id) {
-                        const ObjectByExtruder::Island::Region &region = by_region_specific[region_id];
-                        if (print.get_print_region(region_id).config().bridge_overhang_before_walls.value &&
-                            std::any_of(region.infills.begin(), region.infills.end(),
-                                [](const ExtrusionEntity *entity) { return is_bridge_or_arc_fill(entity->role()); })) {
-                            bridge_overhang_before_walls = true;
-                            break;
-                        }
-                    }
-                    ExPolygons arc_anchor_mask;
-                    if (has_arc_overhang) {
-                        Polygons arc_coverage;
-                        double anchor_margin = 0.;
-                        std::function<void(const ExtrusionEntity &)> collect_arc_contacts;
-                        collect_arc_contacts = [&](const ExtrusionEntity &entity) {
-                            if (const auto *path = dynamic_cast<const ExtrusionPath *>(&entity)) {
-                                if (!is_arc_fill(path->role()) || path->polyline.points.empty()) return;
-                                for (const Point &point : {path->first_point(), path->last_point()}) {
-                                    Polygon contact = make_circle(scale_(0.5 * path->width), SCALED_EPSILON);
-                                    contact.translate(point);
-                                    arc_coverage.push_back(std::move(contact));
+                    // Roots are disconnected material islands inside a connected host
+                    // slice. Finish each local wall/fill group before crossing the host.
+                    // Filter tool/copy overrides first; never change tool or layer order.
+                    using Region = ObjectByExtruder::Island::Region;
+                    std::vector<std::vector<Region>> local_regions;
+                    if (instance_to_print.print_object.config().rooting.value &&
+                        !m_nonplanar_transition_planning) {
+                        struct Entry { size_t region; bool infill; const ExtrusionEntity *entity; };
+                        std::vector<Entry> entries;
+                        std::vector<BoundingBox> boxes;
+                        bool spanning_fill = false;
+                        for (size_t r = 0; r < source_regions.size(); ++r) {
+                            for (bool infill : {false, true}) {
+                                for (const auto *entity : infill ? source_regions[r].infills : source_regions[r].perimeters) {
+                                    // Arc/bridge anchor scheduling remains island-wide.
+                                    spanning_fill |= infill && (is_bridge_or_arc_fill(entity->role()) || entity->role() == erMixed);
+                                    BoundingBox box;
+                                    for (const auto &line : entity->as_polylines()) box.merge(line.points);
+                                    entries.push_back({r, infill, entity});
+                                    boxes.push_back(box);
                                 }
-                            } else if (const auto *collection = dynamic_cast<const ExtrusionEntityCollection *>(&entity)) {
-                                for (const auto *child : collection->entities) collect_arc_contacts(*child);
-                            } else if (const auto *paths = dynamic_cast<const ExtrusionMultiPath *>(&entity)) {
-                                for (const auto &path : paths->paths) collect_arc_contacts(path);
                             }
-                        };
-                        std::function<double(const ExtrusionEntity &)> wall_width;
-                        wall_width = [&](const ExtrusionEntity &entity) {
-                            if (const auto *path = dynamic_cast<const ExtrusionPath *>(&entity))
-                                return double(path->width);
-                            double width = 0.;
-                            if (const auto *loop = dynamic_cast<const ExtrusionLoop *>(&entity))
-                                for (const auto &path : loop->paths) width = std::max(width, double(path.width));
-                            else if (const auto *paths = dynamic_cast<const ExtrusionMultiPath *>(&entity))
-                                for (const auto &path : paths->paths) width = std::max(width, double(path.width));
-                            else if (const auto *collection = dynamic_cast<const ExtrusionEntityCollection *>(&entity))
-                                for (const auto *child : collection->entities) width = std::max(width, wall_width(*child));
-                            return width;
-                        };
-                        for (size_t region_id = 0; region_id < by_region_specific.size(); ++region_id) {
-                            const auto &config = print.get_print_region(region_id).config();
-                            // Retain the local wall stack, not just the innermost
-                            // contact bead: an anchor may itself lean on a wall.
-                            for (const ExtrusionEntity *entity : by_region_specific[region_id].perimeters)
-                                anchor_margin = std::max(anchor_margin,
-                                    wall_width(*entity) * std::max(1, config.wall_loops.value));
-                            for (const ExtrusionEntity *entity : by_region_specific[region_id].infills)
-                                if (is_arc_fill(entity->role()))
-                                    collect_arc_contacts(*entity);
                         }
-                        // Preserve at least a millimeter of lead-in at each
-                        // contact, including the local supporting wall stack.
-                        // Only endpoints need wall anchors; using the whole arc
-                        // footprint also printed unrelated walls beside its crown.
-                        arc_anchor_mask = offset_ex(union_ex(arc_coverage), float(scale_(std::max(1., anchor_margin))));
+                        if (!spanning_fill) {
+                            for (const auto &group : local_extrusion_groups(boxes)) {
+                                auto &regions = local_regions.emplace_back(source_regions.size());
+                                for (size_t i : group) {
+                                    const auto &entry = entries[i];
+                                    (entry.infill ? regions[entry.region].infills : regions[entry.region].perimeters).push_back(entry.entity);
+                                }
+                            }
+                        }
                     }
-                    {
-                        // Some otherwise valid draped paths are blocked only
-                        // by walls assigned to this same nominal layer. Their
-                        // clearance was validated against completed lower
-                        // layers, so emit them before this island's ordinary
-                        // paths. The replacement footprint has already been
-                        // removed, preventing later overlap.
-                        // This is deliberately island-local. A counterbore or arc-overhang
-                        // may need its spanning extrusion before an inner wall can be laid
-                        // down, while unrelated islands on the same Z should retain their
-                        // configured wall/infill order.
-                        if (bridge_overhang_before_walls) {
-                            gcode += this->extrude_infill(print, by_region_specific, false, erBridgeInfill, false, true);
-                            gcode += this->extrude_infill(print, by_region_specific, false, erInternalBridgeInfill, false, true);
-                        }
-                        // Print perimeters of regions that has is_infill_first == false
-                        gcode += this->extrude_perimeters(print, by_region_specific, first_layer, false, false,
-                            has_arc_overhang ? &arc_anchor_mask : nullptr);
-                        // Arc contacts now have their local wall anchors. Emit
-                        // arcs before ordinary fill and the remaining wall spans.
-                        if (has_arc_overhang) {
-                            gcode += this->extrude_infill(print, by_region_specific, false, erArcOverhang);
-                            gcode += this->extrude_infill(print, by_region_specific, false, erArcBridge);
-                            // Only the anchor spans needed to precede the arcs.
-                            // Resume each region's normal wall/fill order now.
-                            gcode += this->extrude_perimeters(print, by_region_specific, first_layer, false, true,
-                                &arc_anchor_mask);
-                        }
-                        if (!has_wipe_tower && need_insert_timelapse_gcode_for_traditional && printer_structure == PrinterStructure::psI3
-                            && !has_insert_timelapse_gcode && has_infill(by_region_specific)) {
-                            gcode += this->retract(false, false, auto_lift_type, true);
+                    if (local_regions.size() < 2) local_regions = {source_regions};
+                    while (!local_regions.empty()) {
+                        // Choose from the actual current nozzle position after each group,
+                        // rather than estimating the end of an entire material island.
+                        auto distance = [&](const std::vector<Region> &regions) {
+                            double best = std::numeric_limits<double>::max();
+                            for (const auto &region : regions)
+                                for (const auto *entity : region.perimeters.empty() ? region.infills : region.perimeters)
+                                    best = std::min(best, (entity->first_point() - this->last_pos()).cast<double>().squaredNorm());
+                            return best;
+                        };
+                        auto next = std::min_element(local_regions.begin(), local_regions.end(),
+                            [&](const auto &a, const auto &b) { return distance(a) < distance(b); });
+                        auto by_region_specific = std::move(*next);
+                        local_regions.erase(next);
 
-                            gcode += insert_timelapse_gcode();
-                            has_insert_timelapse_gcode = true;
+                        auto has_infill = [](const std::vector<ObjectByExtruder::Island::Region> &by_region) {
+                            for (auto region : by_region) {
+                                if (!region.infills.empty())
+                                    return true;
+                            }
+                            return false;
+                        };
+                        const bool has_arc_overhang = std::any_of(
+                            by_region_specific.begin(), by_region_specific.end(),
+                            [](const ObjectByExtruder::Island::Region &region) {
+                                return std::any_of(region.infills.begin(), region.infills.end(),
+                                    [](const ExtrusionEntity *entity) { return is_arc_fill(entity->role()); });
+                            });
+                        bool bridge_overhang_before_walls = false;
+                        for (size_t region_id = 0; region_id < by_region_specific.size(); ++region_id) {
+                            const ObjectByExtruder::Island::Region &region = by_region_specific[region_id];
+                            if (print.get_print_region(region_id).config().bridge_overhang_before_walls.value &&
+                                std::any_of(region.infills.begin(), region.infills.end(),
+                                    [](const ExtrusionEntity *entity) { return is_bridge_or_arc_fill(entity->role()); })) {
+                                bridge_overhang_before_walls = true;
+                                break;
+                            }
                         }
-                        // Then print infill
-                        gcode += this->extrude_infill(print, by_region_specific, false,
-                            has_arc_overhang ? erCount : erMixed,
-                            bridge_overhang_before_walls);
-                        // Then the walls left hanging in mid air, now that the infill can anchor them
-                        gcode += this->extrude_perimeters(print, by_region_specific, first_layer, false, true);
-                        if (has_arc_overhang)
-                            gcode += this->extrude_perimeters(print, by_region_specific, first_layer, true, true,
-                                &arc_anchor_mask);
-                        // Then print perimeters of regions that has is_infill_first == true
-                        gcode += this->extrude_perimeters(print, by_region_specific, first_layer, true);
+                        ExPolygons arc_anchor_mask;
+                        if (has_arc_overhang) {
+                            Polygons arc_coverage;
+                            double anchor_margin = 0.;
+                            std::function<void(const ExtrusionEntity &)> collect_arc_contacts;
+                            collect_arc_contacts = [&](const ExtrusionEntity &entity) {
+                                if (const auto *path = dynamic_cast<const ExtrusionPath *>(&entity)) {
+                                    if (!is_arc_fill(path->role()) || path->polyline.points.empty()) return;
+                                    for (const Point &point : {path->first_point(), path->last_point()}) {
+                                        Polygon contact = make_circle(scale_(0.5 * path->width), SCALED_EPSILON);
+                                        contact.translate(point);
+                                        arc_coverage.push_back(std::move(contact));
+                                    }
+                                } else if (const auto *collection = dynamic_cast<const ExtrusionEntityCollection *>(&entity)) {
+                                    for (const auto *child : collection->entities) collect_arc_contacts(*child);
+                                } else if (const auto *paths = dynamic_cast<const ExtrusionMultiPath *>(&entity)) {
+                                    for (const auto &path : paths->paths) collect_arc_contacts(path);
+                                }
+                            };
+                            std::function<double(const ExtrusionEntity &)> wall_width;
+                            wall_width = [&](const ExtrusionEntity &entity) {
+                                if (const auto *path = dynamic_cast<const ExtrusionPath *>(&entity))
+                                    return double(path->width);
+                                double width = 0.;
+                                if (const auto *loop = dynamic_cast<const ExtrusionLoop *>(&entity))
+                                    for (const auto &path : loop->paths) width = std::max(width, double(path.width));
+                                else if (const auto *paths = dynamic_cast<const ExtrusionMultiPath *>(&entity))
+                                    for (const auto &path : paths->paths) width = std::max(width, double(path.width));
+                                else if (const auto *collection = dynamic_cast<const ExtrusionEntityCollection *>(&entity))
+                                    for (const auto *child : collection->entities) width = std::max(width, wall_width(*child));
+                                return width;
+                            };
+                            for (size_t region_id = 0; region_id < by_region_specific.size(); ++region_id) {
+                                const auto &config = print.get_print_region(region_id).config();
+                                // Retain the local wall stack, not just the innermost
+                                // contact bead: an anchor may itself lean on a wall.
+                                for (const ExtrusionEntity *entity : by_region_specific[region_id].perimeters)
+                                    anchor_margin = std::max(anchor_margin,
+                                        wall_width(*entity) * std::max(1, config.wall_loops.value));
+                                for (const ExtrusionEntity *entity : by_region_specific[region_id].infills)
+                                    if (is_arc_fill(entity->role()))
+                                        collect_arc_contacts(*entity);
+                            }
+                            // Preserve at least a millimeter of lead-in at each
+                            // contact, including the local supporting wall stack.
+                            // Only endpoints need wall anchors; using the whole arc
+                            // footprint also printed unrelated walls beside its crown.
+                            arc_anchor_mask = offset_ex(union_ex(arc_coverage), float(scale_(std::max(1., anchor_margin))));
+                        }
+                        {
+                            // Some otherwise valid draped paths are blocked only
+                            // by walls assigned to this same nominal layer. Their
+                            // clearance was validated against completed lower
+                            // layers, so emit them before this island's ordinary
+                            // paths. The replacement footprint has already been
+                            // removed, preventing later overlap.
+                            // This is deliberately island-local. A counterbore or arc-overhang
+                            // may need its spanning extrusion before an inner wall can be laid
+                            // down, while unrelated islands on the same Z should retain their
+                            // configured wall/infill order.
+                            if (bridge_overhang_before_walls) {
+                                gcode += this->extrude_infill(print, by_region_specific, false, erBridgeInfill, false, true);
+                                gcode += this->extrude_infill(print, by_region_specific, false, erInternalBridgeInfill, false, true);
+                            }
+                            // Print perimeters of regions that has is_infill_first == false
+                            gcode += this->extrude_perimeters(print, by_region_specific, first_layer, false, false,
+                                has_arc_overhang ? &arc_anchor_mask : nullptr);
+                            // Arc contacts now have their local wall anchors. Emit
+                            // arcs before ordinary fill and the remaining wall spans.
+                            if (has_arc_overhang) {
+                                gcode += this->extrude_infill(print, by_region_specific, false, erArcOverhang);
+                                gcode += this->extrude_infill(print, by_region_specific, false, erArcBridge);
+                                // Only the anchor spans needed to precede the arcs.
+                                // Resume each region's normal wall/fill order now.
+                                gcode += this->extrude_perimeters(print, by_region_specific, first_layer, false, true,
+                                    &arc_anchor_mask);
+                            }
+                            if (!has_wipe_tower && need_insert_timelapse_gcode_for_traditional && printer_structure == PrinterStructure::psI3
+                                && !has_insert_timelapse_gcode && has_infill(by_region_specific)) {
+                                gcode += this->retract(false, false, auto_lift_type, true);
+
+                                gcode += insert_timelapse_gcode();
+                                has_insert_timelapse_gcode = true;
+                            }
+                            // Then print infill
+                            gcode += this->extrude_infill(print, by_region_specific, false,
+                                has_arc_overhang ? erCount : erMixed,
+                                bridge_overhang_before_walls);
+                            // Then the walls left hanging in mid air, now that the infill can anchor them
+                            gcode += this->extrude_perimeters(print, by_region_specific, first_layer, false, true);
+                            if (has_arc_overhang)
+                                gcode += this->extrude_perimeters(print, by_region_specific, first_layer, true, true,
+                                    &arc_anchor_mask);
+                            // Then print perimeters of regions that has is_infill_first == true
+                            gcode += this->extrude_perimeters(print, by_region_specific, first_layer, true);
+                        }
+                        // ironing
+                        gcode += this->extrude_infill(print,by_region_specific, true);
                     }
-                    // ironing
-                    gcode += this->extrude_infill(print,by_region_specific, true);
                 }
 
                 if (this->config().gcode_label_objects) {
@@ -11210,6 +11261,54 @@ std::string GCode::_extrude(const ExtrusionPath &input_path, const std::string &
         const double slowed_speed = m_config.dissimilar_support_interface_speed.get_abs_value(speed);
         speed = std::min(speed, Slic3r::lerp(slowed_speed, speed, *dissimilar_interface_speed_blend));
     }
+    bool dissimilar_model_contact = false;
+    if (m_config.dissimilar_material_contact_speed.value > 0. && m_layer != nullptr &&
+        !is_support(path.role()) && m_layer->lower_layer != nullptr &&
+        current_filament_id < m_config.filament_type.values.size()) {
+        const Layer *below = m_layer->lower_layer;
+        // A vertical gap is not material contact. Keep only the current layer's
+        // footprints cached, rather than retaining polygons for the whole print.
+        if (std::abs(below->print_z - m_layer->bottom_z()) < 0.001) {
+            if (m_dissimilar_model_contact_layer != below) {
+                m_dissimilar_model_contact_layer = below;
+                m_dissimilar_model_footprints.clear();
+            }
+            auto footprint = m_dissimilar_model_footprints.find(current_filament_id);
+            if (footprint == m_dissimilar_model_footprints.end()) {
+                Polygons coverage;
+                for (const LayerRegion *region : below->regions()) {
+                    std::function<void(const ExtrusionEntity &)> collect = [&](const ExtrusionEntity &entity) {
+                        if (const auto *collection = dynamic_cast<const ExtrusionEntityCollection *>(&entity)) {
+                            for (const auto *child : collection->entities) collect(*child);
+                            return;
+                        }
+                        const auto role = entity.role();
+                        const FlowRole flow_role = is_perimeter(role) ?
+                            (is_external_perimeter(role) ? frExternalPerimeter : frPerimeter) :
+                            (role == erTopSolidInfill || role == erIroning ? frTopSolidInfill : is_solid_infill(role) ? frSolidInfill : frInfill);
+                        const unsigned int slot = (role == erBottomSurface ?
+                            region->region().config().bottom_surface_filament_id.value : region->region().extruder(flow_role)) - 1;
+                        if (slot >= m_config.filament_type.values.size()) return;
+                        const auto &material = m_config.filament_type.get_at(slot);
+                        const auto &current_material = m_config.filament_type.get_at(current_filament_id);
+                        if (!material.empty() && !current_material.empty() && material != current_material)
+                            entity.polygons_covered_by_width(coverage, float(SCALED_EPSILON));
+                    };
+                    collect(region->perimeters);
+                    collect(region->fills);
+                }
+                footprint = m_dissimilar_model_footprints.emplace(current_filament_id, union_(coverage)).first;
+            }
+            if (!footprint->second.empty()) {
+                Polygons deposited_width;
+                path.polygons_covered_by_width(deposited_width, float(SCALED_EPSILON));
+                if (!intersection(deposited_width, footprint->second).empty()) {
+                    dissimilar_model_contact = true;
+                    speed = std::min(speed, m_config.dissimilar_material_contact_speed.value);
+                }
+            }
+        }
+    }
     //BBS: remove this config
     //else if (this->object_layer_over_raft())
     //    speed = m_config.get_abs_value("first_layer_speed_over_raft", speed);
@@ -11280,6 +11379,9 @@ std::string GCode::_extrude(const ExtrusionPath &input_path, const std::string &
     }
 }
     
+    // Resonance avoidance may raise a speed; contact adhesion remains a hard cap.
+    if (dissimilar_model_contact)
+        speed = std::min(speed, m_config.dissimilar_material_contact_speed.value);
     bool requires_segmented_extrusion = false;
     // A uniform fan state can be represented by the normal path-wide marker. Only a
     // transition within the path requires point-by-point emission.
@@ -11374,6 +11476,9 @@ std::string GCode::_extrude(const ExtrusionPath &input_path, const std::string &
             if (!NOZZLE_CONFIG(enable_overhang_speed))
                 for (ProcessedPoint &point : new_points)
                     point.speed = speed;
+            if (dissimilar_model_contact)
+                for (ProcessedPoint &point : new_points)
+                    point.speed = std::min(point.speed, float(m_config.dissimilar_material_contact_speed.value));
             requires_segmented_extrusion = std::any_of(new_points.begin(), new_points.end(),
                 [speed](const ProcessedPoint &point) { return fabs(double(point.speed) - speed) > 1; }); // Ignore small speed variations (under 1mm/sec)
             if (FILAMENT_CONFIG(enable_overhang_bridge_fan) && m_enable_cooling_markers && fan_overlap_threshold >= 0.f &&

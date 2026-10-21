@@ -42,12 +42,39 @@
 #include "libslic3r/ObjectID.hpp"
 #include "libslic3r/Print.hpp"
 #include "libslic3r/BeltBrim.hpp"
+#include "libslic3r/Brim.hpp"
+#include "libslic3r/Flow.hpp"
 #include "libslic3r/Config.hpp"
 #include "libslic3r/ExtrusionEntity.hpp"
 #include "libslic3r/TriangleMesh.hpp"
 
 using namespace Slic3r::Test;
 using namespace Slic3r;
+
+TEST_CASE("Brim overlap increases between lines without moving the boundary pass", "[SkirtBrim]")
+{
+    const double overlap = GENERATE(0., 5., 15., 25.);
+    Print print;
+    Model model;
+    init_print({cube(20)}, print, model, {
+        {"initial_layer_line_width", 0.45}, {"initial_layer_print_height", 0.2},
+        {"brim_line_overlap", overlap},
+        {"nozzle_diameter", "0.4"}
+    });
+    const Polygon outline({Point::new_scale(0, 0), Point::new_scale(40, 0),
+                           Point::new_scale(40, 40), Point::new_scale(0, 40)});
+    const auto brim = makeBrimInfillFromPlateCoordinates({ExPolygon(outline)}, print, {});
+    std::vector<double> lower_edges;
+    for (const Polyline &line : brim.as_polylines()) {
+        BoundingBox box(line.points);
+        lower_edges.push_back(unscale<double>(box.min.x()));
+    }
+    REQUIRE(lower_edges.size() > 3);
+    std::sort(lower_edges.begin(), lower_edges.end());
+    const double spacing = print.brim_flow().spacing();
+    CHECK_THAT(lower_edges[0], Catch::Matchers::WithinAbs(0.5 * spacing, 0.002));
+    CHECK_THAT(lower_edges[1] - lower_edges[0], Catch::Matchers::WithinAbs((1. - overlap / 100.) * spacing, 0.002));
+}
 
 // Distinct brim regions (combine_brims merges touching brims into one covering >1 object).
 static int brim_count(const Print &print)

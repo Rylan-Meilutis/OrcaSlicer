@@ -1814,7 +1814,7 @@ void PrintConfigDef::init_fff_params()
     def = this->add("automatic_warp_mitigation", coBool);
     def->label = L("Automatic warp and curl mitigation");
     def->category = L("Quality");
-    def->tooltip = L("Screen model materials for bed-lift risk when slicing. For susceptible materials, use a continuous outer brim instead of sparse painted coverage or ears, reduce its gap, and enable curled-overhang slowdown. Existing inner brims, rafts, belt-printer adhesion and object overrides remain authoritative. Painting is retained in the model. This does not detect actual deformation or guarantee adhesion. Temperatures and cooling are not changed. Use a suitable enclosure and prepared build surface.");
+    def->tooltip = L("Estimate thermal base bow from connected contact geometry, solid base thickness and print temperatures using published material properties. When the estimate exceeds one layer, apply a continuous outer brim and curled-overhang slowdown. Unknown materials are not assumed safe and do not trigger automatic changes. This reduced-order model cannot predict bed detachment or measure actual deformation. Existing inner brims, rafts, belt-printer adhesion and object overrides are preserved. Temperatures and cooling are not changed.");
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionBool(false));
 
@@ -2680,6 +2680,16 @@ void PrintConfigDef::init_fff_params()
     def->max = 2;
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionFloat(0.));
+
+    def = this->add("brim_line_overlap", coPercent);
+    def->label = L("Additional brim line overlap");
+    def->category = L("Support");
+    def->tooltip = L("Reduces the spacing between brim lines by this percentage to improve their bonding. The boundary pass and brim-object gap are unchanged. Zero uses normal spacing. This does not change extrusion flow or belt-printer brims.");
+    def->sidetext = "%";
+    def->min = 0;
+    def->max = 25;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionPercent(0.));
 
     def = this->add("brim_flow_ratio", coFloat);
     def->label = L("Brim flow ratio");
@@ -8406,6 +8416,16 @@ void PrintConfigDef::init_fff_params()
     def->max_literal = 1000;
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionFloatOrPercent(50., true));
+
+    def = this->add("dissimilar_material_contact_speed", coFloat);
+    def->label = L("Dissimilar model material contact speed");
+    def->category = L("Multimaterial");
+    def->tooltip = L("Maximum speed for model paths deposited directly onto model extrusion of a different filament material type, including root and beam interlocking contacts. Only paths overlapping the material below are slowed; subsequent same-material layers are unchanged. Set to 0 to disable. Support contacts use the separate dissimilar support contact settings. Slower printing does not guarantee adhesion between incompatible materials.");
+    def->sidetext = L("mm/s");
+    def->min = 0;
+    def->max = 1000;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(0.));
 
     def = this->add("dissimilar_support_interface_speed_layers", coInt);
     def->label = L("Interface speed recovery layers");

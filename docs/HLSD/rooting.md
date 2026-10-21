@@ -51,6 +51,18 @@ slicing, since rooting changes material ownership before perimeter generation.
 
 Only contacts between different filament regions within one multipart or painted
 object qualify. Independently placed objects and generated supports do not.
+Z rooting excludes root-owning components connected to the first native object layer:
+bed-supported material, including inset first-layer lettering and its surrounding
+body, does not need downward anchors. This does not exclude a bed-supported host
+under a separate elevated region, or change XY rooting. Objects without eligible
+Z contacts do not report a failed Z-root placement warning. Each disconnected native
+Z contact records its own placement result, so successful roots elsewhere in an
+assembly cannot hide a failure. Micron-wide clipping slivers are excluded using
+the same 0.001 mm rounding tolerance as XY contacts; changes within 0.01 mm of
+the previous course are treated as continuing material rather than new contacts.
+Failed contacts are intersected with native part
+slices to identify the affected volumes. Warnings carry stable volume IDs, and their
+links re-resolve and select those parts in the assembly tree.
 Filaments marked as support material or soluble are excluded on either side of
 the joint, even if assigned to a model part. Ordinary model filaments that are
 also used by generated supports can still form roots at model-to-model contacts;

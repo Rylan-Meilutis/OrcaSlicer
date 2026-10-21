@@ -97,6 +97,7 @@ public:
         // Otherwise message_id identifies the message. For example, if the message contains a varying number, then
         // it cannot itself identify the message type.
         int 			message_id;
+        ObjectID        volume_id; // Optional part to select inside the object.
     };
 
     struct StateWithWarnings : public StateWithTimeStamp
@@ -301,7 +302,7 @@ public:
     // Return value:
     // 		Current milestone (StepType).
     // 		bool indicates whether the UI has to be updated or not.
-    std::pair<StepType, bool> active_step_add_warning(PrintStateBase::WarningLevel warning_level, const std::string &message, int message_id, std::mutex &mtx)
+    std::pair<StepType, bool> active_step_add_warning(PrintStateBase::WarningLevel warning_level, const std::string &message, int message_id, std::mutex &mtx, ObjectID volume_id = ObjectID())
     {
         std::scoped_lock<std::mutex> lock(mtx);
         assert(m_step_active != -1);
@@ -310,11 +311,11 @@ public:
         std::pair<StepType, bool> retval(static_cast<StepType>(m_step_active), true);
         // Does a warning of the same level and message or message_id exist already?
         auto it = (message_id == 0) ?
-            std::find_if(state.warnings.begin(), state.warnings.end(), [&message](const auto &w) { return w.message_id == 0 && w.message == message; }) :
-            std::find_if(state.warnings.begin(), state.warnings.end(), [message_id](const auto& w) { return w.message_id == message_id; });
+            std::find_if(state.warnings.begin(), state.warnings.end(), [&message, volume_id](const auto &w) { return w.message_id == 0 && w.message == message && w.volume_id == volume_id; }) :
+            std::find_if(state.warnings.begin(), state.warnings.end(), [message_id, volume_id](const auto& w) { return w.message_id == message_id && w.volume_id == volume_id; });
         if (it == state.warnings.end())
             // No, create a new warning and update UI.
-            state.warnings.emplace_back(PrintStateBase::Warning{ warning_level, true, message, message_id });
+            state.warnings.emplace_back(PrintStateBase::Warning{ warning_level, true, message, message_id, volume_id });
         else if (it->message != message || it->level != warning_level) {
             // Yes, however it needs an update.
             it->message = message;
@@ -671,8 +672,9 @@ protected:
     // Add a slicing warning to the active PrintObject step and send a status notification.
     // This method could be called multiple times between this->set_started() and this->set_done().
     void            active_step_add_warning(PrintStateBase::WarningLevel warning_level, const std::string &message,
-                        PrintStateBase::SlicingNotificationType message_id = PrintStateBase::SlicingDefaultNotification) {
-    	std::pair<PrintObjectStepEnum, bool> active_step = m_state.active_step_add_warning(warning_level, message,(int) message_id, PrintObjectBase::state_mutex(m_print));
+                        PrintStateBase::SlicingNotificationType message_id = PrintStateBase::SlicingDefaultNotification,
+                        ObjectID volume_id = ObjectID()) {
+        std::pair<PrintObjectStepEnum, bool> active_step = m_state.active_step_add_warning(warning_level, message, (int) message_id, PrintObjectBase::state_mutex(m_print), volume_id);
     	if (active_step.second)
     		this->status_update_warnings(m_print, static_cast<int>(active_step.first), warning_level, message, message_id);
     }

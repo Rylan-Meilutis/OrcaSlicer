@@ -550,7 +550,7 @@ public:
 	bool 		supports_printer_technology(const PrinterTechnology tech) const override { return tech == ptFFF; }
 
 private:
-    ogStaticText*   m_warp_risk_description = nullptr;
+    wxString       warp_risk_description() const;
 	ogStaticText*	m_recommended_thin_wall_thickness_description_line = nullptr;
 	ogStaticText*	m_top_bottom_shell_thickness_explanation = nullptr;
 };
