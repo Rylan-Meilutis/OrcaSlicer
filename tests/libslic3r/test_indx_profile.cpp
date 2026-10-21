@@ -96,6 +96,9 @@ TEST_CASE("Bundled INDX mesh bounds stay local for small corner prints", "[IndxP
     REQUIRE(template_file.good());
     const std::string bundled_template((std::istreambuf_iterator<char>(template_file)), std::istreambuf_iterator<char>());
     CHECK(start == bundled_template);
+    // RME does not implement the stock INDX calibration command.
+    CHECK(start.find("M574") == std::string::npos);
+    CHECK(start.find("\nM976 A ") != std::string::npos);
     CHECK(start.find("; RME_DEPOSITION_BOUNDS=1") != std::string::npos);
     CHECK(start.find("; RME_TEMPERATURE_ADAPTIVE_PA=0") != std::string::npos);
     // Plain P1 allows the RME host's file-derived bounds to take precedence.
