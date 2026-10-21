@@ -76,6 +76,62 @@ TEST_CASE("Brim overlap increases between lines without moving the boundary pass
     CHECK_THAT(lower_edges[1] - lower_edges[0], Catch::Matchers::WithinAbs((1. - overlap / 100.) * spacing, 0.002));
 }
 
+TEST_CASE("Brim fills the channel left where opposing offset loops meet", "[SkirtBrim][BrimCoverage]")
+{
+    const double overlap = GENERATE(0., 5., 25.);
+    const double courses = GENERATE(3.4, 10.5);
+    Print print;
+    Model model;
+    init_print({cube(20)}, print, model, {
+        {"initial_layer_line_width", 0.45}, {"initial_layer_print_height", 0.2},
+        {"brim_line_overlap", overlap}, {"nozzle_diameter", "0.4"}
+    });
+    const double spacing = print.brim_flow().spacing();
+    // A non-integral number of courses leaves a long channel down the middle.
+    const double width = courses * spacing;
+    const Polygon outline({Point::new_scale(0, 0), Point::new_scale(40, 0),
+                           Point::new_scale(40, width), Point::new_scale(0, width)});
+    const auto brim = makeBrimInfillFromPlateCoordinates({ExPolygon(outline)}, print, {});
+    const auto covered = union_(brim.polygons_covered_by_width(float(scale_(0.005))));
+    for (double x : {5., 20., 35.})
+        CHECK(contains(covered, Point::new_scale(x, width / 2.), false));
+    // Do not close the channel by moving the existing part-facing boundary pass.
+    const auto bounds = get_extents(covered);
+    CHECK(unscale<double>(bounds.min.y()) >= -0.05);
+    CHECK(unscale<double>(bounds.max.y()) <= width + 0.05);
+}
+
+TEST_CASE("Brim channel fill preserves holes and the plate coordinate offset", "[SkirtBrim][BrimCoverage]")
+{
+    Print print;
+    Model model;
+    init_print({cube(20)}, print, model, {
+        {"initial_layer_line_width", 0.45}, {"initial_layer_print_height", 0.2},
+        {"brim_line_overlap", 5.}, {"nozzle_diameter", "0.4"}
+    });
+    const double width = 10.5 * print.brim_flow().spacing();
+    Polygon outer({Point::new_scale(0, 0), Point::new_scale(40, 0),
+                   Point::new_scale(40, 40), Point::new_scale(0, 40)});
+    Polygon hole({Point::new_scale(width, width), Point::new_scale(width, 40 - width),
+                  Point::new_scale(40 - width, 40 - width), Point::new_scale(40 - width, width)});
+    const ExPolygons area{ExPolygon(outer, hole)};
+    const auto brim = makeBrimInfillFromPlateCoordinates(area, print, {});
+    const auto covered = union_(brim.polygons_covered_by_width(float(scale_(0.005))));
+    CHECK(contains(covered, Point::new_scale(20, width / 2.), false));
+    CHECK(contains(covered, Point::new_scale(width / 2., 20), false));
+    hole.make_counter_clockwise();
+    const auto protected_hole = offset(hole, -scale_(0.05));
+    REQUIRE_FALSE(protected_hole.empty());
+    CHECK(intersection_ex(covered, protected_hole).empty());
+    print.set_plate_origin(Vec3d(100., 80., 0.));
+    const auto shifted = makeBrimInfill(area, print, {}).polygons_covered_by_width(float(scale_(0.005)));
+    Polygons expected = covered;
+    for (Polygon &polygon : expected)
+        polygon.translate(Point::new_scale(100, 80));
+    CHECK(diff_ex(shifted, expected).empty());
+    CHECK(diff_ex(expected, shifted).empty());
+}
+
 // Distinct brim regions (combine_brims merges touching brims into one covering >1 object).
 static int brim_count(const Print &print)
 {

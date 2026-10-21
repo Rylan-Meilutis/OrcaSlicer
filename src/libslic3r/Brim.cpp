@@ -37,6 +37,7 @@
 #include "MultiMaterialSegmentation.hpp"
 #include "SurfaceCollection.hpp"
 #include "TriangleMesh.hpp"
+#include "VariableWidth.hpp"
 
 #ifndef NDEBUG
     // #define BRIM_DEBUG_TO_SVG
@@ -920,15 +921,31 @@ static ExtrusionEntityCollection makeBrimInfillImpl(const ExPolygons& singleBrim
     optimize_polylines_by_reversing(&all_loops);
     all_loops = connect_brim_lines(std::move(all_loops), offset(singleBrimArea, float(SCALED_EPSILON)), float(flow.scaled_spacing()) * 2.f);
 
+    // Opposing offsets can leave a channel too narrow for another closed loop.
+    // Fill only the uncovered interior, never the part-facing boundary or its
+    // separation gap. Variable width avoids over-extruding a full bead into it.
+    const float spacing = float(flow.scaled_spacing());
+    const float min_gap = 0.35f * spacing;
+    ExPolygons gaps = diff_ex(offset_ex(singleBrimArea, -0.5f * spacing), offset(all_loops, 0.5f * spacing));
+    gaps = opening_ex(gaps, 0.5f * min_gap);
+    ThickPolylines gap_lines;
+    for (ExPolygon &gap : gaps) {
+        gap.douglas_peucker(scale_(0.0125));
+        gap.medial_axis(min_gap, 2.f * spacing, &gap_lines);
+    }
+
     if (apply_plate_offset) {
         //BBS: finally apply the plate offset which may very large
         auto plate_offset = print.get_plate_origin();
         Point scaled_plate_offset = Point(scaled(plate_offset.x()), scaled(plate_offset.y()));
-        for (Polyline& one_loop : all_loops)
-            one_loop.translate(scaled_plate_offset);
+        for (Polyline &line : all_loops)
+            line.translate(scaled_plate_offset);
+        for (ThickPolyline &line : gap_lines)
+            line.translate(scaled_plate_offset);
     }
 
     extrusion_entities_append_loops_and_paths(brim.entities, std::move(all_loops), erBrim, float(flow.mm3_per_mm()), float(flow.width()), float(print.skirt_first_layer_height()));
+    variable_width(gap_lines, erBrim, flow, brim.entities);
     return brim;
 }
 
