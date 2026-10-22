@@ -1923,8 +1923,8 @@ void PrintConfigDef::init_fff_params()
     def = this->add("buried_top_relief", coBool);
     def->label = L("Buried zigzag relief with smooth cap (experimental)");
     def->category = L("Quality");
-    def->tooltip = L("Cuts zigzag slots in internal solid layers beneath exposed tops while leaving the final cosmetic top paths continuous. "
-                     "Preserves walls, bottom surfaces, bridges and a rim around holes and boundaries. Requires at least three top shell layers. "
+    def->tooltip = L("Cuts zigzag slots in internal solid layers beneath exposed tops while preserving three continuous solid cap layers, including the visible top. "
+                     "Preserves walls, bottom surfaces, bridges and a rim around holes and boundaries. Requires at least four top shell layers. "
                      "Uses Relief minimum gap and Relief section size. Overrides cosmetic top relief if both are enabled. "
                      "May reduce strength or leave surface depressions; the cap still transfers stress. Validate with a test print.");
     def->mode = comExpert;
@@ -1933,7 +1933,7 @@ void PrintConfigDef::init_fff_params()
     def = this->add("buried_top_relief_depth", coFloat);
     def->label = L("Buried relief depth");
     def->category = L("Quality");
-    def->tooltip = L("Maximum vertical distance below an exposed top to cut internal solid infill. The final surface and bridge layers are never cut. Does not add solid layers.");
+    def->tooltip = L("Maximum vertical distance below an exposed top to cut internal solid infill. The top three solid cap layers and bridge layers are never cut. Does not add solid layers.");
     def->sidetext = L("mm");
     def->min = 0.2;
     def->max = 5.;

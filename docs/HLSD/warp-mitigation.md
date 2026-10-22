@@ -168,15 +168,18 @@ operations without regenerating walls.
 `buried_top_relief` is a separate opt-in mode using the same gap and section-size
 controls. It overrides cosmetic top relief when both are enabled. Only internal
 solid infill connected through solid layers to an exposed top within the selected
-depth is cut. At least three configured top shell layers are required. Bridges,
+depth is cut. At least four configured top shell layers are required. Bridges,
 bottom surfaces, sparse infill and perimeters are unchanged. A protective rim is
 retained around walls and holes. Small areas that cannot fit sections are skipped.
 
 The channels form an object-aligned zigzag grid, with adjustable tooth depth and
 pitch. The grid stays aligned across buried layers. Channel geometry accounts for
-extrusion width, and is also removed from gap-fill coverage. The final exposed
-top paths remain continuous; ironing remains available. This creates a cosmetic
-cap over the relief rather than open grooves on the visible surface.
+extrusion width, and is also removed from gap-fill coverage. The exposed top and
+the two solid layers immediately beneath it remain uncut; ironing remains
+available. This continuous three-layer cap limits surface imprinting from the
+slots below. Relief does not add solid layers or cut thin roofs that cannot
+accommodate the cap. Near stepped roofs, the protected nearer top takes priority
+over a higher eligible top.
 
 The default 0.8 mm relief depth, 1 mm tooth depth, 4 mm tooth pitch and 1 mm rim
 are geometric test values, not calibrated shrinkage compensation. Zigzags do not

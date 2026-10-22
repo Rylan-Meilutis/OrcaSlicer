@@ -1020,7 +1020,9 @@ static void apply_cosmetic_top_relief(const Layer &layer, SurfaceFill &fill)
     fill.no_overlap_expolygons = intersection_ex(fill.no_overlap_expolygons, fill.expolygons);
 }
 
-// Leave the cosmetic cap untouched. Only internal solid material connected
+// Leave three continuous cap layers untouched: an exposed path directly over
+// a relief slot can sag and reproduce the zigzag on the visible surface.
+// Only internal solid material connected
 // vertically to a nearby top of this region is eligible; never sparse infill,
 // bottom skins or bridge layers. The uncut rim and cap deliberately retain
 // structural connections, so this is stress relief, not free expansion.
@@ -1031,14 +1033,17 @@ static void apply_buried_top_relief(const Layer &layer, SurfaceFill &fill)
         return;
     const PrintRegion &region = layer.regions()[fill.region_id]->region();
     const PrintRegionConfig &config = region.config();
-    if (!config.buried_top_relief.value || config.top_shell_layers.value < 3 ||
+    constexpr size_t cap_layers = 3;
+    if (!config.buried_top_relief.value || config.top_shell_layers.value <= int(cap_layers) ||
         config.cosmetic_top_relief_gap.value <= 0. || config.cosmetic_top_relief_spacing.value < 2. ||
         config.buried_top_relief_tooth_pitch.value < 2.)
         return;
 
-    ExPolygons corridor = fill.expolygons, roofs;
+    ExPolygons corridor = fill.expolygons, roofs, protected_roofs;
+    size_t layers_above = 1;
     for (const Layer *upper = layer.upper_layer; upper != nullptr &&
-         upper->print_z - layer.print_z <= config.buried_top_relief_depth.value + EPSILON; upper = upper->upper_layer) {
+         upper->print_z - layer.print_z <= config.buried_top_relief_depth.value + EPSILON;
+         upper = upper->upper_layer, ++layers_above) {
         ExPolygons solid, top;
         for (const LayerRegion *candidate : upper->regions()) {
             if (&candidate->region() != &region)
@@ -1050,11 +1055,12 @@ static void apply_buried_top_relief(const Layer &layer, SurfaceFill &fill)
                     solid.push_back(surface.expolygon);
             }
         }
-        append(roofs, intersection_ex(corridor, top));
+        append(layers_above < cap_layers ? protected_roofs : roofs, intersection_ex(corridor, top));
         corridor = intersection_ex(corridor, solid);
         if (corridor.empty())
             break;
     }
+    roofs = diff_ex(union_ex(roofs), union_ex(protected_roofs));
     if (roofs.empty())
         return;
 

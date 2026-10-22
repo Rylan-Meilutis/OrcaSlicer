@@ -268,6 +268,8 @@ TEST_CASE("Buried relief sections solid layers without cutting the cosmetic cap 
         const LayerRegion &after = *b[i]->regions().front();
         CHECK(relief_paths(before.perimeters) == relief_paths(after.perimeters));
         const bool differs = relief_paths(before.fills) != relief_paths(after.fills);
+        if (i + 3 >= a.size())
+            CHECK_FALSE(differs);
         if (differs) {
             ++changed;
             CHECK(a.back()->print_z - a[i]->print_z <= 0.8 + EPSILON);
@@ -316,7 +318,7 @@ TEST_CASE("Buried relief settings reslice and preserve ironing on the smooth cap
 
 TEST_CASE("Buried relief skips roofs with too few shell layers", "[Fill][BuriedTopRelief]")
 {
-    const int shells = GENERATE(1, 2);
+    const int shells = GENERATE(1, 2, 3);
     DynamicPrintConfig config = cosmetic_relief_config(false);
     config.set_deserialize_strict({{"top_shell_layers", shells}});
     Print normal, relieved;
