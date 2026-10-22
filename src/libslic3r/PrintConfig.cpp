@@ -5897,14 +5897,14 @@ void PrintConfigDef::init_fff_params()
 
     def = this->add("rooting", coBool);
     def->label = L("Rooting");
-    def->tooltip = L("Embed a shallow, spreading root network below a vertical material interface. The attachment follows the upper model's footprint; thick primary limbs divide recursively into thinner lateral branches. Buried branches may spread beyond that footprint while preserving surface skins and cavities. Only applies to different filaments in the same multipart or painted object, not support structures. Both regions require walls, top and bottom shells, and a consistent filament for all features. Enables internal interface shells; increases material changes. Mechanical strength must be verified with a test print.");
+    def->tooltip = L("Embed a shallow, spreading root network below a vertical material interface. The attachment follows the upper model's footprint; thick primary limbs divide recursively into thinner lateral branches. Buried branches may spread beyond that footprint while preserving surface skins and cavities. Only applies to different material types in the same multipart or painted object, not colors of the same material, prime towers or support structures. Both regions require walls, top and bottom shells, and a consistent filament for all features. Enables internal interface shells; increases material changes. Mechanical strength must be verified with a test print.");
     def->category = L("Multimaterial");
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionBool(false));
 
     def = this->add("rooting_xy", coBool);
     def->label = L("XY rooting");
-    def->tooltip = L("Grow buried, recursively branching roots sideways across material boundaries, like roots entering a cliff. Uses the root depth, diameter, spacing and protective skin settings independently of vertical rooting. Only applies to different model filaments in one multipart or painted object, never supports or support interfaces. Preserves exposed skins and connected host material. Enables internal interface shells and may increase tool changes. Verify pull-out strength with a test print.");
+    def->tooltip = L("Grow buried, recursively branching roots sideways across material boundaries, like roots entering a cliff. Uses the root depth, diameter, spacing and protective skin settings independently of vertical rooting. Only applies to different model material types in one multipart or painted object, never colors of the same material, prime towers, supports or support interfaces. Preserves exposed skins and connected host material. Enables internal interface shells and may increase tool changes. Verify pull-out strength with a test print.");
     def->category = L("Multimaterial");
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionBool(false));
@@ -8511,6 +8511,53 @@ void PrintConfigDef::init_fff_params()
     def->max = 1000;
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionFloat(0.));
+
+    def = this->add("shrinkage_slowdown", coBool);
+    def->label = L("Enable shrinkage slowdown");
+    def->category = L("Speed");
+    def->tooltip = L("Slow supported walls and solid surfaces near sharp corners and along long straight runs. This optional deposition aid may improve bonding, but does not predict or eliminate thermal contraction. Bridges, support, ironing, scarf joints and nonplanar paths retain their own speed controls. Disabled by default.");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionBool(false));
+
+    def = this->add("shrinkage_slowdown_speed", coPercent);
+    def->label = L("Shrinkage slowdown speed");
+    def->category = L("Speed");
+    def->tooltip = L("Percentage of the otherwise planned speed in affected areas. Existing slower speed limits are preserved. Validate adhesion and surface quality with your material.");
+    def->sidetext = L("%");
+    def->min = 10;
+    def->max = 100;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionPercent(70.));
+
+    def = this->add("shrinkage_slowdown_min_speed", coFloat);
+    def->label = L("Shrinkage slowdown minimum speed");
+    def->category = L("Speed");
+    def->tooltip = L("Do not reduce speed below this value for shrinkage slowdown. Paths already slower than this remain unchanged.");
+    def->sidetext = L("mm/s");
+    def->min = 1;
+    def->max = 1000;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(20.));
+
+    def = this->add("shrinkage_slowdown_long_run", coFloat);
+    def->label = L("Long straight run threshold");
+    def->category = L("Speed");
+    def->tooltip = L("Slow straight runs at least this long, including runs made of multiple segments within 5 degrees of their initial direction. Set to 0 to disable long-run slowdown.");
+    def->sidetext = L("mm");
+    def->min = 0;
+    def->max = 10000;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(40.));
+
+    def = this->add("shrinkage_slowdown_corner_distance", coFloat);
+    def->label = L("Corner slowdown distance");
+    def->category = L("Speed");
+    def->tooltip = L("Slow this distance before and after a change of direction of at least 60 degrees. Set to 0 to disable corner slowdown. Firmware acceleration limits still apply.");
+    def->sidetext = L("mm");
+    def->min = 0;
+    def->max = 100;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(3.));
 
     def = this->add("dissimilar_support_interface_speed_layers", coInt);
     def->label = L("Interface speed recovery layers");

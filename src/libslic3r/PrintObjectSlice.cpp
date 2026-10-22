@@ -1494,13 +1494,13 @@ void PrintObject::slice_volumes()
     }
 
     {
-        if (m_config.rooting || m_config.rooting_xy)
-            report_slice_progress(*this, 3.5, L("Preparing native rooting contacts"));
         const Rooting roots(*this);
+        if (roots.has_candidates())
+            report_slice_progress(*this, 3.5, L("Preparing native rooting contacts"));
         if (m_config.interlocking_beam)
             report_slice_progress(*this, 4., L("Generating beam interlocking"));
         InterlockingGenerator::generate_interlocking_structure(this, [print]() { print->throw_if_canceled(); });
-        if (m_config.rooting || m_config.rooting_xy)
+        if (roots.has_candidates())
             report_slice_progress(*this, 4.5, L("Preparing root growth"));
         int last_progress = -1;
         std::vector<Rooting::ContactResult> root_contacts;
@@ -1517,6 +1517,8 @@ void PrintObject::slice_volumes()
         // Resolve failed native contacts to actual model parts, even when several
         // parts share one PrintRegion. A successful neighbor cannot mask failure.
         std::map<ObjectID, std::vector<ExPolygons>> volume_slices;
+        std::map<ObjectID, std::string> failed_parts;
+        bool unidentified_root_contact = false;
         for (const auto &contact : root_contacts) {
             if (contact.placed) continue;
             const auto &range = *layer_range_first(m_shared_regions->layer_ranges, m_layers[contact.layer]->slice_z);
@@ -1542,16 +1544,23 @@ void PrintObject::slice_volumes()
                 if (contact.layer >= it->second.size() ||
                     intersection_ex(ExPolygons{contact.contact}, it->second[contact.layer]).empty()) continue;
                 identified = true;
-                this->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL,
-                    L("Z roots could not fit at a material contact. Check root thickness, depth and protective walls.") +
-                    std::string("\n") + model_object()->name + " / " + volume->name,
-                    PrintStateBase::SlicingDefaultNotification, volume->id());
+                failed_parts.emplace(volume->id(), volume->name);
             }
             if (!identified)
-                this->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL,
-                    L("Z roots could not fit at a material contact. Check root thickness, depth and protective walls."));
+                unidentified_root_contact = true;
         }
-        if (m_config.rooting_xy && num_printing_regions() > 1 && root_count == 0 && root_contacts.empty())
+        if (!failed_parts.empty() || unidentified_root_contact) {
+            std::string message = L("Z roots could not fit at some material contacts. Check root thickness, depth and protective walls.");
+            message += "\n" + model_object()->name;
+            for (const auto &part : failed_parts)
+                message += "\n - " + part.second;
+            // A single failed part keeps its direct selection link. A grouped
+            // warning selects the owning assembly and lists every failed part.
+            this->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL, message,
+                PrintStateBase::SlicingDefaultNotification,
+                failed_parts.size() == 1 && !unidentified_root_contact ? failed_parts.begin()->first : ObjectID());
+        }
+        if (roots.has_candidates() && m_config.rooting_xy && root_count == 0 && root_contacts.empty())
             this->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL,
                 L("No roots fit in this object with the current settings. Roots in other objects are unaffected. Check material contact, enabled rooting directions, and space for root thickness and protective walls."));
     }

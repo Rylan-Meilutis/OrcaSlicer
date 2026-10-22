@@ -23,6 +23,8 @@ public:
         bool placed = false;
     };
     explicit Rooting(const PrintObject &object);
+    static bool is_enabled(const PrintObject &object);
+    bool has_candidates() const { return !m_slices.empty(); }
     size_t apply(PrintObject &object, const std::function<void()> &cancel, const Progress &progress = {},
                  std::vector<ContactResult> *z_contacts = nullptr) const;
 private:

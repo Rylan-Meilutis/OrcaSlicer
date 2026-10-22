@@ -487,6 +487,106 @@ struct ProcessedPoint
     float overlap = 1.0f;
 };
 
+// Speed-only deposition aid, not a thermal-stress prediction. Preserve the
+// estimator's overlap samples and outgoing-segment speed limits when splitting.
+inline bool apply_shrinkage_slowdown(std::vector<ProcessedPoint> &points, double ratio,
+                                    double minimum_speed, double long_run, double corner_distance)
+{
+    if (points.size() < 2 || ratio >= 1. || ratio <= 0.)
+        return false;
+    std::vector<double> distance(points.size(), 0.);
+    for (size_t i = 1; i < points.size(); ++i)
+        distance[i] = distance[i - 1] + unscale<double>((points[i].p - points[i - 1].p).cast<double>().norm());
+    const double length = distance.back();
+    if (length < EPSILON)
+        return false;
+    const bool closed = points.front().p == points.back().p;
+    std::vector<std::pair<double, double>> ranges;
+    auto add_corner = [&](double position) {
+        ranges.emplace_back(std::max(0., position - corner_distance), std::min(length, position + corner_distance));
+        if (closed && position < corner_distance)
+            ranges.emplace_back(std::max(0., length + position - corner_distance), length);
+        if (closed && position + corner_distance > length)
+            ranges.emplace_back(0., std::min(length, position + corner_distance - length));
+    };
+    if (corner_distance > 0.) {
+        for (size_t i = closed ? 0 : 1; i + 1 < points.size(); ++i) {
+            const Vec3d incoming = (points[i].p - points[i == 0 ? points.size() - 2 : i - 1].p).cast<double>();
+            const Vec3d outgoing = (points[i + 1].p - points[i].p).cast<double>();
+            const double product = incoming.norm() * outgoing.norm();
+            // A change of heading of at least 60 degrees, in either direction.
+            if (product > 0. && incoming.dot(outgoing) <= 0.5 * product)
+                add_corner(distance[i]);
+        }
+    }
+    if (long_run > 0.) {
+        size_t start = 0;
+        Vec3d direction = Vec3d::Zero();
+        const double tolerance = std::cos(5. * PI / 180.);
+        for (size_t i = 1; i < points.size(); ++i) {
+            const Vec3d delta = (points[i].p - points[i - 1].p).cast<double>();
+            if (delta.norm() == 0.)
+                continue;
+            const Vec3d unit = delta.normalized();
+            if (direction.isZero())
+                direction = unit;
+            else if (direction.dot(unit) < tolerance) {
+                if (distance[i - 1] - distance[start] >= long_run)
+                    ranges.emplace_back(distance[start], distance[i - 1]);
+                start = i - 1;
+                direction = unit;
+            }
+        }
+        if (length - distance[start] >= long_run)
+            ranges.emplace_back(distance[start], length);
+    }
+    if (ranges.empty())
+        return false;
+    std::sort(ranges.begin(), ranges.end());
+    std::vector<std::pair<double, double>> merged;
+    for (const auto &range : ranges) {
+        if (!merged.empty() && range.first <= merged.back().second)
+            merged.back().second = std::max(merged.back().second, range.second);
+        else
+            merged.push_back(range);
+    }
+    std::vector<ProcessedPoint> result;
+    size_t range_index = 0;
+    bool changed = false;
+    for (size_t i = 0; i + 1 < points.size(); ++i) {
+        const double begin = distance[i], end = distance[i + 1];
+        if (end - begin < EPSILON)
+            continue;
+        while (range_index < merged.size() && merged[range_index].second <= begin)
+            ++range_index;
+        std::vector<double> cuts{begin, end};
+        for (size_t j = range_index; j < merged.size() && merged[j].first < end; ++j)
+            for (double cut : {merged[j].first, merged[j].second})
+                if (cut > begin && cut < end)
+                    cuts.push_back(cut);
+        std::sort(cuts.begin(), cuts.end());
+        for (size_t j = 0; j + 1 < cuts.size(); ++j) {
+            const double t = (cuts[j] - begin) / (end - begin);
+            ProcessedPoint point = points[i];
+            point.p = (points[i].p.cast<double>() + t * (points[i + 1].p - points[i].p).cast<double>()).cast<coord_t>();
+            point.overlap = float(Slic3r::lerp(double(points[i].overlap), double(points[i + 1].overlap), t));
+            const double middle = (cuts[j] + cuts[j + 1]) * 0.5;
+            while (range_index < merged.size() && merged[range_index].second <= middle)
+                ++range_index;
+            if (range_index < merged.size() && merged[range_index].first <= middle) {
+                point.speed = float(std::min(double(point.speed), std::max(minimum_speed, point.speed * ratio)));
+                changed = changed || point.speed < points[i].speed;
+            }
+            result.push_back(point);
+        }
+    }
+    if (changed) {
+        result.push_back(points.back());
+        points = std::move(result);
+    }
+    return changed;
+}
+
 class ExtrusionQualityEstimator
 {
     using Boundaries   = AABBTreeLines::LinesDistancer<Linef3>;

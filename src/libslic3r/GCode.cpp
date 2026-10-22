@@ -11511,6 +11511,19 @@ std::string GCode::_extrude(const ExtrusionPath &input_path, const std::string &
             }
     }
 
+    if (m_config.shrinkage_slowdown.value && !path.z_contoured && !sloped &&
+        !is_bridge(path.role()) && !is_arc_fill(path.role()) &&
+        (path.role() == erPerimeter || path.role() == erExternalPerimeter ||
+         path.role() == erSolidInfill || path.role() == erTopSolidInfill || path.role() == erBottomSurface)) {
+        if (new_points.empty())
+            for (const Point3 &point : path.polyline.points)
+                new_points.push_back({point, float(speed), 1.f});
+        requires_segmented_extrusion = apply_shrinkage_slowdown(new_points,
+            m_config.shrinkage_slowdown_speed.value / 100., m_config.shrinkage_slowdown_min_speed.value,
+            m_config.shrinkage_slowdown_long_run.value, m_config.shrinkage_slowdown_corner_distance.value) ||
+            requires_segmented_extrusion;
+    }
+
     double F = speed * 60;  // convert mm/sec to mm/min
     
     // Orca: Dynamic PA

@@ -1449,6 +1449,11 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionBool,                slow_down_layer_above_dissimilar_support_interface))
     ((ConfigOptionFloatOrPercent,      dissimilar_support_interface_speed))
     ((ConfigOptionFloat,               dissimilar_material_contact_speed))
+    ((ConfigOptionBool,                shrinkage_slowdown))
+    ((ConfigOptionPercent,             shrinkage_slowdown_speed))
+    ((ConfigOptionFloat,               shrinkage_slowdown_min_speed))
+    ((ConfigOptionFloat,               shrinkage_slowdown_long_run))
+    ((ConfigOptionFloat,               shrinkage_slowdown_corner_distance))
     ((ConfigOptionInt,                 dissimilar_support_interface_speed_layers))
     // Spacing between interface lines (the hatching distance). Set zero to get a solid interface.
     ((ConfigOptionFloat,               support_interface_spacing))

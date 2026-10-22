@@ -772,6 +772,9 @@ void ConfigManipulation::apply_null_fff_config(DynamicPrintConfig *config, std::
 
 void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, int variant_index, const bool is_global_config)
 {
+    for (const char *key : {"shrinkage_slowdown_speed", "shrinkage_slowdown_min_speed",
+                            "shrinkage_slowdown_long_run", "shrinkage_slowdown_corner_distance"})
+        toggle_field(key, config->opt_bool("shrinkage_slowdown"));
     const bool buried_relief = config->opt_bool("buried_top_relief");
     const bool cosmetic_relief = config->opt_bool("cosmetic_top_relief") || buried_relief;
     toggle_field("cosmetic_top_relief", !buried_relief);

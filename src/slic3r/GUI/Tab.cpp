@@ -3133,6 +3133,12 @@ void TabPrint::build()
         optgroup->append_single_option_line("ensure_vertical_shell_thickness", "strength_settings_advanced#ensure-vertical-shell-thickness");
 
     page = add_options_page(L("Speed"), "custom-gcode_speed"); // ORCA: icon only visible on placeholders
+        optgroup = page->new_optgroup(L("Shrinkage slowdown"), L"param_speed", 15);
+        optgroup->append_single_option_line("shrinkage_slowdown");
+        optgroup->append_single_option_line("shrinkage_slowdown_speed");
+        optgroup->append_single_option_line("shrinkage_slowdown_min_speed");
+        optgroup->append_single_option_line("shrinkage_slowdown_long_run");
+        optgroup->append_single_option_line("shrinkage_slowdown_corner_distance");
         optgroup = page->new_optgroup(L("First layer speed"), L"param_speed_first", 15);
         optgroup->append_single_option_line("initial_layer_speed", "speed_settings_initial_layer_speed#initial-layer", 0);
         optgroup->append_single_option_line("initial_layer_infill_speed", "speed_settings_initial_layer_speed#initial-layer-infill", 0);

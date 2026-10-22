@@ -1,5 +1,32 @@
 # Thermal deformation and bed adhesion
 
+## Optional deposition slowdown
+
+The Speed page's `shrinkage_slowdown` controls are opt-in, including per-object
+overrides. Supported walls and solid infill receive a bounded speed reduction
+within the selected distance of heading changes of at least 60 degrees, and on
+straight runs exceeding the configured length. Collinear subdivisions count as
+one run; direction is compared against the run's initial heading with a 5-degree
+tolerance. Run detection is local to each extrusion path, not across travels or
+separate extrusion entities. Closed-path corner zones wrap around the seam.
+
+The initial controls are 70% speed, a 20 mm/s floor, 40 mm long-run threshold and
+3 mm corner zones. These are tuning starting points, not material-derived stress
+limits. Existing lower speed limits remain lower. Paths are split at zone
+boundaries without changing extrusion width, flow or deposited geometry;
+overlap samples remain available to fan and temperature controls. Treated paths
+use segmented linear output rather than fitted arcs. Bridges, arc overhangs,
+support, ironing, scarf joints and nonplanar paths retain their own controls.
+Neither automatic risk screening nor material selection enables this setting.
+
+Slower deposition may improve bonding, but does not remove thermal contraction;
+additional time and local heating may also worsen a particular print. No change
+in predicted bow or guaranteed bed adhesion is inferred from the speed setting.
+Firmware still owns acceleration and junction deceleration. Changing these
+controls invalidates G-code export, not the geometric slicing steps.
+
+## Screening model
+
 The reduced-order model evaluates connected cross sections through the first
 layer of each printable, transformed model instance. Disconnected feet are not
 joined across their empty bounding box. Each contact is represented by a strip

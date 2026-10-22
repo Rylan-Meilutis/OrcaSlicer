@@ -9,6 +9,20 @@ an undercut against vertical pull-out; it is not a guarantee of joint strength.
 Flexible materials can still deform out of an anchor, and material combinations
 need physical qualification.
 
+Contacts require different nonempty filament material types (case-insensitive,
+ignoring surrounding whitespace), not merely different filament slots or colors.
+Equal material types and unknown types do not generate roots. This filtering is
+per pair, including objects containing three or more materials. Conventional
+prime towers are generated outside the model slicing pipeline; model-backed belt
+purge towers are explicitly excluded. Objects without eligible material pairs do
+not acquire rooting-only interface shells or root-failure warnings. Changing a
+material type or an object's purge-tower role invalidates rooting geometry.
+
+Failed Z contacts are aggregated into one warning per object listing affected
+parts. A single affected part retains its direct selection link; a multi-part
+summary links to the owning assembly. Successful contacts and excluded pairs
+are not listed as failures.
+
 XY rooting is an independent, default-off switch for sideways contacts. It grows
 rounded, branching fans into the adjoining material, like roots entering a cliff.
 The smaller native region on a course supplies the root material; the larger

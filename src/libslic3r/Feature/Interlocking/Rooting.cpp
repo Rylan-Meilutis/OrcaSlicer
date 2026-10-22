@@ -19,12 +19,42 @@
 #include <atomic>
 #include <cmath>
 #include <tbb/parallel_for.h>
+#include <boost/algorithm/string/predicate.hpp>
+#include <boost/algorithm/string/trim.hpp>
 
 namespace Slic3r {
 
+namespace {
+bool different_root_materials(const PrintObject &object, size_t a, size_t b)
+{
+    const auto first = object.printing_region(a).extruder(frExternalPerimeter);
+    const auto second = object.printing_region(b).extruder(frExternalPerimeter);
+    const auto &types = object.print()->config().filament_type;
+    if (first == second || first == 0 || second == 0 || first > types.size() || second > types.size())
+        return false;
+    const auto x = boost::algorithm::trim_copy(types.get_at(first - 1));
+    const auto y = boost::algorithm::trim_copy(types.get_at(second - 1));
+    return !x.empty() && !y.empty() && !boost::algorithm::iequals(x, y);
+}
+}
+
+bool Rooting::is_enabled(const PrintObject &object)
+{
+    // Conventional prime towers use WipeTower, outside this pipeline. The
+    // model-backed belt purge tower must also never acquire structural roots.
+    if ((!object.config().rooting && !object.config().rooting_xy) || object.num_printing_regions() < 2 ||
+        object.print()->config().spiral_mode || object.config().belt_purge_tower_object.value)
+        return false;
+    for (size_t a = 0; a < object.num_printing_regions(); ++a)
+        for (size_t b = a + 1; b < object.num_printing_regions(); ++b)
+            if (different_root_materials(object, a, b))
+                return true;
+    return false;
+}
+
 Rooting::Rooting(const PrintObject &object)
 {
-    if ((!object.config().rooting && !object.config().rooting_xy) || object.num_printing_regions() < 2 || object.print()->config().spiral_mode)
+    if (!is_enabled(object))
         return;
     for (const Layer *layer : object.layers()) {
         auto &regions = m_slices.emplace_back();
@@ -155,7 +185,7 @@ size_t Rooting::apply(PrintObject &object, const std::function<void()> &cancel, 
             for (size_t host = 0; host < object.num_printing_regions(); ++host) {
                 size_t top = interface_top;
                 const auto host_tool = object.printing_region(host).extruder(frExternalPerimeter);
-                if (host == upper || host_tool == upper_tool || m_slices[top - 1][host].empty() ||
+                if (!different_root_materials(object, host, upper) || m_slices[top - 1][host].empty() ||
                     !coherent_material(object.printing_region(host), object.print()->config()))
                     continue;
                 const auto &nozzles = object.print()->config().nozzle_diameter;
@@ -523,7 +553,7 @@ size_t Rooting::apply_xy(PrintObject &object, const std::function<void()> &cance
                                    object.num_printing_regions() * object.num_printing_regions());
             if (host == donor || !coherent_material(object.printing_region(host), print_config)) continue;
             const auto host_tool = object.printing_region(host).extruder(frExternalPerimeter);
-            if (host_tool == donor_tool || width + EPSILON < 2. * std::max(
+            if (!different_root_materials(object, host, donor) || width + EPSILON < 2. * std::max(
                 print_config.nozzle_diameter.get_at(donor_tool - 1),
                 print_config.nozzle_diameter.get_at(host_tool - 1))) continue;
             const double web_radius = 0.5 * std::max(skin, 2. * print_config.nozzle_diameter.get_at(host_tool - 1));

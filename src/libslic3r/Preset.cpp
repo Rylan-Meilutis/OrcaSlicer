@@ -1637,6 +1637,11 @@ static std::vector<std::string> s_Preset_print_options{
     "slow_down_layer_above_dissimilar_support_interface",
     "dissimilar_support_interface_speed",
     "dissimilar_material_contact_speed",
+    "shrinkage_slowdown",
+    "shrinkage_slowdown_speed",
+    "shrinkage_slowdown_min_speed",
+    "shrinkage_slowdown_long_run",
+    "shrinkage_slowdown_corner_distance",
     "dissimilar_support_interface_speed_layers",
     // IDEX/IQEX parallel print mode (per-print selection)
     "imex_parallel_mode",

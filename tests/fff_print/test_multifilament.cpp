@@ -135,6 +135,7 @@ TEST_CASE("Mapped exports print the requested first material before a larger bas
 TEST_CASE("Bed supported materials do not attempt Z roots or report failed roots", "[Multifilament][Rooting][RootingBedContact]")
 {
     auto config = multifilament_config(2, {
+        {"filament_type", "PLA;PETG"},
         {"rooting", false}, {"rooting_xy", false}, {"interlocking_beam", false},
         {"layer_height", 0.2}, {"initial_layer_print_height", 0.2},
         {"elefant_foot_compensation", 0.}, {"enable_prime_tower", false}});
@@ -165,9 +166,51 @@ TEST_CASE("Bed supported materials do not attempt Z roots or report failed roots
         }
 }
 
+TEST_CASE("Same material colors and purge objects do not generate roots or warnings", "[Multifilament][Rooting][RootingEligibility]")
+{
+    const bool xy = GENERATE(false, true);
+    const std::string kind = GENERATE("same material", "purge tower", "unknown material");
+    CAPTURE(xy, kind);
+    auto config = multifilament_config(2, {
+        {"filament_type", kind == "same material" ? "PLA;pla" : kind == "unknown material" ? "PLA;" : "PLA;PETG"},
+        {"rooting", false}, {"rooting_xy", false}, {"interlocking_beam", false},
+        {"belt_purge_tower_object", kind == "purge tower"},
+        {"layer_height", 0.2}, {"initial_layer_print_height", 0.2},
+        {"elefant_foot_compensation", 0.}, {"enable_prime_tower", false}});
+    Print baseline, rooted;
+    Model model;
+    init_print({make_cube(24., 24., 6.)}, baseline, model, config);
+    auto insert = make_cube(12., 12., xy ? 6. : 2.);
+    insert.translate(xy ? 24. : 6., 6., xy ? 0. : 6.);
+    model.objects.front()->volumes.front()->config.set("extruder", 1);
+    model.objects.front()->add_volume(insert)->config.set("extruder", 2);
+    baseline.apply(model, config);
+    baseline.get_object(0)->slice();
+    config.set_deserialize_strict(xy ? "rooting_xy" : "rooting", "1");
+    rooted.apply(model, config);
+    rooted.get_object(0)->slice();
+    CHECK(rooted.get_object(0)->step_state_with_warnings(posSlice).warnings.empty());
+    const auto &a = baseline.get_object(0)->layers(), &b = rooted.get_object(0)->layers();
+    REQUIRE(a.size() == b.size());
+    for (size_t z = 0; z < a.size(); ++z)
+        for (size_t r = 0; r < a[z]->regions().size(); ++r) {
+            const auto before = to_expolygons(a[z]->get_region(r)->slices.surfaces);
+            const auto after = to_expolygons(b[z]->get_region(r)->slices.surfaces);
+            CHECK(diff_ex(before, after).empty());
+            CHECK(diff_ex(after, before).empty());
+        }
+    if (kind == "same material") {
+        config.set_deserialize_strict("filament_type", "PLA;PETG");
+        rooted.apply(model, config);
+        CHECK_FALSE(rooted.get_object(0)->is_step_done(posSlice));
+    }
+}
+
 TEST_CASE("A successful root contact does not hide another part's failure", "[Multifilament][Rooting][RootingDiagnostics]")
 {
+    const bool multiple_failures = GENERATE(false, true);
     auto config = multifilament_config(2, {
+        {"filament_type", "PLA;PETG"},
         {"rooting", true}, {"rooting_xy", false}, {"interlocking_beam", false},
         {"rooting_depth", 3.}, {"rooting_width", 1.2}, {"rooting_base_width", 3.},
         {"rooting_skin", 0.4}, {"wall_loops", 2},
@@ -195,6 +238,12 @@ TEST_CASE("A successful root contact does not hide another part's failure", "[Mu
     auto *bad = object->add_volume(narrow);
     bad->config.set("extruder", 2);
     bad->name = "Narrow part";
+    if (multiple_failures) {
+        narrow.translate(-4., 0., 0.);
+        auto *another = object->add_volume(narrow);
+        another->config.set("extruder", 2);
+        another->name = "Another narrow part";
+    }
     // A bed-supported part sharing tool 2 must not suppress the elevated parts.
     auto lettering = make_cube(2., 2., 0.4);
     lettering.translate(45., 0., 0.);
@@ -203,7 +252,10 @@ TEST_CASE("A successful root contact does not hide another part's failure", "[Mu
     print.get_object(0)->slice();
     const auto warnings = print.get_object(0)->step_state_with_warnings(posSlice).warnings;
     REQUIRE(warnings.size() == 1);
-    CHECK(warnings.front().volume_id == bad->id());
+    if (!multiple_failures)
+        CHECK(warnings.front().volume_id == bad->id());
+    else
+        CHECK(warnings.front().message.find("Another narrow part") != std::string::npos);
     CHECK(warnings.front().message.find(bad->name) != std::string::npos);
     double buried_area = 0.;
     for (const auto *layer : print.get_object(0)->layers())
@@ -218,9 +270,46 @@ TEST_CASE("A successful root contact does not hide another part's failure", "[Mu
     CHECK(print.get_object(0)->step_state_with_warnings(posSlice).warnings.empty());
 }
 
+TEST_CASE("Root eligibility filters each material pair inside a mixed assembly", "[Multifilament][Rooting][RootingEligibility]")
+{
+    auto config = multifilament_config(3, {
+        {"filament_type", "PLA;PLA;PETG"}, {"rooting", true}, {"rooting_xy", false},
+        {"rooting_depth", 3.}, {"rooting_width", 1.2}, {"rooting_base_width", 3.},
+        {"rooting_skin", 0.4}, {"wall_loops", 2}, {"interlocking_beam", false},
+        {"layer_height", 0.2}, {"initial_layer_print_height", 0.2},
+        {"elefant_foot_compensation", 0.}, {"enable_prime_tower", false}});
+    Print print;
+    Model model;
+    init_print({make_cube(40., 40., 6.)}, print, model, config);
+    auto *object = model.objects.front();
+    object->volumes.front()->config.set("extruder", 1);
+    auto same_color = make_cube(0.6, 0.6, 2.);
+    same_color.translate(30., 30., 6.);
+    object->add_volume(same_color)->config.set("extruder", 2);
+    auto other_material = make_cube(12., 12., 2.);
+    other_material.translate(4., 4., 6.);
+    object->add_volume(other_material)->config.set("extruder", 3);
+    print.apply(model, config);
+    print.get_object(0)->slice();
+    CHECK(print.get_object(0)->step_state_with_warnings(posSlice).warnings.empty());
+    double other_roots = 0.;
+    for (const auto *layer : print.get_object(0)->layers()) {
+        if (layer->print_z >= 5.4 - EPSILON) continue;
+        for (const auto *region : layer->regions()) {
+            const auto material = region->region().extruder(frExternalPerimeter);
+            if (material == 2)
+                CHECK(region->slices.surfaces.empty());
+            if (material == 3)
+                other_roots += area(to_expolygons(region->slices.surfaces));
+        }
+    }
+    CHECK(other_roots > 0.);
+}
+
 TEST_CASE("Root preparation reports real phases and is deterministic across worker counts", "[Multifilament][Rooting][SliceProgress]")
 {
     auto config = multifilament_config(2, {
+        {"filament_type", "PLA;PETG"},
         {"rooting", true}, {"rooting_xy", true}, {"rooting_depth", 3.},
         {"rooting_width", 1.2}, {"rooting_base_width", 3.}, {"rooting_skin", 0.8},
         {"layer_height", 0.2}, {"initial_layer_print_height", 0.2},
@@ -340,6 +429,7 @@ TEST_CASE("XY roots branch into cliff contacts while preserving material skins",
     const bool expect_roots = mode == "plain" || mode == "beams" || mode == "elevated" || mode == "edge contact";
     CAPTURE(angle, mode);
     auto config = multifilament_config(2, {
+        {"filament_type", "PLA;PETG"},
         {"rooting", false}, {"rooting_xy", false}, {"rooting_depth", 4.},
         {"rooting_width", 1.2}, {"rooting_spacing", 6.}, {"rooting_skin", 0.8},
         {"interlocking_beam", mode == "beams"}, {"interlocking_depth", 1},
@@ -455,6 +545,7 @@ TEST_CASE("Roots preserve the native perimeter stack and a host web", "[Multifil
 {
     const int walls = GENERATE(2, 6);
     auto config = multifilament_config(2, {
+        {"filament_type", "PLA;PETG"},
         {"rooting", false}, {"rooting_xy", false}, {"rooting_depth", 3.},
         {"rooting_width", 1.2}, {"rooting_spacing", 6.}, {"rooting_skin", 0.4},
         {"wall_loops", walls}, {"outer_wall_line_width", 0.6}, {"inner_wall_line_width", 0.6},
@@ -525,6 +616,7 @@ TEST_CASE("Rooting fits printable trunks around screw-hole contacts", "[Multifil
         return TriangleMesh(std::move(vertices), std::move(faces));
     };
     auto config = multifilament_config(2, {
+        {"filament_type", "PLA;PETG"},
         {"rooting", false}, {"rooting_depth", 5.}, {"rooting_width", root_width},
         {"rooting_skin", 0.8}, {"rooting_spacing", 4.}, {"interlocking_beam", beams},
         {"interlocking_depth", 2}, {"interlocking_orientation", 22.5},
@@ -572,6 +664,7 @@ TEST_CASE("Rooting fits printable trunks around screw-hole contacts", "[Multifil
 TEST_CASE("Root base diameter changes buried limbs independently of the tip", "[Multifilament][Rooting][RootingWidth]")
 {
     auto config = multifilament_config(2, {
+        {"filament_type", "PLA;PETG"},
         {"rooting", true}, {"rooting_xy", false}, {"rooting_depth", 3.},
         {"rooting_width", 1.2}, {"rooting_spacing", 100.}, {"rooting_skin", 0.4},
         {"wall_loops", 2}, {"interlocking_beam", false},
@@ -609,6 +702,7 @@ TEST_CASE("Wide roots remain usable in shallow bases", "[Multifilament][Rooting]
     const double width = GENERATE(1.2, 2.4, 4.);
     CAPTURE(width);
     auto config = multifilament_config(2, {
+        {"filament_type", "PLA;PETG"},
         {"rooting", true}, {"rooting_xy", false}, {"rooting_depth", 1.4},
         {"rooting_width", width}, {"rooting_spacing", 100.}, {"rooting_skin", 0.4},
         {"wall_loops", 2}, {"interlocking_beam", false},
@@ -645,6 +739,7 @@ TEST_CASE("Rooting embeds flared anchors without changing exposed surfaces", "[M
     const bool expect_roots = shape == "stacked" || shape == "dense" || shape == "shallow" || shape == "spreading" || shape == "small contact" || shape == "deep request" || shape == "deep roots" || shape == "L contact" || shape == "ring contact";
     CAPTURE(shape);
     auto config = multifilament_config(2, {
+        {"filament_type", "PLA;PETG"},
         {"rooting", false}, {"rooting_depth", requested_depth}, {"rooting_width", 1.2},
         {"rooting_spacing", (shape == "spreading" || shape == "small contact") ? 100. : shape == "dense" ? 1. : 6.}, {"rooting_skin", 0.8},
         {"interlocking_beam", false}, {"layer_height", 0.2}, {"initial_layer_print_height", 0.2},
@@ -814,6 +909,7 @@ TEST_CASE("Root material islands finish locally without changing deposition", "[
     struct Metrics { double extrusion = 0.; size_t crossings = 0; };
     auto measure = [&](bool enabled) {
         auto config = multifilament_config(2, {
+            {"filament_type", "PLA;PETG"},
             {"rooting", enabled}, {"rooting_xy", false},
             {"layer_height", 0.2}, {"initial_layer_print_height", 0.2},
             {"wall_loops", 3}, {"top_shell_layers", 3}, {"bottom_shell_layers", 3},
@@ -883,6 +979,7 @@ TEST_CASE("Rooting reaches emitted toolpaths below the original interface", "[Mu
     const bool interlocking = GENERATE(false, true);
     CAPTURE(enabled, interlocking);
     auto config = multifilament_config(2, {
+        {"filament_type", "PLA;PETG"},
         {"rooting", enabled}, {"rooting_depth", 3.}, {"rooting_width", 1.2},
         {"rooting_spacing", 6.}, {"rooting_skin", 0.8}, {"interlocking_beam", interlocking},
         {"layer_height", 0.2}, {"initial_layer_print_height", 0.2},
@@ -935,6 +1032,7 @@ TEST_CASE("Shallow roots attach below beam interlocking without replacing its co
     const int beam_layers = GENERATE(1, 2);
     CAPTURE(depth, beam_layers);
     auto config = multifilament_config(2, {
+        {"filament_type", "PLA;PETG"},
         {"rooting", false}, {"rooting_depth", depth}, {"rooting_width", 1.2},
         {"rooting_skin", 0.8}, {"rooting_spacing", 100.},
         {"interlocking_beam", true}, {"interlocking_beam_layer_count", beam_layers},

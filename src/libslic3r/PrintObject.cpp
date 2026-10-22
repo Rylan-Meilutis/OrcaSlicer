@@ -1,4 +1,5 @@
 #include "ExPolygon.hpp"
+#include "Feature/Interlocking/Rooting.hpp"
 #include "libslic3r/Fill/FillProgress.hpp"
 #include "Config.hpp"
 #include "Exception.hpp"
@@ -1916,7 +1917,7 @@ bool PrintObject::invalidate_state_by_config_options(
             opt_key == "bottom_shell_layers" || opt_key == "outer_wall_filament_id" ||
             opt_key == "inner_wall_filament_id" || opt_key == "sparse_infill_filament_id" ||
             opt_key == "internal_solid_filament_id" || opt_key == "top_surface_filament_id" ||
-            opt_key == "bottom_surface_filament_id"))
+            opt_key == "bottom_surface_filament_id" || opt_key == "belt_purge_tower_object"))
             steps.emplace_back(posSlice);
         if (   opt_key == "brim_width"
             || opt_key == "leading_brim_length"
@@ -2359,6 +2360,11 @@ bool PrintObject::invalidate_state_by_config_options(
             || opt_key == "support_interface_flow_ratio"
             || opt_key == "support_interface_top_temperature"
             || opt_key == "dissimilar_material_contact_speed"
+            || opt_key == "shrinkage_slowdown"
+            || opt_key == "shrinkage_slowdown_speed"
+            || opt_key == "shrinkage_slowdown_min_speed"
+            || opt_key == "shrinkage_slowdown_long_run"
+            || opt_key == "shrinkage_slowdown_corner_distance"
             || opt_key == "arc_overhang_speed"
             || opt_key == "arc_overhang_min_path_time"
             || opt_key == "arc_overhang_stabilization_speed"
@@ -2469,7 +2475,7 @@ void PrintObject::detect_surfaces_type()
     // This is useful if one of the parts is to be dissolved, or if it is transparent and the internal shells
     // should be visible.
     bool spiral_mode      = this->print()->config().spiral_mode.value;
-    bool interface_shells = ! spiral_mode && (m_config.interface_shells.value || m_config.rooting.value || m_config.rooting_xy.value);
+    bool interface_shells = ! spiral_mode && (m_config.interface_shells.value || Rooting::is_enabled(*this));
     size_t num_layers     = spiral_mode ? std::min(size_t(this->printing_region(0).config().bottom_shell_layers), m_layers.size()) : m_layers.size();
 
     // The regions of a layer do not see each other here, and a layer cut through a fine relief takes far longer than the
@@ -3041,7 +3047,7 @@ void PrintObject::discover_vertical_shells()
     bool     spiral_mode      = this->print()->config().spiral_mode.value;
     size_t   num_layers       = spiral_mode ? std::min(size_t(this->printing_region(0).config().bottom_shell_layers), m_layers.size()) : m_layers.size();
     std::vector<DiscoverVerticalShellsCacheEntry> cache_top_botom_regions(num_layers, DiscoverVerticalShellsCacheEntry());
-    bool top_bottom_surfaces_all_regions = this->num_printing_regions() > 1 && ! m_config.interface_shells.value && !m_config.rooting.value && !m_config.rooting_xy.value;
+    bool top_bottom_surfaces_all_regions = this->num_printing_regions() > 1 && ! m_config.interface_shells.value && !Rooting::is_enabled(*this);
 //    static constexpr const float top_bottom_expansion_coeff = 1.05f;
     // Just a tiny fraction of an infill extrusion width to merge neighbor regions reliably.
     static constexpr const float top_bottom_expansion_coeff = 0.05f;

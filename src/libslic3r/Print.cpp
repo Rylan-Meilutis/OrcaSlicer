@@ -176,6 +176,8 @@ bool Print::invalidate_state_by_config_options(const ConfigOptionResolver & /* n
     // Cache the plenty of parameters, which influence the G-code generator only,
     // or they are only notes not influencing the generated G-code.
     static std::unordered_set<std::string> steps_gcode = {
+        "shrinkage_slowdown", "shrinkage_slowdown_speed", "shrinkage_slowdown_min_speed",
+        "shrinkage_slowdown_long_run", "shrinkage_slowdown_corner_distance",
         // Resolved role IDs independently invalidate the affected toolpaths.
         "project_filament_bindings",
         "project_filament_roles",
@@ -361,6 +363,11 @@ bool Print::invalidate_state_by_config_options(const ConfigOptionResolver & /* n
     bool invalidated = false;
 
     for (const t_config_option_key &opt_key : opt_keys) {
+        if (opt_key == "filament_type" &&
+            std::any_of(m_objects.begin(), m_objects.end(), [](const PrintObject *object) {
+                return object->config().rooting.value || object->config().rooting_xy.value;
+            }))
+            osteps.emplace_back(posSlice);
         if (steps_gcode.find(opt_key) != steps_gcode.end()) {
             // These options only affect G-code export or they are just notes without influence on the generated G-code,
             // so there is nothing to invalidate.

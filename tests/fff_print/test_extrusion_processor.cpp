@@ -21,6 +21,7 @@
 #include <functional>
 #include "libslic3r/Line.hpp"
 #include "libslic3r/Point.hpp"
+#include "libslic3r/libslic3r.h"
 #include <cstddef>
 #include "libslic3r/PrintConfig.hpp"
 #include "libslic3r/Print.hpp"
@@ -36,6 +37,55 @@
 
 using namespace Slic3r;
 using namespace Slic3r::Test;
+
+TEST_CASE("Shrinkage slowdown confines corner changes to the configured distance", "[ExtrusionProcessor][ShrinkageSlowdown]")
+{
+    std::vector<ProcessedPoint> points{{Point3(0, 0, 0), 100.f, 1.f},
+        {Point3::new_scale(20., 0., 0.), 100.f, 0.8f},
+        {Point3::new_scale(20., 20., 0.), 100.f, 1.f}};
+    REQUIRE(apply_shrinkage_slowdown(points, 0.7, 20., 0., 3.));
+    REQUIRE(points.size() == 5);
+    CHECK_THAT(unscale<double>(points[1].p.x()), Catch::Matchers::WithinAbs(17., 1e-6));
+    CHECK_THAT(unscale<double>(points[3].p.y()), Catch::Matchers::WithinAbs(3., 1e-6));
+    CHECK_THAT(points[0].speed, Catch::Matchers::WithinAbs(100., 1e-5));
+    CHECK_THAT(points[1].speed, Catch::Matchers::WithinAbs(70., 1e-5));
+    CHECK_THAT(points[2].speed, Catch::Matchers::WithinAbs(70., 1e-5));
+    CHECK_THAT(points[3].speed, Catch::Matchers::WithinAbs(100., 1e-5));
+    CHECK_THAT(points[1].overlap, Catch::Matchers::WithinAbs(0.83, 1e-5));
+}
+
+TEST_CASE("Shrinkage slowdown recognizes tessellated straight runs and preserves slower limits", "[ExtrusionProcessor][ShrinkageSlowdown]")
+{
+    std::vector<ProcessedPoint> points;
+    for (int i = 0; i <= 10; ++i)
+        points.push_back({Point3::new_scale(5. * i, 0., 0.), i == 5 ? 10.f : 25.f, 1.f});
+    REQUIRE(apply_shrinkage_slowdown(points, 0.7, 20., 40., 0.));
+    REQUIRE(points.size() == 11);
+    for (size_t i = 0; i + 1 < points.size(); ++i)
+        CHECK_THAT(points[i].speed, Catch::Matchers::WithinAbs(i == 5 ? 10. : 20., 1e-5));
+}
+
+TEST_CASE("Shrinkage slowdown preserves unaffected paths and disabled settings", "[ExtrusionProcessor][ShrinkageSlowdown]")
+{
+    std::vector<ProcessedPoint> points{{Point3(0, 0, 0), 100.f, 1.f},
+        {Point3::new_scale(20., 0., 0.), 100.f, 1.f}};
+    CHECK_FALSE(apply_shrinkage_slowdown(points, 0.7, 20., 40., 3.));
+    CHECK_FALSE(apply_shrinkage_slowdown(points, 1., 20., 10., 3.));
+    CHECK_FALSE(apply_shrinkage_slowdown(points, 0.7, 20., 0., 0.));
+    CHECK(points.size() == 2);
+    CHECK_FALSE(DynamicPrintConfig::full_print_config().opt_bool("shrinkage_slowdown"));
+}
+
+TEST_CASE("Shrinkage slowdown covers both sides of a closed path seam", "[ExtrusionProcessor][ShrinkageSlowdown]")
+{
+    std::vector<ProcessedPoint> points;
+    for (const Point &p : Points{{0, 0}, Point::new_scale(20., 0.), Point::new_scale(20., 20.), Point::new_scale(0., 20.), {0, 0}})
+        points.push_back({Point3(p), 100.f, 1.f});
+    REQUIRE(apply_shrinkage_slowdown(points, 0.7, 20., 0., 3.));
+    CHECK(points.front().p == points.back().p);
+    CHECK_THAT(points.front().speed, Catch::Matchers::WithinAbs(70., 1e-5));
+    CHECK_THAT(points[points.size() - 2].speed, Catch::Matchers::WithinAbs(70., 1e-5));
+}
 
 namespace {
 
@@ -787,4 +837,28 @@ TEST_CASE("Benchmark caged overhang interior sampling", "[ExtrusionProcessor][!b
     {
         return caged_overhang_gcode(wall_generator);
     };
+}
+
+TEST_CASE("Shrinkage slowdown reaches exported wall feed rates", "[ExtrusionProcessor][ShrinkageSlowdown]")
+{
+    DynamicPrintConfig config = multifilament_config(1, {
+        {"layer_height", "0.2"}, {"initial_layer_print_height", "0.2"},
+        {"outer_wall_speed", "100"}, {"slow_down_layers", "1"},
+        {"slow_down_for_layer_cooling", "0"}, {"enable_overhang_speed", "0"},
+        {"filament_max_volumetric_speed", "100"}, {"wall_generator", "classic"},
+        {"shrinkage_slowdown_speed", "70"}, {"shrinkage_slowdown_min_speed", "20"},
+        {"shrinkage_slowdown_long_run", "40"}, {"shrinkage_slowdown_corner_distance", "0"}});
+    auto rates = [&](bool enabled) {
+        config.set_deserialize_strict("shrinkage_slowdown", enabled ? "1" : "0");
+        return outer_wall_feed_rates(slice({make_cube(60., 10., 1.)}, config),
+            [](const GCodeReader &reader, const GCodeReader::GCodeLine &line) {
+                return line.new_Z(reader) > 0.3 && line.dist_XY(reader) > 40.;
+            });
+    };
+    const auto normal = rates(false);
+    const auto slowed = rates(true);
+    REQUIRE_FALSE(normal.empty());
+    REQUIRE_FALSE(slowed.empty());
+    CHECK_THAT(*std::max_element(normal.begin(), normal.end()), Catch::Matchers::WithinAbs(6000., 1.));
+    CHECK_THAT(*std::max_element(slowed.begin(), slowed.end()), Catch::Matchers::WithinAbs(4200., 1.));
 }
