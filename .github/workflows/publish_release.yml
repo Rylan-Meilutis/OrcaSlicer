@@ -1,6 +1,6 @@
 name: Publish release artifacts
 
-# Pulls the platform binaries produced by a successful manually dispatched
+# Pulls the platform binaries produced by a successful push or manually dispatched
 # "Build all" run and uploads them to the matching release. It may also be
 # dispatched manually to retry or publish a deliberately partial build.
 #
@@ -37,7 +37,7 @@ jobs:
     name: Publish binaries to release
     if: >-
       github.event_name == 'workflow_dispatch' ||
-      (github.event.workflow_run.event == 'workflow_dispatch' &&
+      ((github.event.workflow_run.event == 'workflow_dispatch' || github.event.workflow_run.event == 'push') &&
        github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-latest
     timeout-minutes: 240
@@ -64,25 +64,37 @@ jobs:
       - name: Resolve matching release
         if: github.event_name == 'workflow_run'
         env:
-          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           set -euo pipefail
-          short_sha=${HEAD_SHA:0:10}
-          matches=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" | jq -s \
-            --arg branch "$HEAD_BRANCH" --arg sha "$HEAD_SHA" --arg short_sha "$short_sha" \
-            '[.[][] | select(.target_commitish == $branch or .target_commitish == $sha) |
-              select((.body // "") | contains($short_sha))]')
-          count=$(jq 'length' <<< "$matches")
+          # Match immutable source identity, never prose in user-facing notes.
+          tag_list=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" \
+            --jq '.[] | select(.draft) | .tag_name')
+          tags=()
+          if [ -n "$tag_list" ]; then
+            mapfile -t tags <<< "$tag_list"
+          fi
+          matches=()
+          for tag in "${tags[@]}"; do
+            ref=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag")
+            sha=$(jq -r '.object.sha' <<< "$ref")
+            if [ "$(jq -r '.object.type' <<< "$ref")" = 'tag' ]; then
+              sha=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$sha" --jq '.object.sha')
+            fi
+            if [ "$sha" = "$HEAD_SHA" ]; then
+              matches+=("$tag")
+            fi
+          done
+          count=${#matches[@]}
           if [ "$count" -eq 0 ]; then
-            echo "::notice::No release matches $HEAD_BRANCH at $short_sha; nothing to upload."
+            echo "::notice::No draft release matches $HEAD_SHA; nothing to upload."
             exit 0
           fi
           if [ "$count" -ne 1 ]; then
-            echo "::error::$count releases match $HEAD_BRANCH at $short_sha; refusing an ambiguous upload."
+            echo "::error::$count releases match $HEAD_SHA; refusing an ambiguous upload."
             exit 1
           fi
-          tag=$(jq -r '.[0].tag_name' <<< "$matches")
+          tag=${matches[0]}
           echo "TAG=$tag" >> "$GITHUB_ENV"
           echo "Matched release: $tag"
 
