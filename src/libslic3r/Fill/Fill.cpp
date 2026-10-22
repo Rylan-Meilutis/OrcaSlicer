@@ -336,6 +336,9 @@ struct SurfaceFillParams
     // grouped fill so support contact can split it without losing the rule.
     bool arc_one_sided_overhang = false;
 
+    // Do not merge relief-bearing fill with another region's settings.
+    size_t cosmetic_top_region = size_t(-1);
+
 	bool operator<(const SurfaceFillParams &rhs) const {
 #define RETURN_COMPARE_NON_EQUAL(KEY) if (this->KEY < rhs.KEY) return true; if (this->KEY > rhs.KEY) return false;
 #define RETURN_COMPARE_NON_EQUAL_TYPED(TYPE, KEY) if (TYPE(this->KEY) < TYPE(rhs.KEY)) return true; if (TYPE(this->KEY) > TYPE(rhs.KEY)) return false;
@@ -377,6 +380,7 @@ struct SurfaceFillParams
         RETURN_COMPARE_NON_EQUAL(separated_infills);
 		RETURN_COMPARE_NON_EQUAL_TYPED(unsigned, fill_order);
 		RETURN_COMPARE_NON_EQUAL(arc_one_sided_overhang);
+        RETURN_COMPARE_NON_EQUAL(cosmetic_top_region);
 
 		return false;
 	}
@@ -411,7 +415,8 @@ struct SurfaceFillParams
                 this->adaptive_infill_gradient  == rhs.adaptive_infill_gradient  &&
                 this->smooth_factor           == rhs.smooth_factor           &&
                 this->fill_order              == rhs.fill_order              &&
-                this->arc_one_sided_overhang  == rhs.arc_one_sided_overhang;
+                this->arc_one_sided_overhang  == rhs.arc_one_sided_overhang &&
+                this->cosmetic_top_region == rhs.cosmetic_top_region;
 	}
 };
 
@@ -941,6 +946,163 @@ static double projected_bbox_span(const BoundingBox &bbox, const Vec2d &axis)
     return max_projection - min_projection;
 }
 
+// Cosmetic-only relief: keep the load-bearing shell and all walls intact.
+// This is not thermal isolation: the sections remain bonded to the layer below.
+static void apply_cosmetic_top_relief(const Layer &layer, SurfaceFill &fill)
+{
+    if (fill.params.cosmetic_top_region == size_t(-1) || layer.lower_layer == nullptr ||
+        fill.params.bridge || !fill.surface.is_top() || fill.expolygons.empty())
+        return;
+    const PrintRegionConfig &config = layer.regions()[fill.region_id]->region().config();
+    if (config.buried_top_relief.value || config.top_shell_layers.value < 2 || config.cosmetic_top_relief_gap.value <= 0. ||
+        config.cosmetic_top_relief_spacing.value < 2.)
+        return;
+
+    // Read classified fill and completed perimeters, never neighboring fills:
+    // layers generate infill concurrently. Require a continuous solid layer
+    // of the same region beneath the entire top; a nominal shell count alone
+    // does not protect thin roofs, slopes or sparse-supported single skins.
+    ExPolygons solid_below;
+    for (const LayerRegion *lower : layer.lower_layer->regions()) {
+        if (&lower->region() != &layer.regions()[fill.region_id]->region())
+            continue;
+        for (const Surface &surface : lower->fill_surfaces.surfaces)
+            if (surface.surface_type == stInternalSolid || surface.surface_type == stBottom)
+                solid_below.push_back(surface.expolygon);
+        const auto walls = lower->perimeters.flatten();
+        Polygons wall_coverage;
+        for (const ExtrusionEntity *wall : walls.entities)
+            if (wall->role() != erOverhangPerimeter)
+                wall->polygons_covered_by_width(wall_coverage, 0.f);
+        append(solid_below, union_ex(wall_coverage));
+    }
+    if (solid_below.empty())
+        return;
+    solid_below = union_ex(solid_below);
+
+    const coord_t spacing = scale_(config.cosmetic_top_relief_spacing.value);
+    // Rectilinear endpoints almost reach the boundary, whereas concentric
+    // patterns inset them. Reserve a bead width across each groove rather than
+    // assuming every filler contracts its paths by half the spacing.
+    const coord_t gap = scale_(config.cosmetic_top_relief_gap.value + fill.params.flow.width());
+    const coord_t wall_clearance = scale_(config.cosmetic_top_relief_gap.value + 0.5 * fill.params.flow.width());
+    ExPolygons sections;
+    bool changed = false;
+    for (const ExPolygon &island : fill.expolygons) {
+        const BoundingBox box = get_extents(island);
+        // Leave small islands unchanged, including their original overlap.
+        if (box.size().maxCoeff() < 2 * spacing + gap || !diff_ex(ExPolygons{island}, solid_below).empty()) {
+            sections.push_back(island);
+            continue;
+        }
+        Polygons grooves;
+        for (int axis = 0; axis < 2; ++axis) {
+            if (box.size()[axis] < 2 * spacing + gap)
+                continue;
+            for (coord_t p = box.min[axis] + spacing; p + gap / 2 < box.max[axis]; p += spacing) {
+                Point lo = box.min, hi = box.max;
+                lo[axis] = p - gap / 2;
+                hi[axis] = p + gap / 2;
+                grooves.emplace_back(Points{lo, {hi.x(), lo.y()}, hi, {lo.x(), hi.y()}});
+            }
+        }
+        ExPolygons pieces = diff_ex(offset_ex(island, -float(wall_clearance)), grooves);
+        if (pieces.empty()) {
+            sections.push_back(island);
+            continue;
+        }
+        changed = true;
+        append(sections, std::move(pieces));
+    }
+    if (!changed)
+        return;
+    fill.expolygons = std::move(sections);
+    fill.no_overlap_expolygons = intersection_ex(fill.no_overlap_expolygons, fill.expolygons);
+}
+
+// Leave the cosmetic cap untouched. Only internal solid material connected
+// vertically to a nearby top of this region is eligible; never sparse infill,
+// bottom skins or bridge layers. The uncut rim and cap deliberately retain
+// structural connections, so this is stress relief, not free expansion.
+static void apply_buried_top_relief(const Layer &layer, SurfaceFill &fill)
+{
+    if (fill.params.cosmetic_top_region == size_t(-1) || fill.params.bridge ||
+        fill.surface.surface_type != stInternalSolid || fill.expolygons.empty())
+        return;
+    const PrintRegion &region = layer.regions()[fill.region_id]->region();
+    const PrintRegionConfig &config = region.config();
+    if (!config.buried_top_relief.value || config.top_shell_layers.value < 3 ||
+        config.cosmetic_top_relief_gap.value <= 0. || config.cosmetic_top_relief_spacing.value < 2. ||
+        config.buried_top_relief_tooth_pitch.value < 2.)
+        return;
+
+    ExPolygons corridor = fill.expolygons, roofs;
+    for (const Layer *upper = layer.upper_layer; upper != nullptr &&
+         upper->print_z - layer.print_z <= config.buried_top_relief_depth.value + EPSILON; upper = upper->upper_layer) {
+        ExPolygons solid, top;
+        for (const LayerRegion *candidate : upper->regions()) {
+            if (&candidate->region() != &region)
+                continue;
+            for (const Surface &surface : candidate->fill_surfaces.surfaces) {
+                if (surface.is_top())
+                    top.push_back(surface.expolygon);
+                if (surface.is_top() || surface.surface_type == stInternalSolid)
+                    solid.push_back(surface.expolygon);
+            }
+        }
+        append(roofs, intersection_ex(corridor, top));
+        corridor = intersection_ex(corridor, solid);
+        if (corridor.empty())
+            break;
+    }
+    if (roofs.empty())
+        return;
+
+    const coord_t spacing = scale_(config.cosmetic_top_relief_spacing.value);
+    const coord_t pitch = scale_(config.buried_top_relief_tooth_pitch.value);
+    const coord_t amplitude = scale_(0.5 * std::clamp(config.buried_top_relief_tooth_depth.value,
+                                                    0., 0.5 * config.cosmetic_top_relief_spacing.value));
+    const float channel_radius = float(scale_(0.5 * (config.cosmetic_top_relief_gap.value + fill.params.flow.width())));
+    // Include the possible endpoint bead overhang in the protected rim.
+    const float rim = float(scale_(std::max(0.5, config.buried_top_relief_wall_rim.value) + 0.5 * fill.params.flow.width()));
+    const ExPolygons eligible = offset_ex(intersection_ex(fill.expolygons, union_ex(roofs)), -rim);
+    if (eligible.empty())
+        return;
+
+    // Fixed object-space phase keeps the air slots aligned through the buried
+    // stack instead of bonding alternate layers back across the same joint.
+    const BoundingBox object_box = layer.object()->bounding_box();
+    Polygons grooves;
+    for (const ExPolygon &island : eligible) {
+        const BoundingBox box = get_extents(island);
+        for (int axis = 0; axis < 2; ++axis) {
+            if (box.size()[axis] < 2 * spacing)
+                continue;
+            const int along = 1 - axis;
+            const coord_t first = object_box.min[axis] + spacing * coord_t(std::ceil(
+                double(box.min[axis] - amplitude - object_box.min[axis]) / spacing));
+            const coord_t start = object_box.min[along] + (pitch / 2) * coord_t(std::floor(
+                double(box.min[along] - object_box.min[along]) / (pitch / 2))) - pitch;
+            for (coord_t position = first; position <= box.max[axis] + amplitude; position += spacing) {
+                Polyline joint;
+                for (coord_t p = start; p <= box.max[along] + pitch; p += pitch / 2) {
+                    Point point;
+                    const coord_t tooth = (p - object_box.min[along]) / (pitch / 2);
+                    point[axis] = position + (tooth % 2 == 0 ? amplitude : -amplitude);
+                    point[along] = p;
+                    joint.points.push_back(point);
+                }
+                append(grooves, offset(joint, channel_radius, jtRound, scale_(0.02)));
+            }
+        }
+    }
+    if (grooves.empty())
+        return;
+    const ExPolygons slots = intersection_ex(grooves, eligible);
+    fill.expolygons = diff_ex(fill.expolygons, slots);
+    fill.no_overlap_expolygons = diff_ex(fill.no_overlap_expolygons, slots);
+}
+
 std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_param)
 {
     ExPolygons support_below;
@@ -982,6 +1144,9 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
 	        	has_internal_voids = true;
 	        else {
 		        const PrintRegionConfig &region_config = layerm.region().config();
+                params.cosmetic_top_region =
+                    ((surface.is_top() && region_config.cosmetic_top_relief.value && !region_config.buried_top_relief.value) ||
+                     (surface.surface_type == stInternalSolid && region_config.buried_top_relief.value)) ? region_id : size_t(-1);
 		        FlowRole extrusion_role = surface.is_top() ? frTopSolidInfill : (surface.is_solid() ? frSolidInfill : frInfill);
 		        bool     is_bridge 	    = layer.id() > 0 && surface.is_bridge();
 		        params.extruder 	 = layerm.region().extruder(extrusion_role);
@@ -1719,6 +1884,11 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
 		}
 	}
 
+    for (SurfaceFill &fill : surface_fills) {
+        apply_cosmetic_top_relief(layer, fill);
+        apply_buried_top_relief(layer, fill);
+    }
+
 	return surface_fills;
 }
 
@@ -2214,6 +2384,9 @@ void Layer::make_ironing()
 		if (! layerm->slices.empty()) {
 			IroningParams ironing_params;
 			const PrintRegionConfig &config = layerm->region().config();
+            // Ironing would bridge the intentionally open cosmetic grooves.
+            if (config.cosmetic_top_relief.value && !config.buried_top_relief.value)
+                continue;
 			ironing_params.extruder = Layer::choose_ironing_extruder(
 				config,
 				/*spiral_mode=*/this->object()->print()->config().spiral_mode,

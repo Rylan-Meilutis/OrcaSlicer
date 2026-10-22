@@ -52,6 +52,8 @@
 #include "libslic3r/Fill/AdaptiveInfillField.hpp"
 #include "libslic3r/Flow.hpp"
 #include "libslic3r/Format/DRC.hpp"
+#include "libslic3r/Format/bbs_3mf.hpp"
+#include "libslic3r/Preset.hpp"
 #include "libslic3r/TriangleMesh.hpp"
 #include "libslic3r/TriangleMeshSlicer.hpp"
 #include "libslic3r/GCode/ArcCooling.hpp"
@@ -76,6 +78,316 @@
 #include "test_utils.hpp"
 
 using namespace Slic3r;
+
+namespace {
+DynamicPrintConfig cosmetic_relief_config(bool enabled)
+{
+    DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+    config.set_deserialize_strict({
+        {"cosmetic_top_relief", enabled}, {"cosmetic_top_relief_gap", 0.2},
+        {"cosmetic_top_relief_spacing", 10.}, {"layer_height", 0.2},
+        {"initial_layer_print_height", 0.2}, {"wall_loops", 3},
+        {"top_shell_layers", 3}, {"bottom_shell_layers", 3},
+        {"top_shell_thickness", 0.}, {"bottom_shell_thickness", 0.},
+        {"sparse_infill_density", "15%"}, {"top_surface_density", "100%"},
+        {"top_surface_expansion", 0.}, {"only_one_wall_top", false},
+        {"ironing_type", "no ironing"}, {"wall_generator", "classic"}
+    });
+    return config;
+}
+
+std::vector<Points> relief_paths(const ExtrusionEntityCollection &collection)
+{
+    std::vector<Points> paths;
+    for (const Polyline &line : collection.as_polylines())
+        paths.push_back(line.points);
+    return paths;
+}
+}
+
+TEST_CASE("Cosmetic relief changes only supported top infill and leaves open grooves", "[Fill][CosmeticTopRelief]")
+{
+    const char *pattern = GENERATE("monotonic", "monotonicline", "rectilinear", "alignedrectilinear",
+                                   "concentric", "spiralinset", "hilbertcurve", "archimedeanchords", "octagramspiral");
+    const char *generator = GENERATE("classic", "arachne");
+    const bool small_island = GENERATE(false, true);
+    CAPTURE(pattern, generator, small_island);
+    TriangleMesh mesh = make_cube(40., 30., 2.);
+    if (small_island) {
+        TriangleMesh small = make_cube(10., 10., 2.);
+        small.translate(50., 0., 0.);
+        mesh.merge(small);
+    }
+    Print normal, relieved;
+    DynamicPrintConfig config = cosmetic_relief_config(false);
+    config.set_deserialize_strict({{"top_surface_pattern", pattern}, {"wall_generator", generator}});
+    Test::init_and_process_print({mesh}, normal, config);
+    config.set_deserialize_strict({{"cosmetic_top_relief", true}});
+    Test::init_and_process_print({mesh}, relieved, config);
+    const auto &original_layers = normal.objects().front()->layers();
+    const auto &layers = relieved.objects().front()->layers();
+    REQUIRE(layers.size() == original_layers.size());
+    REQUIRE(layers.size() > 1);
+    for (size_t i = 0; i < layers.size(); ++i) {
+        const LayerRegion &a = *original_layers[i]->regions().front();
+        const LayerRegion &b = *layers[i]->regions().front();
+        CHECK(relief_paths(a.perimeters) == relief_paths(b.perimeters));
+        if (i + 1 < layers.size())
+            CHECK(relief_paths(a.fills) == relief_paths(b.fills));
+        else {
+            REQUIRE_FALSE(b.fills.empty());
+            CHECK(relief_paths(a.fills) != relief_paths(b.fills));
+            const ExPolygons covered = union_ex(b.fills.polygons_covered_by_width(10));
+            const BoundingBox box = get_extents(to_expolygons(a.fill_surfaces.surfaces));
+            // Test a narrow strip through the first X groove, including bead
+            // widths, so endpoint joins or gap fill cannot silently close it.
+            const coord_t x = box.min.x() + scale_(10.);
+            const coord_t y0 = box.min.y() + scale_(1.);
+            const coord_t y1 = box.max.y() - scale_(1.);
+            const coord_t half_gap = scale_(0.04);
+            Polygon groove(Points{{x-half_gap,y0}, {x+half_gap,y0}, {x+half_gap,y1}, {x-half_gap,y1}});
+            CHECK(intersection_ex(covered, Polygons{groove}).empty());
+        }
+    }
+}
+
+TEST_CASE("Cosmetic relief leaves small islands and single skins unchanged", "[Fill][CosmeticTopRelief]")
+{
+    const int scenario = GENERATE(0, 1, 2);
+    CAPTURE(scenario);
+    DynamicPrintConfig config = cosmetic_relief_config(false);
+    if (scenario == 0)
+        config.set_deserialize_strict({{"top_shell_layers", 1}});
+    const double width = scenario == 1 ? 10. : 40.;
+    const double height = scenario == 2 ? 0.2 : 2.;
+    Print normal, relieved;
+    Test::init_and_process_print({make_cube(width, width, height)}, normal, config);
+    config.set_deserialize_strict({{"cosmetic_top_relief", true}});
+    Test::init_and_process_print({make_cube(width, width, height)}, relieved, config);
+    const auto &a = normal.objects().front()->layers();
+    const auto &b = relieved.objects().front()->layers();
+    REQUIRE(a.size() == b.size());
+    for (size_t i = 0; i < a.size(); ++i) {
+        CHECK(relief_paths(a[i]->regions().front()->fills) == relief_paths(b[i]->regions().front()->fills));
+        CHECK(relief_paths(a[i]->regions().front()->perimeters) == relief_paths(b[i]->regions().front()->perimeters));
+    }
+}
+
+TEST_CASE("Cosmetic relief edits invalidate infill and can be disabled without changing walls", "[Fill][CosmeticTopRelief]")
+{
+    DynamicPrintConfig config = cosmetic_relief_config(false);
+    CHECK_FALSE(DynamicPrintConfig::full_print_config().opt_bool("cosmetic_top_relief"));
+    Print print;
+    Model model;
+    Test::init_print({make_cube(40., 30., 2.)}, print, model, config);
+    print.process();
+    const auto baseline = relief_paths(print.objects().front()->layers().back()->regions().front()->fills);
+    config.set_deserialize_strict({{"cosmetic_top_relief", true}});
+    print.apply(model, config);
+    CHECK(print.objects().front()->is_step_done(posPerimeters));
+    CHECK_FALSE(print.objects().front()->is_step_done(posInfill));
+    print.process();
+    config.set_deserialize_strict({{"ironing_type", "top"}});
+    print.apply(model, config);
+    print.process();
+    auto top_coverage = [&]() {
+        const auto &fills = print.objects().front()->layers().back()->regions().front()->fills;
+        for (const ExtrusionEntity *entity : fills.flatten().entities)
+            CHECK(entity->role() != erIroning);
+        return area(union_ex(fills.polygons_covered_by_width()));
+    };
+    const double narrow_gap_area = top_coverage();
+    config.set_deserialize_strict({{"cosmetic_top_relief_gap", 0.6}});
+    print.apply(model, config);
+    CHECK(print.objects().front()->is_step_done(posPerimeters));
+    CHECK_FALSE(print.objects().front()->is_step_done(posInfill));
+    print.process();
+    CHECK(top_coverage() < narrow_gap_area);
+    config.set_deserialize_strict({{"cosmetic_top_relief_spacing", 5.}});
+    print.apply(model, config);
+    CHECK_FALSE(print.objects().front()->is_step_done(posInfill));
+    print.process();
+    CHECK(top_coverage() < narrow_gap_area);
+    config.set_deserialize_strict({{"cosmetic_top_relief", false}, {"ironing_type", "no ironing"}});
+    print.apply(model, config);
+    print.process();
+    CHECK(relief_paths(print.objects().front()->layers().back()->regions().front()->fills) == baseline);
+}
+
+TEST_CASE("Cosmetic relief does not cut a thin roof above a bridge", "[Fill][CosmeticTopRelief]")
+{
+    TriangleMesh roof = make_cube(40., 30., 0.4);
+    roof.translate(0., 0., 2.);
+    roof.merge(make_cube(3., 30., 2.));
+    TriangleMesh pillar = make_cube(3., 30., 2.);
+    pillar.translate(37., 0., 0.);
+    roof.merge(pillar);
+    DynamicPrintConfig config = cosmetic_relief_config(false);
+    config.set_deserialize_strict({{"enable_support", false}});
+    Print normal, relieved;
+    Test::init_and_process_print({roof}, normal, config);
+    config.set_deserialize_strict({{"cosmetic_top_relief", true}});
+    Test::init_and_process_print({roof}, relieved, config);
+    const auto &a = normal.objects().front()->layers();
+    const auto &b = relieved.objects().front()->layers();
+    REQUIRE(a.size() == b.size());
+    bool bridge_seen = false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        const LayerRegion &region = *a[i]->regions().front();
+        bridge_seen |= region.fill_surfaces.has(stBottomBridge);
+        CHECK(relief_paths(region.fills) == relief_paths(b[i]->regions().front()->fills));
+        CHECK(relief_paths(region.perimeters) == relief_paths(b[i]->regions().front()->perimeters));
+    }
+    CHECK(bridge_seen);
+}
+
+TEST_CASE("Buried relief sections solid layers without cutting the cosmetic cap or walls", "[Fill][BuriedTopRelief]")
+{
+    const char *generator = GENERATE("classic", "arachne");
+    const char *pattern = GENERATE("monotonicline", "concentric", "archimedeanchords");
+    CAPTURE(generator, pattern);
+    DynamicPrintConfig config = cosmetic_relief_config(false);
+    config.set_deserialize_strict({{"wall_generator", generator}, {"top_surface_pattern", pattern},
+        {"top_shell_layers", 5}, {"buried_top_relief_depth", 0.8},
+        {"buried_top_relief_tooth_depth", 1.}, {"buried_top_relief_tooth_pitch", 4.},
+        {"buried_top_relief_wall_rim", 1.}});
+    Print normal, relieved;
+    Test::init_and_process_print({make_cube(40., 30., 3.)}, normal, config);
+    // Buried mode must override stale cosmetic-only settings, leaving the cap
+    // continuous even when opening a project that previously cut exposed tops.
+    config.set_deserialize_strict({{"buried_top_relief", true}, {"cosmetic_top_relief", true}});
+    Test::init_and_process_print({make_cube(40., 30., 3.)}, relieved, config);
+    const auto &a = normal.objects().front()->layers();
+    const auto &b = relieved.objects().front()->layers();
+    REQUIRE(a.size() == b.size());
+    size_t changed = 0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        const LayerRegion &before = *a[i]->regions().front();
+        const LayerRegion &after = *b[i]->regions().front();
+        CHECK(relief_paths(before.perimeters) == relief_paths(after.perimeters));
+        const bool differs = relief_paths(before.fills) != relief_paths(after.fills);
+        if (differs) {
+            ++changed;
+            CHECK(a.back()->print_z - a[i]->print_z <= 0.8 + EPSILON);
+            CHECK(before.fill_surfaces.has(stInternalSolid));
+            CHECK_FALSE(before.fill_surfaces.has(stTop));
+            CHECK_FALSE(before.fill_surfaces.has(stBottomBridge));
+            CHECK(area(union_ex(after.fills.polygons_covered_by_width())) <
+                  area(union_ex(before.fills.polygons_covered_by_width())));
+        }
+    }
+    CHECK(changed >= 1);
+    CHECK(relief_paths(a.back()->regions().front()->fills) == relief_paths(b.back()->regions().front()->fills));
+    CHECK(relief_paths(a.front()->regions().front()->fills) == relief_paths(b.front()->regions().front()->fills));
+}
+
+TEST_CASE("Buried relief settings reslice and preserve ironing on the smooth cap", "[Fill][BuriedTopRelief]")
+{
+    DynamicPrintConfig config = cosmetic_relief_config(false);
+    config.set_deserialize_strict({{"top_shell_layers", 5}, {"ironing_type", "top"}});
+    CHECK_FALSE(config.opt_bool("buried_top_relief"));
+    Model model;
+    Print print;
+    Test::init_print({make_cube(40., 30., 3.)}, print, model, config);
+    print.process();
+    const auto top = relief_paths(print.objects().front()->layers().back()->regions().front()->fills);
+    size_t ironing = 0;
+    for (const ExtrusionEntity *entity : print.objects().front()->layers().back()->regions().front()->fills.flatten().entities)
+        ironing += entity->role() == erIroning;
+    REQUIRE(ironing > 0);
+    const std::vector<std::pair<std::string, std::string>> changes = {
+        {"buried_top_relief", "1"}, {"buried_top_relief_depth", "0.6"},
+        {"buried_top_relief_tooth_depth", "2"}, {"buried_top_relief_tooth_pitch", "6"},
+        {"buried_top_relief_wall_rim", "1.5"}, {"cosmetic_top_relief_gap", "0.3"},
+        {"cosmetic_top_relief_spacing", "8"}, {"buried_top_relief", "0"}
+    };
+    for (const auto &[key, value] : changes) {
+        CAPTURE(key, value);
+        config.set_deserialize_strict({{key, value}});
+        print.apply(model, config);
+        CHECK(print.objects().front()->is_step_done(posPerimeters));
+        CHECK_FALSE(print.objects().front()->is_step_done(posInfill));
+        print.process();
+        CHECK(relief_paths(print.objects().front()->layers().back()->regions().front()->fills) == top);
+    }
+}
+
+TEST_CASE("Buried relief skips roofs with too few shell layers", "[Fill][BuriedTopRelief]")
+{
+    const int shells = GENERATE(1, 2);
+    DynamicPrintConfig config = cosmetic_relief_config(false);
+    config.set_deserialize_strict({{"top_shell_layers", shells}});
+    Print normal, relieved;
+    Test::init_and_process_print({make_cube(40., 30., 2.)}, normal, config);
+    config.set_deserialize_strict({{"buried_top_relief", true}});
+    Test::init_and_process_print({make_cube(40., 30., 2.)}, relieved, config);
+    const auto &a = normal.objects().front()->layers();
+    const auto &b = relieved.objects().front()->layers();
+    REQUIRE(a.size() == b.size());
+    for (size_t i = 0; i < a.size(); ++i)
+        CHECK(relief_paths(a[i]->regions().front()->fills) == relief_paths(b[i]->regions().front()->fills));
+}
+
+// Manual coverage for user projects, which are not distributed with the tests.
+TEST_CASE("Buried relief in a supplied project preserves visible tops and perimeters", "[Fill][.BuriedReliefProject]")
+{
+    const char *path = std::getenv("ORCA_RELIEF_PROJECT");
+    if (path == nullptr) SKIP("Set ORCA_RELIEF_PROJECT to a 3MF with a broad solid top");
+    ScopedSlic3rTemporaryDir temporary_dir("buried_relief_project");
+    DynamicPrintConfig imported;
+    ConfigSubstitutionContext substitutions{ForwardCompatibilitySubstitutionRule::Enable};
+    PlateDataPtrs plates;
+    std::vector<Preset *> presets;
+    bool is_bbl = false;
+    Semver version;
+    auto model = Model::read_from_file(path, &imported, &substitutions,
+        LoadStrategy::LoadModel | LoadStrategy::LoadConfig | LoadStrategy::AddDefaultInstances,
+        &plates, &presets, &is_bbl, &version);
+    release_PlateData_list(plates);
+    for (Preset *preset : presets) delete preset;
+    auto config = DynamicPrintConfig::full_print_config();
+    config.apply(imported);
+    config.set_deserialize_strict({{"buried_top_relief", false}, {"cosmetic_top_relief", false}});
+    Print normal, relieved;
+    normal.apply(model, config);
+    normal.process();
+    config.set_deserialize_strict({{"buried_top_relief", true}});
+    relieved.apply(model, config);
+    relieved.process();
+    REQUIRE(normal.objects().size() == relieved.objects().size());
+    size_t changed = 0, caps = 0;
+    auto top_paths = [](const ExtrusionEntityCollection &fills) {
+        Polylines paths;
+        for (const ExtrusionEntity *entity : fills.flatten().entities)
+            if (entity->role() == erTopSolidInfill || entity->role() == erIroning)
+                entity->collect_polylines(paths);
+        std::vector<Points> points;
+        for (const Polyline &line : paths) points.push_back(line.points);
+        return points;
+    };
+    for (size_t o = 0; o < normal.objects().size(); ++o) {
+        const auto &a = normal.objects()[o]->layers();
+        const auto &b = relieved.objects()[o]->layers();
+        REQUIRE(a.size() == b.size());
+        for (size_t z = 0; z < a.size(); ++z) {
+            REQUIRE(a[z]->regions().size() == b[z]->regions().size());
+            for (size_t r = 0; r < a[z]->regions().size(); ++r) {
+                CAPTURE(o, z, r);
+                const LayerRegion &before = *a[z]->regions()[r], &after = *b[z]->regions()[r];
+                CHECK(relief_paths(before.perimeters) == relief_paths(after.perimeters));
+                CHECK(top_paths(before.fills) == top_paths(after.fills));
+                caps += !top_paths(before.fills).empty();
+                if (relief_paths(before.fills) != relief_paths(after.fills)) {
+                    CHECK(before.fill_surfaces.has(stInternalSolid));
+                    ++changed;
+                }
+            }
+        }
+    }
+    INFO("Changed buried layer-regions: " << changed << "; preserved top layer-regions: " << caps);
+    CHECK(changed > 0);
+    CHECK(caps > 0);
+}
 
 TEST_CASE("Temperature tower arc bridges retain coherent supported courses", "[Fill][ArcOverhang][Tower]")
 {
@@ -8296,6 +8608,43 @@ static Print &slice_parts(Print &print, DynamicPrintConfig config, const std::ve
     print.apply(model, config);
     print.process();
     return print;
+}
+
+TEST_CASE("Cosmetic relief stays within its opted-in part", "[Fill][CosmeticTopRelief]")
+{
+    DynamicPrintConfig config = cosmetic_relief_config(false);
+    Model model;
+    Print print;
+    Test::init_print({make_cube(40., 30., 2.)}, print, model, config, nullptr, false);
+    model.objects.front()->volumes.front()->config.set_key_value("cosmetic_top_relief", new ConfigOptionBool(true));
+    TriangleMesh second = make_cube(40., 30., 2.);
+    second.translate(50., 0., 0.);
+    model.objects.front()->add_volume(std::move(second), ModelVolumeType::MODEL_PART, false);
+    print.apply(model, config);
+    print.process();
+    const Layer &top = *print.objects().front()->layers().back();
+    size_t treated = 0, unchanged = 0;
+    for (const LayerRegion *region : top.regions()) {
+        if (region->fill_surfaces.empty())
+            continue;
+        const BoundingBox box = get_extents(to_expolygons(region->fill_surfaces.surfaces));
+        const coord_t x = box.min.x() + scale_(10.);
+        const coord_t half_gap = scale_(0.04), margin = scale_(1.);
+        Polygon strip(Points{{x-half_gap, box.min.y()+margin},
+                             {x+half_gap, box.min.y()+margin},
+                             {x+half_gap, box.max.y()-margin},
+                             {x-half_gap, box.max.y()-margin}});
+        const bool empty = intersection_ex(union_ex(region->fills.polygons_covered_by_width()), Polygons{strip}).empty();
+        if (region->region().config().cosmetic_top_relief.value) {
+            ++treated;
+            CHECK(empty);
+        } else {
+            ++unchanged;
+            CHECK_FALSE(empty);
+        }
+    }
+    CHECK(treated == 1);
+    CHECK(unchanged == 1);
 }
 
 // Orca: Two identical cubes in one mesh that never touch, so each is a body of its own.

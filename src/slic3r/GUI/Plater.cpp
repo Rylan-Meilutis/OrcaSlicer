@@ -1520,18 +1520,21 @@ static StaticBox *create_sidebar_section_header(wxWindow *parent, const wxString
     header->SetBackgroundColor2(0xF1F1F1);
     header->SetBorderWidth(0);
     header->SetCornerRadius(0);
-    auto *label = new Label(header, title);
-    auto *icon = new ScalableButton(header, wxID_ANY, icon_name);
+    // A single custom button owns the icon, text and stretch area. Native
+    // static-text hit testing differs between ports and can leave dead space.
+    auto *body = new Button(header, title, icon_name, 0, 16);
+    style_sidebar_section_toggle(body);
+    body->SetFont(Label::Body_14);
+    body->SetCenter(false);
     toggle = new Button(header, wxEmptyString, "expand_btn", 0, 16);
     style_sidebar_section_toggle(toggle);
     toggle->SetToolTip(title);
     auto *row = new wxBoxSizer(wxHORIZONTAL);
-    row->Add(icon, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, parent->FromDIP(SidebarProps::TitlebarMargin()));
-    row->Add(label, 1, wxALIGN_CENTER_VERTICAL | wxLEFT | wxRIGHT, parent->FromDIP(SidebarProps::ElementSpacing()));
+    row->Add(body, 1, wxEXPAND);
     row->Add(toggle, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, parent->FromDIP(SidebarProps::TitlebarMargin()));
     row->SetMinSize(-1, parent->FromDIP(30));
     header->SetSizer(row);
-    icon->Bind(wxEVT_BUTTON, [toggle](wxCommandEvent &) {
+    body->Bind(wxEVT_BUTTON, [toggle](wxCommandEvent &) {
         wxCommandEvent click(wxEVT_BUTTON, toggle->GetId());
         click.SetEventObject(toggle);
         toggle->ProcessWindowEvent(click);
@@ -1548,9 +1551,17 @@ static StaticBox *create_sidebar_section_header(wxWindow *parent, const wxString
     };
     header->Bind(wxEVT_LEFT_DOWN, toggle_section);
     header->Bind(wxEVT_LEFT_DCLICK, toggle_section);
-    label->Bind(wxEVT_LEFT_DOWN, toggle_section);
-    label->Bind(wxEVT_LEFT_DCLICK, toggle_section);
     return header;
+}
+
+static void rescale_sidebar_section_header(Button *toggle)
+{
+    for (wxWindow *child : toggle->GetParent()->GetChildren())
+        if (auto *button = dynamic_cast<Button *>(child)) {
+            button->Rescale();
+            style_sidebar_section_toggle(button);
+            button->SetFont(Label::Body_14);
+        }
 }
 
 // The nozzle rows are set in the small body font their "T1" prefix and diameter readout use, so the
@@ -1663,8 +1674,7 @@ struct ExtruderGroup : StaticBox
         btn_up->msw_rescale();
         btn_down->msw_rescale();
         combo_diameter->Rescale();
-        nozzle_toggle->Rescale();
-        style_sidebar_section_toggle(nozzle_toggle);
+        rescale_sidebar_section_header(nozzle_toggle);
         for (const NozzleRow &row : rows) {
             row.prefix->SetFont(NozzleRow::prefix_font());
             row.diameter_label->SetFont(NozzleRow::diameter_font());
@@ -1679,8 +1689,7 @@ struct ExtruderGroup : StaticBox
     {
         if (hover_label)
             hover_label->sys_color_changed();
-        nozzle_toggle->Rescale();
-        style_sidebar_section_toggle(nozzle_toggle);
+        rescale_sidebar_section_header(nozzle_toggle);
         if (btn_edit)
             btn_edit->SetBackgroundColour(extruder_group_chip_bg());
         for (const NozzleRow &row : rows) {
@@ -4435,7 +4444,7 @@ Sidebar::Sidebar(Plater *parent)
     }
 
     {
-        scrolled_sizer->Add(create_sidebar_section_header(p->scrolled, _L("Project settings"), p->project_settings_toggle, "plate_settings"),
+        scrolled_sizer->Add(create_sidebar_section_header(p->scrolled, _L("Project Settings"), p->project_settings_toggle, "settings"),
                             0, wxEXPAND);
         auto *project_content = new wxPanel(p->scrolled);
         project_content->SetBackgroundColour(StateColor::darkModeColorFor(*wxWHITE));
@@ -6654,8 +6663,7 @@ void Sidebar::msw_rescale()
     p->left_extruder->Rescale();
     p->right_extruder->Rescale();
     p->single_extruder->Rescale();
-    p->project_settings_toggle->Rescale();
-    style_sidebar_section_toggle(p->project_settings_toggle);
+    rescale_sidebar_section_header(p->project_settings_toggle);
 
     //p->btn_sync_printer->SetPaddingSize({FromDIP(6), FromDIP(12)});
     //p->btn_sync_printer->SetMinSize(BTN_SYNC_SIZE);
@@ -6769,8 +6777,7 @@ void Sidebar::sys_color_changed()
     for (ExtruderGroup *ext : {p->left_extruder, p->right_extruder, p->single_extruder})
         if (ext)
             ext->sys_color_changed();
-    p->project_settings_toggle->Rescale();
-    style_sidebar_section_toggle(p->project_settings_toggle);
+    rescale_sidebar_section_header(p->project_settings_toggle);
 
     // call a kill focus event to ensure new colors applied
     for (ComboBox* combo : std::vector<ComboBox*>{p->combo_printer, p->combo_nozzle_dia, p->combo_printer_bed}){

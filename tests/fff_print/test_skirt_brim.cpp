@@ -101,7 +101,29 @@ TEST_CASE("Brim fills the channel left where opposing offset loops meet", "[Skir
     CHECK(unscale<double>(bounds.max.y()) <= width + 0.05);
 }
 
-TEST_CASE("Brim channel fill preserves holes and the plate coordinate offset", "[SkirtBrim][BrimCoverage]")
+TEST_CASE("Adaptive brim courses cover a tapered channel", "[SkirtBrim][BrimCoverage]")
+{
+    Print print;
+    Model model;
+    init_print({cube(20)}, print, model, {
+        {"initial_layer_line_width", 0.45}, {"initial_layer_print_height", 0.2},
+        {"brim_line_overlap", GENERATE(0., 5., 25.)}, {"nozzle_diameter", "0.4"}
+    });
+    const double spacing = print.brim_flow().spacing();
+    const double narrow = 3.4 * spacing, wide = 10.5 * spacing;
+    const Polygon outline({Point::new_scale(0, 0), Point::new_scale(40, 0),
+                           Point::new_scale(40, wide), Point::new_scale(0, narrow)});
+    const auto brim = makeBrimInfillFromPlateCoordinates({ExPolygon(outline)}, print, {});
+    const auto covered = union_(brim.polygons_covered_by_width(float(scale_(0.005))));
+    // The opposing fronts meet at a changing width, not an integral bead count.
+    for (double x = 2.; x <= 38.; x += 0.5) {
+        const double width = narrow + (wide - narrow) * x / 40.;
+        CAPTURE(x, width);
+        CHECK(contains(covered, Point::new_scale(x, width / 2.), false));
+    }
+}
+
+TEST_CASE("Adaptive brim preserves holes and the plate coordinate offset", "[SkirtBrim][BrimCoverage]")
 {
     Print print;
     Model model;
@@ -128,8 +150,9 @@ TEST_CASE("Brim channel fill preserves holes and the plate coordinate offset", "
     Polygons expected = covered;
     for (Polygon &polygon : expected)
         polygon.translate(Point::new_scale(100, 80));
-    CHECK(diff_ex(shifted, expected).empty());
-    CHECK(diff_ex(expected, shifted).empty());
+    // Coverage polygon arc tessellation can round differently after translation.
+    CHECK(diff_ex(shifted, offset(expected, scale_(0.001))).empty());
+    CHECK(diff_ex(expected, offset(shifted, scale_(0.001))).empty());
 }
 
 // Distinct brim regions (combine_brims merges touching brims into one covering >1 object).

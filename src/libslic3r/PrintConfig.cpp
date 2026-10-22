@@ -1891,6 +1891,85 @@ void PrintConfigDef::init_fff_params()
     def->mode = comExpert;
     def->set_default_value(new ConfigOptionFloat(10.));
 
+    def = this->add("cosmetic_top_relief", coBool);
+    def->label = L("Cosmetic top relief (experimental)");
+    def->category = L("Quality");
+    def->tooltip = L("Divides exposed top infill into short sections with visible grooves and a small wall clearance. "
+                     "Walls and underlying solid layers are unchanged. Requires at least two top shell layers and solid support beneath each treated surface; bridges and thin roofs are skipped. "
+                     "Ironing is disabled for this region. May reduce surface strength or sealing; does not guarantee against warping. Validate before printing.");
+    def->mode = comExpert;
+    def->set_default_value(new ConfigOptionBool(false));
+
+    def = this->add("cosmetic_top_relief_gap", coFloat);
+    def->label = L("Relief minimum gap");
+    def->category = L("Quality");
+    def->tooltip = L("Minimum planned clearance between relief sections. Used by both cosmetic top relief and buried zigzag relief. A bead-width allowance keeps line endpoints from closing the grooves. Patterns that inset their paths farther may leave wider grooves. Actual printed clearance depends on extrusion and material behavior.");
+    def->sidetext = L("mm");
+    def->min = 0.1;
+    def->max = 1.;
+    def->mode = comExpert;
+    def->set_default_value(new ConfigOptionFloat(0.2));
+
+    def = this->add("cosmetic_top_relief_spacing", coFloat);
+    def->label = L("Relief section size");
+    def->category = L("Quality");
+    def->tooltip = L("Distance between relief grooves along X and Y. Used by both cosmetic top relief and buried zigzag relief. Smaller sections add grooves and travel moves. Surfaces shorter than two sections in both directions are left unchanged.");
+    def->sidetext = L("mm");
+    def->min = 2.;
+    def->max = 100.;
+    def->mode = comExpert;
+    def->set_default_value(new ConfigOptionFloat(10.));
+
+    def = this->add("buried_top_relief", coBool);
+    def->label = L("Buried zigzag relief with smooth cap (experimental)");
+    def->category = L("Quality");
+    def->tooltip = L("Cuts zigzag slots in internal solid layers beneath exposed tops while leaving the final cosmetic top paths continuous. "
+                     "Preserves walls, bottom surfaces, bridges and a rim around holes and boundaries. Requires at least three top shell layers. "
+                     "Uses Relief minimum gap and Relief section size. Overrides cosmetic top relief if both are enabled. "
+                     "May reduce strength or leave surface depressions; the cap still transfers stress. Validate with a test print.");
+    def->mode = comExpert;
+    def->set_default_value(new ConfigOptionBool(false));
+
+    def = this->add("buried_top_relief_depth", coFloat);
+    def->label = L("Buried relief depth");
+    def->category = L("Quality");
+    def->tooltip = L("Maximum vertical distance below an exposed top to cut internal solid infill. The final surface and bridge layers are never cut. Does not add solid layers.");
+    def->sidetext = L("mm");
+    def->min = 0.2;
+    def->max = 5.;
+    def->mode = comExpert;
+    def->set_default_value(new ConfigOptionFloat(0.8));
+
+    def = this->add("buried_top_relief_tooth_depth", coFloat);
+    def->label = L("Relief tooth depth");
+    def->category = L("Quality");
+    def->tooltip = L("Peak-to-peak width of the zigzag. Limited to half the section size so adjacent joints do not cross. Teeth remain separated by an air gap; they are not bonded interlocks.");
+    def->sidetext = L("mm");
+    def->min = 0.;
+    def->max = 10.;
+    def->mode = comExpert;
+    def->set_default_value(new ConfigOptionFloat(1.));
+
+    def = this->add("buried_top_relief_tooth_pitch", coFloat);
+    def->label = L("Relief tooth pitch");
+    def->category = L("Quality");
+    def->tooltip = L("Distance along a joint between successive zigzag teeth. Joints align through the buried layers and have rounded slot joins.");
+    def->sidetext = L("mm");
+    def->min = 2.;
+    def->max = 20.;
+    def->mode = comExpert;
+    def->set_default_value(new ConfigOptionFloat(4.));
+
+    def = this->add("buried_top_relief_wall_rim", coFloat);
+    def->label = L("Buried relief protective rim");
+    def->category = L("Quality");
+    def->tooltip = L("Uncut solid-infill margin around walls, holes and the projected top boundary. Also preserves material around narrow mounting features. The connected rim retains some shrinkage-stress transfer.");
+    def->sidetext = L("mm");
+    def->min = 0.5;
+    def->max = 5.;
+    def->mode = comExpert;
+    def->set_default_value(new ConfigOptionFloat(1.));
+
     def = this->add("localized_shrinkage_perforation_diameter", coFloat);
     def->label = L("Wall relief pocket diameter");
     def->category = L("Quality");

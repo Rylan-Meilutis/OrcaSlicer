@@ -3001,6 +3001,14 @@ void TabPrint::build()
         optgroup->append_single_option_line("localized_shrinkage_section_spacing");
         optgroup->append_single_option_line("localized_shrinkage_perforation_diameter");
         optgroup->append_single_option_line("localized_shrinkage_perforation_spacing");
+        optgroup->append_single_option_line("cosmetic_top_relief");
+        optgroup->append_single_option_line("buried_top_relief");
+        optgroup->append_single_option_line("cosmetic_top_relief_gap");
+        optgroup->append_single_option_line("cosmetic_top_relief_spacing");
+        optgroup->append_single_option_line("buried_top_relief_depth");
+        optgroup->append_single_option_line("buried_top_relief_tooth_depth");
+        optgroup->append_single_option_line("buried_top_relief_tooth_pitch");
+        optgroup->append_single_option_line("buried_top_relief_wall_rim");
 
         optgroup = page->new_optgroup(L("Bridging"), L"param_bridge");
         optgroup->append_single_option_line("bridge_flow", "quality_settings_bridging#flow-ratio");

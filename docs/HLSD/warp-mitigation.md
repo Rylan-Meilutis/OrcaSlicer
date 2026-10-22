@@ -137,3 +137,49 @@ an explicit action to apply recommendations; opening or closing it changes no se
 Revalidation clears stale messages. Tests cover dimensional consistency, thermal
 and geometric scaling, disconnected contacts, small parts, unknown materials and
 warning/note behavior. They do not establish real-world failure probabilities.
+
+## Cosmetic top relief
+
+`cosmetic_top_relief` is an independent, experimental, opt-in process/region
+setting in Localized shrinkage mitigation. It is never enabled by the thermal
+screening model. Its 0.2 mm gap and 10 mm section defaults describe toolpath
+geometry, not calibrated mechanical performance. It does not alter chamber,
+bed, nozzle or fan targets.
+
+After infill grouping, exposed top infill is inset and divided by X/Y grooves.
+Walls, buried solid infill and bottom surfaces are not cut. Treatment requires
+at least two configured top shell layers and actual non-bridge solid fill or
+wall coverage of the same region immediately underneath. Small surfaces and unsupported skins
+are left unchanged. Region identity is part of top-fill grouping when enabled,
+so a neighboring region cannot inherit the option. Classified lower-layer fill
+and completed perimeters are read without touching concurrently generated infill.
+Ironing is skipped for opted-in regions so it cannot reconnect grooves.
+
+The sections remain vertically bonded to the structural layer below: this is
+not a detached skin and does not eliminate stress transfer. Visible grooves,
+surface-strength and sealing tradeoffs require user validation. Preserving the
+underlying toolpaths does not establish identical part strength or demonstrate
+that a particular lid will stop warping. The disabled default preserves existing
+projects and toolpaths; changing these options invalidates infill and downstream
+operations without regenerating walls.
+
+## Buried zigzag relief
+
+`buried_top_relief` is a separate opt-in mode using the same gap and section-size
+controls. It overrides cosmetic top relief when both are enabled. Only internal
+solid infill connected through solid layers to an exposed top within the selected
+depth is cut. At least three configured top shell layers are required. Bridges,
+bottom surfaces, sparse infill and perimeters are unchanged. A protective rim is
+retained around walls and holes. Small areas that cannot fit sections are skipped.
+
+The channels form an object-aligned zigzag grid, with adjustable tooth depth and
+pitch. The grid stays aligned across buried layers. Channel geometry accounts for
+extrusion width, and is also removed from gap-fill coverage. The final exposed
+top paths remain continuous; ironing remains available. This creates a cosmetic
+cap over the relief rather than open grooves on the visible surface.
+
+The default 0.8 mm relief depth, 1 mm tooth depth, 4 mm tooth pitch and 1 mm rim
+are geometric test values, not calibrated shrinkage compensation. Zigzags do not
+establish preserved strength, and the continuous rim and cap still transfer
+stress. The cap may show depressions over channels. Neither relief mode is
+automatically enabled by risk screening; print validation is required.

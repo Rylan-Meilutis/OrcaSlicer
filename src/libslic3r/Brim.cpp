@@ -38,6 +38,7 @@
 #include "SurfaceCollection.hpp"
 #include "TriangleMesh.hpp"
 #include "VariableWidth.hpp"
+#include "Arachne/WallToolPaths.hpp"
 
 #ifndef NDEBUG
     // #define BRIM_DEBUG_TO_SVG
@@ -866,35 +867,53 @@ static Polylines connect_brim_lines(Polylines &&polylines, const Polygons &brim_
 
     return std::move(polylines);
 }
-//BBS: generate out brim by offseting ExPolygons 'islands_area_ex'
-Polygons tryExPolygonOffset(const ExPolygons& islandAreaEx, const Print& print)
-{
-    Polygons   loops;
-    ExPolygons islands_ex;
-    Flow       flow = print.brim_flow();
-
-    double resolution = 0.0125 / SCALING_FACTOR;
-    islands_ex = islandAreaEx;
-    for (ExPolygon& poly_ex : islands_ex)
-        poly_ex.douglas_peucker(resolution);
-    islands_ex = offset_ex(std::move(islands_ex), -0.5f * float(flow.scaled_spacing()), jtRound, resolution);
-    // Keep the boundary pass (and therefore the object separation) unchanged.
-    // A little extra overlap belongs between brim lines, not at the part-facing
-    // edge. Do not erode farther and then grow back: that opening deletes narrow
-    // necks which the next brim line could still occupy.
-    const float line_step = float(1. - std::clamp(print.config().brim_line_overlap.value, 0., 25.) / 100.) * float(flow.scaled_spacing());
-    while (!islands_ex.empty()) {
-        for (ExPolygon& poly_ex : islands_ex)
-            poly_ex.douglas_peucker(resolution);
-        polygons_append(loops, to_polygons(islands_ex));
-        islands_ex = offset_ex(std::move(islands_ex), -line_step, jtRound, resolution);
-    }
-    return loops;
-}
 static ExtrusionEntityCollection makeBrimInfillImpl(const ExPolygons& singleBrimArea, const Print& print, const Polygons& islands_area, bool apply_plate_offset) {
-    Polygons        loops = tryExPolygonOffset(singleBrimArea, print);
     Flow  flow = print.brim_flow();
+    const coord_t spacing = flow.scaled_spacing();
+    const coord_t step = coord_t((1. - std::clamp(print.config().brim_line_overlap.value, 0., 25.) / 100.) * spacing);
+    if (step <= 0 || singleBrimArea.empty())
+        return {};
+    // Keep the boundary course fixed: adaptive interior widths must not change
+    // the user's part separation. The remaining courses are planned together,
+    // redistributing bead widths where opposing concentric fronts meet instead
+    // of leaving a fractional-course channel to patch with gap fill afterwards.
+    Polygons loops = offset(singleBrimArea, -0.5f * spacing, jtRound, scale_(0.0125));
     loops = union_pt_chained_outside_in(loops);
+
+    const Polygons interior = offset(singleBrimArea, -0.5f * (spacing + step), jtRound, scale_(0.0125));
+    ThickPolylines inner_lines;
+    if (!interior.empty()) {
+        Arachne::WallToolPathsParams params;
+        params.min_bead_width = 0.85f * unscale<float>(step);
+        params.min_feature_size = 0.01f;
+        params.min_length_factor = 0.f;
+        params.wall_maximum_resolution = scale_(0.05);
+        params.wall_maximum_deviation = scale_(0.005);
+        // Brims need coverage through merging fronts and corners, not the long,
+        // shallow width transitions preferred for visible model walls.
+        params.wall_transition_length = 0.1f * flow.width();
+        params.wall_transition_angle = 90.f;
+        params.wall_transition_filter_deviation = 0.01f * flow.width();
+        params.wall_distribution_count = 1;
+        const size_t count = size_t(get_extents(interior).size().maxCoeff() / step) + 1;
+        Arachne::WallToolPaths paths(interior, step, step, count, 0, flow.height(), params);
+        Point last_pos(0, 0);
+        for (const auto &level : paths.getToolPaths())
+            for (const Arachne::ExtrusionLine &line : level) {
+                if (line.empty())
+                    continue;
+                ThickPolyline path = Arachne::to_thick_polyline(line);
+                // Arachne plans spacing, while variable_width converts it to
+                // physical bead width. Restore the requested between-line
+                // overlap without moving the fixed boundary course.
+                for (coordf_t &width : path.width)
+                    width += spacing - step;
+                if (line.is_closed)
+                    path.start_at_index(last_pos.nearest_point_index(path.points));
+                last_pos = path.last_point();
+                inner_lines.emplace_back(std::move(path));
+            }
+    }
 
     std::vector<Polylines> loops_pl_by_levels;
     {
@@ -921,31 +940,23 @@ static ExtrusionEntityCollection makeBrimInfillImpl(const ExPolygons& singleBrim
     optimize_polylines_by_reversing(&all_loops);
     all_loops = connect_brim_lines(std::move(all_loops), offset(singleBrimArea, float(SCALED_EPSILON)), float(flow.scaled_spacing()) * 2.f);
 
-    // Opposing offsets can leave a channel too narrow for another closed loop.
-    // Fill only the uncovered interior, never the part-facing boundary or its
-    // separation gap. Variable width avoids over-extruding a full bead into it.
-    const float spacing = float(flow.scaled_spacing());
-    const float min_gap = 0.35f * spacing;
-    ExPolygons gaps = diff_ex(offset_ex(singleBrimArea, -0.5f * spacing), offset(all_loops, 0.5f * spacing));
-    gaps = opening_ex(gaps, 0.5f * min_gap);
-    ThickPolylines gap_lines;
-    for (ExPolygon &gap : gaps) {
-        gap.douglas_peucker(scale_(0.0125));
-        gap.medial_axis(min_gap, 2.f * spacing, &gap_lines);
-    }
-
+    extrusion_entities_append_loops_and_paths(brim.entities, std::move(all_loops), erBrim, float(flow.mm3_per_mm()), float(flow.width()), float(print.skirt_first_layer_height()));
+    variable_width(inner_lines, erBrim, flow, brim.entities);
     if (apply_plate_offset) {
         //BBS: finally apply the plate offset which may very large
         auto plate_offset = print.get_plate_origin();
         Point scaled_plate_offset = Point(scaled(plate_offset.x()), scaled(plate_offset.y()));
-        for (Polyline &line : all_loops)
-            line.translate(scaled_plate_offset);
-        for (ThickPolyline &line : gap_lines)
-            line.translate(scaled_plate_offset);
+        // Subdivide variable-width paths in local coordinates before translating,
+        // so integer rounding does not depend on the plate origin.
+        for (ExtrusionEntity *entity : brim.entities) {
+            if (auto *path = dynamic_cast<ExtrusionPath *>(entity))
+                path->polyline.translate(Point3(scaled_plate_offset));
+            else if (auto *loop = dynamic_cast<ExtrusionLoop *>(entity))
+                for (ExtrusionPath &path : loop->paths)
+                    path.polyline.translate(Point3(scaled_plate_offset));
+        }
     }
 
-    extrusion_entities_append_loops_and_paths(brim.entities, std::move(all_loops), erBrim, float(flow.mm3_per_mm()), float(flow.width()), float(print.skirt_first_layer_height()));
-    variable_width(gap_lines, erBrim, flow, brim.entities);
     return brim;
 }
 
