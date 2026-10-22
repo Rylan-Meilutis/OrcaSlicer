@@ -47,9 +47,63 @@
 #include "libslic3r/Config.hpp"
 #include "libslic3r/ExtrusionEntity.hpp"
 #include "libslic3r/TriangleMesh.hpp"
+#include "libslic3r/Format/bbs_3mf.hpp"
+#include "libslic3r/Preset.hpp"
+#include "libslic3r/Semver.hpp"
+#include "libslic3r/SVG.hpp"
+#include "test_utils.hpp"
+#include <cstdlib>
 
 using namespace Slic3r::Test;
 using namespace Slic3r;
+
+TEST_CASE("Outer brims in a supplied project stay outside solid footprints and cutouts", "[SkirtBrim][.BrimProject]")
+{
+    const char *path = std::getenv("ORCA_BRIM_PROJECT");
+    if (!path) SKIP("Set ORCA_BRIM_PROJECT to a saved 3MF");
+    ScopedSlic3rTemporaryDir temporary_dir("brim_project");
+    DynamicPrintConfig imported;
+    ConfigSubstitutionContext substitutions{ForwardCompatibilitySubstitutionRule::Enable};
+    PlateDataPtrs plates;
+    std::vector<Preset *> presets;
+    bool is_bbl = false;
+    Semver version;
+    auto model = Model::read_from_file(path, &imported, &substitutions,
+        LoadStrategy::LoadModel | LoadStrategy::LoadConfig | LoadStrategy::AddDefaultInstances,
+        &plates, &presets, &is_bbl, &version);
+    release_PlateData_list(plates);
+    for (Preset *preset : presets) delete preset;
+    auto config = DynamicPrintConfig::full_print_config();
+    config.apply(imported);
+    config.set_deserialize_strict({{"brim_type", "outer_only"}, {"brim_width", 2.}});
+    Print print;
+    print.apply(model, config);
+    print.process();
+    ExPolygons footprints;
+    for (const PrintObject *object : print.objects()) {
+        for (const PrintInstance &instance : object->instances()) {
+            auto slices = object->layers().front()->lslices;
+            for (auto &slice : slices) slice.translate(instance.shift_without_plate_offset());
+            append(footprints, slices);
+        }
+    }
+    Polylines lines;
+    for (const auto &group : print.skirt_brim_groups())
+        for (const auto &brim : group.brims)
+            append(lines, brim.brim.as_polylines());
+    REQUIRE_FALSE(lines.empty());
+    if (const char *svg_path = std::getenv("ORCA_BRIM_SVG")) {
+        SVG svg(svg_path, get_extents(footprints));
+        svg.draw(footprints, "#cccccc");
+        svg.draw(lines, "red", scale_(0.15));
+    }
+    CHECK(intersection_pl(lines, offset_ex(footprints, -scale_(0.3))).empty());
+    for (const ExPolygon &footprint : footprints)
+        for (Polygon hole : footprint.holes) {
+            hole.make_counter_clockwise();
+            CHECK(intersection_pl(lines, Polygons{hole}).empty());
+        }
+}
 
 TEST_CASE("Brim overlap increases between lines without moving the boundary pass", "[SkirtBrim]")
 {
@@ -74,6 +128,105 @@ TEST_CASE("Brim overlap increases between lines without moving the boundary pass
     const double spacing = print.brim_flow().spacing();
     CHECK_THAT(lower_edges[0], Catch::Matchers::WithinAbs(0.5 * spacing, 0.002));
     CHECK_THAT(lower_edges[1] - lower_edges[0], Catch::Matchers::WithinAbs((1. - overlap / 100.) * spacing, 0.002));
+}
+
+TEST_CASE("An outer brim does not leave detached patches in a neighboring object's hole", "[SkirtBrim][BrimOwnership]")
+{
+    auto config = DynamicPrintConfig::full_print_config();
+    config.set_deserialize_strict({{"brim_type", "outer_only"}, {"brim_width", 20.},
+        {"brim_object_gap", 0.2}, {"skirt_loops", 0}, {"layer_height", 0.2},
+        {"initial_layer_print_height", 0.2}, {"combine_brims", GENERATE(false, true)}});
+    TriangleMesh source = make_cube(10., 10., 1.);
+    source.translate(80., 90., 0.);
+    TriangleMesh neighbor = make_cube(30., 30., 1.);
+    neighbor.translate(92., 80., 0.);
+    Print print;
+    Model model;
+    std::vector<TriangleMesh> meshes{std::move(source), std::move(neighbor)};
+    init_print(std::move(meshes), print, model, config, nullptr, false);
+    TriangleMesh cutout = make_cube(10., 10., 1.);
+    cutout.translate(96., 90., 0.);
+    model.objects[1]->add_volume(std::move(cutout), ModelVolumeType::NEGATIVE_VOLUME, false);
+    model.objects[1]->config.set_key_value("brim_width", new ConfigOptionFloat(2.));
+    print.apply(model, config);
+    print.process();
+    const Polygon hole({Point::new_scale(96.5, 90.5), Point::new_scale(105.5, 90.5),
+                        Point::new_scale(105.5, 99.5), Point::new_scale(96.5, 99.5)});
+    size_t paths = 0;
+    for (const auto &group : print.skirt_brim_groups())
+        for (const auto &brim : group.brims) {
+            const auto lines = brim.brim.as_polylines();
+            paths += lines.size();
+            CHECK(intersection_pl(lines, Polygons{hole}).empty());
+        }
+    REQUIRE(paths > 0);
+}
+
+TEST_CASE("Compensated multi-material footprints do not grow outer brims from embedded islands", "[SkirtBrim][BrimOwnership]")
+{
+    auto config = multifilament_config(2, {
+        {"brim_type", "outer_only"}, {"brim_width", 8.}, {"brim_object_gap", 0.2},
+        {"brim_use_efc_outline", true}, {"elefant_foot_compensation", 0.25},
+        {"elefant_foot_compensation_layers", 1}, {"skirt_loops", 0},
+        {"layer_height", 0.2}, {"initial_layer_print_height", 0.2}
+    });
+    // A nearly touching material inset is connected in the merged footprint.
+    // Closing each region separately leaves it as an apparent outer island.
+    TriangleMesh host = make_cube(10., 30., 1.);
+    auto add_bar = [&host](double x, double y, double w, double h) {
+        auto bar = make_cube(w, h, 1.);
+        bar.translate(x, y, 0.);
+        host.merge(bar);
+    };
+    add_bar(20., 0., 20., 30.);
+    add_bar(10., 0., 10., 10.);
+    add_bar(10., 20., 10., 10.);
+    Print print;
+    Model model;
+    std::vector<TriangleMesh> meshes{std::move(host)};
+    init_print(std::move(meshes), print, model, config, nullptr, false);
+    const double gap = 0.00002;
+    auto inset = make_cube(10. - 2. * gap, 10. - 2. * gap, 1.);
+    inset.translate(10. + gap, 10. + gap, 0.);
+    auto *volume = model.objects.front()->add_volume(std::move(inset), ModelVolumeType::MODEL_PART, false);
+    volume->config.set_key_value("extruder", new ConfigOptionInt(2));
+    auto cutout = make_cube(6., 10., 1.);
+    cutout.translate(22., 10., 0.);
+    model.objects.front()->add_volume(std::move(cutout), ModelVolumeType::NEGATIVE_VOLUME, false);
+    print.apply(model, config);
+    print.process();
+    const Polygon hole({Point::new_scale(22.5, 10.5), Point::new_scale(27.5, 10.5),
+                        Point::new_scale(27.5, 19.5), Point::new_scale(22.5, 19.5)});
+    REQUIRE_FALSE(print.skirt_brim_groups().empty());
+    for (const auto &group : print.skirt_brim_groups())
+        for (const auto &brim : group.brims)
+            CHECK(intersection_pl(brim.brim.as_polylines(), Polygons{hole}).empty());
+}
+
+TEST_CASE("A separate part inside a cutout keeps its own outer brim", "[SkirtBrim][BrimOwnership]")
+{
+    auto config = DynamicPrintConfig::full_print_config();
+    config.set_deserialize_strict({{"brim_type", "outer_only"}, {"brim_width", 2.},
+        {"brim_object_gap", 0.2}, {"skirt_loops", 0}, {"layer_height", 0.2},
+        {"initial_layer_print_height", 0.2}});
+    auto inset = make_cube(5., 5., 1.);
+    inset.translate(12., 12., 0.);
+    Print print;
+    Model model;
+    std::vector<TriangleMesh> meshes{make_cube(30., 30., 1.), std::move(inset)};
+    init_print(std::move(meshes), print, model, config, nullptr, false);
+    auto cutout = make_cube(20., 20., 1.);
+    cutout.translate(5., 5., 0.);
+    model.objects.front()->add_volume(std::move(cutout), ModelVolumeType::NEGATIVE_VOLUME, false);
+    print.apply(model, config);
+    print.process();
+    Polygons covered;
+    for (const auto &group : print.skirt_brim_groups())
+        for (const auto &brim : group.brims)
+            append(covered, brim.brim.polygons_covered_by_width());
+    covered = union_(covered);
+    CHECK(contains(covered, Point::new_scale(11., 14.), false));
+    CHECK_FALSE(contains(covered, Point::new_scale(7., 14.), false));
 }
 
 TEST_CASE("Brim fills the channel left where opposing offset loops meet", "[SkirtBrim][BrimCoverage]")

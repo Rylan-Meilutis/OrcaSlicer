@@ -36,6 +36,7 @@
 #include "ExtrusionEntityCollection.hpp"
 #include "MultiMaterialSegmentation.hpp"
 #include "SurfaceCollection.hpp"
+#include "Surface.hpp"
 #include "TriangleMesh.hpp"
 #include "VariableWidth.hpp"
 #include "Arachne/WallToolPaths.hpp"
@@ -138,8 +139,11 @@ static ExPolygons get_print_object_bottom_layer_expolygons(const PrintObject &pr
 {
     ExPolygons ex_polygons;
     for (LayerRegion *region : print_object.layers().front()->regions())
-        Slic3r::append(ex_polygons, closing_ex(region->slices.surfaces, float(SCALED_EPSILON)));
-    return ex_polygons;
+        Slic3r::append(ex_polygons, to_expolygons(region->slices.surfaces));
+    // Close numerical cracks across material boundaries as well as within each
+    // region. Otherwise embedded lettering may become an apparent outer island
+    // whose brim reaches into a nearby cutout after the solid is subtracted.
+    return closing_ex(ex_polygons, float(SCALED_EPSILON));
 }
 //BBS adhesion coefficients from print object class
 double getadhesionCoeff(const PrintObject* printObject)
@@ -519,7 +523,7 @@ static ExPolygons outer_inner_brim_area(const Print& print,
     for (const auto& objectWithExtruder : objPrintVec)
         brimToWrite.insert({ objectWithExtruder.first, {true,true} });
 
-    ExPolygons objectIslands;
+    std::map<ObjectInstanceID, ExPolygons> objectIslands;
     for (unsigned int extruderNo : printExtruders) {
         ++extruderNo;
         for (const auto& objectWithExtruder : objPrintVec) {
@@ -658,7 +662,7 @@ static ExPolygons outer_inner_brim_area(const Print& print,
                         append_and_translate(brim_area_object, instance, instance_idx, brimAreaMap);
                     append_and_translate(no_brim_area, no_brim_area_object, instance);
                     append_and_translate(holes, holes_object, instance);
-                    append_and_translate(objectIslands, objectIsland, instance);
+                    append_and_translate(objectIsland, instance, instance_idx, objectIslands);
 
                 }
                 for (const auto& [key, areas] : brimAreaMap)
@@ -743,31 +747,19 @@ static ExPolygons outer_inner_brim_area(const Print& print,
 
     brim_area.clear();
     for (const PrintObject* object : print.objects()) {
-        // BBS: brim should be contacted to at least one object's island or brim area
+        // Clipping against other objects can strand a fragment inside their
+        // holes. Proximity to that other object does not anchor the source brim.
         for (auto map_it = brimAreaMap.begin(); map_it != brimAreaMap.end(); ++map_it) {
             if (map_it->first.object_id != object->id())
                 continue;
 
-            // find other objects' brim area
-            ExPolygons otherExPolys;
-            for (const auto& [other_key, other_areas] : brimAreaMap)
-                if (other_key != map_it->first)
-                    expolygons_append(otherExPolys, other_areas);
-
             auto tempArea = map_it->second;
             map_it->second.clear();
 
-            for (int ia = 0; ia != tempArea.size(); ++ia) {
-                // find this object's other brim area
-                ExPolygons otherExPoly;
-                for (int iao = 0; iao != tempArea.size(); ++iao)
-                    if (iao != ia) otherExPoly.push_back(tempArea[iao]);
-
-                auto offsetedTa = offset_ex(tempArea[ia], print.brim_flow().scaled_spacing() * 2, jtRound, SCALED_RESOLUTION);
-                if (!intersection_ex(offsetedTa, objectIslands).empty() ||
-                    !intersection_ex(offsetedTa, otherExPoly).empty() ||
-                    !intersection_ex(offsetedTa, otherExPolys).empty())
-                    map_it->second.push_back(tempArea[ia]);
+            for (const ExPolygon &area : tempArea) {
+                auto expanded = offset_ex(area, print.brim_flow().scaled_spacing() * 2, jtRound, SCALED_RESOLUTION);
+                if (!intersection_ex(expanded, objectIslands.at(map_it->first)).empty())
+                    map_it->second.push_back(area);
             }
             expolygons_append(brim_area, map_it->second);
         }
