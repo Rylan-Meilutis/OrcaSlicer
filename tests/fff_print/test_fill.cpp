@@ -2,6 +2,8 @@
 #include <catch2/matchers/catch_matchers_string.hpp>
 #include <exception>
 #include "libslic3r/ArcFitter.hpp"
+#include "libslic3r/Config.hpp"
+#include "libslic3r/Semver.hpp"
 #include "libslic3r/Exception.hpp"
 #include "libslic3r/Fill/FillProgress.hpp"
 #include "libslic3r/PrintBase.hpp"

@@ -39,6 +39,7 @@
 #include "TriangleMesh.hpp"
 #include "VariableWidth.hpp"
 #include "Arachne/WallToolPaths.hpp"
+#include "Arachne/utils/ExtrusionLine.hpp"
 
 #ifndef NDEBUG
     // #define BRIM_DEBUG_TO_SVG
