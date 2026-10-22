@@ -17,6 +17,7 @@
 #include "libslic3r/GCodeReader.hpp"
 #include "libslic3r/Layer.hpp"
 #include "libslic3r/ClipperUtils.hpp"
+#include "libslic3r/ConnectedBodies.hpp"
 #include "libslic3r/Format/bbs_3mf.hpp"
 #include "libslic3r/Preset.hpp"
 #include "libslic3r/PresetBundle.hpp"
@@ -385,14 +386,18 @@ TEST_CASE("A supplied valid rooting project gains buried material without warnin
     config.apply(imported_config);
     config.set_deserialize_strict("rooting", "0");
     config.set_deserialize_strict("rooting_xy", "0");
-    Print baseline, rooted;
+    Print baseline, rooted, native;
     baseline.apply(model, config);
+    auto native_config = config;
+    native_config.set_deserialize_strict("interlocking_beam", "0");
+    native.apply(model, native_config);
     config.set_deserialize_strict("rooting", "1");
     rooted.apply(model, config);
     REQUIRE(rooted.objects().size() == baseline.objects().size());
     double added_area = 0.;
     for (size_t object = 0; object < rooted.objects().size(); ++object) {
         baseline.get_object(object)->slice();
+        native.get_object(object)->slice();
         rooted.get_object(object)->slice();
         const auto warnings = rooted.get_object(object)->step_state_with_warnings(posSlice).warnings;
         CAPTURE(object, rooted.get_object(object)->model_object()->name);
@@ -402,6 +407,29 @@ TEST_CASE("A supplied valid rooting project gains buried material without warnin
         CHECK(warnings.empty());
         const auto &before = baseline.objects()[object]->layers();
         const auto &after = rooted.objects()[object]->layers();
+        for (unsigned tool = 1; tool <= config.option<ConfigOptionStrings>("filament_type")->values.size(); ++tool) {
+            std::vector<ExPolygons> beam_material(before.size()), native_material(before.size());
+            std::vector<const ExPolygons *> layers;
+            for (size_t z = 0; z < before.size(); ++z) {
+                for (const auto *region : before[z]->regions())
+                    if (region->region().extruder(frExternalPerimeter) == tool)
+                        append(beam_material[z], to_expolygons(region->slices.surfaces));
+                for (const auto *region : native.get_object(object)->get_layer(z)->regions())
+                    if (region->region().extruder(frExternalPerimeter) == tool)
+                        append(native_material[z], to_expolygons(region->slices.surfaces));
+                beam_material[z] = union_ex(beam_material[z]);
+                layers.push_back(&beam_material[z]);
+            }
+            size_t count = 0;
+            const auto bodies = connected_bodies(layers, count);
+            std::vector<bool> anchored(count, false);
+            for (size_t z = 0; z < before.size(); ++z)
+                for (size_t i = 0; i < beam_material[z].size(); ++i)
+                    if (!intersection_ex(ExPolygons{beam_material[z][i]}, native_material[z]).empty())
+                        anchored[bodies[z][i]] = true;
+            CAPTURE(tool, count);
+            CHECK(std::count(anchored.begin(), anchored.end(), false) == 0);
+        }
         REQUIRE(before.size() == after.size());
         for (size_t z = 0; z < after.size(); ++z) {
             ExPolygons old_all, new_all;
@@ -1024,6 +1052,70 @@ TEST_CASE("Rooting reaches emitted toolpaths below the original interface", "[Mu
         if (move.type == EMoveType::Extrude && move.extruder_id == 1)
             preview_lowest = std::min(preview_lowest, double(move.position.z()));
     CHECK_THAT(preview_lowest, Catch::Matchers::WithinAbs(lowest_upper_material, 0.001));
+}
+
+TEST_CASE("Beam interlocking keeps each material connected to its native body", "[Multifilament][InterlockingConnectivity]")
+{
+    const double width = GENERATE(1.2, 4., 12.);
+    const int avoidance = GENERATE(0, 2);
+    CAPTURE(width, avoidance);
+    auto config = multifilament_config(2, {
+        {"filament_type", "ASA;TPU"}, {"rooting", false}, {"rooting_xy", false},
+        {"interlocking_beam", false}, {"interlocking_beam_width", 0.8},
+        {"interlocking_depth", 4}, {"interlocking_boundary_avoidance", avoidance},
+        {"interlocking_orientation", 22.}, {"interlocking_beam_layer_count", 2},
+        {"layer_height", 0.2}, {"initial_layer_print_height", 0.2},
+        {"elefant_foot_compensation", 0.}, {"enable_prime_tower", false}});
+    Print baseline, interlocked;
+    Model model;
+    init_print({make_cube(24., 24., 8.)}, baseline, model, config);
+    auto upper = make_cube(width, width, 2.);
+    upper.translate(6., 6., 8.);
+    model.objects.front()->volumes.front()->config.set("extruder", 1);
+    model.objects.front()->add_volume(upper)->config.set("extruder", 2);
+    baseline.apply(model, config);
+    baseline.get_object(0)->slice();
+    config.set_deserialize_strict("interlocking_beam", "1");
+    interlocked.apply(model, config);
+    interlocked.get_object(0)->slice();
+    const auto &before = baseline.get_object(0)->layers();
+    const auto &after = interlocked.get_object(0)->layers();
+    REQUIRE(before.size() == after.size());
+    for (unsigned tool : {1u, 2u}) {
+        std::vector<ExPolygons> material(after.size());
+        std::vector<const ExPolygons *> layers;
+        for (size_t z = 0; z < after.size(); ++z) {
+            for (const auto *region : after[z]->regions())
+                if (region->region().extruder(frExternalPerimeter) == tool)
+                    append(material[z], to_expolygons(region->slices.surfaces));
+            material[z] = union_ex(material[z]);
+            layers.push_back(&material[z]);
+        }
+        size_t count = 0;
+        const auto bodies = connected_bodies(layers, count);
+        std::vector<bool> anchored(count, false);
+        for (size_t z = 0; z < before.size(); ++z) {
+            ExPolygons original;
+            for (const auto *region : before[z]->regions())
+                if (region->region().extruder(frExternalPerimeter) == tool)
+                    append(original, to_expolygons(region->slices.surfaces));
+            for (size_t i = 0; i < material[z].size(); ++i)
+                if (!intersection_ex(ExPolygons{material[z][i]}, original).empty())
+                    anchored[bodies[z][i]] = true;
+        }
+        CHECK(count > 0);
+        CHECK(std::count(anchored.begin(), anchored.end(), false) == 0);
+    }
+    for (size_t z = 0; z < after.size(); ++z) {
+        ExPolygons native, generated;
+        for (const auto *region : before[z]->regions())
+            append(native, to_expolygons(region->slices.surfaces));
+        for (const auto *region : after[z]->regions())
+            append(generated, to_expolygons(region->slices.surfaces));
+        // Clipping/rotation can leave sub-micron rounding slivers, not holes.
+        CHECK(offset_ex(diff_ex(native, generated), -scaled(0.001)).empty());
+        CHECK(offset_ex(diff_ex(generated, native), -scaled(0.001)).empty());
+    }
 }
 
 TEST_CASE("Shallow roots attach below beam interlocking without replacing its courses", "[Multifilament][Rooting][Interlocking]")

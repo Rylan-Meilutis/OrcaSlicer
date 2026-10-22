@@ -11,6 +11,7 @@
 #include "libslic3r/Surface.hpp"
 #include "libslic3r/ExPolygon.hpp"
 #include "libslic3r/ClipperUtils.hpp"
+#include "libslic3r/ConnectedBodies.hpp"
 #include "Layer.hpp"
 #include <functional>
 #include <cstddef>
@@ -63,6 +64,13 @@ void InterlockingGenerator::generate_interlocking_structure(PrintObject* print_o
     const coord_t cell_width = beam_width + beam_width;
     const Vec3crd cell_size(cell_width, cell_width, 2 * beam_layer_count);
 
+    // Keep original ownership so rejected beam islands can be restored, not
+    // deleted from the part. Thin-area expansion also changes this ownership.
+    std::vector<std::vector<ExPolygons>> original(print_object->num_printing_regions());
+    for (size_t r = 0; r < original.size(); ++r)
+        for (const Layer *layer : print_object->layers())
+            original[r].push_back(to_expolygons(layer->get_region(r)->slices.surfaces));
+
     for (size_t region_a_index = 0; region_a_index < print_object->num_printing_regions(); region_a_index++) {
         const PrintRegion& region_a      = print_object->printing_region(region_a_index);
         const auto         extruder_nr_a = region_a.extruder(FlowRole::frExternalPerimeter);
@@ -79,6 +87,57 @@ void InterlockingGenerator::generate_interlocking_structure(PrintObject* print_o
             InterlockingGenerator gen(*print_object, region_a_index, region_b_index, beam_width, boundary_avoidance, rotation, cell_size, beam_layer_count,
                                       interface_dilation, air_dilation, air_filtering, throw_on_cancel);
             gen.generateInterlockingStructure();
+        }
+    }
+
+    // A clipped beam may form a stack entirely inside the other material.
+    // Follow connectivity through all layers: a beam need not reach its own
+    // material on every course, but its body must reach it somewhere. Combine
+    // regions using the same extruder, including modifier-created regions.
+    std::vector<ExPolygons> rejected(print_object->layer_count());
+    std::unordered_set<unsigned int> checked_tools;
+    for (size_t r = 0; r < original.size(); ++r) {
+        const auto tool = print_object->printing_region(r).extruder(frExternalPerimeter);
+        if (!checked_tools.insert(tool).second)
+            continue;
+        std::vector<ExPolygons> native(rejected.size()), generated(rejected.size());
+        for (size_t other = 0; other < original.size(); ++other) {
+            if (print_object->printing_region(other).extruder(frExternalPerimeter) != tool)
+                continue;
+            for (size_t z = 0; z < rejected.size(); ++z) {
+                append(native[z], original[other][z]);
+                append(generated[z], to_expolygons(print_object->get_layer(z)->get_region(other)->slices.surfaces));
+            }
+        }
+        std::vector<const ExPolygons *> layers;
+        for (auto &polygons : generated) {
+            throw_on_cancel();
+            polygons = union_ex(polygons);
+            layers.push_back(&polygons);
+        }
+        size_t count = 0;
+        const auto bodies = connected_bodies(layers, count, throw_on_cancel);
+        std::vector<bool> anchored(count, false);
+        for (size_t z = 0; z < generated.size(); ++z) {
+            throw_on_cancel();
+            for (size_t i = 0; i < generated[z].size(); ++i)
+                if (!anchored[bodies[z][i]] && !intersection_ex(ExPolygons{generated[z][i]}, native[z]).empty())
+                    anchored[bodies[z][i]] = true;
+        }
+        for (size_t z = 0; z < generated.size(); ++z)
+            for (size_t i = 0; i < generated[z].size(); ++i)
+                if (!anchored[bodies[z][i]])
+                    rejected[z].push_back(std::move(generated[z][i]));
+    }
+    for (size_t z = 0; z < rejected.size(); ++z) {
+        if (rejected[z].empty())
+            continue;
+        throw_on_cancel();
+        rejected[z] = union_ex(rejected[z]);
+        for (size_t r = 0; r < original.size(); ++r) {
+            auto &slices = print_object->get_layer(z)->get_region(r)->slices;
+            slices.set(union_ex(diff_ex(to_expolygons(slices.surfaces), rejected[z]),
+                                intersection_ex(original[r][z], rejected[z])), stInternal);
         }
     }
 }
