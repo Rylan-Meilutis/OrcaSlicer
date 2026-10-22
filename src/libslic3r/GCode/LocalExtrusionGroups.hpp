@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../BoundingBox.hpp"
+#include "../ExtrusionEntity.hpp"
 #include "../ExtrusionEntityCollection.hpp"
 #include <algorithm>
 #include <cstddef>

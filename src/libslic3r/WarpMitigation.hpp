@@ -1,6 +1,9 @@
 #pragma once
 
 #include "Model.hpp"
+#include "ObjectID.hpp"
+#include "TriangleMesh.hpp"
+#include "libslic3r.h"
 #include "Config.hpp"
 #include "Point.hpp"
 #include "PrintConfig.hpp"

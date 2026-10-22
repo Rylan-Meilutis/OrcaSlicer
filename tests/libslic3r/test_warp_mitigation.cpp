@@ -4,6 +4,7 @@
 #include <catch2/generators/catch_generators.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 #include "libslic3r/Config.hpp"
+#include "libslic3r/libslic3r.h"
 #include "libslic3r/PrintConfig.hpp"
 #include "libslic3r/Semver.hpp"
 #include "libslic3r/TriangleMesh.hpp"

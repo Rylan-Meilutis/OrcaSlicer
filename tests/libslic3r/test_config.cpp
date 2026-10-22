@@ -2464,7 +2464,8 @@ TEST_CASE("Custom G-code placeholder lists are keyed by option keys", "[Config]"
 
     // Multiline text options that aren't custom G-code; add any new one that isn't G-code here.
     const std::set<std::string> not_gcode = { "notes", "filament_notes", "printer_notes", "post_process",
-                                              "adaptive_pressure_advance_model", "small_area_infill_flow_compensation_model" };
+                                              "adaptive_pressure_advance_model", "small_area_infill_flow_compensation_model",
+                                              "sequential_print_gantry_geometry" };
     size_t gcode_options = 0;
     for (const auto &[key, def] : print_config_def.options) {
         if (!def.multiline || not_gcode.count(key) > 0)

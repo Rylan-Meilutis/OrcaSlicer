@@ -1,4 +1,5 @@
 #include "NotificationManager.hpp"
+#include <wx/app.h>
 
 #include "HintNotification.hpp"
 #include "SlicingProgressNotification.hpp"

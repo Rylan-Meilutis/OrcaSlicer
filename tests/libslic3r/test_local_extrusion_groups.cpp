@@ -1,5 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include "libslic3r/GCode/LocalExtrusionGroups.hpp"
+#include "libslic3r/ExtrusionEntity.hpp"
+#include "libslic3r/ExtrusionEntityCollection.hpp"
 #include "libslic3r/BoundingBox.hpp"
 #include "libslic3r/Point.hpp"
 #include <cstddef>

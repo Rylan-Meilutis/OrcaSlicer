@@ -8,6 +8,8 @@
 #include <cassert>
 #include <cstdlib>
 #include <memory>
+#include <map>
+#include <set>
 #include <mutex>
 #include <math.h>
 #include <cmath>
