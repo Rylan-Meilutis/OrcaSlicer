@@ -151,16 +151,59 @@ Automatic mitigation defaults off. When enabled, or explicitly applied in Others
 elevated base-bow potential selects a continuous outer brim and overhang/curled-
 perimeter slowdown. Suggested brim width is a bounded policy of twice estimated
 bow, limited to 3–10 mm; it is not a solved adhesive width. Larger existing brims
-and inner coverage remain. Separation gap is capped at 0.1 mm. Rafts, belt-printer
-adhesion and explicit object overrides are preserved. Temperatures, fan settings
-and material strength are not changed. Automatic changes affect the effective
-slicing configuration, not saved presets.
+and inner coverage remain. Painted ears are unioned into automatic continuous
+coverage, and automatic mouse-ear mode is retained. Separation gap is left as
+configured. Brim width remains editable in Auto and painted-plus-mitigation
+modes; automatic brim generation treats it as a minimum. Rafts, belt-printer
+adhesion and explicit object overrides are preserved. Temperatures
+and structural geometry are not changed. Cooling always follows the filament
+profile. The material-aware cooling assistant in Filament → Cooling is an explicit
+profile edit, not an effective slicing override. It selects a compatible system
+preset of the exact material type, preferring the inherited preset, then the same
+filament product, then a generic material preset. Printer-specific presets win
+over all-printer references at equal priority. No arbitrary other brand is used.
+Cooling fan limits, feature fans, first-layer ramps and layer-time controls come
+from that resolved reference. Variant fan values match by nozzle-variant name,
+not array position. Only the selected variant's fan values and shared cooling
+settings are edited; unused variants are untouched and do not disqualify a
+reference. A missing selected-variant match leaves the entire edit unapplied.
+
+ABS, ASA and PC use a conservative no-ordinary-part-cooling policy while retaining
+the reference's bridge/overhang/interface settings. Filled materials and blends
+retain their own exact material reference's policy. First-layer part cooling is
+zero; auxiliary cooling is zero for those three materials or when the printer
+does not declare an auxiliary fan. Temperatures, exhaust/filtration, flow and all
+other presets are untouched. Users review the visible edits and save through the
+normal preset workflow; clicking the assistant does not enable a persistent
+override. Missing material/printer references require manual configuration.
+
+The low-cooling policy follows the [Prusa cooling guidance](https://help.prusa3d.com/article/cooling_127569)
+and large-print guidance in the [Prusament ASA datasheet](https://prusament.com/wp-content/uploads/2022/10/ASA_Prusament_TDS_2022_16_EN.pdf).
+It is not a calibrated airflow model or a simulated stress reduction. PWM is
+hardware-dependent, which is why other material recommendations reuse compatible
+presets rather than a universal percentage table. Cooling edits may affect
+surface quality and require validation for the actual filament.
+
+During G-code generation, Auto mode also limits first-layer ASA model walls and
+solid fill on elevated objects to 75% of the applicable configured first-layer
+speed. Lower speed limits still apply. The screen is cached once per export;
+small objects below the geometry-based threshold, non-ASA material, later layers,
+raft-supported objects, belt printers, supports, skirts and prime structures are
+excluded. No path, extrusion amount, temperature or saved speed is changed.
+This is a separate first-layer adhesion precaution based on
+[Prusa first-layer troubleshooting](https://help.prusa3d.com/article/first-layer-issues_1804),
+not a force-model result or a measured adhesion margin. It addresses deposition
+of exposed first-layer features, including lettering, independently of later
+cap-contraction loads.
 
 An unmitigated elevated estimate produces a warning. Adequate continuous brim or
 raft produces an informational note, not a warning or certification of safety.
 The note only confirms mitigation and asks the user to validate changes before
 printing. The Others page opens the detailed assessment in a modal dialog, with
-an explicit action to apply recommendations; opening or closing it changes no settings.
+an explicit action to apply process recommendations; opening or closing it changes no settings.
+The one-click process action does not edit filament presets or enable the
+automatic option. The modal directs users with elevated ASA contacts to the
+filament editor for explicit cooling edits and saving.
 Revalidation clears stale messages. Tests cover dimensional consistency, thermal
 and geometric scaling, disconnected contacts, small parts, unknown materials and
 warning/note behavior. They do not establish real-world failure probabilities.

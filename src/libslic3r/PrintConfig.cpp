@@ -1820,7 +1820,8 @@ void PrintConfigDef::init_fff_params()
     def = this->add("automatic_warp_mitigation", coBool);
     def->label = L("Automatic warp and curl mitigation");
     def->category = L("Quality");
-    def->tooltip = L("Estimate thermal base bow from connected contact geometry, solid base thickness and print temperatures using published material properties. When the estimate exceeds one layer, apply a continuous outer brim and curled-overhang slowdown. Unknown materials are not assumed safe and do not trigger automatic changes. This reduced-order model cannot predict bed detachment or measure actual deformation. Existing inner brims, rafts, belt-printer adhesion and object overrides are preserved. Temperatures and cooling are not changed.");
+    // xgettext:no-c-format, no-boost-format
+    def->tooltip = L("Estimate thermal base bow from connected contact geometry, solid base thickness and print temperatures using published material properties. When the estimate exceeds one layer, apply a continuous outer brim and curled-overhang slowdown. Cooling follows the filament profile; review ASA cooling recommendations in the filament editor. On affected ASA objects, limit first-layer model extrusion on the bed to 75% of the configured first-layer speed as an adhesion precaution. Unknown materials are not assumed safe and do not trigger automatic changes. This reduced-order model cannot predict bed detachment or measure actual deformation. Existing inner brims, rafts, belt-printer adhesion and object overrides are preserved. Temperatures and structural geometry are not changed.");
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionBool(false));
 
@@ -2685,7 +2686,7 @@ void PrintConfigDef::init_fff_params()
     def = this->add("brim_width", coFloat);
     def->label = L("Brim width");
     def->category = L("Support");
-    def->tooltip = L("This is the distance from the model to the outermost brim line.");
+    def->tooltip = L("This is the distance from the model to the outermost brim line. In Auto mode this is the minimum width; automatic calculations may increase it. Automatic warp mitigation also preserves larger configured widths and added painted ears.");
     def->sidetext = L("mm");	// millimeters, CIS languages need translation
     def->min = 0;
     def->max = 100;

@@ -30,6 +30,7 @@ struct WarpRisk {
     std::set<std::string> resin_screened_materials;
     std::set<std::string> family_screened_materials;
     std::set<ObjectID> elevated_objects;
+    std::set<size_t> asa_cooling_slots;
     double span_mm = 0.;
     double free_contraction_mm = 0.;
     double free_bow_mm = 0.;
@@ -225,8 +226,11 @@ inline WarpRisk assess_warp_risk(const DynamicPrintConfig &config, const Model &
             for (const auto &[span, thickness] : sections) {
                 WarpRisk section;
                 assess_thermal_strip(section, *material, span, thickness, bed, ambient, deposition);
-                if (section.free_bow_mm > layer)
+                if (section.free_bow_mm > layer) {
                     risk.elevated_objects.insert(object->id());
+                    if (types->values[slot] == "ASA")
+                        risk.asa_cooling_slots.insert(slot);
+                }
                 risk.span_mm = std::max(risk.span_mm, section.span_mm);
                 risk.free_contraction_mm = std::max(risk.free_contraction_mm, section.free_contraction_mm);
                 risk.restrained_energy_j_m2 = std::max(risk.restrained_energy_j_m2, section.restrained_energy_j_m2);
@@ -244,20 +248,18 @@ inline WarpRisk assess_warp_risk(const DynamicPrintConfig &config, const Model &
 inline void apply_warp_mitigations(DynamicPrintConfig &config, const WarpRisk &risk)
 {
     if (!risk.elevated()) return;
-    // Do not alter temperature, cooling, geometry, or material strength settings.
-    // An opted-in continuous brim replaces sparse ears/painted coverage; the
-    // painting itself stays in the model and is restored by selecting that mode.
+    // Do not alter temperatures or structural geometry.
+    // Add continuous coverage without discarding painted ears (Brim.cpp unions
+    // them into the automatic brim). Preserve explicit automatic-ear placement.
     const auto *raft = config.option<ConfigOptionInt>("raft_layers");
     const auto *belt = config.option<ConfigOptionBool>("belt_printer");
     const auto *brim = config.option<ConfigOptionEnum<BrimType>>("brim_type");
     if ((!raft || raft->value == 0) && (!belt || !belt->value) && brim) {
         config.set_key_value("brim_type", new ConfigOptionEnum<BrimType>(
+            brim->value == btEar ? btEar :
             brim->value == btInnerOnly || brim->value == btOuterAndInner ? btOuterAndInner : btOuterOnly));
         const auto *width = config.option<ConfigOptionFloat>("brim_width");
         config.set_key_value("brim_width", new ConfigOptionFloat(std::max(width ? width->value : 0., risk.brim_mm())));
-        const auto *gap = config.option<ConfigOptionFloat>("brim_object_gap");
-        if (gap && gap->value > 0.1)
-            config.set_key_value("brim_object_gap", new ConfigOptionFloat(0.1));
     }
     for (const char *key : {"enable_overhang_speed", "slowdown_for_curled_perimeters"}) {
         if (auto *value = config.option<ConfigOptionBoolsNullable>(key))

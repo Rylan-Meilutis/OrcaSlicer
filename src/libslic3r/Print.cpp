@@ -1930,9 +1930,11 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
                 if (warp_risk.elevated_objects.count(object->model_object()->id()) == 0)
                     return false;
                 const auto &cfg = object->config();
+                const bool retained_ears = m_config.automatic_warp_mitigation && cfg.brim_type.value == btEar;
                 return cfg.raft_layers.value == 0 &&
-                    ((cfg.brim_type.value != btOuterOnly && cfg.brim_type.value != btOuterAndInner) ||
-                     cfg.brim_width.value < warp_risk.brim_mm() || cfg.brim_object_gap.value > 0.1);
+                    ((cfg.brim_type.value != btOuterOnly && cfg.brim_type.value != btOuterAndInner && !retained_ears) ||
+                     cfg.brim_width.value < warp_risk.brim_mm() ||
+                     (!m_config.automatic_warp_mitigation && cfg.brim_object_gap.value > 0.1));
             });
         if (sparse_adhesion && !m_config.belt_printer.value)
             warn(L("The geometry and temperature model estimates potential base bow greater than one layer, with limited continuous bed adhesion. In Others, review Warp and curl risk and its assumptions. A continuous brim is a precaution; bed detachment cannot be predicted without plate-bond data."),

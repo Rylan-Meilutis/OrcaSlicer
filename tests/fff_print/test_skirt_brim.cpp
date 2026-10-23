@@ -593,6 +593,58 @@ TEST_CASE("Outer-only brim ears stay out of model holes", "[SkirtBrim]")
     }
 }
 
+TEST_CASE("Auto brim respects a user minimum wider than the model", "[SkirtBrim]")
+{
+    auto config = multifilament_config(1, {{"brim_type", "auto_brim"},
+        {"brim_width", 25.}, {"skirt_loops", 0}});
+    Print print;
+    Model model;
+    init_print({cube(10)}, print, model, config);
+    print.process();
+    Polylines paths;
+    for (const auto &group : print.skirt_brim_groups())
+        for (const auto &brim : group.brims)
+            append(paths, brim.brim.as_polylines());
+    REQUIRE_FALSE(paths.empty());
+    CHECK(unscale<double>(get_extents(paths).size().x()) > 58.);
+}
+
+TEST_CASE("Automatic warp brims retain added painted ears and larger manual widths", "[SkirtBrim][WarpMitigation]")
+{
+    auto config = multifilament_config(1, {
+        {"filament_type", "ASA"}, {"automatic_warp_mitigation", true},
+        {"brim_type", "painted"}, {"brim_width", 0.}, {"brim_object_gap", 0.25},
+        {"skirt_loops", 0}});
+    Print print;
+    Model model;
+    init_print({make_cube(80., 70., 1.)}, print, model, config);
+    print.process();
+    const auto bounds = [](const Print &p) {
+        Polylines paths;
+        for (const auto &group : p.skirt_brim_groups())
+            for (const auto &brim : group.brims)
+                append(paths, brim.brim.as_polylines());
+        return get_extents(paths);
+    };
+    const auto original = bounds(print);
+    REQUIRE(original.defined);
+    auto *object = model.objects.front();
+    const auto box = object->raw_mesh_bounding_box();
+    object->brim_points.emplace_back(Vec3f(float(box.max.x()), float(box.max.y()), float(box.min.z() - 0.0001)), 20.f);
+    print.apply(model, config);
+    print.process();
+    const auto painted = bounds(print);
+    CHECK(painted.size().x() > original.size().x());
+    CHECK(painted.size().y() > original.size().y());
+    CHECK(object->brim_points.size() == 1);
+    CHECK_THAT(print.objects().front()->config().brim_object_gap.value, Catch::Matchers::WithinAbs(0.25, 1e-6));
+    config.set_deserialize_strict("brim_width", "25");
+    print.apply(model, config);
+    print.process();
+    CHECK(bounds(print).size().x() > painted.size().x());
+    CHECK_THAT(print.objects().front()->config().brim_width.value, Catch::Matchers::WithinAbs(25., 1e-6));
+}
+
 TEST_CASE("Painted brim radius and brush shape control sliced size", "[SkirtBrim]")
 {
     constexpr double ear_radius = 10.0;

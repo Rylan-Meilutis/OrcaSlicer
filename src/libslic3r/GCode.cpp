@@ -33,6 +33,7 @@
 #include "PrintBase.hpp"
 #include "ConnectedBodies.hpp"
 #include "PrintConfig.hpp"
+#include "WarpMitigation.hpp"
 #include "enum_bitmask.hpp"
 #include "libslic3r.h"
 #include "I18N.hpp"
@@ -3351,6 +3352,9 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
     PROFILE_FUNC();
 
     m_print = &print;
+    m_warp_first_layer_objects.clear();
+    if (print.config().automatic_warp_mitigation && !print.config().belt_printer)
+        m_warp_first_layer_objects = assess_warp_risk(print.full_print_config(), print.model()).elevated_objects;
     m_timelapse_pos_picker.init(&print,m_writer.get_xy_offset().cast<coord_t>());
     {
         // Runs the costly per-layer snapshot picker only for a template that names its results.
@@ -11230,6 +11234,20 @@ std::string GCode::_extrude(const ExtrusionPath &input_path, const std::string &
                                                      (double) (_layer - m_config.raft_layers) / m_config.slow_down_layers));
             }
         }
+    }
+    // First-layer adhesion is separate from later thermal bow. Prusa's
+    // first-layer troubleshooting guidance recommends 75% speed. Apply that
+    // precaution only to opted-in, geometry-screened ASA model extrusion on
+    // the bed; never alter support, prime structures, rafts or later layers.
+    // This is not a calibrated adhesion margin or residual-stress prediction.
+    if (path_on_first_layer && m_config.raft_layers == 0 && m_layer != nullptr &&
+        FILAMENT_CONFIG(filament_type) == "ASA" &&
+        (is_perimeter(path.role()) || path.role() == erBottomSurface || path.role() == erSolidInfill) &&
+        m_warp_first_layer_objects.count(m_layer->object()->model_object()->id()) != 0) {
+        const double first_layer_speed = is_perimeter(path.role()) ?
+            NOZZLE_CONFIG(initial_layer_speed) : NOZZLE_CONFIG(initial_layer_infill_speed);
+        if (first_layer_speed > 0.)
+            speed = std::min(speed, 0.75 * first_layer_speed);
     }
     // Override skirt speed if set
     if (path.role() == erSkirt) {

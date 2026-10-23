@@ -183,7 +183,7 @@ TEST_CASE("Bed lift mitigation replaces painted-only adhesion with a continuous 
     apply_warp_mitigations(config, risk);
     CHECK(config.option<ConfigOptionEnum<BrimType>>("brim_type")->value == btOuterOnly);
     CHECK_THAT(config.opt_float("brim_width"), WithinAbs(10., 1e-6));
-    CHECK_THAT(config.opt_float("brim_object_gap"), WithinAbs(0.1, 1e-6));
+    CHECK_THAT(config.opt_float("brim_object_gap"), WithinAbs(0.2, 1e-6));
     const auto applied = config;
     apply_warp_mitigations(config, risk);
     CHECK(config.diff(applied).empty());
@@ -222,6 +222,63 @@ TEST_CASE("Absent warp risk leaves settings untouched", "[WarpMitigation]")
     CHECK_FALSE(assess_warp_risk(config, empty).elevated());
 }
 
+TEST_CASE("Automatic mitigation respects saved filament cooling", "[WarpMitigation]")
+{
+    auto config = DynamicPrintConfig::full_print_config();
+    config.set_key_value("filament_type", new ConfigOptionStrings({"ASA", "TPU", "ASA"}));
+    // Compact legacy vectors broadcast their first element. Expand before
+    // changing slot zero so unrelated materials do not inherit its new value.
+    config.set_key_value("reduce_fan_stop_start_freq", new ConfigOptionBools({true}));
+    const auto original = config;
+    WarpRisk risk;
+    risk.free_bow_mm = 1.;
+    risk.asa_cooling_slots.insert(0);
+    apply_warp_mitigations(config, risk);
+    const auto *always_on = config.option<ConfigOptionBools>("reduce_fan_stop_start_freq");
+    REQUIRE(always_on->values.size() == 1);
+    CHECK(always_on->get_at(0));
+    CHECK(always_on->get_at(1));
+    CHECK(always_on->get_at(2));
+    for (const char *key : {"fan_min_speed", "fan_max_speed"}) {
+        const auto *value = config.option<ConfigOptionFloats>(key);
+        CHECK_THAT(value->get_at(0), WithinAbs(original.option<ConfigOptionFloats>(key)->get_at(0), 1e-9));
+        CHECK_THAT(value->get_at(1), WithinAbs(original.option<ConfigOptionFloats>(key)->get_at(1), 1e-9));
+        CHECK_THAT(value->get_at(2), WithinAbs(original.option<ConfigOptionFloats>(key)->get_at(2), 1e-9));
+    }
+    CHECK(config.opt_serialize("additional_cooling_fan_speed") == original.opt_serialize("additional_cooling_fan_speed"));
+    for (const char *key : {"fan_cooling_layer_time", "slow_down_for_layer_cooling", "slow_down_layer_time",
+             "overhang_fan_speed", "internal_bridge_fan_speed", "initial_layer_fan_speed",
+             "support_material_interface_fan_speed", "arc_overhang_cooling", "during_print_exhaust_fan_speed",
+             "top_shell_layers", "bottom_shell_layers", "wall_loops", "sparse_infill_density"})
+        CHECK(config.opt_serialize(key) == original.opt_serialize(key));
+    const auto applied = config;
+    apply_warp_mitigations(config, risk);
+    CHECK(config.diff(applied).empty());
+}
+
+TEST_CASE("ASA cooling mitigation requires an elevated assigned contact", "[WarpMitigation]")
+{
+    auto config = DynamicPrintConfig::full_print_config();
+    config.set_key_value("filament_type", new ConfigOptionStrings({"ASA", "ASA"}));
+    config.set_key_value("reduce_fan_stop_start_freq", new ConfigOptionBools({true, true}));
+    config.set_key_value("chamber_temperature", new ConfigOptionInts({50, 50}));
+    config.set_deserialize_strict("curr_bed_type", "Textured PEI Plate");
+    config.set_key_value("textured_plate_temp", new ConfigOptionInts({110, 110}));
+    config.set_key_value("layer_height", new ConfigOptionFloat(0.2));
+    const double size = GENERATE(1., 80.);
+    Model model;
+    auto *object = model.add_object();
+    object->add_volume(make_cube(size, size, 2.))->config.set_key_value("extruder", new ConfigOptionInt(1));
+    object->add_instance();
+    const auto risk = assess_warp_risk(config, model);
+    CHECK((risk.asa_cooling_slots.count(0) == 1) == (size == 80.));
+    CHECK(risk.asa_cooling_slots.count(1) == 0);
+    apply_warp_mitigations(config, risk);
+    const auto *always_on = config.option<ConfigOptionBools>("reduce_fan_stop_start_freq");
+    CHECK(always_on->get_at(0));
+    CHECK(always_on->get_at(1));
+}
+
 TEST_CASE("Warp screening follows model and feature material assignments", "[WarpMitigation]")
 {
     auto config = DynamicPrintConfig::full_print_config();
@@ -248,7 +305,7 @@ TEST_CASE("A supplied bed-lift project receives an adhesion recommendation", "[W
 {
     // Opt-in local regression: do not ship private project geometry in the suite.
     const char *path = std::getenv("ORCA_WARP_REGRESSION_3MF");
-    REQUIRE(path != nullptr);
+    if (path == nullptr) SKIP("Set ORCA_WARP_REGRESSION_3MF to a local project");
     ScopedSlic3rTemporaryDir backup{"orca_warp_regression"};
     boost::filesystem::create_directories(boost::filesystem::path(backup.string()) / "Metadata");
     Model model;
@@ -270,8 +327,9 @@ TEST_CASE("A supplied bed-lift project receives an adhesion recommendation", "[W
     const auto risk = assess_warp_risk(config, model);
     REQUIRE(risk.elevated());
     INFO("Recommended brim width: " << risk.brim_mm());
+    const double original_gap = config.opt_float("brim_object_gap");
     apply_warp_mitigations(config, risk);
     CHECK(config.option<ConfigOptionEnum<BrimType>>("brim_type")->value == btOuterOnly);
     CHECK(config.opt_float("brim_width") >= risk.brim_mm());
-    CHECK(config.opt_float("brim_object_gap") <= 0.1);
+    CHECK_THAT(config.opt_float("brim_object_gap"), WithinAbs(original_gap, 1e-6));
 }

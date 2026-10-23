@@ -954,6 +954,7 @@ protected:
     bool m_silent_time_estimator_enabled;
 
     Print *m_print{nullptr};
+    std::set<ObjectID> m_warp_first_layer_objects;
 
     std::vector<const PrintObject*> m_printed_objects;
 

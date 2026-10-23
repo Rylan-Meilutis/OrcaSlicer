@@ -1110,13 +1110,15 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, in
     // so brim type / width / object gap all apply.  A belt printer with no tilt is
     // geometrically a flat bed and uses the ordinary plate brim, hence the separate
     // is_belt_tilted test.
-    bool have_brim = config->opt_enum<BrimType>("brim_type") != btNoBrim;
+    const auto *warp_mitigation = config->option<ConfigOptionBool>("automatic_warp_mitigation");
+    bool have_brim = config->opt_enum<BrimType>("brim_type") != btNoBrim ||
+                     (warp_mitigation && warp_mitigation->value);
     toggle_field("brim_object_gap", have_brim);
     // Both are first-layer-only concepts that the belt path cannot honour.
     toggle_field("brim_use_efc_outline", have_brim && !is_belt_tilted);
     toggle_field("combine_brims", have_brim && !is_belt_tilted);
-    bool have_brim_width = have_brim && config->opt_enum<BrimType>("brim_type") != btAutoBrim &&
-                           config->opt_enum<BrimType>("brim_type") != btPainted;
+    bool have_brim_width = have_brim && (config->opt_enum<BrimType>("brim_type") != btPainted ||
+                                       (warp_mitigation && warp_mitigation->value));
     // On a tilted belt Auto / Mouse ear / Painted all collapse to outer-only at the
     // configured width, so the width field has to stay live for them too.
     toggle_field("brim_width", have_brim_width || (have_brim && is_belt_tilted));

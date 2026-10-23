@@ -538,6 +538,8 @@ static ExPolygons outer_inner_brim_area(const Print& print,
             bool               has_brim_auto = object->config().brim_type == btAutoBrim;
             const bool         use_auto_brim_ears = object->config().brim_type == btEar;
             const bool         use_brim_ears = object->config().brim_type == btPainted;
+            const ExPolygons extra_ears = print.config().automatic_warp_mitigation && !use_brim_ears ?
+                make_brim_ears(object) : ExPolygons{};
             const bool         use_inner_brim_ears = (use_auto_brim_ears || use_brim_ears) && !object->config().brim_ears_outer_only.value;
             const bool         has_inner_brim = brim_type == btInnerOnly || brim_type == btOuterAndInner || use_inner_brim_ears;
             // btLeadingEdgeOnly is a belt-printer mode; on a flat bed there is no leading
@@ -609,6 +611,8 @@ static ExPolygons outer_inner_brim_area(const Print& print,
                             if (has_brim_auto) {
                                 BoundingBox bbox2 = ex_poly.contour.bounding_box();
                                 brim_width_mod = std::min(brim_width_mod, float(std::max(bbox2.size()(0), bbox2.size()(1))));
+                                // Limit only the heuristic, never a deliberately larger user width.
+                                brim_width_mod = std::max(brim_width_mod, float(scale_(object->config().brim_width.value)));
                             }
                             brim_width_mod = floor(brim_width_mod / scaled_flow_width / 2) * scaled_flow_width * 2;
 
@@ -628,6 +632,10 @@ static ExPolygons outer_inner_brim_area(const Print& print,
                                 }else {
                                     outerExpoly = offset_ex(innerExpoly, brim_width_mod, jtRound, SCALED_RESOLUTION);
                                 }
+                                // Auto mitigation may promote painted mode to continuous coverage.
+                                // The user's extra anchors must still contribute to that coverage.
+                                if (!extra_ears.empty())
+                                    outerExpoly = union_ex(outerExpoly, extra_ears);
                                 append(brim_area_object, diff_ex(outerExpoly, innerExpoly));
                             }
                             if (has_inner_brim) {

@@ -38,6 +38,38 @@ using namespace Slic3r;
 using Catch::Matchers::WithinAbs;
 using Catch::Matchers::WithinRel;
 
+// Opt-in research export; private G-code is not distributed with the test suite.
+TEST_CASE("A supplied G-code exposes finite nonnegative deposition timing", "[GCodeTiming][.ThermalHistory]")
+{
+    const char *input = std::getenv("ORCA_THERMAL_GCODE");
+    const char *output = std::getenv("ORCA_THERMAL_TIMELINE");
+    if (input == nullptr || output == nullptr)
+        SKIP("Set ORCA_THERMAL_GCODE and ORCA_THERMAL_TIMELINE for the local timing export");
+    const auto previous_resources = resources_dir();
+    set_resources_dir(std::string(TEST_DATA_DIR) + "/../../resources");
+    const ScopeGuard restore_resources([&] { set_resources_dir(previous_resources); });
+    GCodeProcessor processor;
+    processor.process_file(input);
+    const auto &result = processor.get_result();
+    REQUIRE_FALSE(result.moves.empty());
+    std::ofstream stream(output);
+    REQUIRE(stream.is_open());
+    stream << "gcode_line,duration_s\n" << std::setprecision(9);
+    double duration = 0.;
+    for (const auto &move : result.moves) {
+        const float seconds = move.time[static_cast<size_t>(PrintEstimatedStatistics::ETimeMode::Normal)];
+        REQUIRE(std::isfinite(seconds));
+        REQUIRE(seconds >= 0.f);
+        stream << move.gcode_id << ',' << seconds << '\n';
+        duration += seconds;
+    }
+    stream.close();
+    REQUIRE(stream.good());
+    CHECK(duration > 0.);
+    INFO("Summed move duration: " << duration);
+    SUCCEED("Exported estimator timing; this is not measured printer timing");
+}
+
 // Regression coverage for filament/tool-change time being folded into the first
 // pending motion block (an extrusion move) instead of the tool-change move, and
 // for that delay being dropped entirely when too few motion blocks precede the

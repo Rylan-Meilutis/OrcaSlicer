@@ -22,6 +22,7 @@ add_executable(${_TEST_NAME}_tests
     test_bambu_networking.cpp
     test_belt_brim.cpp
     test_warp_mitigation.cpp
+    test_cooling_assistant.cpp
     test_buildvolume.cpp
     test_brim.cpp
     test_calib.cpp

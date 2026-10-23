@@ -8,6 +8,7 @@
 #include "libslic3r/PresetBundle.hpp"
 #include "libslic3r/PrintConfig.hpp"
 #include "libslic3r/WarpMitigation.hpp"
+#include "libslic3r/CoolingAssistant.hpp"
 #include "libslic3r/BeltTransform.hpp"
 #include "libslic3r/FilamentMixer.hpp"
 #include "libslic3r/Utils.hpp"
@@ -3528,7 +3529,9 @@ wxString TabPrint::warp_risk_description() const
             }
             text = format_wxstr(_L("Thermal bow potential exceeds one layer: %1%. Suggested outer brim: %2% mm. This is an adhesion precaution, not a calculated guarantee against detachment."),
                                 from_u8(materials), risk.brim_mm());
-            text += "\n" + _L("Applying uses a continuous outer brim instead of painted coverage or ears; painting is retained in the model. Rafts, belt-printer adhesion and object overrides are preserved. Use a stable enclosure, avoid drafts, and prepare the build surface. Keep bridge/arc cooling appropriate for unsupported paths. This screening cannot measure adhesion or guarantee a successful print.");
+            text += "\n" + _L("Applying adds continuous outer brim coverage while retaining painted ears, or preserves automatic mouse-ear mode. Larger brim widths, your brim separation gap, rafts, belt-printer adhesion and object overrides are preserved. Use a stable enclosure, avoid drafts, and prepare the build surface. Keep bridge/arc cooling appropriate for unsupported paths. This screening cannot measure adhesion or guarantee a successful print.");
+            if (!risk.asa_cooling_slots.empty())
+                text += "\n" + _L("Review the affected filament profiles under Filament → Cooling. Auto-configure cooling applies material and printer-specific recommendations to the profile. Review and save the changes. Automatic warp mitigation respects the filament profile.");
         } else {
             text = _L("No thermal bow above one layer was estimated for the assessed geometry. This does not establish that unassessed materials or unsupported edges are safe.");
         }
@@ -4978,6 +4981,37 @@ void TabFilament::build()
         optgroup->append_single_option_line("dont_slow_down_outer_wall", "material_cooling#dont-slow-down-outer-walls");
         optgroup->append_single_option_line("slow_down_min_speed", "material_cooling#min-print-speed");
 
+        optgroup = page->new_optgroup(L("Cooling assistant"));
+        line = { "", "" };
+        line.full_width = 1;
+        line.widget = [this](wxWindow *parent) {
+            auto *sizer = new wxBoxSizer(wxVERTICAL);
+            auto *apply = new Button(parent, _L("Auto-configure cooling"));
+            apply->SetStyle(ButtonStyle::Regular, ButtonType::Parameter);
+            apply->SetToolTip(_L("Configure the selected filament variant and shared cooling settings from a compatible inherited or generic material preset for the selected printer. Other variants are unchanged. ABS, ASA and PC use no ordinary part cooling; feature cooling follows the reference preset. First-layer part cooling is disabled, and auxiliary cooling is disabled when the printer has no auxiliary fan. Temperatures and exhaust/filtration controls are unchanged. Review and save the edited preset. No settings are changed if a matching reference is unavailable."));
+            apply->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
+                const auto preset_name = m_presets->get_edited_preset().name;
+                CallAfter([this, preset_name] {
+                    if (wxGetApp().is_closing() || m_presets->get_edited_preset().name != preset_name) return;
+                    try {
+                        DynamicPrintConfig recommended = *m_config;
+                        const auto printer = m_preset_bundle->printers.get_edited_preset_with_vendor_profile();
+                        const auto variant = selected_variant_index();
+                        const Preset *reference = find_cooling_reference(*m_presets, m_presets->get_edited_preset(), printer, variant);
+                        if (!reference || !apply_material_cooling(recommended, reference->config, printer.preset.config, variant)) {
+                            show_error(this, _L("No compatible cooling reference is available for this material, printer and selected filament variant. Your settings have not changed. Configure cooling manually or install a matching system filament preset."));
+                            return;
+                        }
+                        load_config(recommended);
+                    } catch (const std::exception &error) {
+                        show_error(this, from_u8(error.what()));
+                    }
+                });
+            });
+            sizer->Add(apply, 0, wxEXPAND);
+            return sizer;
+        };
+        optgroup->append_line(line);
         optgroup = page->new_optgroup(L("Localized shrinkage mitigation"));
         optgroup->append_single_option_line("hull_line_mitigation");
         optgroup->append_single_option_line("hull_line_max_layer_time_variation");
