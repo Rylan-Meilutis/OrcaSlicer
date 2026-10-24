@@ -27,6 +27,9 @@ add_executable(${_TEST_NAME}_tests
 	test_seam_placer.cpp
 	test_skirt_brim.cpp
 	test_warp_mitigation.cpp
+	test_thermoelastic_gcode.cpp
+	test_deposition_mesh.cpp
+	test_tool_dispatch.cpp
 	test_slicing_pipeline_hook.cpp
 	test_support_material.cpp
 	test_texture_displacement.cpp

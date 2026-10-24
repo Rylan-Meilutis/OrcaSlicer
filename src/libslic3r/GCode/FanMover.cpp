@@ -307,7 +307,23 @@ void FanMover::_process_gcode_line(GCodeReader& reader, const GCodeReader::GCode
         switch (::toupper(cmd[0])) {
         case 'T':
         case 't':
+            // Fan commands address the selected tool on toolchangers. Finish
+            // the outgoing tool's queue before selecting another one: neither
+            // look-ahead nor duplicate suppression may cross that boundary.
+            while (!m_buffer.empty()) {
+                m_process_output += m_buffer.front().raw + "\n";
+                remove_from_buffer(m_buffer.begin());
+            }
+            // Finish an already-started boost on the outgoing fan, not on the
+            // newly selected tool after the delayed kickstart would expire.
+            if (m_current_kickstart.time >= 0)
+                m_process_output += m_current_kickstart.raw + "\n";
             _process_T(cmd);
+            m_current_kickstart.time = -1;
+            m_front_buffer_fan_speed = -1;
+            m_back_buffer_fan_speed = -1;
+            m_process_output += line.raw() + "\n";
+            time = -1;
                 break;
         case 'G':
         {
@@ -339,7 +355,7 @@ void FanMover::_process_gcode_line(GCodeReader& reader, const GCodeReader::GCode
                             time = -1;
                             // this M106 need to go in the past
                             //check if we have ( kickstart and not in slowdown )
-                            if (kickstart > 0 && fan_speed > m_front_buffer_fan_speed) {
+                            if (kickstart > 0 && fan_speed > 0 && fan_speed > m_front_buffer_fan_speed) {
                                 //stop current kickstart , it's not relevant anymore
                                 if (m_current_kickstart.time > 0) {
                                     m_current_kickstart.time = (-1);

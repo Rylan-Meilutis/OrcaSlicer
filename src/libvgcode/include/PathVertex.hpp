@@ -134,6 +134,9 @@ struct PathVertex
     //
     float actual_volumetric_rate() const { return actual_feedrate * mm3_per_mm; }
 
+    // Negative means no converged mechanical sample, never zero stress.
+    float thermal_stress_mpa{ -1.0f };
+
     static const PathVertex DUMMY_PATH_VERTEX;
 };
 

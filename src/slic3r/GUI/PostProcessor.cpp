@@ -34,6 +34,7 @@
 #include <exception>
 #include <iostream>
 #include <fstream>
+#include <functional>
 #include "libslic3r/PrintConfig.hpp"
 #include <memory>
 #include "libslic3r/Print.hpp"
@@ -277,7 +278,8 @@ static void run_post_process_plugins(const ConfigOptionStrings& capabilities,
                                      const std::string& gcode_path,
                                      const std::string& host,
                                      const std::string& output_name,
-                                     const DynamicPrintConfig& config)
+                                     const DynamicPrintConfig& config,
+                                     const std::function<void(const std::string&)>& report_status)
 {
     // Let plugins observe the (possibly script-updated) target file name, mirroring the script env.
     boost::nowide::setenv("SLIC3R_PP_OUTPUT_NAME", output_name.c_str(), 1);
@@ -285,6 +287,8 @@ static void run_post_process_plugins(const ConfigOptionStrings& capabilities,
     const boost::filesystem::path gcode_file(gcode_path);
 
     auto execute_fn = [&](std::shared_ptr<SlicingPipelinePluginCapability> cap, const PluginCapabilityRef& ref) {
+        if (report_status)
+            report_status(Slic3r::format(_u8L("Running post-processing plugin: %1%"), ref.capability_name));
         SlicingPipelineContext ctx;
         ctx.orca_version = SoftFever_VERSION;
         ctx.step         = SlicingPipelineStepPlugin::psGCodePostProcess;
@@ -346,7 +350,8 @@ static void run_post_process_plugins(const ConfigOptionStrings& capabilities,
 // If uploading to PrusaLink or OctoPrint, then the file will be renamed to output_name first on the target host.
 // The post-processing script may change the output_name.
 bool run_post_process_scripts(
-    std::string& src_path, bool make_copy, const std::string& host, std::string& output_name, const DynamicPrintConfig& config)
+    std::string& src_path, bool make_copy, const std::string& host, std::string& output_name, const DynamicPrintConfig& config,
+    const std::function<void(const std::string&)>& report_status)
 {
     // post_process / slicing_pipeline_plugin are absent in SLA mode, hence the null checks. G-code
     // post-processing is now the psGCodePostProcess step of the slicing-pipeline plugin, so the same
@@ -360,6 +365,8 @@ bool run_post_process_scripts(
 
     std::string path;
     if (make_copy) {
+        if (report_status)
+            report_status(_u8L("Preparing a working copy for post-processing"));
         // Don't run the post-processing script/plugin on the input file, it will be memory mapped by the G-code viewer.
         // Make a copy.
         path = src_path + ".pp";
@@ -431,6 +438,8 @@ bool run_post_process_scripts(
                     boost::trim(script);
                     if (script.empty())
                         continue;
+                    if (report_status)
+                        report_status(Slic3r::format(_u8L("Running post-processing script: %1%"), script));
                     BOOST_LOG_TRIVIAL(info) << "Executing script " << script << " on file " << path;
                     std::string std_err;
                     const int result = run_script(script, gcode_file.string(), std_err);
@@ -502,7 +511,8 @@ bool run_post_process_scripts(
         // Run plugins after the scripts so they observe any output_name the scripts produced. A thrown
         // exception is handled by the catch below, which removes the temp copy.
         if (have_plugins) {
-            run_post_process_plugins(*slicing_pipeline_plugin, config.opt<ConfigOptionStrings>("plugins"), path, host, output_name, config);
+            run_post_process_plugins(*slicing_pipeline_plugin, config.opt<ConfigOptionStrings>("plugins"), path, host, output_name, config,
+                                     report_status);
         }
     } catch (...) {
         remove_output_name_file();

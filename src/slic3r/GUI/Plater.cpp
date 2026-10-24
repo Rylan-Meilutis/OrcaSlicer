@@ -4,6 +4,7 @@
 #include <boost/algorithm/string/replace.hpp>
 #include <boost/algorithm/string/trim.hpp>
 #include <cctype>
+#include <chrono>
 #include <stdexcept>
 #include <wx/dialog.h>
 #include "../Utils/NetworkAgent.hpp"
@@ -24,6 +25,7 @@
 #include <climits>
 #include <array>
 #include <boost/filesystem/fstream.hpp>
+#include <boost/system/error_code.hpp>
 #include <clocale>
 #include <cstddef>
 #include <algorithm>
@@ -34,6 +36,8 @@
 #include <exception>
 #include <functional>
 #include <memory>
+#include <mutex>
+#include <wx/weakref.h>
 #include <initializer_list>
 #include <cstdint>
 #include <cstdlib>
@@ -44,6 +48,7 @@
 #include "libslic3r/FlushVolCalc.hpp"
 #include "libslic3r/Point.hpp"
 #include "libslic3r/GCode/GCodeProcessor.hpp"
+#include "libslic3r/GCode/DepositionMesh.hpp"
 #include "libslic3r/Technologies.hpp"
 #include "libslic3r/BoundingBox.hpp"
 #include "libslic3r/PrintBase.hpp"
@@ -189,6 +194,7 @@
 #include "libslic3r/Format/bbs_3mf.hpp"
 #include "libslic3r/GCode/ThumbnailData.hpp"
 #include "libslic3r/GCode/SpoolManagerMetadata.hpp"
+#include "libslic3r/GCode/ToolMapping.hpp"
 #include "libslic3r/Model.hpp"
 #include "libslic3r/SeamCalibration.hpp"
 #include "libslic3r/SLA/SupportPoint.hpp"
@@ -217,6 +223,7 @@
 #include "AuiMgr.hpp"
 #include "AuiPaneLayout.hpp"
 #include "GUI_Utils.hpp"
+#include "OptionsGroup.hpp"
 #include "GUI_Factories.hpp"
 #include "wxExtensions.hpp"
 #include "../Utils/PrintHost.hpp"
@@ -453,6 +460,55 @@ bool uses_independent_tool_dispatch()
         wxGetApp().preset_bundle->get_printer_extruder_count() > 1 &&
         !config.opt_bool("single_extruder_multi_material");
 }
+
+class AutoMitigationDialog final : public DPIDialog
+{
+public:
+    DynamicPrintConfig edited;
+
+    AutoMitigationDialog(wxWindow *parent, const DynamicPrintConfig &config)
+        : DPIDialog(parent, wxID_ANY, _L("Adjust auto mitigations — active plate"), wxDefaultPosition,
+                    wxDefaultSize, wxDEFAULT_DIALOG_STYLE), edited(config)
+    {
+        SetBackgroundColour(StateColor::darkModeColorFor(*wxWHITE));
+        auto *layout = new wxBoxSizer(wxVERTICAL);
+        auto *note = new wxStaticText(this, wxID_ANY,
+            _L("Changes apply only to the active plate and are saved in the 3MF project. Presets and painted ears are unchanged; object overrides take precedence."));
+        note->Wrap(FromDIP(480));
+        layout->Add(note, 0, wxEXPAND | wxALL, FromDIP(12));
+        m_options = std::make_unique<ConfigOptionsGroup>(this, _L("Plate overrides"), &edited);
+        for (const char *key : {"automatic_warp_mitigation", "brim_type", "brim_width", "brim_object_gap"})
+            m_options->append_single_option_line(key);
+        m_options->activate();
+        m_options->reload_config();
+        layout->Add(m_options->sizer, 0, wxEXPAND | wxLEFT | wxRIGHT, FromDIP(12));
+        auto *minimum = new wxStaticText(this, wxID_ANY,
+            _L("With Auto enabled, brim width is a minimum: Auto may increase it and add outer coverage while retaining mouse ears. Disable Auto here to use fully manual brim settings."));
+        minimum->Wrap(FromDIP(480));
+        layout->Add(minimum, 0, wxEXPAND | wxALL, FromDIP(12));
+        auto *buttons = new DialogButtons(this, {"OK", "Cancel"});
+        layout->Add(buttons, 0, wxEXPAND | wxALL, FromDIP(12));
+        SetSizerAndFit(layout);
+        CenterOnParent();
+        wxGetApp().UpdateDlgDarkUI(this);
+    }
+
+protected:
+    void on_dpi_changed(const wxRect &) override
+    {
+        m_options->msw_rescale();
+        GetSizer()->SetSizeHints(this);
+        Layout();
+    }
+    void on_sys_color_changed() override
+    {
+        wxGetApp().UpdateDlgDarkUI(this);
+        m_options->sys_color_changed();
+    }
+
+private:
+    std::unique_ptr<ConfigOptionsGroup> m_options;
+};
 
 class ToolMappingDialog final : public DPIDialog
 {
@@ -724,8 +780,15 @@ private:
 
 // Shared by file export and Print/Send. Called only with the background worker
 // stopped so the source print and its plate membership form a stable snapshot.
+struct ToolDispatch {
+    std::unique_ptr<Print> print;
+    bool reuse_gcode = false;
+    std::vector<int> tools;
+    explicit operator bool() const { return bool(print); }
+};
+
 bool prepare_tool_dispatch(wxWindow *parent, const Print &source, const DynamicPrintConfig &plate_config,
-                               std::unique_ptr<Print> &dispatch,
+                               ToolDispatch &dispatch,
                                std::vector<SpoolManagerMetadata::Filament> &spools)
 {
     auto host_config = filament_sync_host_config();
@@ -785,7 +848,37 @@ bool prepare_tool_dispatch(wxWindow *parent, const Print &source, const DynamicP
         const auto validation = mapped->validate();
         if (!validation.string.empty())
             throw std::runtime_error(validation.string);
-        dispatch = std::move(mapped);
+        // Configuration equivalence is only a candidate for changed tools. The
+        // worker certifies custom-script replay against the final G-code before
+        // writing anything; rejected replay asks again before regeneration.
+        const bool reuse_gcode = can_reuse_identity_tool_mapping(
+            source.full_print_config(), mapped->full_print_config(), tools) ||
+            equivalent_tool_mapping_config(source.full_print_config(), mapped->full_print_config(), tools);
+        bool nozzle_changed = false;
+        const auto &source_nozzles = source.config().nozzle_diameter;
+        const auto &target_nozzles = mapped->config().nozzle_diameter;
+        for (unsigned int material : used_materials) {
+            const size_t target = size_t(tools.at(material));
+            if (source_nozzles.get_at(source.get_extruder_id(material)) !=
+                target_nozzles.get_at(mapped->get_extruder_id(unsigned(target)))) {
+                nozzle_changed = true;
+                break;
+            }
+        }
+        if (!reuse_gcode) {
+            MessageDialog confirm(parent,
+                nozzle_changed ?
+                    _L("A selected printer tool has a different nozzle diameter. The print job must be sliced again for that nozzle. Continue? Progress will be shown while preparing the mapped print job.") :
+                    _L("This tool mapping requires regenerating the print job, including its printer scripts. Continue? Progress will be shown while preparing the mapped print job."),
+                _L("Prepare mapped print job"), wxYES_NO | wxNO_DEFAULT | wxICON_QUESTION);
+            confirm.SetButtonLabel(wxID_YES, _L("Regenerate"));
+            confirm.SetButtonLabel(wxID_NO, _L("Cancel"));
+            if (confirm.ShowModal() != wxID_YES || wxGetApp().is_closing())
+                return false;
+        }
+        dispatch.print = std::move(mapped);
+        dispatch.reuse_gcode = reuse_gcode;
+        dispatch.tools = tools;
         const auto *sync = host_config.option<ConfigOptionBool>("sync_spool_manager_filament_names");
         const auto *embed = host_config.option<ConfigOptionBool>("embed_spool_manager_filament_names");
         if (sync == nullptr || !sync->value || (embed != nullptr && !embed->value))
@@ -1753,6 +1846,7 @@ struct Sidebar::priv
     wxPanel *area_bindings_panel = nullptr;
     ComboBox *project_print_order = nullptr;
     Button *project_settings_toggle = nullptr;
+    Button *adjust_auto_mitigations = nullptr;
     wxPanel *area_bindings_content = nullptr;
     bool area_bindings_collapsed = false;
     std::vector<wxPanel *> area_binding_rows;
@@ -4444,6 +4538,37 @@ Sidebar::Sidebar(Plater *parent)
     }
 
     {
+        auto *adjust_mitigations = new Button(p->scrolled, _L("Adjust auto mitigations…"));
+        p->adjust_auto_mitigations = adjust_mitigations;
+        adjust_mitigations->SetStyle(ButtonStyle::Regular, ButtonType::Parameter);
+        adjust_mitigations->SetToolTip(_L("Edit active-plate mitigation and brim overrides without changing presets."));
+        scrolled_sizer->Add(adjust_mitigations, 0, wxEXPAND | wxALL, FromDIP(8));
+        adjust_mitigations->Bind(wxEVT_BUTTON, [this](wxCommandEvent &event) {
+            event.Skip();
+            CallAfter([this] {
+                if (wxGetApp().is_closing() || p->plater->only_gcode_mode()) return;
+                auto &plates = p->plater->get_partplate_list();
+                auto *plate = plates.get_curr_plate();
+                if (!plate) return;
+                DynamicPrintConfig initial = wxGetApp().preset_bundle->full_config();
+                initial.apply(*plate->config());
+                AutoMitigationDialog dialog(this, initial);
+                wxWeakRef<Sidebar> alive(this);
+                if (dialog.ShowModal() != wxID_OK || !alive || wxGetApp().is_closing()) return;
+                // A nested modal loop must not redirect edits to another plate.
+                if (plates.get_curr_plate() != plate) return;
+                const auto changed = initial.diff(dialog.edited);
+                if (changed.empty()) return;
+                p->plater->take_snapshot(_u8L("Adjust active-plate auto mitigations"));
+                plate->config()->apply_only(dialog.edited, changed);
+                plate->update_slice_result_valid_state(false);
+                p->plater->set_plater_dirty(true);
+                p->plater->update_project_dirty_from_presets();
+                for (const auto &key : changed)
+                    p->plater->config_change_notification(*plate->config(), key);
+                p->plater->update();
+            });
+        });
         scrolled_sizer->Add(create_sidebar_section_header(p->scrolled, _L("Project Settings"), p->project_settings_toggle, "settings"),
                             0, wxEXPAND);
         auto *project_content = new wxPanel(p->scrolled);
@@ -6664,6 +6789,7 @@ void Sidebar::msw_rescale()
     p->right_extruder->Rescale();
     p->single_extruder->Rescale();
     rescale_sidebar_section_header(p->project_settings_toggle);
+    if (p->adjust_auto_mitigations) p->adjust_auto_mitigations->Rescale();
 
     //p->btn_sync_printer->SetPaddingSize({FromDIP(6), FromDIP(12)});
     //p->btn_sync_printer->SetMinSize(BTN_SYNC_SIZE);
@@ -6778,6 +6904,7 @@ void Sidebar::sys_color_changed()
         if (ext)
             ext->sys_color_changed();
     rescale_sidebar_section_header(p->project_settings_toggle);
+    if (p->adjust_auto_mitigations) p->adjust_auto_mitigations->Rescale();
 
     // call a kill focus event to ensure new colors applied
     for (ComboBox* combo : std::vector<ComboBox*>{p->combo_printer, p->combo_nozzle_dia, p->combo_printer_bed}){
@@ -9260,9 +9387,9 @@ struct Plater::priv
         }
     }
     void export_gcode(fs::path output_path, bool output_path_on_removable_media);
-    bool prepare_dispatch(std::unique_ptr<Print> &dispatch, std::vector<SpoolManagerMetadata::Filament> &spools);
+    bool prepare_dispatch(ToolDispatch &dispatch, std::vector<SpoolManagerMetadata::Filament> &spools);
     void export_gcode(fs::path output_path, bool output_path_on_removable_media, PrintHostJob upload_job,
-                      std::unique_ptr<Print> dispatch = {}, std::vector<SpoolManagerMetadata::Filament> spools = {});
+                      ToolDispatch dispatch = {}, std::vector<SpoolManagerMetadata::Filament> spools = {});
 
     void reload_from_disk();
     bool replace_volume_with_stl(int object_idx, int volume_idx, const fs::path& new_path, const std::string& snapshot = "");
@@ -13291,7 +13418,7 @@ void Plater::priv::export_gcode(fs::path output_path, bool output_path_on_remova
 {
     export_gcode(std::move(output_path), output_path_on_removable_media, PrintHostJob{});
 }
-bool Plater::priv::prepare_dispatch(std::unique_ptr<Print> &dispatch,
+bool Plater::priv::prepare_dispatch(ToolDispatch &dispatch,
                                     std::vector<SpoolManagerMetadata::Filament> &spools)
 {
     if (background_process.current_printer_technology() != ptFFF || !uses_independent_tool_dispatch())
@@ -13306,7 +13433,7 @@ bool Plater::priv::prepare_dispatch(std::unique_ptr<Print> &dispatch,
 }
 
 void Plater::priv::export_gcode(fs::path output_path, bool output_path_on_removable_media, PrintHostJob upload_job,
-                               std::unique_ptr<Print> dispatch, std::vector<SpoolManagerMetadata::Filament> spools)
+                               ToolDispatch dispatch, std::vector<SpoolManagerMetadata::Filament> spools)
 {
     wxCHECK_RET(!(output_path.empty() && upload_job.empty()), "export_gcode: output_path and upload_job empty");
 
@@ -13347,7 +13474,8 @@ void Plater::priv::export_gcode(fs::path output_path, bool output_path_on_remova
         background_process.schedule_upload(std::move(upload_job));
     }
     if (dispatch)
-        background_process.set_dispatch_print(std::move(dispatch), std::move(spools));
+        background_process.set_dispatch_print(std::move(dispatch.print), std::move(spools),
+            dispatch.reuse_gcode, std::move(dispatch.tools));
 
     // If the SLA processing of just a single object's supports is running, restart slicing for the whole object.
     this->background_process.set_task(PrintBase::TaskParams());
@@ -21225,7 +21353,7 @@ void Plater::export_gcode(bool prefer_removable)
             start_dir = appconfig.get_last_output_dir(default_output_file.parent_path().string(), false);
     }
 
-    std::unique_ptr<Print> dispatch;
+    ToolDispatch dispatch;
     std::vector<SpoolManagerMetadata::Filament> dispatch_spools;
     if (!p->prepare_dispatch(dispatch, dispatch_spools))
         return;
@@ -21329,7 +21457,7 @@ void Plater::export_gcode_3mf(bool export_all)
     default_output_file.replace_extension(".gcode.3mf");
     default_output_file = fs::path(Slic3r::fold_utf8_to_ascii(default_output_file.string()));
 
-    std::unique_ptr<Print> dispatch;
+    ToolDispatch dispatch;
     std::vector<SpoolManagerMetadata::Filament> dispatch_spools;
     if (!p->prepare_dispatch(dispatch, dispatch_spools))
         return;
@@ -22442,6 +22570,158 @@ void Plater::export_toolpaths_to_obj() const
     p->preview->get_canvas3d()->export_toolpaths_to_obj(into_u8(path).c_str());
 }
 
+void Plater::export_deposition_stl()
+{
+    // Defer native dialogs out of the export button's mouse-event stack.
+    CallAfter([this] {
+        if (wxGetApp().is_closing() || IsBeingDeleted() || wxGetApp().IsScheduledForDestruction(this) ||
+            printer_technology() != ptFFF || !get_ui_job_worker().is_idle() || is_background_process_slicing())
+            return;
+        auto* plate = get_partplate_list().get_curr_plate();
+        if (!plate || !plate->is_slice_result_valid())
+            return;
+        const int plate_index = plate->get_index();
+        const auto* source_result = plate->get_slice_result();
+        if (!source_result) return;
+        unsigned int source_id;
+        std::string source_filename;
+        {
+            std::unique_lock<std::mutex> lock(source_result->result_mutex, std::try_to_lock);
+            if (!lock.owns_lock()) return;
+            source_id = source_result->id;
+            source_filename = source_result->filename;
+        }
+        wxWeakRef<Plater> alive(this);
+        MessageDialog confirmation(this,
+            _L("Export the G-code's extrusion paths as one nominal bead mesh, including infill, supports, brims and the prime tower. Choose the sampling resolution; smaller gaps may be lost. STL does not retain materials, deformation or bonding, and extruder-only purging has no reconstructible shape.\n\nDetailed exports can take several minutes and create files up to 32 GiB. Export keeps at least 30 GiB free and stops at resource limits without lowering resolution."),
+            _L("Export printed extrusion as STL"), wxYES_NO | wxCANCEL | wxICON_INFORMATION);
+        confirmation.SetButtonLabel(wxID_YES, _L("Export at 0.05 mm"), true);
+        confirmation.SetButtonLabel(wxID_NO, _L("Export at 0.1 mm"));
+        const int choice = confirmation.ShowModal();
+        if ((choice != wxID_YES && choice != wxID_NO) || !alive || wxGetApp().is_closing() ||
+            IsBeingDeleted() || wxGetApp().IsScheduledForDestruction(this))
+            return;
+        const wxString path = p->get_export_file(FT_STL);
+        if (!alive || wxGetApp().is_closing() || path.empty() || IsBeingDeleted() || wxGetApp().IsScheduledForDestruction(this))
+            return;
+        plate = get_partplate_list().get_curr_plate();
+        if (!plate || plate->get_index() != plate_index || !plate->is_slice_result_valid() ||
+            is_background_process_slicing() || !get_ui_job_worker().is_idle())
+            return;
+
+        struct ExportState {
+            DepositionMesh::Snapshot snapshot;
+            DepositionMesh::Options options;
+            boost::filesystem::path target;
+            boost::filesystem::path temporary;
+            ~ExportState()
+            {
+                boost::system::error_code ec;
+                if (!temporary.empty()) boost::filesystem::remove(temporary, ec);
+            }
+        };
+        try {
+            auto state = std::make_shared<ExportState>();
+            state->options.voxel_size_mm = choice == wxID_YES ? .05 : .1;
+            state->options.max_memory_bytes = 1024ULL * 1024 * 1024;
+            state->options.max_output_bytes = 32ULL * 1024 * 1024 * 1024;
+            state->options.max_sample_visits = 50000000000ULL;
+            state->target = into_path(path);
+            auto* result = plate->get_slice_result();
+            if (!result || result != source_result) return;
+            {
+                // A bounded compact snapshot avoids copying the full preview result or
+                // retaining a plate pointer across edits, plate deletion or shutdown.
+                std::unique_lock<std::mutex> lock(result->result_mutex, std::try_to_lock);
+                if (!lock.owns_lock()) {
+                    show_error(this, _L("The G-code preview is being updated. Please try exporting again when it finishes."));
+                    return;
+                }
+                if (result->id != source_id || result->filename != source_filename) {
+                    show_error(this, _L("The sliced G-code changed while choosing the export destination. Please start the export again."));
+                    return;
+                }
+                state->snapshot = DepositionMesh::snapshot(*result, state->options, {});
+            }
+            if (state->snapshot.unrepresented_motion_extrusion_moves != 0 ||
+                state->snapshot.unrepresented_stationary_extrusion_moves != 0) {
+                MessageDialog incomplete(this,
+                    _L("Some extrusion commands, such as cleaning, wiping or stationary extrusion, have no defined bead shape and will be omitted. Export the remaining extrusion paths?"),
+                    _L("Unrepresented extrusion commands"), wxYES_NO | wxICON_WARNING);
+                if (incomplete.ShowModal() != wxID_YES || !alive || wxGetApp().is_closing() ||
+                    IsBeingDeleted() || wxGetApp().IsScheduledForDestruction(this) || !get_ui_job_worker().is_idle())
+                    return;
+            }
+            queue_job(get_ui_job_worker(), [state](Job::Ctl& ctl) {
+                ctl.update_status(0, _u8L("Reconstructing printed extrusion as STL"));
+                const auto check_space = [&] {
+                    boost::system::error_code ec;
+                    std::uint64_t written = 0;
+                    if (!state->temporary.empty()) {
+                        written = boost::filesystem::file_size(state->temporary, ec);
+                        if (ec) throw std::runtime_error(_u8L("Could not verify the temporary STL file size."));
+                    }
+                    const auto space = boost::filesystem::space(state->target.parent_path(), ec);
+                    constexpr std::uint64_t reserve = 30ULL * 1024ULL * 1024ULL * 1024ULL;
+                    const auto remaining = state->options.max_output_bytes - std::min(written, state->options.max_output_bytes);
+                    if (ec || space.available < reserve + remaining)
+                        throw std::runtime_error(_u8L("Not enough free disk space for the STL while retaining 30 GiB of system headroom."));
+                };
+                check_space();
+                auto last_space_check = std::chrono::steady_clock::now();
+                if (ctl.was_canceled()) return;
+                state->temporary = state->target.parent_path() / boost::filesystem::unique_path(".orca-extrusion-%%%%-%%%%-%%%%.stl.part");
+                boost::filesystem::ofstream output(state->temporary, std::ios::binary | std::ios::trunc);
+                if (!output) throw std::runtime_error(_u8L("Could not create the temporary STL file."));
+                int last_progress = -1;
+                DepositionMesh::export_stl(state->snapshot, output, state->options,
+                    [&](int progress) {
+                        if (progress != last_progress) {
+                            check_space();
+                            last_progress = progress;
+                            ctl.update_status(progress, _u8L("Reconstructing printed extrusion as STL"));
+                        }
+                    }, [&] {
+                        if (ctl.was_canceled()) throw std::runtime_error("STL export canceled.");
+                        const auto now = std::chrono::steady_clock::now();
+                        if (now - last_space_check >= std::chrono::seconds(2)) {
+                            check_space();
+                            last_space_check = now;
+                        }
+                    });
+                output.flush();
+                if (!output) throw std::runtime_error(_u8L("Could not finish writing the STL file."));
+                output.close();
+                if (!output) throw std::runtime_error(_u8L("Could not close the STL file."));
+            }, [state, owner = this](bool canceled, std::exception_ptr& error) {
+                // Worker finalization runs on the main thread, including during shutdown.
+                if (canceled || wxGetApp().is_closing() || wxGetApp().plater() != owner) {
+                    error = nullptr;
+                    return;
+                }
+                try {
+                    if (error) std::rethrow_exception(error);
+                    // Both files have the same parent: use one native rename,
+                    // never a remove-then-rename fallback that could lose the old STL.
+                    boost::system::error_code ec;
+                    boost::filesystem::rename(state->temporary, state->target, ec);
+                    if (ec) throw std::runtime_error(ec.message());
+                    state->temporary.clear();
+                    show_info(owner, format_wxstr(_L("Printed extrusion was exported to %1%. Check mesh resolution and material assignments before simulation."), from_path(state->target)),
+                              _L("STL export complete"));
+                } catch (const std::exception& e) {
+                    show_error(owner, format_wxstr(_L("Could not export printed extrusion as STL: %1%"), from_u8(e.what())));
+                } catch (...) {
+                    show_error(owner, _L("Could not export printed extrusion as STL."));
+                }
+                error = nullptr;
+            });
+        } catch (const std::exception& e) {
+            show_error(this, format_wxstr(_L("Could not prepare printed extrusion for STL export: %1%"), from_u8(e.what())));
+        }
+    });
+}
+
 bool Plater::is_empty_project() {
     return model().objects.empty();
 }
@@ -22720,7 +23000,7 @@ void Plater::send_gcode_legacy(int plate_idx, Export3mfProgressFn proFn)
 
     // Confirm materials before asking where to upload the job. Cancellation of
     // either dialog destroys this private job without altering the project.
-    std::unique_ptr<Print> dispatch;
+    ToolDispatch dispatch;
     std::vector<SpoolManagerMetadata::Filament> dispatch_spools;
     if (!p->prepare_dispatch(dispatch, dispatch_spools))
         return;

@@ -24,8 +24,11 @@ namespace Slic3r {
 // output_name is the final name of the G-code on SD card or when uploaded to PrusaLink or OctoPrint.
 // If uploading to PrusaLink or OctoPrint, then the file will be renamed to output_name first on the target host.
 // The post-processing script may change the output_name.
+// report_status runs synchronously on the caller's thread, before each operation.
+// It must not touch GUI controls when called from the slicing worker.
 extern bool run_post_process_scripts(
-    std::string& src_path, bool make_copy, const std::string& host, std::string& output_name, const DynamicPrintConfig& config);
+    std::string& src_path, bool make_copy, const std::string& host, std::string& output_name, const DynamicPrintConfig& config,
+    const std::function<void(const std::string&)>& report_status = {});
 
 inline bool run_post_process_scripts(std::string& src_path, const DynamicPrintConfig& config)
 {

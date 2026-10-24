@@ -65,7 +65,7 @@ M140 S[first_layer_bed_temperature] ; set bed temp
 
 {if used_tools > 1 and (is_extruder_used[0] and filament_type[0]=="PLA") or (is_extruder_used[1] and filament_type[1]=="PLA") or (is_extruder_used[2] and filament_type[2]=="PLA") or (is_extruder_used[3] and filament_type[3]=="PLA") or (is_extruder_used[4] and filament_type[4]=="PLA") or (is_extruder_used[5] and filament_type[5]=="PLA") or (is_extruder_used[6] and filament_type[6]=="PLA") or (is_extruder_used[7] and filament_type[7]=="PLA")}
 M141 S20 ; set nominal chamber temp
-{elsif chamber_minimal_temperature[initial_tool]==0}
+{else}
 M141 S{chamber_temperature[initial_tool]} ; set nominal chamber temp
 {endif}
 

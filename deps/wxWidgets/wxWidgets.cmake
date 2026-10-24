@@ -32,9 +32,10 @@ endif ()
 set(_wx_patch_command "")
 if (APPLE)
     set(_wx_patch_command
-        ${GIT_EXECUTABLE} checkout -f -- src/osx/cocoa/colour.mm
-        COMMAND ${GIT_EXECUTABLE} apply --verbose
-                ${CMAKE_CURRENT_LIST_DIR}/0001-macos-use-srgb-colour-components.patch
+        ${CMAKE_COMMAND}
+            -DGIT_EXECUTABLE=${GIT_EXECUTABLE}
+            -DPATCH_FILE=${CMAKE_CURRENT_LIST_DIR}/0001-macos-use-srgb-colour-components.patch
+            -P ${CMAKE_CURRENT_LIST_DIR}/apply_colour_patch.cmake
     )
 endif ()
 

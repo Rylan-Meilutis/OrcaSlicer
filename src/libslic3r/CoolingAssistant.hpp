@@ -10,8 +10,33 @@
 #include <set>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace Slic3r {
+
+inline bool material_prefers_no_ordinary_cooling(const std::string &material)
+{
+    return material == "ASA" || material == "ABS" || material == "PC";
+}
+
+// Advisory only: loaded materials do not establish proximity, actual airflow or
+// a safe PWM for the combination. Never modify the proposed profile here.
+inline std::vector<std::string> cooling_sensitive_companions(
+    const DynamicPrintConfig &proposed, size_t variant_index, const std::vector<std::string> &loaded_materials)
+{
+    const auto *material = proposed.option<ConfigOptionStrings>("filament_type");
+    const auto *minimum = proposed.option<ConfigOptionFloats>("fan_min_speed");
+    const auto *maximum = proposed.option<ConfigOptionFloats>("fan_max_speed");
+    if (!material || material->values.size() != 1 || !minimum || minimum->values.empty() ||
+        !maximum || maximum->values.empty() ||
+        (minimum->get_at(variant_index) <= 0 && maximum->get_at(variant_index) <= 0))
+        return {};
+    std::set<std::string> sensitive;
+    for (const auto &other : loaded_materials)
+        if (other != material->values.front() && material_prefers_no_ordinary_cooling(other))
+            sensitive.insert(other);
+    return {sensitive.begin(), sensitive.end()};
+}
 
 // Explicit profile edits only: never called by Print::apply or G-code generation.
 // Use resolved printer/material presets for fan percentages and layer-time limits
@@ -75,7 +100,7 @@ inline bool apply_material_cooling(DynamicPrintConfig &target, const DynamicPrin
     // Conservative strength/warp policy for these unfilled material types.
     // Blends, filled materials and flexibles retain their own preset's policy.
     const std::string &type = material->values.front();
-    const bool heat_sensitive = type == "ASA" || type == "ABS" || type == "PC";
+    const bool heat_sensitive = material_prefers_no_ordinary_cooling(type);
     if (heat_sensitive)
         for (const char *key : {"fan_min_speed", "fan_max_speed", "reduce_fan_stop_start_freq"}) clear(key);
     const auto *aux = printer.option<ConfigOptionBool>("auxiliary_fan");

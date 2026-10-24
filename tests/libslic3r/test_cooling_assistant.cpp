@@ -7,8 +7,31 @@
 #include "libslic3r/PresetBundle.hpp"
 #include "libslic3r/PrintConfig.hpp"
 #include <string>
+#include <vector>
 
 using namespace Slic3r;
+
+TEST_CASE("Cooling assistance flags ordinary airflow across loaded sensitive materials", "[CoolingAssistant]")
+{
+    auto proposed = DynamicPrintConfig::full_print_config();
+    proposed.set_deserialize_strict("filament_type", "TPU");
+    proposed.set_deserialize_strict("fan_min_speed", "0,100");
+    proposed.set_deserialize_strict("fan_max_speed", "0,100");
+    const auto original = proposed;
+    const std::vector<std::string> loaded{"TPU", "ASA", "ASA", "ABS", "PC", "PLA"};
+    CHECK(cooling_sensitive_companions(proposed, 0, loaded).empty());
+    const std::vector<std::string> expected{"ABS", "ASA", "PC"};
+    CHECK(cooling_sensitive_companions(proposed, 1, loaded) == expected);
+    CHECK(cooling_sensitive_companions(proposed, 1, {"TPU", "PLA", "PETG"}).empty());
+    CHECK(proposed.diff(original).empty());
+    // Feature-only cooling is not mistaken for ordinary fan cooling.
+    proposed.set_deserialize_strict("overhang_fan_speed", "100");
+    CHECK(cooling_sensitive_companions(proposed, 0, loaded).empty());
+    // A preset with a single value applies it to every supported variant.
+    proposed.set_deserialize_strict("fan_min_speed", "100");
+    proposed.set_deserialize_strict("fan_max_speed", "100");
+    CHECK(cooling_sensitive_companions(proposed, 1, loaded) == expected);
+}
 
 TEST_CASE("Bundled material cooling is available on custom RME printers", "[CoolingAssistant]")
 {

@@ -276,6 +276,16 @@ set(lisbslic3r_sources
     GCode/FanMover.cpp
     GCode/FanMover.hpp
     GCode/GCodeProcessor.cpp
+    ThermoelasticSolver.cpp
+    ThermoelasticSolver.hpp
+    ThermoelasticField.cpp
+    ThermoelasticField.hpp
+    ThermoelasticMesh.cpp
+    ThermoelasticMesh.hpp
+    ThermoelasticGCode.cpp
+    ThermoelasticGCode.hpp
+    GCode/DepositionMesh.cpp
+    GCode/DepositionMesh.hpp
     GCode/GCodeProcessor.hpp
     GCode/GCodeStatistics.cpp
     GCode/GCodeStatistics.hpp
@@ -310,6 +320,8 @@ set(lisbslic3r_sources
     GCode/Thumbnails.hpp
     GCode/ToolOrdering.cpp
     GCode/ToolOrdering.hpp
+    GCode/ToolMapping.hpp
+    GCode/ToolMapping.cpp
     GCode/OrderingStrategies.cpp
     GCode/OrderingStrategies.hpp
     GCode/WipeTower2.cpp

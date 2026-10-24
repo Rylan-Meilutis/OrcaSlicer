@@ -22,6 +22,7 @@
 #include "GCode/SeamPlacer.hpp"
 #include "GCode/GCodeProcessor.hpp"
 #include "GCode/ThumbnailData.hpp"
+#include "GCode/ToolMapping.hpp"
 #include "libslic3r/ObjectID.hpp"
 #include "GCode/ExtrusionProcessor.hpp"
 #include "SequentialGantryGeometry.hpp"
@@ -807,6 +808,7 @@ protected:
         std::vector<double>                 e_retracted;
         std::vector<double>                 e_restart_extra;
     } m_placeholder_parser_integration;
+    std::shared_ptr<GCodeDispatchData> m_dispatch_data;
 
     OozePrevention                      m_ooze_prevention;
     Wipe                                m_wipe;

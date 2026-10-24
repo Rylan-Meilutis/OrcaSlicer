@@ -2135,6 +2135,7 @@ const char* print_select_type_key(MainFrame::PrintSelectType type)
     case MainFrame::eExportSlicedFile:    return "export_sliced_file";
     case MainFrame::eExportAllSlicedFile: return "export_all_sliced_file";
     case MainFrame::eExportGcode:         return "export_gcode";
+    case MainFrame::eExportDepositionStl: return "export_deposition_stl";
     case MainFrame::eSendGcode:           return "send_gcode";
     case MainFrame::eSendToPrinter:       return "send_to_printer";
     case MainFrame::eSendToPrinterAll:    return "send_to_printer_all";
@@ -2153,6 +2154,7 @@ wxString print_select_type_label(MainFrame::PrintSelectType type)
     case MainFrame::eExportSlicedFile:    return _L("Export plate sliced file");
     case MainFrame::eExportAllSlicedFile: return _L("Export all sliced file");
     case MainFrame::eExportGcode:         return _L("Export G-code file");
+    case MainFrame::eExportDepositionStl: return _L("Export printed extrusion as STL");
     case MainFrame::eSendGcode:           return _L_CONTEXT("Print", "Verb");
     case MainFrame::eSendToPrinter:       return _L("Send");
     case MainFrame::eSendToPrinterAll:    return _L("Send all");
@@ -2178,6 +2180,7 @@ std::vector<MainFrame::PrintSelectType> MainFrame::available_print_actions() con
         if (use_3mf_opt != nullptr && use_3mf_opt->value)
             actions.push_back(eExportSlicedFile);
         actions.push_back(eExportGcode);
+        actions.push_back(eExportDepositionStl);
         return actions;
     }
 
@@ -2205,6 +2208,7 @@ std::vector<MainFrame::PrintSelectType> MainFrame::available_print_actions() con
     actions.push_back(eExportSlicedFile);
     actions.push_back(eExportAllSlicedFile);
     actions.push_back(eExportGcode);
+    actions.push_back(eExportDepositionStl);
     return actions;
 }
 
@@ -2377,6 +2381,8 @@ wxBoxSizer* MainFrame::create_side_tools()
             }
             else if (m_print_select == eExportGcode)
                 wxPostEvent(m_plater, SimpleEvent(EVT_GLTOOLBAR_EXPORT_GCODE));
+            else if (m_print_select == eExportDepositionStl)
+                m_plater->export_deposition_stl();
             else if (m_print_select == eSendGcode)
                 wxPostEvent(m_plater, SimpleEvent(EVT_GLTOOLBAR_SEND_GCODE));
             else if (m_print_select == eUploadGcode)
@@ -2532,13 +2538,16 @@ bool MainFrame::get_enable_print_status()
         }
         enable = enable && !is_all_plates;
     }
-    else if (m_print_select == eExportGcode)
+    else if (m_print_select == eExportGcode || m_print_select == eExportDepositionStl)
     {
         if (!current_plate->is_slice_result_valid())
         {
             enable = false;
         }
         enable = enable && !is_all_plates;
+        if (m_print_select == eExportDepositionStl)
+            enable = enable && m_plater->printer_technology() == ptFFF &&
+                     !m_plater->is_background_process_slicing() && m_plater->get_ui_job_worker().is_idle();
     }
     else if (m_print_select == eSendGcode)
     {
@@ -3102,6 +3111,11 @@ void MainFrame::init_menubar_as_editor()
         append_menu_item(export_menu, wxID_ANY, _L("Export G-code") + dots/* + "\t" + ctrl + "G"*/, _L("Export current plate as G-code"),
             [this](wxCommandEvent&) { if (m_plater) m_plater->export_gcode(false); }, "menu_export_gcode", nullptr,
             [this]() {return can_export_gcode(); }, this);
+
+        append_menu_item(export_menu, wxID_ANY, _L("Export printed extrusion as STL") + dots,
+            _L("Reconstruct the current G-code as one nominal extrusion mesh, including infill and air gaps"),
+            [this](wxCommandEvent&) { if (m_plater) m_plater->export_deposition_stl(); }, "menu_export_toolpaths", nullptr,
+            [this]() { return can_export_gcode(); }, this);
 
         append_menu_item(export_menu, wxID_ANY, _L("Export toolpaths as OBJ") + dots, _L("Export toolpaths as OBJ"),
             [this](wxCommandEvent&) { if (m_plater != nullptr) m_plater->export_toolpaths_to_obj(); }, "menu_export_toolpaths", nullptr,

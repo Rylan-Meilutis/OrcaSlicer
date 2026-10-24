@@ -25,6 +25,7 @@
 #include "libslic3r/Config.hpp"
 #include <boost/any.hpp>
 #include <vector>
+#include <wx/weakref.h>
 #include <string>
 #include <utility>
 #include <cassert>
@@ -5001,6 +5002,35 @@ void TabFilament::build()
                         if (!reference || !apply_material_cooling(recommended, reference->config, printer.preset.config, variant)) {
                             show_error(this, _L("No compatible cooling reference is available for this material, printer and selected filament variant. Your settings have not changed. Configure cooling manually or install a matching system filament preset."));
                             return;
+                        }
+                        std::vector<std::string> loaded_materials;
+                        for (const auto &name : m_preset_bundle->filament_presets) {
+                            const auto *loaded = m_preset_bundle->filaments.find_preset(name, false);
+                            if (loaded)
+                                if (const auto *types = loaded->config.option<ConfigOptionStrings>("filament_type"))
+                                    loaded_materials.insert(loaded_materials.end(), types->values.begin(), types->values.end());
+                        }
+                        const auto companions = cooling_sensitive_companions(recommended, variant, loaded_materials);
+                        if (!companions.empty()) {
+                            wxString materials;
+                            for (const auto &material : companions) {
+                                if (!materials.empty()) materials += ", ";
+                                materials += from_u8(material);
+                            }
+                            // TRN: %1% is a list of loaded material names; %2% and %3% are fan percentages.
+                            const wxString message = format_wxstr(
+                                _L("This project also has %1% loaded. The reference's ordinary fan range of %2%%% to %3%%% may cool neighboring materials and increase warping; it is not validated for this combination.\n\nApply the reference settings to this filament? Cancel keeps your current settings."),
+                                materials,
+                                recommended.option<ConfigOptionFloats>("fan_min_speed")->get_at(variant),
+                                recommended.option<ConfigOptionFloats>("fan_max_speed")->get_at(variant));
+                            MessageDialog confirm(this, message, _L("Mixed-material cooling"), wxYES_NO | wxICON_WARNING);
+                            confirm.SetButtonLabel(wxID_YES, _L("Apply reference"));
+                            confirm.SetButtonLabel(wxID_NO, _L("Cancel"));
+                            wxWeakRef<Tab> self(this);
+                            if (confirm.ShowModal() != wxID_YES || !self || self->IsBeingDeleted() ||
+                                wxGetApp().IsScheduledForDestruction(self.get()) || wxGetApp().is_closing() ||
+                                m_presets->get_edited_preset().name != preset_name)
+                                return;
                         }
                         load_config(recommended);
                     } catch (const std::exception &error) {

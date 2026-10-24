@@ -3,6 +3,7 @@
 #include "Exception.hpp"
 #include "Flow.hpp"
 #include "PrintConfig.hpp"
+#include "Preset.hpp"
 #include "Point.hpp"
 #include "Utils.hpp"
 #include "I18N.hpp"
@@ -1039,6 +1040,11 @@ namespace client
             std::string         opt_key_str(opt_key.begin(), opt_key.end());
             const ConfigOption *opt = ctx->resolve_symbol(opt_key_str);
             size_t              idx = ctx->current_extruder_id;
+            if (opt && opt->is_vector() && ctx->context_data && ctx->context_data->legacy_machine_mode_index) {
+                const auto &machine_limits = Preset::machine_limits_options();
+                if (std::find(machine_limits.begin(), machine_limits.end(), opt_key_str) != machine_limits.end())
+                    idx = *ctx->context_data->legacy_machine_mode_index;
+            }
             if (opt == nullptr) {
                 // Check whether this is a legacy vector indexing.
                 idx = opt_key_str.rfind('_');

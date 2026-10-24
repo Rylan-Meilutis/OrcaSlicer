@@ -4,6 +4,8 @@
 #include "Config.hpp"
 #include <map>
 #include <memory>
+#include <optional>
+#include <cstddef>
 #include <random>
 #include <set>
 #include <string>
@@ -29,6 +31,10 @@ public:
         std::unique_ptr<DynamicConfig>  global_config;
         // Global variables declared in {if} branches that were not taken, see check_inactive_branches.
         std::set<std::string>           inactive_global_variables;
+        // Dispatch replay preserves the source's implicit machine-limit mode
+        // while relocating tool-indexed variables. Explicit indices and normal
+        // generation (unset) keep their existing semantics.
+        std::optional<std::size_t>      legacy_machine_mode_index;
     };
 
     // Orca: when set, variable names inside {if} branches that are not taken must resolve too, so a single

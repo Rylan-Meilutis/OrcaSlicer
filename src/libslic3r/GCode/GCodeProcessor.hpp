@@ -36,6 +36,7 @@
 namespace Slic3r {
 
 class Print;
+struct GCodeDispatchData;
 
 // For a filament whose density is not set, in g/cm³.
 inline constexpr float DEFAULT_FILAMENT_DENSITY = 1.245f;
@@ -311,8 +312,22 @@ inline constexpr float DEFAULT_FILAMENT_DENSITY = 1.245f;
         };
 
         std::string filename;
+        std::shared_ptr<const GCodeDispatchData> dispatch_data;
         unsigned int id;
         std::vector<MoveVertex> moves;
+        // Maximum principal tensile stress at each move, in MPa. An empty
+        // vector or negative entry denotes unavailable mechanical analysis.
+        // This is separate from motion/temperature state and does not affect
+        // exported G-code or imply a bed-adhesion safety factor.
+        std::vector<float> thermal_stress_mpa;
+        struct ThermalAnalysis {
+            enum class Status { NotRun, Converged, UnsupportedMaterial, InvalidThermalInputs,
+                                BudgetExceeded, Unconverged, InvalidGeometry };
+            Status status = Status::NotRun;
+            double tensile_force_n = 0.;
+            double elastic_energy_j = 0.;
+            unsigned scenario_count = 0;
+        } thermal_analysis;
         struct TemperatureTargets {
             std::optional<float> bed;
             std::map<unsigned int, float> tools;
@@ -410,8 +425,11 @@ inline constexpr float DEFAULT_FILAMENT_DENSITY = 1.245f;
         template<class Other> void assign(Other &&other)
         {
             filename = std::forward<Other>(other).filename;
+            dispatch_data = std::forward<Other>(other).dispatch_data;
             id = std::forward<Other>(other).id;
             moves = std::forward<Other>(other).moves;
+            thermal_stress_mpa = std::forward<Other>(other).thermal_stress_mpa;
+            thermal_analysis = other.thermal_analysis;
             plate_mass = std::forward<Other>(other).plate_mass;
             object_masses = std::forward<Other>(other).object_masses;
             body_masses = std::forward<Other>(other).body_masses;

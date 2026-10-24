@@ -5678,6 +5678,10 @@ void Print::export_gcode_from_previous_file(const std::string& file, GCodeProces
 
 void Print::reload_gcode_moves(GCodeProcessorResult* result) const
 {
+    // External post-processing has no provenance for captured custom spans.
+    // Re-imported files retain preview geometry, but cannot reuse a certificate
+    // issued for the generator's original motion stream.
+    result->dispatch_data.reset();
     GCodeProcessor processor;
     GCodeProcessor::s_IsBBLPrinter = is_BBL_printer();
     const Vec3d origin = this->get_plate_origin();
@@ -5692,6 +5696,8 @@ void Print::reload_gcode_moves(GCodeProcessorResult* result) const
         BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": cannot re-read the G-code file " << result->filename << ": " << ex.what();
         std::lock_guard<std::mutex> lock(result->result_mutex);
         result->lines_ends.clear();
+        result->thermal_stress_mpa.clear();
+        result->thermal_analysis = {};
         return;
     }
 
@@ -5699,6 +5705,10 @@ void Print::reload_gcode_moves(GCodeProcessorResult* result) const
     std::lock_guard<std::mutex> lock(result->result_mutex);
     result->moves      = std::move(reloaded.moves);
     result->lines_ends = std::move(reloaded.lines_ends);
+    // Post-processing can change coordinates without changing the move count.
+    // A field sampled for the old paths is not valid for the edited file.
+    result->thermal_stress_mpa.clear();
+    result->thermal_analysis = {};
 }
 
 std::tuple<float, float> Print::object_skirt_offset(double margin_height) const

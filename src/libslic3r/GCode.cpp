@@ -39,6 +39,8 @@
 #include "I18N.hpp"
 #include "IMEXHelpers.hpp"
 #include "GCode.hpp"
+#include "GCode/ToolMapping.hpp"
+#include <boost/nowide/fstream.hpp>
 #include "NonplanarSurface.hpp"
 #include <cstdio>
 #include "Exception.hpp"
@@ -2816,6 +2818,11 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
     if (print->is_step_done(psGCodeExport) && boost::filesystem::exists(boost::filesystem::path(path)))
         return;
 
+    m_dispatch_data.reset();
+    if (!print->is_BBL_printer() && print->config().nozzle_diameter.size() > 1 &&
+        !print->config().single_extruder_multi_material.value && !print->config().is_imex.value)
+        m_dispatch_data = std::make_shared<GCodeDispatchData>();
+
     BOOST_LOG_TRIVIAL(info) << boost::format("Will export G-code to %1% soon")%path;
 
     GCodeProcessor::s_IsBBLPrinter = print->is_BBL_printer();
@@ -2989,6 +2996,18 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
     m_processor.result().nozzle_group_result = m_print->get_layered_nozzle_group_result();
 
     m_processor.finalize(true);
+    if (m_dispatch_data && m_dispatch_data->valid) {
+        try {
+            boost::nowide::ifstream generated(path_tmp, std::ios::binary);
+            if (!generated) throw std::runtime_error("Cannot read generated G-code for dispatch certification.");
+            seal_gcode_dispatch(generated, *m_dispatch_data, [print] { print->throw_if_canceled(); });
+        } catch (const CanceledException &) {
+            throw;
+        } catch (const std::exception &) {
+            m_dispatch_data->valid = false;
+            m_dispatch_data->templates.clear();
+        }
+    }
 //    DoExport::update_print_estimated_times_stats(m_processor, print->m_print_statistics);
     DoExport::update_print_estimated_stats(m_processor, m_writer.extruders(), print->m_print_statistics, print->config());
     // Printed-mass safety check. Flushed filament leaves the bed, so subtract it
@@ -3008,6 +3027,8 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
     }
     if (result != nullptr) {
         *result = std::move(m_processor.extract_result());
+        if (m_dispatch_data && m_dispatch_data->valid)
+            result->dispatch_data = m_dispatch_data;
         // set the filename to the correct value
         result->filename = path;
     }
@@ -5395,6 +5416,27 @@ std::string GCode::placeholder_parser_process(const std::string &name, const std
 PlaceholderParserIntegration &ppi = m_placeholder_parser_integration;
     try {
         ppi.update_from_gcodewriter(m_writer);
+        std::optional<GCodeTemplateSnapshot> dispatch_snapshot;
+        if (m_dispatch_data && m_dispatch_data->valid && !templ.empty()) {
+            // Rotated wipe-tower fragments are generated motion, not an
+            // independent printer macro. Their replay needs a separate motion
+            // certificate; do not mistake them for a user script.
+            if (name == "tcr_rotated_gcode" || m_dispatch_data->templates.size() >= 2048) {
+                m_dispatch_data->valid = false;
+                m_dispatch_data->templates.clear();
+            } else {
+                try {
+                    dispatch_snapshot = GCodeTemplateSnapshot::capture(name, templ, current_filament_id,
+                        ppi.parser, config_override, ppi.output_config, ppi.context,
+                        m_dispatch_data->templates.empty() ? nullptr : m_dispatch_data->templates.front().environment);
+                } catch (const std::exception &) {
+                    // Certification is optional. Its failure must never turn
+                    // a valid printer macro into a slicing error.
+                    m_dispatch_data->valid = false;
+                    m_dispatch_data->templates.clear();
+                }
+            }
+        }
         std::string output = ppi.parser.process(templ, current_filament_id, config_override, &ppi.output_config, &ppi.context);
         ppi.validate_output_vector_variables();
         const CustomGCodeMotionStateChanges motion_state_changes = custom_gcode_motion_state_changes(output);
@@ -5421,6 +5463,40 @@ PlaceholderParserIntegration &ppi = m_placeholder_parser_integration;
             }
         }
 
+        if (dispatch_snapshot) {
+          try {
+            dispatch_snapshot->finish(output, ppi.output_config, ppi.context);
+            // Bound retained RAM as well as snapshot count. The large static
+            // parser environment is shared; each call keeps only its runtime
+            // diff. No on-disk cache or duplicate G-code is created here.
+            std::size_t bytes = sizeof(GCodeTemplateSnapshot) + templ.size() + output.size();
+            const auto config_bytes = [](const DynamicConfig &config) {
+                std::size_t size = 0;
+                for (const auto &key : config.keys()) size += key.size() + config.option(key)->serialize().size() + 128;
+                return size;
+            };
+            for (const auto *config : {&dispatch_snapshot->parser_changes, &dispatch_snapshot->overrides,
+                    &dispatch_snapshot->outputs_before, &dispatch_snapshot->outputs_after,
+                    &dispatch_snapshot->globals_before, &dispatch_snapshot->globals_after})
+                bytes += config_bytes(*config);
+            if (m_dispatch_data->templates.empty() || dispatch_snapshot->environment != m_dispatch_data->templates.front().environment)
+                bytes += config_bytes(dispatch_snapshot->environment->parser_config) + config_bytes(dispatch_snapshot->environment->external_config);
+            constexpr std::size_t max_snapshot_bytes = 16 * 1024 * 1024;
+            if (bytes > max_snapshot_bytes - std::min(m_dispatch_data->memory_bytes, max_snapshot_bytes)) {
+                m_dispatch_data->valid = false;
+                m_dispatch_data->templates.clear();
+            } else {
+                const std::string id = std::to_string(m_dispatch_data->templates.size());
+                m_dispatch_data->memory_bytes += bytes;
+                m_dispatch_data->templates.emplace_back(std::move(*dispatch_snapshot));
+                return "\n; ORCA_DISPATCH_BEGIN " + id + "\n" + output +
+                    (output.empty() || output.back() == '\n' ? "" : "\n") + "; ORCA_DISPATCH_END " + id + "\n";
+            }
+          } catch (const std::exception &) {
+            m_dispatch_data->valid = false;
+            m_dispatch_data->templates.clear();
+          }
+        }
         return output;
     } 
     catch (std::runtime_error &err) 

@@ -311,6 +311,8 @@ GCodeInputData convert(const Slic3r::GCodeProcessorResult& result, const std::ve
                 /* ORCA: Add Jerk visualization support */ curr.jerk };
 #endif // VGCODE_ENABLE_COG_AND_TOOL_MARKERS
             ret.vertices.emplace_back(vertex);
+            if (result.thermal_stress_mpa.size() == moves.size())
+                ret.vertices.back().thermal_stress_mpa = result.thermal_stress_mpa[i];
         }
 
 #if VGCODE_ENABLE_COG_AND_TOOL_MARKERS
@@ -332,6 +334,8 @@ GCodeInputData convert(const Slic3r::GCodeProcessorResult& result, const std::ve
             /* ORCA: Add Jerk visualization support */ curr.jerk };
 #endif // VGCODE_ENABLE_COG_AND_TOOL_MARKERS
         ret.vertices.emplace_back(vertex);
+        if (result.thermal_stress_mpa.size() == moves.size())
+            ret.vertices.back().thermal_stress_mpa = result.thermal_stress_mpa[i];
     }
     assert(ret.vertices.size() == vertices_count);
     // A no-op when the count above is exact; restores the exact fit if the count ever drifts.

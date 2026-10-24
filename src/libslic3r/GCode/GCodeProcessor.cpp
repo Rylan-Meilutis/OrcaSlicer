@@ -2724,6 +2724,9 @@ void GCodeProcessorResult::reset() {
 
     // moves and lines_ends grow with the print: free them, as no reset result reuses the capacity.
     clear_and_shrink(moves);
+    dispatch_data.reset();
+    clear_and_shrink(thermal_stress_mpa);
+    thermal_analysis = {};
     plate_mass = {};
     object_masses.clear();
     body_masses.clear();

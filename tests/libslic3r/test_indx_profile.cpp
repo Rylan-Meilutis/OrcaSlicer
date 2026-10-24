@@ -8,6 +8,7 @@
 #include <iterator>
 #include "libslic3r/Config.hpp"
 #include <string>
+#include <vector>
 #include <boost/filesystem.hpp>
 #include <fstream>
 #include <sstream>
@@ -16,6 +17,45 @@
 #include "libslic3r/GCode/RMEOutputPlan.hpp"
 
 using namespace Slic3r;
+
+TEST_CASE("RME INDX activates chamber control before waiting for bed heating", "[IndxProfile][INDX]")
+{
+    std::ifstream input((boost::filesystem::path(PROFILES_DIR) / "Prusa" / "machine" /
+                         "Prusa CORE One INDX RME 0.4 nozzle.json").string());
+    REQUIRE(input.good());
+    const std::string start = nlohmann::json::parse(input).at("machine_start_gcode");
+    const auto bed_set = start.find("M140 S[first_layer_bed_temperature]");
+    const auto pickup = start.find("; Pick tool for Z homing");
+    const auto bed_wait = start.find("M190 R[first_layer_bed_temperature]");
+    REQUIRE(bed_set != std::string::npos);
+    REQUIRE(pickup != std::string::npos);
+    REQUIRE(bed_wait != std::string::npos);
+    REQUIRE(bed_set < pickup);
+    CHECK(pickup < bed_wait);
+
+    const int minimum = GENERATE(0, 45);
+    const bool includes_pla = GENERATE(false, true);
+    PlaceholderParser parser;
+    parser.set("initial_tool", 0);
+    parser.set("used_tools", includes_pla ? 2 : 1);
+    parser.set("is_extruder_used", new ConfigOptionBools{true, includes_pla, false, false, false, false, false, false});
+    auto materials = std::vector<std::string>(8, "ASA");
+    if (includes_pla) materials[1] = "PLA";
+    parser.set("filament_type", new ConfigOptionStrings(materials));
+    parser.set("chamber_temperature", new ConfigOptionInts(std::vector<int>(8, 55)));
+    parser.set("chamber_minimal_temperature", new ConfigOptionInts(std::vector<int>(8, minimum)));
+    parser.set("first_layer_bed_temperature", new ConfigOptionInts(std::vector<int>(8, 110)));
+    const auto commands = parser.process(start.substr(bed_set, pickup - bed_set));
+    CHECK(commands.find("M140 S110") != std::string::npos);
+    CHECK(commands.find(includes_pla ? "M141 S20" : "M141 S55") != std::string::npos);
+    CHECK(commands.find("M191") == std::string::npos);
+    // The later minimum-temperature wait may change the controller target;
+    // keep restoring the nominal target after that wait.
+    const auto chamber_wait = start.find("M191 S{chamber_minimal_temperature[initial_tool]}");
+    REQUIRE(chamber_wait != std::string::npos);
+    CHECK(bed_wait < chamber_wait);
+    CHECK(start.find("M141 S{chamber_temperature[initial_tool]}", chamber_wait) != std::string::npos);
+}
 
 TEST_CASE("INDX startup homes before vent motion and shutdown parks before closing it", "[IndxProfile][INDX]")
 {

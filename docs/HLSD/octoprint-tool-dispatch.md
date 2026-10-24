@@ -112,23 +112,82 @@ the currently selected material, and literal tool numbers when they mean a
 specific physical tool.
 
 `BackgroundSlicingProcess` owns the mapped `Print` until dispatch completes or
-is cancelled. It re-slices the job and generates a separate temporary G-code
-file; the editable project, ordinary preview and its memory-mapped G-code are
+is cancelled. An identity mapping with an identical complete effective
+configuration reuses the sliced G-code through a separate working copy. Unused
+physical-slot material padding is excluded from that comparison. Changed plain
+G-code assignments can reuse motion when their effective material rows, nozzle
+properties, feature roles, purge tables and sequences are equivalent. Unknown
+configuration differences require regeneration.
+
+The generator captures custom-template inputs, runtime overrides, output state,
+globals and random-generator state. Immutable parser settings are shared between
+snapshots; retained data is capped at 16 MiB and 2048 expansions. Marked template
+spans and a fingerprint of the final generated file establish provenance. Dispatch
+requires a fresh slice from this generator to obtain that in-memory certificate;
+an older exported G-code file alone cannot establish script provenance. Dispatch
+first performs a read-only preflight: it reproduces each original expansion, then
+replays it with physical tool IDs and relocated arrays. Literal custom parameters
+are never globally replaced. Changed macro motion or writer/global state rejects
+reuse. Replay rebuilds effective retraction settings from the destination nozzle
+defaults and material overrides, preserving the parser's extrusion-state outputs.
+The exported derived nozzle-map metadata describes the physical slots even though
+the destination Print has not been sliced. Replay preserves the source index of implicit legacy machine-limit vectors
+(normal/silent modes), independently of the relocated physical tool. Explicit
+machine-limit indices and ordinary generation keep their existing semantics.
+The motion check covers recognized positioning, cleaner/parking, coordinate,
+extrusion, acceleration and driver-control commands; it is not a complete
+firmware-state interpreter. Firmware calibration commands such as RME's `G427`
+and `M976` are evaluated from their captured templates with the mapped tool lists.
+Outside those spans an explicit native-command dialect identifies tool
+operands; an unknown command rejects reuse rather than guessing what its parameters
+mean. The copied motion remains byte-identical. Physical configuration, filament
+lists and usage statistics are updated separately.
+
+Within a template span, dispatch replaces only lines that changed during replay,
+not the entire rendered template. Original and replayed line counts must match;
+every changed line must occur exactly as often in the sealed final span as in the
+original expansion. Replacements follow original occurrence order in a single
+pass, so a newly written tool ID is never remapped again. Missing, rewritten or
+additional matching lines reject reuse. All other final bytes are preserved,
+including relocated fan commands, split moves, timing updates and computed mesh
+bounds inserted by the generator's post-processing.
+
+The preflight edit plan is capped at 32 MiB. A bounded streaming pass writes one
+private destination and verifies the source fingerprint again before the output
+can be published. Disk-space checks reserve system headroom and account for the
+additional spool-metadata rewrite. IMEX, SEMM, prime towers, nozzle preheating, logical nozzle-group
+templates, non-Marlin dialects, external processors and changed-tool sliced-3MF
+packaging use regeneration. Rejected preflight asks for Regenerate or Cancel on
+the main thread; it does not silently start a second slice. Different nozzle
+diameters receive a specific explanation before regeneration.
+
+Regeneration produces a separate temporary
+G-code file; the editable project, ordinary preview and its memory-mapped G-code are
 not replaced. Cancellation reaches both prints, and cancelled jobs are checked
 before upload enqueueing. Post-processing receives the mapped configuration;
-filename statistics come from the mapped print. Connection credentials are
-not copied into the exported job configuration.
+filename statistics come from the mapped print when regenerated and the original
+print when reusing its motion. Connection credentials are
+not copied into the exported job configuration. Progress identifies mapped-job
+slicing, G-code generation, spool metadata, packaging and copying. Script and
+plugin names are reported when those processors actually run.
 
 Physical-index spool metadata is embedded when spool-name embedding is enabled.
 Sliced 3MF packaging uses the mapped print and its G-code processor result,
 including used physical tool IDs and material metadata. It does not package
-the old logical preview file. Upload receives its own temporary copy so GUI
+the old logical preview file for changed mappings. Identity reuse packages the
+unchanged print and its existing processor result. Upload receives its own temporary copy so GUI
 cleanup cannot remove a queued job's input.
 
 Regression coverage uses `[ToolMapping]` in the core and FFF suites. It checks
 project preservation, painting and role remapping, invalid assignments,
 T0/T7 commands, used-tool masks, temperature ordering, purge matrices and the
 G-code/filament metadata inside a sliced 3MF.
+The opt-in FFF tag `[.ToolMappingProject]` reads `ORCA_TOOL_MAPPING_PROJECT` and
+checks an actual three-material/eight-tool project's applied configuration without
+slicing or exporting the model.
+Setting `ORCA_TOOL_MAPPING_SLICE=1` additionally creates one fresh logical slice,
+certifies its real printer scripts, and verifies that physical remapping retains
+the motion fingerprint and slicing timestamp without processing the mapped print.
 
 The mapping editor separates brand/material rules from exact-roll overrides.
 Profile choices are material-filtered and searchable; the current selection

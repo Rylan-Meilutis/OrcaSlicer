@@ -1725,6 +1725,12 @@ Color ViewerImpl::get_vertex_color(const PathVertex& v) const
     {
         return v.is_travel() ? get_option_color(move_type_to_option(v.type)) : m_temperature_range.get_color_at(v.temperature);
     }
+    case EViewType::ThermalStress:
+    {
+        if (v.is_travel()) return get_option_color(move_type_to_option(v.type));
+        return v.thermal_stress_mpa < 0.0f || !std::isfinite(v.thermal_stress_mpa) ? Color{128, 128, 128} :
+            m_thermal_stress_range.get_color_at(v.thermal_stress_mpa);
+    }
 // ORCA: Add Pressure Advance visualization support
     case EViewType::PressureAdvance:
     {
@@ -1829,6 +1835,7 @@ const ColorRange& ViewerImpl::get_color_range(EViewType type) const
     case EViewType::ActualSpeed:              { return m_actual_speed_range; }
     case EViewType::FanSpeed:                 { return m_fan_speed_range; }
     case EViewType::Temperature:              { return m_temperature_range; }
+    case EViewType::ThermalStress:            { return m_thermal_stress_range; }
 // ORCA: Add Pressure Advance visualization support
     case EViewType::PressureAdvance:          { return m_pressure_advance_range; }
     // ORCA: Add Acceleration visualization support
@@ -1853,6 +1860,7 @@ void ViewerImpl::set_color_range_palette(EViewType type, const Palette& palette)
     case EViewType::ActualSpeed:              { m_actual_speed_range.set_palette(palette);    break; }
     case EViewType::FanSpeed:                 { m_fan_speed_range.set_palette(palette);       break; }
     case EViewType::Temperature:              { m_temperature_range.set_palette(palette);     break; }
+    case EViewType::ThermalStress:            { m_thermal_stress_range.set_palette(palette);   break; }
 // ORCA: Add Pressure Advance visualization support
     case EViewType::PressureAdvance:          { m_pressure_advance_range.set_palette(palette); break; }
     // ORCA: Add Acceleration visualization support
@@ -1900,6 +1908,7 @@ size_t ViewerImpl::get_used_cpu_memory() const
     ret += m_actual_speed_range.size_in_bytes_cpu();
     ret += m_fan_speed_range.size_in_bytes_cpu();
     ret += m_temperature_range.size_in_bytes_cpu();
+    ret += m_thermal_stress_range.size_in_bytes_cpu();
     // ORCA: Add Pressure Advance visualization support
     ret += m_pressure_advance_range.size_in_bytes_cpu();
     // ORCA: Add Acceleration visualization support
@@ -2069,6 +2078,7 @@ void ViewerImpl::update_color_ranges()
     m_actual_speed_range.reset();
     m_fan_speed_range.reset();
     m_temperature_range.reset();
+    m_thermal_stress_range.reset();
     // ORCA: Add Pressure Advance visualization support
     m_pressure_advance_range.reset();
     // ORCA: Add Acceleration visualization support
@@ -2091,6 +2101,8 @@ void ViewerImpl::update_color_ranges()
             }
             m_fan_speed_range.update(round_to_bin(v.fan_speed));
             m_temperature_range.update(round_to_bin(v.temperature));
+            if (v.thermal_stress_mpa >= 0.0f && std::isfinite(v.thermal_stress_mpa))
+                m_thermal_stress_range.update(v.thermal_stress_mpa);
             // ORCA: Add Pressure Advance visualization support
             if (v.pressure_advance >= 0.0f)
                 m_pressure_advance_range.update(v.pressure_advance);

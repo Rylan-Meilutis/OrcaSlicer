@@ -2929,6 +2929,55 @@ static std::set<int> fan_speeds(const std::string &gcode, const std::string &com
     return speeds;
 }
 
+TEST_CASE("Buried roots do not request overhang cooling on supported material contacts", "[Multifilament][Rooting][Cooling]")
+{
+    const bool rooting = GENERATE(false, true);
+    const bool unsupported = GENERATE(false, true);
+    auto config = multifilament_config(2, {
+        {"filament_type", "ASA;TPU"}, {"rooting", rooting}, {"rooting_xy", false},
+        {"interlocking_beam", false}, {"rooting_depth", 3.}, {"rooting_base_width", 3.},
+        {"rooting_width", 1.2}, {"rooting_skin", 0.4},
+        {"layer_height", 0.2}, {"initial_layer_print_height", 0.2},
+        {"sparse_infill_density", "100%"}, {"wall_loops", 2},
+        {"elefant_foot_compensation", 0.}, {"enable_prime_tower", false},
+        {"skirt_loops", 0}, {"brim_type", "no_brim"},
+        {"fan_min_speed", "0,0"}, {"fan_max_speed", "0,0"},
+        {"reduce_fan_stop_start_freq", "0,0"}, {"close_fan_the_first_x_layers", "0,0"},
+        {"initial_layer_fan_speed", "-1,-1"}, {"full_fan_speed_layer", "0,0"},
+        {"slow_down_for_layer_cooling", "0,0"},
+        {"enable_overhang_bridge_fan", "1,1"}, {"overhang_fan_speed", "80,80"},
+        {"internal_bridge_fan_speed", "-1,-1"},
+        {"machine_start_gcode", ""}, {"machine_end_gcode", ""}});
+    config.set_key_value("overhang_fan_threshold", new ConfigOptionEnumsGeneric{
+        Overhang_threshold_1_4, Overhang_threshold_1_4});
+    Print print;
+    Model model;
+    init_print({make_cube(20., 20., 6.)}, print, model, config);
+    auto *object = model.objects.front();
+    object->volumes.front()->config.set("extruder", 1);
+    auto insert = make_cube(12., 12., 2.);
+    insert.translate(unsupported ? 16. : 4., 4., 6.);
+    object->add_volume(insert)->config.set("extruder", 2);
+    print.apply(model, config);
+    const auto output = gcode(print);
+    if (rooting && !unsupported) {
+        double buried_area = 0.;
+        for (const auto *layer : print.get_object(0)->layers())
+            if (layer->print_z < 6. - EPSILON)
+                for (const auto *region : layer->regions())
+                    if (region->region().extruder(frExternalPerimeter) == 2)
+                        buried_area += area(to_expolygons(region->slices.surfaces));
+        REQUIRE(buried_area > 0.);
+    }
+    // Cooling follows actual lower-layer support, not a material change or
+    // rooting enablement. The cantilever still honors the filament's fan.
+    const auto fans = fan_speeds(output, "M106 S");
+    if (unsupported)
+        CHECK(fans.count(80) == 1);
+    else
+        CHECK(fans.empty());
+}
+
 // The fan speeds and the recommended nozzle temperature range are tuned per extruder variant like the
 // other filament variant settings.
 TEST_CASE("Each filament cools with the fan speeds of its extruder variant", "[MultiFilament]")

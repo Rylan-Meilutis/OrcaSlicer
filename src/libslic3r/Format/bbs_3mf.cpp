@@ -4680,7 +4680,7 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                 std::istringstream(value) >> std::boolalpha >> spiral_mode;
                 m_curr_plater->config.set_key_value("spiral_mode", new ConfigOptionBool(spiral_mode));
             }
-            else if (key == "brim_type" || key == "brim_width" || key == "brim_object_gap" || key == "raft_layers" ||
+            else if (key == "automatic_warp_mitigation" || key == "brim_type" || key == "brim_width" || key == "brim_object_gap" || key == "raft_layers" ||
                      key == "brim_flow_ratio" || key == "raft_contact_distance" || key == "raft_expansion" ||
                      key == "raft_first_layer_expansion" || key == "raft_first_layer_density") {
                 m_curr_plater->config.set_deserialize_strict(key, value);
@@ -8530,7 +8530,7 @@ bool _BBS_3MF_Exporter::_add_model_config_file_to_archive(mz_zip_archive& archiv
                 }
 
                 //filament map related
-                for (const char *key : {"brim_type", "brim_width", "brim_object_gap", "raft_layers", "brim_flow_ratio",
+                for (const char *key : {"automatic_warp_mitigation", "brim_type", "brim_width", "brim_object_gap", "raft_layers", "brim_flow_ratio",
                                        "raft_contact_distance", "raft_expansion", "raft_first_layer_expansion", "raft_first_layer_density"})
                     if (const auto *option = plate_data->config.option(key))
                         stream << "    <" << METADATA_TAG << " " << KEY_ATTR << "=\"" << key << "\" " << VALUE_ATTR << "=\"" << option->serialize() << "\"/>\n";

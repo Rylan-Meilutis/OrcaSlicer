@@ -6,8 +6,12 @@
 #include "libslic3r/calib.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/catch_message.hpp>
 #include "test_helpers.hpp"
 #include "libslic3r/GCode/CoolingBuffer.hpp"
+#include "libslic3r/GCode/FanMover.hpp"
+#include "libslic3r/GCode.hpp"
+#include "libslic3r/GCodeWriter.hpp"
 
 #include <algorithm>
 #include <cstddef>
@@ -22,6 +26,127 @@
 
 using namespace Slic3r;
 using namespace Slic3r::Test;
+
+TEST_CASE("Custom fan changes restore the active cooling request", "[Cooling][FanResume]")
+{
+    const bool overhang = GENERATE(false, true);
+    const int normal_fan = GENERATE(0, 100);
+    PrintConfig config;
+    config.fan_min_speed.values = {double(normal_fan)};
+    config.fan_max_speed.values = {double(normal_fan)};
+    config.reduce_fan_stop_start_freq.values = {true};
+    config.close_fan_the_first_x_layers.values = {0};
+    config.initial_layer_fan_speed.values = {-1};
+    config.full_fan_speed_layer.values = {0};
+    config.overhang_fan_speed.values = {80};
+    config.enable_overhang_bridge_fan.values = {true};
+    config.slow_down_for_layer_cooling.values = {false};
+    GCode generator;
+    generator.apply_print_config(config);
+    generator.writer().set_extruders({0});
+    CoolingBuffer cooling(generator);
+    std::string input = overhang ? ";_OVERHANG_FAN_START\n" : "";
+    input += "M106 S200\n;_FORCE_RESUME_FAN_SPEED\nG1 X1 F600\n";
+    const std::string output = cooling.process_layer(std::move(input), 2, true);
+    const auto custom = output.find("M106 S200");
+    REQUIRE(custom != std::string::npos);
+    const std::string expected = normal_fan == 100 ? "M106 S255" : overhang ? "M106 S204" : "M106 S0";
+    const auto restored = output.find(expected, custom);
+    REQUIRE(restored != std::string::npos);
+    CHECK(restored < output.find("G1 X1"));
+    CHECK(output.find("_FORCE_RESUME_FAN_SPEED") == std::string::npos);
+}
+
+TEST_CASE("Tool boundaries restore incoming cooling after selecting the tool", "[Cooling][FanResume][Toolchange]")
+{
+    const bool first_layer = GENERATE(false, true);
+    const bool custom_fan = GENERATE(false, true);
+    const bool same_fan = GENERATE(false, true);
+    const bool continuing_feature = GENERATE(false, true);
+    CAPTURE(first_layer, custom_fan, same_fan, continuing_feature);
+    const auto dynamic = multifilament_config(2, {
+        {"filament_type", "ASA;TPU"},
+        {"fan_min_speed", same_fan ? "0,0" : "0,40"},
+        {"fan_max_speed", same_fan ? "0,0" : "0,40"},
+        {"reduce_fan_stop_start_freq", "1,1"},
+        {"close_fan_the_first_x_layers", "1,1"},
+        {"initial_layer_fan_speed", "-1,-1"}, {"full_fan_speed_layer", "0,0"},
+        {"overhang_fan_speed", "80,80"}, {"enable_overhang_bridge_fan", "0,1"},
+        {"slow_down_for_layer_cooling", "0,0"}});
+    PrintConfig config;
+    config.apply(dynamic, true);
+    GCode generator;
+    generator.apply_print_config(config);
+    generator.writer().set_extruders({0, 1});
+    CoolingBuffer cooling(generator);
+    const std::string cleaning = custom_fan ?
+        ";_FAN_MOVER_SKIP_START\nM106 S200\n;_FAN_MOVER_SKIP_END\n;_FORCE_RESUME_FAN_SPEED\n" : "";
+    // Consecutive feature paths may share a START across tools. The incoming
+    // profile decides whether it applies; END always clears the shared scope.
+    const std::string end = continuing_feature ? "" : ";_OVERHANG_FAN_END\n";
+    std::string input = ";_OVERHANG_FAN_START\nT1\n" + cleaning +
+        end + "G1 X1 E1 F600\nG1 X9 E2 F60\n;_OVERHANG_FAN_START\nT0\n" + cleaning +
+        ";_OVERHANG_FAN_END\nG1 X2 E2 F600\n";
+    const auto cooled = cooling.process_layer(std::move(input), first_layer ? 0 : 2, true);
+    FanMover mover(generator.writer(), 3.f, false, true, false, 0.f);
+    const std::string output = mover.process_gcode(cooled, true);
+    INFO(output);
+    const auto tpu = output.find("T1\n");
+    const auto asa = output.find("T0\n");
+    REQUIRE(tpu != std::string::npos);
+    REQUIRE(asa != std::string::npos);
+    const std::string expected_tpu = first_layer || same_fan ? "M106 S0" : "M106 S102";
+    // Each incoming tool receives a command immediately after T, not before it.
+    CHECK(output.compare(tpu + 3, expected_tpu.size(), expected_tpu) == 0);
+    CHECK(output.compare(asa + 3, 7, "M106 S0") == 0);
+    if (custom_fan) {
+        const auto tpu_custom = output.find("M106 S200", tpu);
+        const auto asa_custom = output.find("M106 S200", asa);
+        REQUIRE(tpu_custom != std::string::npos);
+        REQUIRE(asa_custom != std::string::npos);
+        const auto active_tpu = continuing_feature && !first_layer ? "M106 S204" : expected_tpu;
+        CHECK(output.find(active_tpu, tpu_custom) < output.find("G1 X1"));
+        CHECK(output.find("M106 S0", asa_custom) < output.find("G1 X2"));
+    }
+    if (continuing_feature && !first_layer)
+        CHECK(output.find("M106 S204", tpu) < output.find("G1 X1"));
+}
+
+TEST_CASE("Fan look-ahead and kickstarts stay on their side of tool changes", "[Cooling][FanMover][Toolchange]")
+{
+    GCodeWriter writer;
+    PrintConfig config;
+    writer.apply_print_config(config);
+    SECTION("Identical incoming fan commands survive the tool boundary") {
+        FanMover mover(writer, 3.f, false, true, false, 0.f);
+        const std::string output = mover.process_gcode(
+            "M106 S102\nG1 X10 F600\nT1 S1 L0 D0\nM106 S102\nG1 X20 F600\n", true);
+        const auto tool = output.find("T1 S1 L0 D0\n");
+        REQUIRE(tool != std::string::npos);
+        CHECK(output.find("M106 S102") < tool);
+        const auto incoming = output.find("M106 S102", tool);
+        REQUIRE(incoming != std::string::npos);
+        CHECK(incoming < output.find("G1 X20"));
+    }
+    SECTION("An unfinished kickstart restores the outgoing fan before selection") {
+        FanMover mover(writer, 0.f, false, true, false, 1.f);
+        const std::string output = mover.process_gcode("M106 S51\nT1\nM106 S0\nG1 X10 F600\n", true);
+        const auto tool = output.find("T1\n");
+        REQUIRE(tool != std::string::npos);
+        const auto outgoing = output.rfind("M106", tool);
+        REQUIRE(outgoing != std::string::npos);
+        CHECK(output.compare(outgoing, 8, "M106 S51") == 0);
+        CHECK(output.find("M106 S0", tool) < output.find("G1 X10"));
+    }
+    SECTION("Unknown incoming fan state never kickstarts a fan-off command") {
+        FanMover mover(writer, 3.f, false, true, false, 1.f);
+        const std::string output = mover.process_gcode("T1\nM106 S0\nG1 X10 F600\n", true);
+        CHECK(output.find("M106 S255") == std::string::npos);
+        const auto tool = output.find("T1\n");
+        REQUIRE(tool != std::string::npos);
+        CHECK(output.find("M106 S0", tool) < output.find("G1 X10"));
+    }
+}
 
 TEST_CASE("Bridge temperature is independent of arcs and restores normal extrusion", "[Cooling][FeatureTemperature]")
 {

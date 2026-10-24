@@ -263,6 +263,7 @@ TEST_CASE("Loading an independent printer capacity preserves the project palette
 TEST_CASE("Dispatch mapping preserves the project and binds roles to physical tools", "[PresetBundle][ToolMapping]")
 {
     PresetBundle bundle;
+    bundle.extruder_ams_counts = {{{1, 0}, {4, 1}}, {{1, 1}}};
     auto &printer = bundle.printers.get_edited_preset().config;
     printer.set_key_value("host_type", new ConfigOptionEnum<PrintHostType>(htOctoPrint));
     printer.set_deserialize_strict("single_extruder_multi_material", "0");
@@ -283,6 +284,8 @@ TEST_CASE("Dispatch mapping preserves the project and binds roles to physical to
     plate.set_key_value("other_layers_print_sequence_nums", new ConfigOptionInt(2));
     plate.set_key_value("other_layers_print_sequence", new ConfigOptionInts{2, 5, 2, 1, 6, 10, 1, 2});
     const auto config = bundle.tool_mapped_config(job, {7, 0}, plate);
+    CHECK(config.option<ConfigOptionStrings>("extruder_ams_count")->values ==
+          save_extruder_ams_count_to_string(bundle.extruder_ams_counts));
     CHECK(config.option<ConfigOptionInts>("first_layer_print_sequence")->values == std::vector<int>{8, 1});
     CHECK(config.option<ConfigOptionInts>("other_layers_print_sequence")->values == std::vector<int>{2, 5, 1, 8, 6, 10, 8, 1});
     CHECK(config.opt_int("other_layers_print_sequence_nums") == 2);

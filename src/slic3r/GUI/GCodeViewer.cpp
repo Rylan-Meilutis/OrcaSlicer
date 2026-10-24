@@ -152,6 +152,8 @@ static std::string get_view_type_string(libvgcode::EViewType view_type)
         return _u8L("Fan Speed");
     else if (view_type == libvgcode::EViewType::Temperature)
         return _u8L("Temperature");
+    else if (view_type == libvgcode::EViewType::ThermalStress)
+        return _u8L("Thermal stress");
     else if (view_type == libvgcode::EViewType::VolumetricFlowRate)
         return _u8L("Flow");
     else if (view_type == libvgcode::EViewType::ActualVolumetricFlowRate)
@@ -190,6 +192,7 @@ static const std::vector<std::pair<std::string, libvgcode::EViewType>>& view_typ
         { "layer_time_logarithmic",       libvgcode::EViewType::LayerTimeLogarithmic },
         { "fan_speed",                    libvgcode::EViewType::FanSpeed },
         { "temperature",                  libvgcode::EViewType::Temperature },
+        { "thermal_stress",               libvgcode::EViewType::ThermalStress },
         { "pressure_advance",             libvgcode::EViewType::PressureAdvance },
     };
     return map;
@@ -806,6 +809,13 @@ void GCodeViewer::SequentialView::Marker::render_position_window(const libvgcode
             case libvgcode::EViewType::Temperature:
                 sprintf(detail_buf, "%s%.0f", _u8L("Temperature: ").c_str(), vertex.temperature);
                 break;
+            case libvgcode::EViewType::ThermalStress: {
+                const std::string detail = is_extrusion && std::isfinite(vertex.thermal_stress_mpa) && vertex.thermal_stress_mpa >= 0.f ?
+                    GUI::format(_u8L("Final-state static tensile stress: %1% MPa"), vertex.thermal_stress_mpa) :
+                    _u8L("Thermal stress unavailable");
+                snprintf(detail_buf, sizeof(detail_buf), "%s", detail.c_str());
+                break;
+            }
             case libvgcode::EViewType::LayerTimeLinear:
             case libvgcode::EViewType::LayerTimeLogarithmic:
                 sprintf(detail_buf, "%s%.1f", _u8L("Layer Time: ").c_str(), vertex.layer_duration);
@@ -1678,6 +1688,7 @@ void GCodeViewer::update_by_mode(ConfigOptionMode mode)
     view_type_items.push_back(libvgcode::EViewType::LayerTimeLogarithmic);
     view_type_items.push_back(libvgcode::EViewType::FanSpeed);
     view_type_items.push_back(libvgcode::EViewType::Temperature);
+    view_type_items.push_back(libvgcode::EViewType::ThermalStress);
 // ORCA: Add Pressure Advance visualization support
     view_type_items.push_back(libvgcode::EViewType::PressureAdvance);
     //if (mode == ConfigOptionMode::comDevelop) {
@@ -1828,6 +1839,7 @@ void GCodeViewer::load_as_gcode(const GCodeProcessorResult& gcode_result, const 
         return;
     }
     m_plate_mass    = gcode_result.plate_mass;
+    m_thermal_analysis = gcode_result.thermal_analysis;
     m_object_masses = gcode_result.object_masses;
     m_body_masses   = gcode_result.body_masses;
     m_support_masses = gcode_result.support_masses;
@@ -2340,6 +2352,7 @@ void GCodeViewer::reset()
     //BBS: should also reset the result id
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": current result id %1% ")%m_last_result_id;
     m_last_result_id = -1;
+    m_thermal_analysis = {};
     m_belt_layer_zs.clear();
     //BBS: add only gcode mode
     m_only_gcode_in_preview = false;
@@ -5059,6 +5072,7 @@ void GCodeViewer::render_legend(float &legend_height, int canvas_width, int canv
     }
     case libvgcode::EViewType::FanSpeed:       { imgui.title(_u8L("Fan speed (%)")); break; }
     case libvgcode::EViewType::Temperature:    { imgui.title(_u8L("Temperature (℃)")); break; }
+    case libvgcode::EViewType::ThermalStress:  { imgui.title(_u8L("Tensile thermal stress (MPa)")); break; }
 // ORCA: Add Pressure Advance visualization support
     case libvgcode::EViewType::PressureAdvance:{ imgui.title(_u8L("Pressure Advance")); break; }
     case libvgcode::EViewType::VolumetricFlowRate:
@@ -5332,6 +5346,50 @@ void GCodeViewer::render_legend(float &legend_height, int canvas_width, int canv
     }
     case libvgcode::EViewType::FanSpeed:                 { append_range(m_viewer.get_color_range(libvgcode::EViewType::FanSpeed), 0); break; }
     case libvgcode::EViewType::Temperature:              { append_range(m_viewer.get_color_range(libvgcode::EViewType::Temperature), 0); break; }
+    case libvgcode::EViewType::ThermalStress: {
+        const auto &range = m_viewer.get_color_range(libvgcode::EViewType::ThermalStress).get_range();
+        const bool available = range[0] <= range[1];
+        imgui.text(_u8L("Final-state static estimate. Layer selection does not simulate stress during printing."));
+        if (available)
+            append_range(m_viewer.get_color_range(libvgcode::EViewType::ThermalStress), 2);
+        else {
+            using Status = GCodeProcessorResult::ThermalAnalysis::Status;
+            const Status status = m_thermal_analysis.status;
+            switch (status) {
+            case Status::NotRun:
+                imgui.text(_u8L("Mechanical analysis has not run. Enable automatic warp mitigation and slice the project to request it."));
+                break;
+            case Status::UnsupportedMaterial:
+                imgui.text(_u8L("Mechanical analysis unavailable: a material has no compatible mechanical data."));
+                break;
+            case Status::InvalidThermalInputs:
+                imgui.text(_u8L("Mechanical analysis unavailable: the thermal inputs are incomplete."));
+                break;
+            case Status::BudgetExceeded:
+                imgui.text(_u8L("Mechanical analysis exceeded its resource limit; no stress estimate is shown."));
+                break;
+            case Status::Unconverged:
+                imgui.text(_u8L("Mechanical analysis did not converge; no stress estimate is shown."));
+                break;
+            case Status::InvalidGeometry:
+                imgui.text(_u8L("Mechanical analysis could not resolve the deposited geometry or its bed contact."));
+                break;
+            default:
+                imgui.text(_u8L("No converged mechanical analysis is available for this plate."));
+                break;
+            }
+        }
+        if (available) {
+            const auto &analysis = m_thermal_analysis;
+            if (analysis.status == GCodeProcessorResult::ThermalAnalysis::Status::Converged) {
+                imgui.text(_u8L("Published-property scenario envelope, not measured print stress."));
+                imgui.text(GUI::format(_u8L("Bonded-bed tensile demand: %1% N"), analysis.tensile_force_n));
+                imgui.text(GUI::format(_u8L("Stored elastic energy: %1% J"), analysis.elastic_energy_j));
+            }
+        }
+        imgui.text(_u8L("Gray: no mechanical sample. Stress is not an adhesion safety margin."));
+        break;
+    }
 // ORCA: Add Pressure Advance visualization support
     case libvgcode::EViewType::PressureAdvance:          { append_range(m_viewer.get_color_range(libvgcode::EViewType::PressureAdvance), 3); break; }
     case libvgcode::EViewType::LayerTimeLinear:          { append_range(m_viewer.get_color_range(libvgcode::EViewType::LayerTimeLinear), true); break; }

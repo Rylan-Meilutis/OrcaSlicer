@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <map>
 #include <queue>
 
 #include <boost/log/trivial.hpp>
@@ -104,7 +105,8 @@ struct HeapEntry
 
 DecimateResult decimate(const TriSoup &geometry, size_t target_triangles, bool harvest_flat,
                         double harvest_tol, const std::vector<uint8_t> &locked_faces,
-                        const DecimateProgressFn &on_progress, const std::vector<int> &face_color)
+                        const DecimateProgressFn &on_progress, const std::vector<int> &face_color,
+                        bool exact_horizontal_only)
 {
     DecimateResult result;
     const size_t   n = geometry.pos.size();
@@ -115,14 +117,24 @@ DecimateResult decimate(const TriSoup &geometry, size_t target_triangles, bool h
 
     // The finest grid. Anything coarser fuses distinct fine-feature vertices on a displaced mesh,
     // leaving it non-manifold before decimation starts and producing open edges afterwards.
-    QuantizedPointMap  vert_map(WELD_GRID_DECIMATION, std::min(n, size_t(1) << 22));
     std::vector<Vec3d> pos;
     std::vector<int>   remap(n);
-    for (size_t i = 0; i < n; ++i) {
-        const int idx = vert_map.get_or_set(geometry.pos[i], int(pos.size()));
-        if (vert_map.inserted())
-            pos.push_back(geometry.pos[i].cast<double>());
-        remap[i] = idx;
+    if (exact_horizontal_only) {
+        std::map<std::array<float,3>,int> vertices;
+        for(size_t i=0;i<n;++i) {
+            if(on_progress && i%4096==0 && !on_progress(0.)) { result.geometry=geometry; return result; }
+            const auto &p=geometry.pos[i];
+            const auto entry=vertices.emplace(std::array<float,3>{p.x(),p.y(),p.z()},int(pos.size()));
+            if(entry.second) pos.push_back(p.cast<double>());
+            remap[i]=entry.first->second;
+        }
+    } else {
+        QuantizedPointMap vert_map(WELD_GRID_DECIMATION, std::min(n, size_t(1) << 22));
+        for (size_t i = 0; i < n; ++i) {
+            const int idx = vert_map.get_or_set(geometry.pos[i], int(pos.size()));
+            if (vert_map.inserted()) pos.push_back(geometry.pos[i].cast<double>());
+            remap[i] = idx;
+        }
     }
     const size_t     vert_count = pos.size();
     const size_t     face_count = n / 3;
@@ -138,10 +150,13 @@ DecimateResult decimate(const TriSoup &geometry, size_t target_triangles, bool h
     // An edge with a locked endpoint never reaches the heap.
     std::vector<uint8_t> locked_vert;
     size_t               locked_face_count = 0;
-    if (!locked_faces.empty()) {
+    if (!locked_faces.empty() || exact_horizontal_only) {
         locked_vert.assign(vert_count, 0);
-        for (size_t f = 0; f < face_count && f < locked_faces.size(); ++f) {
-            if (!locked_faces[f])
+        for (size_t f = 0; f < face_count; ++f) {
+            const double z=pos[size_t(faces[f*3])].z();
+            const bool nonhorizontal=exact_horizontal_only &&
+                (pos[size_t(faces[f*3+1])].z()!=z || pos[size_t(faces[f*3+2])].z()!=z);
+            if (!nonhorizontal && (f>=locked_faces.size() || !locked_faces[f]))
                 continue;
             ++locked_face_count;
             for (int k = 0; k < 3; ++k)
@@ -211,6 +226,9 @@ DecimateResult decimate(const TriSoup &geometry, size_t target_triangles, bool h
 
         const double sqrt_w = std::sqrt(DECIMATE_CREASE_WEIGHT);
         for (const EdgeRec &er : edges) {
+            if(exact_horizontal_only && er.count!=2) {
+                locked_vert[size_t(er.va)]=locked_vert[size_t(er.vb)]=1;
+            }
             if (er.count != 2)
                 continue; // boundary or non-manifold
             const Vec3d n0 = face_normal_unit(pos, faces[size_t(er.f0) * 3], faces[size_t(er.f0) * 3 + 1],
@@ -260,6 +278,39 @@ DecimateResult decimate(const TriSoup &geometry, size_t target_triangles, bool h
             face_slot[size_t(s)] = s;
             ++vf_count[size_t(v)];
         }
+    if(exact_horizontal_only) {
+        // Edge incidence alone misses a bowtie vertex: multiple closed fans
+        // can meet at one exact coordinate without sharing an edge. Keep such
+        // contacts fixed, rather than pulling one shell into the other.
+        for(size_t v=0;v<vert_count;++v) {
+            if(on_progress && v%4096==0 && !on_progress(0.)) { result.geometry=geometry; return result; }
+            if(locked_vert[v]) continue;
+            if(vf_count[v]<3 || vf_count[v]>DECIMATE_MAX_VALENCE) { locked_vert[v]=1; continue; }
+            std::array<std::array<int,2>,DECIMATE_MAX_VALENCE> links{};
+            unsigned count=0;
+            for(int s=vf_head[v];s>=0;s=slot_next[size_t(s)]) {
+                const size_t f=size_t(slot_face[size_t(s)]);
+                unsigned k=0;
+                for(unsigned corner=0;corner<3;++corner)
+                    if(faces[f*3+corner]!=int(v)) links[count][k++]=faces[f*3+corner];
+                ++count;
+            }
+            std::array<bool,DECIMATE_MAX_VALENCE> reached{};
+            reached[0]=true;
+            unsigned seen=1;
+            bool changed=true;
+            while(changed) {
+                changed=false;
+                for(unsigned i=0;i<count;++i) if(reached[i])
+                    for(unsigned j=0;j<count;++j) if(!reached[j])
+                        if(links[i][0]==links[j][0] || links[i][0]==links[j][1] ||
+                           links[i][1]==links[j][0] || links[i][1]==links[j][1]) {
+                            reached[j]=true; ++seen; changed=true;
+                        }
+            }
+            if(seen!=count) locked_vert[v]=1;
+        }
+    }
     const auto unlink_slot = [&](int s) {
         const int p = slot_prev[size_t(s)], nx = slot_next[size_t(s)], v = slot_vert[size_t(s)];
         if (p >= 0) slot_next[size_t(p)] = nx;
@@ -290,6 +341,9 @@ DecimateResult decimate(const TriSoup &geometry, size_t target_triangles, bool h
     std::vector<HeapEntry> heap;
     heap.reserve(std::min<size_t>(face_count * 3, size_t(1) << 24));
     const auto heap_push = [&](HeapEntry e) {
+        // Exact planar export is resource bounded. Dropping extra candidate
+        // edges can reduce simplification, but cannot change the surface.
+        if(exact_horizontal_only && heap.size()>=face_count*3) return;
         heap.push_back(e);
         std::push_heap(heap.begin(), heap.end(), std::greater<HeapEntry>());
     };
@@ -324,6 +378,7 @@ DecimateResult decimate(const TriSoup &geometry, size_t target_triangles, bool h
 
     // Where an edge collapses to. Also re-run on pop instead of stored - see HeapEntry.
     const auto collapse_target = [&](int v1, int v2) -> Vec3d {
+        if(exact_horizontal_only) return (pos[size_t(v1)]+pos[size_t(v2)])*.5;
         Vec3d p;
         if (!solve_q(quadrics, v1, v2, p)) {
             const Vec3d  mid = (pos[size_t(v1)] + pos[size_t(v2)]) * 0.5;
@@ -346,7 +401,7 @@ DecimateResult decimate(const TriSoup &geometry, size_t target_triangles, bool h
         // the same split as when the rounded target was stored in the entry, so no ordering changes.
         // Where quadric costs are all near zero, shorter edges first keeps triangle quality up.
         const double len2 = (pos[size_t(v2)] - pos[size_t(v1)]).squaredNorm();
-        heap_push({ eval_sum(quadrics, v1, v2, p) + len2 * 1e-8, v1, v2, version[size_t(v1)],
+        heap_push({ (exact_horizontal_only ? 0. : eval_sum(quadrics, v1, v2, p)) + len2 * 1e-8, v1, v2, version[size_t(v1)],
                     version[size_t(v2)] });
     };
 
@@ -438,6 +493,7 @@ DecimateResult decimate(const TriSoup &geometry, size_t target_triangles, bool h
             const Vec3d nb = (fb == vc) ? np : ob;
             const Vec3d nc = (fc == vc) ? np : oc;
             const Vec3d nn = (nb - na).cross(nc - na);
+            if(exact_horizontal_only && nn.squaredNorm()==0.) return true;
             const double raw = on.dot(nn);
             if (raw < 0.0)
                 return true;
@@ -474,7 +530,7 @@ DecimateResult decimate(const TriSoup &geometry, size_t target_triangles, bool h
             }
         }
         // The popped entry is the cheapest left, so exceeding the tolerance ends the run.
-        if (reached_target && top.cost > harvest_ceil)
+        if (!exact_horizontal_only && reached_target && top.cost > harvest_ceil)
             break;
 
         const int v1 = top.v1, v2 = top.v2;
@@ -492,9 +548,18 @@ DecimateResult decimate(const TriSoup &geometry, size_t target_triangles, bool h
         if (has_link_violation(v1, v2, lk_epoch))
             continue;
         const Vec3d target = collapse_target(v1, v2).cast<float>().cast<double>();
+        if(exact_horizontal_only) {
+            bool planar=pos[size_t(v1)].z()==target.z() && pos[size_t(v2)].z()==target.z();
+            for(const int v:{v1,v2}) for(int s=vf_head[size_t(v)];s>=0;s=slot_next[size_t(s)]) {
+                const size_t f=size_t(slot_face[size_t(s)]);
+                if(faces[f*3]<0) continue;
+                for(unsigned k=0;k<3;++k) planar &= pos[size_t(faces[f*3+k])].z()==target.z();
+            }
+            if(!planar) continue;
+        }
         if (check_flipped(v1, v2, target) || check_flipped(v2, v1, target))
             continue;
-        if (!reached_target && top.cost > harvest_ceil)
+        if (!exact_horizontal_only && !reached_target && top.cost > harvest_ceil)
             result.target_cost_detail = true;
 
         // v1 survives at the new position, v2 goes.
@@ -545,7 +610,7 @@ DecimateResult decimate(const TriSoup &geometry, size_t target_triangles, bool h
         maybe_compact();
     }
 
-    BOOST_LOG_TRIVIAL(info) << "TextureBake decimate: pops=" << pops << " stale=" << stale_pops
+    if(!exact_horizontal_only) BOOST_LOG_TRIVIAL(info) << "TextureBake decimate: pops=" << pops << " stale=" << stale_pops
                             << " compactions=" << compactions << " heap_peak=" << heap.capacity()
                             << " faces=" << active_faces;
 

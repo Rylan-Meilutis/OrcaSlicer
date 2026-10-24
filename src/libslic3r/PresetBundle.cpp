@@ -5526,6 +5526,9 @@ DynamicPrintConfig PresetBundle::tool_mapped_config(Model &job_model, const std:
             throw std::invalid_argument("Each material must map to a different available printer tool.");
 
     PresetBundle job(*this);
+    // The bundle copy omits runtime device topology, but dispatch changes
+    // material assignment, not the printer's physical feeder groups.
+    job.extruder_ams_counts = extruder_ams_counts;
     job.prints.get_edited_preset().config.apply(plate_config);
     DynamicPrintConfig roles = full_config(false);
     roles.apply(plate_config);

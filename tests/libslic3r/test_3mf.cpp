@@ -112,6 +112,7 @@ using namespace Slic3r;
 TEST_CASE("Brim brush operations and project adhesion overrides survive saving", "[3mf][Brim]")
 {
     const bool legacy = GENERATE(false, true);
+    const int auto_override = GENERATE(-1, 0, 1);
     Model model;
     REQUIRE(load_stl((std::string(TEST_DATA_DIR) + "/test_3mf/Prusa.stl").c_str(), &model));
     model.add_default_instances();
@@ -123,9 +124,12 @@ TEST_CASE("Brim brush operations and project adhesion overrides survive saving",
         model.objects.front()->brim_points.push_back(point);
     }
     DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+    config.set_key_value("automatic_warp_mitigation", new ConfigOptionBool(auto_override != 1));
     const auto original_profile = config.option("brim_width")->serialize();
     PlateData plate;
     plate.plate_index = 0;
+    if (auto_override >= 0)
+        plate.config.set_key_value("automatic_warp_mitigation", new ConfigOptionBool(auto_override != 0));
     plate.config.set_deserialize_strict({{"brim_type", "painted"}, {"brim_width", 12.5},
         {"brim_object_gap", 0.25}, {"raft_layers", 3}, {"brim_flow_ratio", 0.9},
         {"raft_contact_distance", 0.15}, {"raft_expansion", 2.5},
@@ -161,6 +165,11 @@ TEST_CASE("Brim brush operations and project adhesion overrides survive saving",
     CHECK_THAT(plates.front()->config.opt_float("brim_width"), Catch::Matchers::WithinAbs(12.5, 1e-6));
     CHECK_THAT(plates.front()->config.opt_float("brim_object_gap"), Catch::Matchers::WithinAbs(0.25, 1e-6));
     CHECK(plates.front()->config.opt_int("raft_layers") == 3);
+    CHECK(plates.front()->config.has("automatic_warp_mitigation") == (auto_override >= 0));
+    CHECK(loaded_config.opt_bool("automatic_warp_mitigation") == (auto_override != 1));
+    auto effective = loaded_config;
+    effective.apply(plates.front()->config);
+    CHECK(effective.opt_bool("automatic_warp_mitigation") == (auto_override != 0));
     for (const auto &key : plate.config.keys()) {
         REQUIRE(plates.front()->config.has(key));
         CHECK(plates.front()->config.option(key)->serialize() == plate.config.option(key)->serialize());
