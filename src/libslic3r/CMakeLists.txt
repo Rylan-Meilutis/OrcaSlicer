@@ -322,6 +322,10 @@ set(lisbslic3r_sources
     GCode/ToolOrdering.hpp
     GCode/ToolMapping.hpp
     GCode/ToolMapping.cpp
+    GCode/LearnedTiming.hpp
+    GCode/LearnedTiming.cpp
+    GCode/OctoPrintTiming.hpp
+    GCode/OctoPrintTiming.cpp
     GCode/OrderingStrategies.cpp
     GCode/OrderingStrategies.hpp
     GCode/WipeTower2.cpp

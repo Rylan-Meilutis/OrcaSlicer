@@ -224,6 +224,8 @@
 #include "AuiPaneLayout.hpp"
 #include "GUI_Utils.hpp"
 #include "OptionsGroup.hpp"
+#include "Widgets/TextInput.hpp"
+#include "libslic3r/GCode/OctoPrintTiming.hpp"
 #include "GUI_Factories.hpp"
 #include "wxExtensions.hpp"
 #include "../Utils/PrintHost.hpp"
@@ -460,6 +462,55 @@ bool uses_independent_tool_dispatch()
         wxGetApp().preset_bundle->get_printer_extruder_count() > 1 &&
         !config.opt_bool("single_extruder_multi_material");
 }
+
+class LearnedTimingDialog final : public DPIDialog
+{
+public:
+    LearnedTimingDialog(wxWindow *parent, const wxString &revision)
+        : DPIDialog(parent, wxID_ANY, _L("Update learned time estimate"), wxDefaultPosition,
+                    wxDefaultSize, wxDEFAULT_DIALOG_STYLE)
+    {
+        SetBackgroundColour(StateColor::darkModeColorFor(*wxWHITE));
+        auto *layout = new wxBoxSizer(wxVERTICAL);
+        auto *note = new wxStaticText(this, wxID_ANY,
+            _L("Read the selected OctoPrint file's latest print metadata and learn only if that attempt succeeded and its file exactly matches this G-code. No files are uploaded and no printer commands are sent. Timing records stay on this computer."));
+        note->Wrap(FromDIP(480));
+        layout->Add(note, 0, wxEXPAND | wxALL, FromDIP(12));
+        layout->Add(new wxStaticText(this, wxID_ANY, _L("Printer setup revision")), 0, wxLEFT | wxRIGHT, FromDIP(12));
+        m_revision = new ::TextInput(this, revision);
+        m_revision->GetTextCtrl()->SetMaxLength(256);
+        layout->Add(m_revision, 0, wxEXPAND | wxALL, FromDIP(12));
+        auto *hint = new wxStaticText(this, wxID_ANY,
+            _L("Enter your firmware/macro setup identifier and change it after firmware, calibration or macro changes. This is your declaration, not a detected printer revision."));
+        hint->Wrap(FromDIP(480));
+        layout->Add(hint, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, FromDIP(12));
+        auto *buttons = new DialogButtons(this, {"OK", "Cancel"});
+        buttons->GetOK()->SetLabel(_L("Read and learn"));
+        buttons->GetOK()->Enable(!setup_revision().empty());
+        m_revision->GetTextCtrl()->Bind(wxEVT_TEXT, [this, buttons](wxCommandEvent &event) {
+            buttons->GetOK()->Enable(!setup_revision().empty());
+            event.Skip();
+        });
+        layout->Add(buttons, 0, wxEXPAND | wxALL, FromDIP(12));
+        SetSizerAndFit(layout);
+        CenterOnParent();
+        wxGetApp().UpdateDlgDarkUI(this);
+    }
+    std::string setup_revision() const
+    {
+        return into_u8(m_revision->GetTextCtrl()->GetValue().Trim().Trim(false));
+    }
+protected:
+    void on_dpi_changed(const wxRect &) override
+    {
+        m_revision->Rescale();
+        GetSizer()->SetSizeHints(this);
+        Layout();
+    }
+    void on_sys_color_changed() override { wxGetApp().UpdateDlgDarkUI(this); }
+private:
+    ::TextInput *m_revision = nullptr;
+};
 
 class AutoMitigationDialog final : public DPIDialog
 {
@@ -22568,6 +22619,83 @@ void Plater::export_toolpaths_to_obj() const
 
     wxBusyCursor wait;
     p->preview->get_canvas3d()->export_toolpaths_to_obj(into_u8(path).c_str());
+}
+
+std::string Plater::learned_timing_context() const
+{
+    auto &bundle = *wxGetApp().preset_bundle;
+    const auto &edited = bundle.printers.get_edited_preset().config;
+    const auto *physical = bundle.physical_printers.get_selected_printer_config();
+    const auto *host = physical ? physical->option<ConfigOptionString>("print_host") : nullptr;
+    const auto *type = physical ? physical->option<ConfigOptionEnum<PrintHostType>>("host_type") : nullptr;
+    if (!host) host = edited.option<ConfigOptionString>("print_host");
+    if (!type) type = edited.option<ConfigOptionEnum<PrintHostType>>("host_type");
+    if (!host || host->value.empty() || !type || type->value != htOctoPrint) return {};
+    const std::string server = OctoPrintTiming::server_key(host->value);
+    return server + ':' + wxGetApp().app_config->get("learned_timing_revisions", server);
+}
+
+void Plater::update_learned_time_estimate(unsigned int result_id, const std::string &filename)
+{
+    CallAfter([this, result_id, filename] {
+        if (wxGetApp().is_closing() || IsBeingDeleted() || wxGetApp().IsScheduledForDestruction(this)) return;
+        if (!get_ui_job_worker().is_idle() || is_background_process_slicing()) {
+            show_error(this, _L("Wait for the current operation to finish before updating learned timing."));
+            return;
+        }
+        auto host_config = filament_sync_host_config();
+        if (host_config.opt_enum<PrintHostType>("host_type") != htOctoPrint || host_config.opt_string("print_host").empty()) {
+            show_error(this, _L("Select a configured OctoPrint printer before updating learned timing."));
+            return;
+        }
+        const std::string revision_key = OctoPrintTiming::server_key(host_config.opt_string("print_host"));
+        wxWeakRef<Plater> alive(this);
+        LearnedTimingDialog dialog(this, from_u8(wxGetApp().app_config->get("learned_timing_revisions", revision_key)));
+        if (dialog.ShowModal() != wxID_OK || !alive || wxGetApp().is_closing() ||
+            IsBeingDeleted() || wxGetApp().IsScheduledForDestruction(this) || !get_ui_job_worker().is_idle()) return;
+        const std::string revision = dialog.setup_revision();
+        if (revision.empty()) return;
+        wxGetApp().app_config->set("learned_timing_revisions", revision_key, revision);
+        const std::string context = revision_key + ':' + revision;
+        const std::string store = (boost::filesystem::path(data_dir()) / "learned_timing.json").string();
+        auto outcome = std::make_shared<OctoPrintTiming::RefreshResult>();
+        queue_job(get_ui_job_worker(), [host_config = std::move(host_config), filename, store, revision, outcome](Job::Ctl &ctl) mutable {
+            ctl.update_status(0, _u8L("Reading completed-print timing from OctoPrint"));
+            OctoPrint host(&host_config);
+            *outcome = host.refresh_learned_timing(filename, store, revision, true, [&ctl] { return ctl.was_canceled(); });
+            if (!ctl.was_canceled()) ctl.update_status(100, _u8L("Completed-print timing check finished"));
+        }, [alive, outcome, result_id, filename, context](bool canceled, std::exception_ptr &error) {
+            if (canceled || !alive || wxGetApp().is_closing()) { error = nullptr; return; }
+            auto *owner = alive.get();
+            if (owner->IsBeingDeleted() || wxGetApp().IsScheduledForDestruction(owner)) { error = nullptr; return; }
+            std::string status;
+            using Status = OctoPrintTiming::Status;
+            if (error) {
+                status = _u8L("Learned timing unavailable: the update failed.");
+                outcome->estimate.reset();
+                error = nullptr; // Do not expose network responses or credentials in an exception dialog.
+            } else switch (outcome->status) {
+            case Status::Success:
+                if (outcome->estimate) {
+                    status = _u8L("Timing history updated.");
+                } else {
+                    status = _u8L("Learned timing unavailable: at least three similar completed prints with the same setup are required.");
+                }
+                break;
+            case Status::NetworkError: status = _u8L("Timing history not updated: OctoPrint could not be reached."); break;
+            case Status::NoCompletedJob: status = _u8L("Timing history not updated: OctoPrint has no successful completed job for its selected file."); break;
+            case Status::HashMismatch: status = _u8L("Timing history not updated: OctoPrint's completed file does not exactly match this G-code."); break;
+            case Status::InvalidSource: status = _u8L("Learned timing unavailable: this G-code lacks compatible timing or configuration metadata, or changed during the update."); break;
+            case Status::StorageError: status = _u8L("Timing history not updated: local timing records could not be saved."); break;
+            case Status::InvalidResponse: status = _u8L("Timing history not updated: OctoPrint returned incomplete or unsupported completion metadata."); break;
+            case Status::Disabled: case Status::Cancelled: return;
+            }
+            owner->p->preview->get_canvas3d()->get_gcode_viewer().set_learned_timing(
+                result_id, filename, outcome->estimate, std::move(status), context);
+            owner->p->preview->get_canvas3d()->set_as_dirty();
+            owner->p->preview->get_canvas3d()->request_extra_frame();
+        });
+    });
 }
 
 void Plater::export_deposition_stl()

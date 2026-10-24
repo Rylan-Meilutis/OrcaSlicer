@@ -6,6 +6,10 @@
 #include <boost/optional/optional.hpp>
 #include "libslic3r/Config.hpp"
 #include "libslic3r/PrintConfig.hpp"
+#include "libslic3r/GCode/OctoPrintTiming.hpp"
+#include "libslic3r/GCode/LearnedTiming.hpp"
+#include <functional>
+#include <optional>
 #include "libslic3r/Exception.hpp"
 #include <sstream>
 #include <exception>
@@ -18,6 +22,9 @@
 #include <boost/asio.hpp>
 #include <boost/algorithm/string/split.hpp>
 #include <boost/nowide/convert.hpp>
+#include <boost/nowide/fstream.hpp>
+#include <stdexcept>
+#include <mutex>
 
 #include <curl/curl.h>
 #include <nlohmann/json.hpp>
@@ -154,6 +161,94 @@ OctoPrint::OctoPrint(DynamicPrintConfig *config) :
 {}
 
 const char* OctoPrint::get_name() const { return "OctoPrint"; }
+
+OctoPrintTiming::Status OctoPrint::get_completed_print(const std::string &expected_sha1,
+    OctoPrintTiming::CompletedPrint &result, bool opted_in, const std::function<bool()> &cancelled) const
+{
+    using OctoPrintTiming::Status;
+    result = {};
+    if (!opted_in) return Status::Disabled;
+    if (cancelled && cancelled()) return Status::Cancelled;
+    // One bounded metadata refresh, no retries, downloads, discovery or logs
+    // containing host URLs, API keys or server response bodies.
+    const auto fetch = [&](const std::string &path, std::string &body) {
+        bool success = false;
+        auto http = Http::get(make_url(path));
+        set_auth(http);
+        http.timeout_connect(3).timeout_max(7).size_limit(1024 * 1024)
+            .on_progress([&](Http::Progress, bool &cancel) { if (cancelled && cancelled()) cancel = true; })
+            .on_complete([&](std::string response, unsigned) { body = std::move(response); success = true; })
+            .on_error([](std::string, std::string, unsigned) {})
+#ifdef WIN32
+            .ssl_revoke_best_effort(m_ssl_revoke_best_effort)
+#endif
+            .perform_sync();
+        return success;
+    };
+    std::string body;
+    if (!fetch("api/job", body)) return cancelled && cancelled() ? Status::Cancelled : Status::NetworkError;
+    std::string path;
+    try { path = OctoPrintTiming::selected_local_path(body); }
+    catch (const std::exception &) { return Status::InvalidResponse; }
+    if (path.empty()) return Status::NoCompletedJob;
+    if (cancelled && cancelled()) return Status::Cancelled;
+    if (!fetch("api/files/local/" + escape_path_by_element(boost::filesystem::path(path)), body))
+        return cancelled && cancelled() ? Status::Cancelled : Status::NetworkError;
+    if (cancelled && cancelled()) return Status::Cancelled;
+    return OctoPrintTiming::completed_print(body, expected_sha1, OctoPrintTiming::server_key(m_host), result);
+}
+
+OctoPrintTiming::RefreshResult OctoPrint::refresh_learned_timing(const std::string &local_filename,
+    const std::string &store_path, const std::string &setup_revision, bool opted_in,
+    const std::function<bool()> &cancelled) const
+{
+    using OctoPrintTiming::Status;
+    OctoPrintTiming::RefreshResult result;
+    if (!opted_in) { result.status = Status::Disabled; return result; }
+    if (setup_revision.empty() || setup_revision.size() > 256) return result;
+    const auto check = [&] { if (cancelled && cancelled()) throw std::runtime_error("cancelled"); };
+    std::optional<LearnedTimingFeatures> features;
+    try {
+        const auto hash = OctoPrintTiming::file_sha1(local_filename, check);
+        boost::nowide::ifstream input(local_filename);
+        features = extract_learned_timing_features(input,
+            OctoPrintTiming::server_key(m_host) + ':' + setup_revision, hash, check);
+        if (!features || OctoPrintTiming::file_sha1(local_filename, check) != hash) return result;
+    } catch (const std::exception &) {
+        result.status = cancelled && cancelled() ? Status::Cancelled : Status::InvalidSource;
+        return result;
+    }
+    try {
+        check();
+        const auto model = OctoPrintTiming::load(store_path);
+        result.estimate = model.estimate(*features);
+        result.accepted_samples = model.observations().size();
+    } catch (const std::exception &) {
+        result.status = cancelled && cancelled() ? Status::Cancelled : Status::StorageError;
+        return result;
+    }
+    OctoPrintTiming::CompletedPrint completed;
+    result.status = get_completed_print(features->gcode_hash, completed, true, cancelled);
+    if (result.status != Status::Success) return result;
+    // Serialize read/modify/write transactions across concurrent refresh jobs.
+    static std::mutex refresh_mutex;
+    const std::lock_guard<std::mutex> lock(refresh_mutex);
+    try {
+        check();
+        auto model = OctoPrintTiming::load(store_path);
+        LearnedTimingObservation observation{completed.job_id, *features, completed.active_seconds, true, true};
+        const bool added = model.add_observation(observation);
+        result.estimate = model.estimate(*features);
+        result.accepted_samples = model.observations().size();
+        check();
+        if (added) OctoPrintTiming::save(store_path, model);
+    } catch (const std::exception &) {
+        result.status = cancelled && cancelled() ? Status::Cancelled : Status::StorageError;
+        result.estimate.reset();
+        result.accepted_samples = 0;
+    }
+    return result;
+}
 
 #ifdef WIN32
 bool OctoPrint::test_with_resolved_ip(wxString &msg) const

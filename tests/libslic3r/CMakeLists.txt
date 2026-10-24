@@ -30,6 +30,7 @@ add_executable(${_TEST_NAME}_tests
     test_calib.cpp
     test_octoprint_spool_cache.cpp
     test_indx_profile.cpp
+    test_learned_timing.cpp
     test_clipper_offset.cpp
     test_clipper_utils.cpp
     test_config.cpp

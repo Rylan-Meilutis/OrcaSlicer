@@ -4,6 +4,8 @@
 #include "3DScene.hpp"
 #include "libslic3r/GCode/GCodeProcessor.hpp"
 #include "libslic3r/GCode/ThumbnailData.hpp"
+#include "libslic3r/GCode/LearnedTiming.hpp"
+#include <optional>
 #include "IMSlider.hpp"
 #include "GLModel.hpp"
 #include "I18N.hpp"
@@ -220,6 +222,9 @@ private:
     //BBS: save m_gcode_result as well
     const GCodeProcessorResult* m_gcode_result;
     GCodeProcessorResult::ThermalAnalysis m_thermal_analysis;
+    std::optional<LearnedTimingEstimate> m_learned_timing;
+    std::string m_learned_timing_status;
+    std::string m_learned_timing_context;
     std::array<unsigned int, static_cast<size_t>(EMoveType::Count)> m_move_type_counts{};
     std::array<std::array<float, static_cast<size_t>(PrintEstimatedStatistics::ETimeMode::Count)>, static_cast<size_t>(EMoveType::Count)> m_move_type_times{};
     std::array<float, static_cast<size_t>(EMoveType::Count)> m_move_type_distances{};
@@ -526,6 +531,8 @@ public:
     float get_legend_height() { return m_legend_height; }
 
     void export_toolpaths_to_obj(const char* filename) const;
+    void set_learned_timing(unsigned int result_id, const std::string &filename,
+                           std::optional<LearnedTimingEstimate> estimate, std::string status, std::string context);
 
     void set_belt_printer(bool enabled, float angle_deg) { m_belt_view_enabled = enabled; m_belt_angle_deg = angle_deg; }
     bool is_belt_view() const { return m_belt_view_enabled && m_belt_angle_deg > 0.f; }

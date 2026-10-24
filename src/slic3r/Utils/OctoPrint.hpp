@@ -11,6 +11,8 @@
 #include "PrintHost.hpp"
 #include "libslic3r/PrintConfig.hpp"
 #include "libslic3r/GCode/SpoolManagerMetadata.hpp"
+#include "libslic3r/GCode/OctoPrintTiming.hpp"
+#include <functional>
 #include "libslic3r/enum_bitmask.hpp"
 
 
@@ -37,6 +39,13 @@ public:
     std::string get_host() const override { return m_host; }
     const std::string& get_apikey() const { return m_apikey; }
     const std::string& get_cafile() const { return m_cafile; }
+    // Explicit opt-in only. Reads metadata; never issues printer commands.
+    OctoPrintTiming::Status get_completed_print(const std::string &expected_sha1,
+        OctoPrintTiming::CompletedPrint &result, bool opted_in,
+        const std::function<bool()> &cancelled = {}) const;
+    OctoPrintTiming::RefreshResult refresh_learned_timing(const std::string &local_filename,
+        const std::string &store_path, const std::string &setup_revision, bool opted_in,
+        const std::function<bool()> &cancelled = {}) const;
     // Successful live reads are persisted. Cached fallback is opt-in; on a
     // cached success, error contains a warning which the caller must display.
     bool get_selected_filament_spools(std::vector<SpoolManagerMetadata::Filament> &slots, wxString &error,

@@ -102,6 +102,7 @@
 #include <unordered_set>
 #include <Eigen/Geometry>
 #include "libslic3r/AppConfig.hpp"
+#include "libslic3r/GCode/LearnedTiming.hpp"
 #include "libslic3r/BoundingBox.hpp"
 #include "libslic3r/CutUtils.hpp"
 #include "libslic3r/GCode/ToolOrdering.hpp"
@@ -2125,6 +2126,10 @@ void GCodeViewer::load_as_gcode(const GCodeProcessorResult& gcode_result, const 
     m_extruders_count = gcode_result.filaments_count;
 
     //BBS: move the id to the end of reset
+    if (m_last_result_id != gcode_result.id) {
+        m_learned_timing.reset();
+        m_learned_timing_status.clear();
+    }
     m_last_result_id = gcode_result.id;
     m_last_belt_show_designed = m_belt_show_designed;
     m_gcode_result = &gcode_result;
@@ -2347,11 +2352,23 @@ void GCodeViewer::reset_shell()
     m_shell_bounding_box = BoundingBoxf3();
 }
 
+void GCodeViewer::set_learned_timing(unsigned int result_id, const std::string &filename,
+                                   std::optional<LearnedTimingEstimate> estimate, std::string status, std::string context)
+{
+    if (m_last_result_id != result_id || !m_gcode_result || m_gcode_result->filename != filename) return;
+    m_learned_timing = std::move(estimate);
+    m_learned_timing_status = std::move(status);
+    m_learned_timing_context = std::move(context);
+}
+
 void GCodeViewer::reset()
 {
     //BBS: should also reset the result id
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": current result id %1% ")%m_last_result_id;
     m_last_result_id = -1;
+    m_learned_timing.reset();
+    m_learned_timing_status.clear();
+    m_learned_timing_context.clear();
     m_thermal_analysis = {};
     m_belt_layer_zs.clear();
     //BBS: add only gcode mode
@@ -6080,6 +6097,27 @@ void GCodeViewer::render_legend(float &legend_height, int canvas_width, int canv
         ImGui::SameLine(max_len);
         imgui.text(short_time(get_time_dhms(stealth_estimate.time)));
     }
+
+    if ((!m_learned_timing_status.empty() || m_learned_timing) &&
+        m_learned_timing_context != wxGetApp().plater()->learned_timing_context()) {
+        m_learned_timing.reset();
+        m_learned_timing_status.clear();
+    }
+    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 320.f * m_scale);
+    if (m_learned_timing) {
+        const auto &learned = *m_learned_timing;
+        imgui.text(GUI::format(_u8L("History-adjusted total (normal): %1%"), short_time(get_time_dhms(learned.seconds))));
+        imgui.text(GUI::format(_u8L("Observed range: %1%–%2%"),
+            short_time(get_time_dhms(learned.lower_seconds)), short_time(get_time_dhms(learned.upper_seconds))));
+        imgui.text(into_u8(format_wxstr(_L_PLURAL("Based on %1% compatible completed print.",
+            "Based on %1% compatible completed prints.", learned.sample_count), learned.sample_count)));
+        imgui.text(_u8L("Observed variation, not a confidence interval. The slicer estimate is unchanged."));
+    }
+    if (!m_learned_timing_status.empty()) imgui.text(m_learned_timing_status);
+    ImGui::PopTextWrapPos();
+    if (m_gcode_result && !m_gcode_result->filename.empty() &&
+        imgui.button(_u8L("Update learned time estimate…")))
+        wxGetApp().plater()->update_learned_time_estimate(m_last_result_id, m_gcode_result->filename);
 
     auto show_mode_button = [this, &imgui, can_show_mode_button](const std::string& label, libvgcode::ETimeMode mode) {
         if (can_show_mode_button(mode)) {

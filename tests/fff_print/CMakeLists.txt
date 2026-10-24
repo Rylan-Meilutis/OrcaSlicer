@@ -30,6 +30,7 @@ add_executable(${_TEST_NAME}_tests
 	test_thermoelastic_gcode.cpp
 	test_deposition_mesh.cpp
 	test_tool_dispatch.cpp
+	test_octoprint_timing.cpp
 	test_slicing_pipeline_hook.cpp
 	test_support_material.cpp
 	test_texture_displacement.cpp
