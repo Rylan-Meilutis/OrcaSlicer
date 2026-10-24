@@ -1,6 +1,23 @@
+#include <algorithm>
+#include "libslic3r/Fill/FillProgress.hpp"
+#include <functional>
 #include <assert.h>
+#include <regex>
+#include <cstdlib>
+#include <cmath>
+#include <iterator>
+#include <math.h>
+#include <set>
+#include <map>
 #include <stdio.h>
+#include <array>
+#include <limits>
 #include <memory>
+#include <string>
+#include <vector>
+#include <queue>
+#include <unordered_set>
+#include <utility>
 
 #include "../ClipperUtils.hpp"
 #include "../Geometry.hpp"
@@ -9,16 +26,35 @@
 #include "../PrintConfig.hpp"
 #include "../Surface.hpp"
 
+#include <tbb/parallel_for.h>
+
 #include "AABBTreeLines.hpp"
+#include "libslic3r/Config.hpp"
+#include "libslic3r/ExPolygon.hpp"
+#include "libslic3r/BoundingBox.hpp"
 #include "ExtrusionEntity.hpp"
-#include "FillBase.hpp"
+#include "Fill.hpp"
+#include "libslic3r/Fill/FillBase.hpp"
+#include "FillAdaptive.hpp"
 #include "FillRectilinear.hpp"
 #include "FillLightning.hpp"
 #include "FillConcentricInternal.hpp"
 #include "FillTpmsD.hpp"
 #include "FillTpmsFK.hpp"
 #include "FillConcentric.hpp"
+#include "libslic3r/Flow.hpp"
+#include "libslic3r/Point.hpp"
+#include "libslic3r/Line.hpp"
+#include "libslic3r/Polygon.hpp"
+#include "libslic3r/Polyline.hpp"
 #include "libslic3r.h"
+#include "libslic3r/ExtrusionEntityCollection.hpp"
+#include "libslic3r/MultiMaterialSegmentation.hpp"
+#include "libslic3r/Slicing.hpp"
+#include "libslic3r/SurfaceCollection.hpp"
+
+namespace Slic3r::FillAdaptive { struct Octree; }
+namespace Slic3r::FillLightning { class Generator; }
 
 namespace Slic3r {
 
@@ -272,11 +308,19 @@ struct SurfaceFillParams
     float skin_infill_depth       = 0;
     bool symmetric_infill_y_axis  = false;
 
+    // Top fill for 3D honeycomb
+    bool infill_complete_top = false;
+  
     // Params for Lateral honeycomb
     float infill_overhang_angle = 60.f;
 
     // For Gyroid: when true, use the parameterized "optimized" wave.
     bool gyroid_optimized = false;
+
+    // For TPMS: grade the density from the surface to the interior of the object.
+    AdaptiveInfillMode     adaptive_infill_mode          = AdaptiveInfillMode::Disabled;
+    float                adaptive_infill_interior_density  = 0.f;
+    AdaptiveInfillGradient adaptive_infill_gradient = AdaptiveInfillGradient::Linear;
 
     // Orca: corner smoothing factor in the range [0, 1].
     double      smooth_factor { 0. };
@@ -286,6 +330,14 @@ struct SurfaceFillParams
 
     // Orca: forced print order of surface fill loops/fragments for center-based patterns.
     SurfaceFillOrder fill_order = SurfaceFillOrder::Default;
+
+    // Arc overhangs use different minimum-span settings for one-sided
+    // cantilevers and two-sided bridges. Keep that classification with the
+    // grouped fill so support contact can split it without losing the rule.
+    bool arc_one_sided_overhang = false;
+
+    // Do not merge relief-bearing fill with another region's settings.
+    size_t cosmetic_top_region = size_t(-1);
 
 	bool operator<(const SurfaceFillParams &rhs) const {
 #define RETURN_COMPARE_NON_EQUAL(KEY) if (this->KEY < rhs.KEY) return true; if (this->KEY > rhs.KEY) return false;
@@ -315,14 +367,20 @@ struct SurfaceFillParams
         RETURN_COMPARE_NON_EQUAL(lateral_lattice_angle_1);
 		RETURN_COMPARE_NON_EQUAL(lateral_lattice_angle_2);
 		RETURN_COMPARE_NON_EQUAL(symmetric_infill_y_axis);
+		RETURN_COMPARE_NON_EQUAL(infill_complete_top);
 		RETURN_COMPARE_NON_EQUAL(infill_lock_depth);
 		RETURN_COMPARE_NON_EQUAL(skin_infill_depth);
         RETURN_COMPARE_NON_EQUAL(infill_overhang_angle);
 		RETURN_COMPARE_NON_EQUAL(gyroid_optimized);
+		RETURN_COMPARE_NON_EQUAL(adaptive_infill_mode);
+		RETURN_COMPARE_NON_EQUAL(adaptive_infill_interior_density);
+		RETURN_COMPARE_NON_EQUAL(adaptive_infill_gradient);
         RETURN_COMPARE_NON_EQUAL(smooth_factor);
         RETURN_COMPARE_NON_EQUAL(center_of_surface_pattern);
         RETURN_COMPARE_NON_EQUAL(separated_infills);
 		RETURN_COMPARE_NON_EQUAL_TYPED(unsigned, fill_order);
+		RETURN_COMPARE_NON_EQUAL(arc_one_sided_overhang);
+        RETURN_COMPARE_NON_EQUAL(cosmetic_top_region);
 
 		return false;
 	}
@@ -352,8 +410,13 @@ struct SurfaceFillParams
                 this->center_of_surface_pattern == rhs.center_of_surface_pattern &&
                 this->separated_infills       == rhs.separated_infills &&
                 this->gyroid_optimized        == rhs.gyroid_optimized        &&
+                this->adaptive_infill_mode           == rhs.adaptive_infill_mode           &&
+                this->adaptive_infill_interior_density   == rhs.adaptive_infill_interior_density   &&
+                this->adaptive_infill_gradient  == rhs.adaptive_infill_gradient  &&
                 this->smooth_factor           == rhs.smooth_factor           &&
-                this->fill_order              == rhs.fill_order;
+                this->fill_order              == rhs.fill_order              &&
+                this->arc_one_sided_overhang  == rhs.arc_one_sided_overhang &&
+                this->cosmetic_top_region == rhs.cosmetic_top_region;
 	}
 };
 
@@ -362,11 +425,17 @@ struct SurfaceFill {
 
 	size_t 				region_id;
 	Surface 			surface;
-	ExPolygons       	expolygons;
+    ExPolygons       	expolygons;
 	SurfaceFillParams	params;
     // BBS
     std::vector<size_t> region_id_group;
     ExPolygons          no_overlap_expolygons;
+    ExPolygons          arc_anchor_regions;
+    ExPolygons          arc_root_anchor_regions;
+    Polylines           arc_obstacle_paths;
+    Polylines           arc_support_paths;
+    std::vector<coord_t> arc_support_widths;
+    ExPolygons          arc_obstacle_regions;
 };
 
 
@@ -630,24 +699,28 @@ void split_solid_surface(size_t layer_id, const SurfaceFill &fill, ExPolygons &n
     if (!line_based_pattern) {
         const coord_t scaled_spacing = scaled<coord_t>(fill.params.spacing);
 
-        for (const ExPolygon &expolygon : fill.expolygons) {
+        // Each expolygon is split on its own, so they run in parallel and are collected in their original order.
+        std::vector<std::pair<ExPolygons, ExPolygons>> split_parts(fill.expolygons.size()); // normal, narrow
+        tbb::parallel_for(size_t(0), fill.expolygons.size(), [&](size_t idx) {
+            const ExPolygon &expolygon = fill.expolygons[idx];
             Polygons filled_area = to_polygons(expolygon);
 
             // "Core" area: open (erode+dilate) to drop thin features, then clamp back to the original polygon.
             Polygons inner_area  = intersection(filled_area, opening(filled_area, scaled_spacing, scaled_spacing));
 
             if (inner_area.empty()) {
-                narrow_infill.emplace_back(expolygon);
-                continue;
+                split_parts[idx].second.emplace_back(expolygon);
+                return;
             }
 
             ExPolygons inner_ex = union_ex(inner_area);
             ExPolygons expolys{expolygon};
-            ExPolygons narrow_ex = diff_ex(expolys, inner_ex);
-            ExPolygons normal_ex = intersection_ex(expolys, inner_ex);
-
-            append(normal_infill, normal_ex); // normal infill area
-            append(narrow_infill, narrow_ex); // narrow infill area
+            split_parts[idx].second = diff_ex(expolys, inner_ex);         // narrow infill area
+            split_parts[idx].first  = intersection_ex(expolys, inner_ex); // normal infill area
+        });
+        for (auto &[normal_ex, narrow_ex] : split_parts) {
+            append(normal_infill, std::move(normal_ex));
+            append(narrow_infill, std::move(narrow_ex));
         }
 
         return;
@@ -669,7 +742,10 @@ void split_solid_surface(size_t layer_id, const SurfaceFill &fill, ExPolygons &n
     }
     const double aligning_angle = -base_angle + PI;
 
-	for (const ExPolygon &expolygon : fill.expolygons) {
+    // Each expolygon is reconstructed on its own, so they run in parallel and are collected in their original order.
+    std::vector<Polygons> split_reconstructed(fill.expolygons.size());
+    tbb::parallel_for(size_t(0), fill.expolygons.size(), [&](size_t expolygon_idx) {
+        const ExPolygon &expolygon = fill.expolygons[expolygon_idx];
         Polygons filled_area = to_polygons(expolygon);
         polygons_rotate(filled_area, aligning_angle);
         BoundingBox bb = get_extents(filled_area);
@@ -800,8 +876,10 @@ void split_solid_surface(size_t layer_id, const SurfaceFill &fill, ExPolygons &n
             }
         }
 
-        polygons_append(normal_fill_areas, reconstructed_area);
-    }
+        split_reconstructed[expolygon_idx] = std::move(reconstructed_area);
+    });
+    for (Polygons &reconstructed_area : split_reconstructed)
+        polygons_append(normal_fill_areas, std::move(reconstructed_area));
 
     polygons_rotate(normal_fill_areas, -aligning_angle);
 
@@ -850,8 +928,196 @@ void split_solid_surface(size_t layer_id, const SurfaceFill &fill, ExPolygons &n
 #endif
 }
 
+static double projected_bbox_span(const BoundingBox &bbox, const Vec2d &axis)
+{
+    const std::array<Point, 4> corners{
+        bbox.min,
+        bbox.max,
+        Point(bbox.min.x(), bbox.max.y()),
+        Point(bbox.max.x(), bbox.min.y())
+    };
+    double min_projection = std::numeric_limits<double>::max();
+    double max_projection = std::numeric_limits<double>::lowest();
+    for (const Point &corner : corners) {
+        const double projection = corner.cast<double>().dot(axis);
+        min_projection = std::min(min_projection, projection);
+        max_projection = std::max(max_projection, projection);
+    }
+    return max_projection - min_projection;
+}
+
+// Cosmetic-only relief: keep the load-bearing shell and all walls intact.
+// This is not thermal isolation: the sections remain bonded to the layer below.
+static void apply_cosmetic_top_relief(const Layer &layer, SurfaceFill &fill)
+{
+    if (fill.params.cosmetic_top_region == size_t(-1) || layer.lower_layer == nullptr ||
+        fill.params.bridge || !fill.surface.is_top() || fill.expolygons.empty())
+        return;
+    const PrintRegionConfig &config = layer.regions()[fill.region_id]->region().config();
+    if (config.buried_top_relief.value || config.top_shell_layers.value < 2 || config.cosmetic_top_relief_gap.value <= 0. ||
+        config.cosmetic_top_relief_spacing.value < 2.)
+        return;
+
+    // Read classified fill and completed perimeters, never neighboring fills:
+    // layers generate infill concurrently. Require a continuous solid layer
+    // of the same region beneath the entire top; a nominal shell count alone
+    // does not protect thin roofs, slopes or sparse-supported single skins.
+    ExPolygons solid_below;
+    for (const LayerRegion *lower : layer.lower_layer->regions()) {
+        if (&lower->region() != &layer.regions()[fill.region_id]->region())
+            continue;
+        for (const Surface &surface : lower->fill_surfaces.surfaces)
+            if (surface.surface_type == stInternalSolid || surface.surface_type == stBottom)
+                solid_below.push_back(surface.expolygon);
+        const auto walls = lower->perimeters.flatten();
+        Polygons wall_coverage;
+        for (const ExtrusionEntity *wall : walls.entities)
+            if (wall->role() != erOverhangPerimeter)
+                wall->polygons_covered_by_width(wall_coverage, 0.f);
+        append(solid_below, union_ex(wall_coverage));
+    }
+    if (solid_below.empty())
+        return;
+    solid_below = union_ex(solid_below);
+
+    const coord_t spacing = scale_(config.cosmetic_top_relief_spacing.value);
+    // Rectilinear endpoints almost reach the boundary, whereas concentric
+    // patterns inset them. Reserve a bead width across each groove rather than
+    // assuming every filler contracts its paths by half the spacing.
+    const coord_t gap = scale_(config.cosmetic_top_relief_gap.value + fill.params.flow.width());
+    const coord_t wall_clearance = scale_(config.cosmetic_top_relief_gap.value + 0.5 * fill.params.flow.width());
+    ExPolygons sections;
+    bool changed = false;
+    for (const ExPolygon &island : fill.expolygons) {
+        const BoundingBox box = get_extents(island);
+        // Leave small islands unchanged, including their original overlap.
+        if (box.size().maxCoeff() < 2 * spacing + gap || !diff_ex(ExPolygons{island}, solid_below).empty()) {
+            sections.push_back(island);
+            continue;
+        }
+        Polygons grooves;
+        for (int axis = 0; axis < 2; ++axis) {
+            if (box.size()[axis] < 2 * spacing + gap)
+                continue;
+            for (coord_t p = box.min[axis] + spacing; p + gap / 2 < box.max[axis]; p += spacing) {
+                Point lo = box.min, hi = box.max;
+                lo[axis] = p - gap / 2;
+                hi[axis] = p + gap / 2;
+                grooves.emplace_back(Points{lo, {hi.x(), lo.y()}, hi, {lo.x(), hi.y()}});
+            }
+        }
+        ExPolygons pieces = diff_ex(offset_ex(island, -float(wall_clearance)), grooves);
+        if (pieces.empty()) {
+            sections.push_back(island);
+            continue;
+        }
+        changed = true;
+        append(sections, std::move(pieces));
+    }
+    if (!changed)
+        return;
+    fill.expolygons = std::move(sections);
+    fill.no_overlap_expolygons = intersection_ex(fill.no_overlap_expolygons, fill.expolygons);
+}
+
+// Leave three continuous cap layers untouched: an exposed path directly over
+// a relief slot can sag and reproduce the zigzag on the visible surface.
+// Only internal solid material connected
+// vertically to a nearby top of this region is eligible; never sparse infill,
+// bottom skins or bridge layers. The uncut rim and cap deliberately retain
+// structural connections, so this is stress relief, not free expansion.
+static void apply_buried_top_relief(const Layer &layer, SurfaceFill &fill)
+{
+    if (fill.params.cosmetic_top_region == size_t(-1) || fill.params.bridge ||
+        fill.surface.surface_type != stInternalSolid || fill.expolygons.empty())
+        return;
+    const PrintRegion &region = layer.regions()[fill.region_id]->region();
+    const PrintRegionConfig &config = region.config();
+    constexpr size_t cap_layers = 3;
+    if (!config.buried_top_relief.value || config.top_shell_layers.value <= int(cap_layers) ||
+        config.cosmetic_top_relief_gap.value <= 0. || config.cosmetic_top_relief_spacing.value < 2. ||
+        config.buried_top_relief_tooth_pitch.value < 2.)
+        return;
+
+    ExPolygons corridor = fill.expolygons, roofs, protected_roofs;
+    size_t layers_above = 1;
+    for (const Layer *upper = layer.upper_layer; upper != nullptr &&
+         upper->print_z - layer.print_z <= config.buried_top_relief_depth.value + EPSILON;
+         upper = upper->upper_layer, ++layers_above) {
+        ExPolygons solid, top;
+        for (const LayerRegion *candidate : upper->regions()) {
+            if (&candidate->region() != &region)
+                continue;
+            for (const Surface &surface : candidate->fill_surfaces.surfaces) {
+                if (surface.is_top())
+                    top.push_back(surface.expolygon);
+                if (surface.is_top() || surface.surface_type == stInternalSolid)
+                    solid.push_back(surface.expolygon);
+            }
+        }
+        append(layers_above < cap_layers ? protected_roofs : roofs, intersection_ex(corridor, top));
+        corridor = intersection_ex(corridor, solid);
+        if (corridor.empty())
+            break;
+    }
+    roofs = diff_ex(union_ex(roofs), union_ex(protected_roofs));
+    if (roofs.empty())
+        return;
+
+    const coord_t spacing = scale_(config.cosmetic_top_relief_spacing.value);
+    const coord_t pitch = scale_(config.buried_top_relief_tooth_pitch.value);
+    const coord_t amplitude = scale_(0.5 * std::clamp(config.buried_top_relief_tooth_depth.value,
+                                                    0., 0.5 * config.cosmetic_top_relief_spacing.value));
+    const float channel_radius = float(scale_(0.5 * (config.cosmetic_top_relief_gap.value + fill.params.flow.width())));
+    // Include the possible endpoint bead overhang in the protected rim.
+    const float rim = float(scale_(std::max(0.5, config.buried_top_relief_wall_rim.value) + 0.5 * fill.params.flow.width()));
+    const ExPolygons eligible = offset_ex(intersection_ex(fill.expolygons, union_ex(roofs)), -rim);
+    if (eligible.empty())
+        return;
+
+    // Fixed object-space phase keeps the air slots aligned through the buried
+    // stack instead of bonding alternate layers back across the same joint.
+    const BoundingBox object_box = layer.object()->bounding_box();
+    Polygons grooves;
+    for (const ExPolygon &island : eligible) {
+        const BoundingBox box = get_extents(island);
+        for (int axis = 0; axis < 2; ++axis) {
+            if (box.size()[axis] < 2 * spacing)
+                continue;
+            const int along = 1 - axis;
+            const coord_t first = object_box.min[axis] + spacing * coord_t(std::ceil(
+                double(box.min[axis] - amplitude - object_box.min[axis]) / spacing));
+            const coord_t start = object_box.min[along] + (pitch / 2) * coord_t(std::floor(
+                double(box.min[along] - object_box.min[along]) / (pitch / 2))) - pitch;
+            for (coord_t position = first; position <= box.max[axis] + amplitude; position += spacing) {
+                Polyline joint;
+                for (coord_t p = start; p <= box.max[along] + pitch; p += pitch / 2) {
+                    Point point;
+                    const coord_t tooth = (p - object_box.min[along]) / (pitch / 2);
+                    point[axis] = position + (tooth % 2 == 0 ? amplitude : -amplitude);
+                    point[along] = p;
+                    joint.points.push_back(point);
+                }
+                append(grooves, offset(joint, channel_radius, jtRound, scale_(0.02)));
+            }
+        }
+    }
+    if (grooves.empty())
+        return;
+    const ExPolygons slots = intersection_ex(grooves, eligible);
+    fill.expolygons = diff_ex(fill.expolygons, slots);
+    fill.no_overlap_expolygons = diff_ex(fill.no_overlap_expolygons, slots);
+}
+
 std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_param)
 {
+    ExPolygons support_below;
+    if (const SupportLayer *support_layer = support_layer_below(layer)) {
+        Polygons support_coverage;
+        support_layer->support_fills.polygons_covered_by_width(support_coverage, float(SCALED_EPSILON));
+        support_below = union_ex(support_coverage);
+    }
+
 	std::vector<SurfaceFill> surface_fills;
 	// Fill in a map of a region & surface to SurfaceFillParams.
 	std::set<SurfaceFillParams> 						set_surface_params;
@@ -884,6 +1150,9 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
 	        	has_internal_voids = true;
 	        else {
 		        const PrintRegionConfig &region_config = layerm.region().config();
+                params.cosmetic_top_region =
+                    ((surface.is_top() && region_config.cosmetic_top_relief.value && !region_config.buried_top_relief.value) ||
+                     (surface.surface_type == stInternalSolid && region_config.buried_top_relief.value)) ? region_id : size_t(-1);
 		        FlowRole extrusion_role = surface.is_top() ? frTopSolidInfill : (surface.is_solid() ? frSolidInfill : frInfill);
 		        bool     is_bridge 	    = layer.id() > 0 && surface.is_bridge();
 		        params.extruder 	 = layerm.region().extruder(extrusion_role);
@@ -893,7 +1162,6 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
                 params.lateral_lattice_angle_2 = region_config.lateral_lattice_angle_2;
                 params.infill_overhang_angle = region_config.infill_overhang_angle;
                 params.center_of_surface_pattern = region_config.center_of_surface_pattern;
-                params.separated_infills = region_config.separated_infills;
                 if (params.pattern == ipLockedZag) {
                     params.infill_lock_depth = scale_(region_config.infill_lock_depth);
                     params.skin_infill_depth = scale_(region_config.skin_infill_depth);
@@ -902,6 +1170,8 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
                     params.symmetric_infill_y_axis = region_config.symmetric_infill_y_axis;
                 } else if (params.pattern == ipZigZag) {
                     params.symmetric_infill_y_axis = region_config.symmetric_infill_y_axis;
+                } else if (params.pattern == ip3DHoneycomb) {
+                    params.infill_complete_top = region_config.infill_complete_top;
                 }
 
                 if (surface.is_solid()) {
@@ -950,7 +1220,7 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
                     params.extruder = region_config.internal_solid_filament_id;
                 // Orca: forced fill order applies only to top/bottom surfaces filled with a
                 // center-based pattern; everything else stays at Default to keep batching together.
-                if (params.pattern == ipConcentric || params.pattern == ipArchimedeanChords || params.pattern == ipOctagramSpiral) {
+                if (params.pattern == ipConcentric || params.pattern == ipSpiralInset || params.pattern == ipArchimedeanChords || params.pattern == ipOctagramSpiral) {
                     if (params.extrusion_role == erTopSolidInfill)
                         params.fill_order = region_config.top_surface_fill_order.value;
                     else if (params.extrusion_role == erBottomSurface)
@@ -959,20 +1229,31 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
                 // Orca: apply fill multiline only for sparse infill
                 params.multiline = params.extrusion_role == erInternalInfill ? int(region_config.fill_multiline) : 1;
 
+                // Orca: Pass through separated_infills only where it can move the pattern.
+                params.separated_infills = region_config.separated_infills && is_separable_infill_pattern(params.pattern) &&
+                                           params.extrusion_role != erTopSolidInfill && params.extrusion_role != erBottomSurface;
+
+                // Orca: only the TPMS sparse infill is graded; reset otherwise, as params is reused.
+                params.adaptive_infill_mode = is_adaptive_infill_pattern(params.pattern) && params.extrusion_role == erInternalInfill ?
+                                           region_config.adaptive_infill_mode.value : AdaptiveInfillMode::Disabled;
+                const bool adaptive_infill_mode      = params.adaptive_infill_mode != AdaptiveInfillMode::Disabled;
+                params.adaptive_infill_interior_density  = adaptive_infill_mode ? std::max(1.f, float(region_config.adaptive_infill_interior_density)) : 0.f;
+                params.adaptive_infill_gradient = adaptive_infill_mode ? region_config.adaptive_infill_gradient.value : AdaptiveInfillGradient::Linear;
+
                 // Pass through gyroid_optimized only when the effective pattern is Gyroid,
                 // so non-Gyroid fills do not differ in SurfaceFillParams by an irrelevant flag
-                // (which would unnecessarily split fill batching).
+                // (which would unnecessarily split fill batching). Adaptive density replaces it.
                 // Stored on SurfaceFillParams; copied to FillParams during conversion.
-                params.gyroid_optimized = (params.pattern == ipGyroid) && region_config.gyroid_optimized;
+                params.gyroid_optimized = (params.pattern == ipGyroid) && region_config.gyroid_optimized && !adaptive_infill_mode;
 
                 if (params.extrusion_role == erInternalInfill) {
                     params.angle = calculate_infill_rotation_angle(layer.object(), layer.id(), region_config.infill_direction.value,
                                                                    region_config.sparse_infill_rotate_template.value);
                     params.fixed_angle = !region_config.sparse_infill_rotate_template.value.empty();
 
-                    // Orca: special case; apply smoothing factor only for Hilbert Curve sparse infill.
-                    // FillHilbertCurve::generate clamps and validates the value itself.
-                    if (params.pattern == ipHilbertCurve)
+                    // Orca: the smoothing factor only applies to the sparse infill patterns that
+                    // implement it. The fills clamp and validate the value themselves.
+                    if (is_smoothable_infill_pattern(params.pattern, params.multiline))
                         params.smooth_factor = 0.01 * region_config.sparse_infill_smooth_factor.value;
                 } else {
                     const bool top_layer_direction_set    = surface.is_top() && region_config.top_layer_direction.value >= 0.;
@@ -986,7 +1267,120 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
                         params.fixed_angle = !region_config.solid_infill_rotate_template.value.empty();
                     }
                 }
+                if (params.extrusion_role == erTopSolidInfill &&
+                    nonplanar_perimeters_enabled(region_config)) {
+                    // Variable-Z top skins need one stable raster direction
+                    // across every nominal slice band. Rotating the ordinary
+                    // solid-fill angle between bands produces diagonal seams
+                    // and incomplete joins on a draped roof or deck.
+                    params.angle = 0.f;
+                    params.fixed_angle = true;
+                }
                 params.bridge_angle = float(surface.bridge_angle);
+
+                if (is_bridge && !surface.is_internal_bridge() && region_config.arc_overhang_enabled) {
+                    const BoundingBox surface_bbox = get_extents(surface.expolygon);
+                    const Vec2d bridge_axis(std::cos(params.bridge_angle), std::sin(params.bridge_angle));
+                    const Vec2d overhang_axis(-bridge_axis.y(), bridge_axis.x());
+                    double bridge_span = projected_bbox_span(surface_bbox, bridge_axis);
+                    double overhang_span = projected_bbox_span(surface_bbox, overhang_axis);
+                    bool has_unsupported_area = true;
+                    bool one_sided_overhang = false;
+                    Vec2d support_center = Vec2d::Zero();
+                    size_t support_points = 0;
+                    ExPolygons nearby_support;
+
+                    const ExPolygons expanded_surface = offset_ex(surface.expolygon, scale_(1.));
+                    if (layer.lower_layer != nullptr)
+                        nearby_support = intersection_ex(expanded_surface, layer.lower_layer->lslices);
+                    if (!support_below.empty())
+                        append(nearby_support, intersection_ex(expanded_surface, support_below));
+                    nearby_support = union_ex(nearby_support);
+                    for (const ExPolygon &support : nearby_support)
+                        for (const Point &point : support.contour.points) {
+                            support_center += point.cast<double>();
+                            ++support_points;
+                        }
+
+                    if (support_points > 0) {
+                        support_center /= double(support_points);
+                        double surface_min = std::numeric_limits<double>::max();
+                        double surface_max = std::numeric_limits<double>::lowest();
+                        double support_min = std::numeric_limits<double>::max();
+                        double support_max = std::numeric_limits<double>::lowest();
+                        const auto expand_projection = [&overhang_axis](
+                                const ExPolygons &polygons, double &minimum, double &maximum) {
+                            for (const ExPolygon &polygon : polygons)
+                                for (const Point &point : polygon.contour.points) {
+                                    const double projection = point.cast<double>().dot(overhang_axis);
+                                    minimum = std::min(minimum, projection);
+                                    maximum = std::max(maximum, projection);
+                                }
+                        };
+                        expand_projection(ExPolygons{surface.expolygon}, surface_min, surface_max);
+                        expand_projection(nearby_support, support_min, support_max);
+                        const double edge_tolerance = std::max<double>(
+                            scale_(0.25), 0.5 * layerm.flow(frPerimeter).scaled_width());
+                        const bool touches_low_edge  = support_min <= surface_min + edge_tolerance;
+                        const bool touches_high_edge = support_max >= surface_max - edge_tolerance;
+
+                        // A cantilever must have an anchor at exactly one edge
+                        // normal to its growth direction. Centroid displacement
+                        // misclassified asymmetric but two-sided Benchy bridge
+                        // surfaces as arc overhangs.
+                        one_sided_overhang = touches_low_edge != touches_high_edge;
+                    }
+
+                    // Measure only the unsupported remainder. Actual support toolpaths split a
+                    // long span just like model geometry does, so a nearby support can keep a
+                    // short section on traditional bridge/overhang infill or eliminate arcs.
+                    if (!nearby_support.empty()) {
+                        // A centerline is supported by the deposited bead
+                        // footprint, not only by exact polygon overlap. Without
+                        // this allowance, tessellation-sized slivers on an
+                        // otherwise supported roof spuriously enabled arcs.
+                        const coord_t support_reach = coord_t(std::lround(
+                            0.5 * layerm.flow(frPerimeter).scaled_width()));
+                        const ExPolygons unsupported = diff_ex(
+                            surface.expolygon, offset_ex(nearby_support, float(support_reach)));
+                        has_unsupported_area = !unsupported.empty();
+                        bridge_span = 0.;
+                        overhang_span = 0.;
+                        for (const ExPolygon &part : unsupported) {
+                            const BoundingBox part_bbox = get_extents(part);
+                            bridge_span = std::max(bridge_span, projected_bbox_span(part_bbox, bridge_axis));
+                            overhang_span = std::max(overhang_span, projected_bbox_span(part_bbox, overhang_axis));
+                        }
+                    }
+
+                    bool use_arc_overhang;
+                    if (one_sided_overhang) {
+                        const double minimum_depth = region_config.arc_overhang_min_overhang_distance.value;
+                        use_arc_overhang = region_config.arc_overhang_overhangs && has_unsupported_area &&
+                            (minimum_depth <= 0. || unscale_(overhang_span) > minimum_depth);
+                    } else {
+                        const double minimum_span = region_config.arc_overhang_bridge_distance.value;
+                        use_arc_overhang = region_config.arc_overhang_bridges && has_unsupported_area &&
+                            (minimum_span <= 0. || unscale_(bridge_span) > minimum_span);
+                    }
+
+                    if (use_arc_overhang) {
+                        params.arc_one_sided_overhang = one_sided_overhang;
+                        if (one_sided_overhang) {
+                            layer.has_one_sided_arc_overhang = true;
+                            // Arc growth is normal to the supported edge. Point it
+                            // away from the lower-layer support so the smallest arcs
+                            // start at the attached side of the overhang.
+                            Vec2d growth_axis = overhang_axis;
+                            const Vec2d surface_center = surface_bbox.center().cast<double>();
+                            if ((support_center - surface_center).dot(growth_axis) > 0.)
+                                growth_axis = -growth_axis;
+                            params.bridge_angle = float(std::atan2(growth_axis.y(), growth_axis.x()));
+                        }
+                        params.pattern = ipArcOverhang;
+                        params.extrusion_role = one_sided_overhang ? erArcOverhang : erArcBridge;
+                    }
+                }
 
                 // ORCA: Align infill angle to model
                 float align_offset = 0.f;
@@ -1003,10 +1397,22 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
 					//Orca: enable thick bridge based on config
 					layerm.bridging_flow(extrusion_role, is_thick_bridge) :
 					layerm.flow(extrusion_role, (surface.thickness == -1) ? layer.height : surface.thickness);
+                if (is_arc_fill(params.extrusion_role)) {
+                    // Keep arc paths at the normal perimeter width. Representing
+                    // reduced free-air volume by shrinking the path width may
+                    // request a strand narrower than the nozzle and makes both
+                    // spacing and preview misleading. FillBase applies the
+                    // arc-specific volume percentage independently.
+                    const Flow perimeter_flow = layerm.flow(frPerimeter);
+                    params.flow = Flow::bridging_flow(
+                        perimeter_flow.width(), perimeter_flow.nozzle_diameter());
+                }
 
 				params.role_speed = 0;
                 if (params.extrusion_role == erBridgeInfill)
                     params.role_speed = region_config.bridge_speed.get_at(layer.get_extruder_id(params.extruder));
+                else if (is_arc_fill(params.extrusion_role))
+                    params.role_speed = region_config.arc_overhang_speed.value;
                 else if (params.extrusion_role == erInternalBridgeInfill)
                     params.role_speed = region_config.get_abs_value_at("internal_bridge_speed", layer.get_extruder_id(params.extruder));
                 else if (params.extrusion_role == erInternalInfill)
@@ -1017,7 +1423,11 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
                     params.role_speed = region_config.internal_solid_infill_speed.get_at(layer.get_extruder_id(params.extruder));
 				// Calculate flow spacing for infill pattern generation.
 		        if (surface.is_solid() || is_bridge) {
-		            params.spacing = params.flow.spacing();
+                    // Straight bridges intentionally separate their round strands.
+                    // Arc courses must touch the preceding course to grow from it;
+                    // BRIDGE_EXTRA_SPACING otherwise strands the primary family
+                    // and turns the residual into hundreds of tiny restarts.
+                    params.spacing = is_arc_fill(params.extrusion_role) ? params.flow.width() : params.flow.spacing();
 		            // Don't limit anchor length for solid or bridging infill.
 		            params.anchor_length = 1000.f;
 					params.anchor_length_max = 1000.f;
@@ -1038,7 +1448,7 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
 				//get locked region param
 				if (params.pattern == ipLockedZag){
 					const PrintObject *object = layerm.layer()->object();
-					auto nozzle_diameter = float(object->print()->config().nozzle_diameter.get_at(layerm.region().extruder(extrusion_role) - 1));
+					auto nozzle_diameter = float(nozzle_diameter_for_filament(object->print()->config(), layerm.region().extruder(extrusion_role), object->print()->is_BBL_printer()));
 					Flow skin_flow = params.bridge ? params.flow : Flow::new_from_config_width(extrusion_role, region_config.skin_infill_line_width, nozzle_diameter, float((surface.thickness == -1) ? layer.height : surface.thickness));
 					//add skin flow
 					append_flow_param(lock_param.skin_flow_params, skin_flow, surface.expolygon);
@@ -1096,6 +1506,255 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
 				}
 	        }
 	}
+
+    // Fill surfaces are inset by the perimeter generator. Grow arc overhangs
+    // through every unsupported wall footprint. Unsupported wall fragments are
+    // omitted at G-code generation time, while supported fragments remain as
+    // the physical ledge from which the arcs start.
+    ExPolygons supported;
+    if (layer.lower_layer != nullptr)
+        supported = layer.lower_layer->lslices;
+    append(supported, support_below);
+    supported = union_ex(supported);
+
+    // A bridge surface may be only partly supported by generated support
+    // material. Do not switch that whole surface to arcs: split it at the
+    // actual support contact, then apply the configured minimum unsupported
+    // span to each remaining connected component. This keeps supported areas
+    // on ordinary bridge flow and prevents a single remote unsupported corner
+    // from converting the entire bottom surface.
+    std::vector<SurfaceFill> supported_bridge_fills;
+    for (SurfaceFill &fill : surface_fills) {
+        if (!is_arc_fill(fill.params.extrusion_role) || fill.expolygons.empty())
+            continue;
+
+        const LayerRegion &layerm = *layer.regions()[fill.region_id];
+        const PrintRegionConfig &region_config = layerm.region().config();
+        const coord_t contact_margin = coord_t(std::lround(0.5 * layerm.bridging_flow(frSolidInfill).scaled_spacing()));
+        const ExPolygons support_contact = support_below.empty() ? ExPolygons{} :
+            intersection_ex(fill.expolygons, offset_ex(support_below, float(contact_margin)));
+        ExPolygons candidates = support_contact.empty() ? fill.expolygons : diff_ex(fill.expolygons, support_contact);
+        ExPolygons regular_parts = support_contact;
+        ExPolygons arc_parts;
+
+        const Vec2d span_axis(std::cos(fill.params.bridge_angle), std::sin(fill.params.bridge_angle));
+        const double minimum_span = fill.params.arc_one_sided_overhang ?
+            region_config.arc_overhang_min_overhang_distance.value :
+            region_config.arc_overhang_bridge_distance.value;
+        for (ExPolygon &candidate : candidates) {
+            const double span = unscale_(projected_bbox_span(get_extents(candidate), span_axis));
+            if (minimum_span <= 0. || span > minimum_span)
+                arc_parts.emplace_back(std::move(candidate));
+            else
+                regular_parts.emplace_back(std::move(candidate));
+        }
+
+        fill.expolygons = std::move(arc_parts);
+        if (!regular_parts.empty()) {
+            SurfaceFillParams regular_params = fill.params;
+            regular_params.pattern = ipRectilinear;
+            regular_params.extrusion_role = erBridgeInfill;
+            regular_params.arc_one_sided_overhang = false;
+            regular_params.flow = layerm.bridging_flow(frSolidInfill, object_config.thick_bridges);
+            regular_params.spacing = regular_params.flow.spacing();
+            regular_params.role_speed = region_config.bridge_speed.get_at(layer.get_extruder_id(regular_params.extruder));
+
+            supported_bridge_fills.emplace_back(regular_params);
+            SurfaceFill &regular_fill = supported_bridge_fills.back();
+            regular_fill.region_id = fill.region_id;
+            regular_fill.surface = fill.surface;
+            regular_fill.expolygons = std::move(regular_parts);
+            regular_fill.region_id_group = fill.region_id_group;
+            regular_fill.no_overlap_expolygons = fill.no_overlap_expolygons;
+        }
+    }
+    append(surface_fills, std::move(supported_bridge_fills));
+
+    // Arc layers keep the outer wall stack as a dimensional shell, but replace
+    // the innermost configured wall (and any extra overhang walls inside it).
+    // That exposes a lower-layer runway wide enough for the first arc to be
+    // deposited fully supported before it grows across the opening. Build one
+    // layer-wide obstacle set here: a fill may be grouped across regions, and
+    // considering only its primary region allowed arcs to cross walls emitted
+    // by another region on the same layer.
+    std::vector<bool> arc_regions(layer.regions().size(), false);
+    for (const SurfaceFill &fill : surface_fills) {
+        if (!is_arc_fill(fill.params.extrusion_role) || fill.expolygons.empty())
+            continue;
+        for (const size_t region_id : fill.region_id_group)
+            if (region_id < arc_regions.size())
+                arc_regions[region_id] = true;
+    }
+
+    const bool has_arc_regions = std::any_of(arc_regions.begin(), arc_regions.end(),
+        [](bool enabled) { return enabled; });
+    Polylines layer_arc_obstacle_paths;
+    Polylines layer_arc_support_paths;
+    std::vector<coord_t> layer_arc_support_widths;
+    Polygons layer_arc_support_coverage;
+    Polygons layer_retained_perimeter_coverage;
+    std::function<void(const ExtrusionEntity &, int)> collect_retained_perimeters;
+    collect_retained_perimeters =
+        [&](const ExtrusionEntity &entity, int replaced_inset) {
+            if (replaced_inset > 0 && entity.inset_idx >= replaced_inset)
+                return;
+            if (const auto *collection =
+                    dynamic_cast<const ExtrusionEntityCollection *>(&entity)) {
+                for (const ExtrusionEntity *child : collection->entities)
+                    collect_retained_perimeters(*child, replaced_inset);
+            } else if (const auto *multipath =
+                           dynamic_cast<const ExtrusionMultiPath *>(&entity)) {
+                for (const ExtrusionPath &path : multipath->paths)
+                    collect_retained_perimeters(path, replaced_inset);
+            } else if (const auto *loop =
+                           dynamic_cast<const ExtrusionLoop *>(&entity)) {
+                for (const ExtrusionPath &path : loop->paths)
+                    collect_retained_perimeters(path, replaced_inset);
+            } else if (entity.role() != erOverhangPerimeter) {
+                entity.collect_polylines(layer_arc_obstacle_paths);
+                entity.polygons_covered_by_width(
+                    layer_retained_perimeter_coverage,
+                    float(SCALED_EPSILON));
+                const auto *path = dynamic_cast<const ExtrusionPath *>(&entity);
+                if (path != nullptr && (!path->z_contoured || std::all_of(
+                        path->polyline.points.begin(), path->polyline.points.end(),
+                        [](const Point3 &point) { return std::abs(point.z()) <= SCALED_EPSILON; }))) {
+                    path->collect_polylines(layer_arc_support_paths);
+                    layer_arc_support_widths.resize(layer_arc_support_paths.size(), scale_(path->width));
+                    path->polygons_covered_by_width(layer_arc_support_coverage, float(SCALED_EPSILON));
+                }
+            }
+        };
+    for (size_t region_id = 0; has_arc_regions && region_id < layer.regions().size(); ++region_id) {
+        const LayerRegion &perimeter_region = *layer.regions()[region_id];
+        const int wall_loops =
+            std::max(0, int(perimeter_region.region().config().wall_loops));
+        const int replaced_inset =
+            arc_regions[region_id] && wall_loops > 1 ? wall_loops - 1 : -1;
+        collect_retained_perimeters(
+            perimeter_region.perimeters, replaced_inset);
+    }
+
+    ExPolygons previous_layer_perimeter_beads;
+    if (has_arc_regions && layer.lower_layer != nullptr) {
+        Polygons previous_layer_perimeter_coverage;
+        for (const LayerRegion *lower_region : layer.lower_layer->regions())
+            lower_region->perimeters.polygons_covered_by_width(
+                previous_layer_perimeter_coverage,
+                float(SCALED_EPSILON));
+        if (!previous_layer_perimeter_coverage.empty())
+            previous_layer_perimeter_beads =
+                union_ex(previous_layer_perimeter_coverage);
+    }
+    for (SurfaceFill &fill : surface_fills) {
+        if (!is_arc_fill(fill.params.extrusion_role) || fill.expolygons.empty())
+            continue;
+
+        const LayerRegion &layerm = *layer.regions()[fill.region_id];
+        const int wall_loops = std::max(0, int(layerm.region().config().wall_loops));
+        const coord_t wall_footprint =
+            wall_loops * layerm.flow(frPerimeter).scaled_spacing();
+        if (wall_footprint > 0) {
+            ExPolygons unsupported_region = supported.empty() ?
+                to_expolygons(layerm.slices.surfaces) :
+                diff_ex(layerm.slices.surfaces, offset_ex(supported, 0.5f * layerm.flow(frPerimeter).scaled_width()));
+            ExPolygons replacement = intersection_ex(offset_ex(fill.expolygons, float(wall_footprint)), unsupported_region);
+            append(replacement, fill.expolygons);
+            fill.expolygons = union_ex(replacement);
+        }
+
+        if (!supported.empty()) {
+            const coord_t perimeter_width = layerm.flow(frPerimeter).scaled_width();
+            const ExPolygons supported_wall = intersection_ex(
+                layerm.slices.surfaces,
+                offset_ex(supported, 0.5f * perimeter_width));
+            if (!previous_layer_perimeter_beads.empty()) {
+                // Keep the root on a bead that was actually emitted on the
+                // preceding layer. The broader supported-wall mask remains
+                // available for later arcs and for models where no lower
+                // perimeter intersects this bridge.
+                fill.arc_root_anchor_regions = intersection_ex(
+                    supported_wall, previous_layer_perimeter_beads);
+            }
+
+            // The ordinary fill surface stops roughly one perimeter spacing
+            // before the retained wall. Add the complete runway between that
+            // inset and the supported bead; adding only the final overlap would
+            // leave it as a disconnected island and the arc generator would
+            // continue to seed from the unsupported fill edge.
+            const coord_t anchor_runway_depth =
+                layerm.flow(frPerimeter).scaled_spacing();
+            ExPolygons anchor_runways = intersection_ex(
+                offset_ex(fill.expolygons, float(anchor_runway_depth)),
+                offset_ex(supported_wall, float(anchor_runway_depth)));
+            anchor_runways = intersection_ex(
+                anchor_runways, to_expolygons(layerm.slices.surfaces));
+            fill.arc_anchor_regions = intersection_ex(anchor_runways, supported_wall);
+            if (!fill.arc_anchor_regions.empty()) {
+                append(fill.expolygons, std::move(anchor_runways));
+                fill.expolygons = union_ex(fill.expolygons);
+            }
+        }
+
+        // Perimeters are generated before fills and arc anchors are emitted
+        // before the arcs. Preserve every centerline that will actually be
+        // emitted anywhere on this layer as a hard obstacle.
+        fill.arc_obstacle_paths = layer_arc_obstacle_paths;
+        fill.arc_support_paths = layer_arc_support_paths;
+        fill.arc_support_widths = layer_arc_support_widths;
+        if (!layer_retained_perimeter_coverage.empty()) {
+            const ExPolygons perimeter_beads =
+                union_ex(layer_retained_perimeter_coverage);
+            const coord_t arc_width =
+                std::max<coord_t>(1, fill.params.flow.scaled_width());
+            const double overlap_ratio = 0.01 * std::clamp(
+                layerm.region().config().arc_overhang_overlap.value,
+                0., 50.);
+            const coord_t perimeter_clearance =
+                std::max<coord_t>(
+                    0, coord_t(std::lround(
+                           0.5 * double(arc_width) -
+                           overlap_ratio * double(arc_width))));
+            // Clip arc centerlines far enough from a retained wall that the
+            // deposited beads have only the configured overlap. Protecting
+            // merely the wall center allowed a 0.45 mm arc to track a 0.45 mm
+            // perimeter only 0.12 mm away around a corner, laying most of one
+            // extrusion on top of the other without a centerline crossing.
+            ExPolygons perimeter_cores = offset_ex(
+                perimeter_beads, float(perimeter_clearance));
+            fill.arc_obstacle_regions = perimeter_cores;
+
+            // A fill surface may be more than half a line width away from the
+            // innermost retained perimeter. Grow a connected runway to the
+            // contact band before clipping the protected bead footprint.
+            const coord_t anchor_runway_depth =
+                layerm.flow(frPerimeter).scaled_spacing();
+            ExPolygons perimeter_runways = intersection_ex(
+                offset_ex(fill.expolygons, float(anchor_runway_depth)),
+                offset_ex(perimeter_beads, float(anchor_runway_depth)));
+            perimeter_runways = intersection_ex(
+                perimeter_runways, to_expolygons(layerm.slices.surfaces));
+            const ExPolygons perimeter_contact_extent = offset_ex(
+                union_ex(layer_arc_support_coverage), 0.5f * float(arc_width));
+            const ExPolygons perimeter_anchor_rims =
+                diff_ex(perimeter_contact_extent, perimeter_cores);
+            ExPolygons perimeter_anchors = intersection_ex(
+                perimeter_runways, perimeter_anchor_rims);
+            if (!perimeter_anchors.empty()) {
+                // The bead is printable support after the perimeter-first pass.
+                append(fill.arc_anchor_regions, perimeter_anchors);
+                fill.arc_anchor_regions = union_ex(fill.arc_anchor_regions);
+            }
+            if (!perimeter_runways.empty()) {
+                // Keep the connected approach even when safety-offset
+                // quantization removes the very thin bead-rim intersection.
+                // Final path validation still requires the emitted arc to be
+                // within one extrusion width of the real perimeter centerline.
+                append(fill.expolygons, std::move(perimeter_runways));
+                fill.expolygons = union_ex(fill.expolygons);
+            }
+        }
+    }
 
 	{
 		Polygons all_polygons;
@@ -1231,7 +1890,38 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
 		}
 	}
 
+    for (SurfaceFill &fill : surface_fills) {
+        apply_cosmetic_top_relief(layer, fill);
+        apply_buried_top_relief(layer, fill);
+    }
+
 	return surface_fills;
+}
+
+// Orca: Anchors and printed infill must share the same body origin. Keep the choice
+// here so per-model surface centering and separated sparse infill cannot drift apart.
+// Returns the connected body the fill region is laid out on, or -1 to keep the object's origin.
+static int infill_body(const Layer &layer, const SurfaceFill &fill, const ExPolygon &expoly)
+{
+    const auto &params = fill.params;
+    const bool per_model = (params.extrusion_role == erTopSolidInfill || params.extrusion_role == erBottomSurface) &&
+                           params.center_of_surface_pattern == CenterOfSurfacePattern::Each_Model &&
+                           (params.pattern == ipArchimedeanChords || params.pattern == ipOctagramSpiral);
+    int body = -1;
+    if (per_model || params.separated_infills || is_octree_infill_pattern(params.pattern)) {
+        const BoundingBox box          = get_extents(expoly);
+        double            best_overlap = 0.;
+        for (size_t i = 0; i < layer.lslices.size() && i < layer.lslices_separated_component_ids.size(); ++i) {
+            if (! layer.lslices_bboxes[i].overlap(box))
+                continue;
+            const double overlap = area(intersection_ex(layer.lslices[i], expoly));
+            if (overlap > best_overlap) {
+                best_overlap = overlap;
+                body         = int(layer.lslices_separated_component_ids[i]);
+            }
+        }
+    }
+    return body;
 }
 
 #ifdef SLIC3R_DEBUG_SLICE_PROCESSING
@@ -1256,8 +1946,9 @@ void export_group_fills_to_svg(const char *path, const std::vector<SurfaceFill> 
 #endif
 
 // friend to Layer
-void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive::Octree* support_fill_octree, FillLightning::Generator* lightning_generator)
+void Layer::make_fills(const FillAdaptive::RegionOctrees* fill_octrees, FillLightning::Generator* lightning_generator, const FillProgressCallback* progress)
 {
+    has_one_sided_arc_overhang = false;
 	for (LayerRegion *layerm : m_regions)
 		layerm->fills.clear();
 
@@ -1266,7 +1957,10 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
 //	this->export_region_fill_surfaces_to_svg_debug("10_fill-initial");
 #endif /* SLIC3R_DEBUG_SLICE_PROCESSING */
     LockRegionParam lock_param;
+    if (progress != nullptr)
+        (*progress)(FillProgressStage::GroupSurfaces, 0, 1);
     std::vector<SurfaceFill>     surface_fills = group_fills(*this, lock_param);
+    Polylines                    prior_arc_paths;
 	const Slic3r::BoundingBox bbox 			= this->object()->bounding_box();
 	const auto                resolution 	= this->object()->print()->config().resolution.value;
 
@@ -1289,7 +1983,8 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
         f->z 		= this->print_z;
         f->angle 	= surface_fill.params.angle;
         f->fixed_angle = surface_fill.params.fixed_angle;
-        f->adapt_fill_octree   = (surface_fill.params.pattern == ipSupportCubic) ? support_fill_octree : adaptive_fill_octree;
+        const FillAdaptive::Octrees *octrees = fill_octrees ? fill_octrees->region(surface_fill.region_id) : nullptr;
+        f->adaptive_infill_field   = this->object()->adaptive_infill_field(surface_fill.params.adaptive_infill_mode);
         f->print_config        = &this->object()->print()->config();
         f->print_object_config = &this->object()->config();
 		if (surface_fill.params.pattern == ipConcentricInternal) {
@@ -1326,18 +2021,23 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
 
         // apply half spacing using this flow's own spacing and generate infill
         FillParams params;
+        params.progress          = progress;
         params.density 		     = float(0.01 * surface_fill.params.density);
         params.multiline         = surface_fill.params.multiline;
 		params.dont_adjust		 = false; //  surface_fill.params.dont_adjust;
         params.anchor_length     = surface_fill.params.anchor_length;
 		params.anchor_length_max = surface_fill.params.anchor_length_max;
 		params.resolution        = resolution;
-        params.use_arachne       = surface_fill.params.pattern == ipConcentric || surface_fill.params.pattern == ipConcentricInternal;
+        params.use_arachne       = surface_fill.params.pattern == ipConcentric || surface_fill.params.pattern == ipSpiralInset ||
+                                   surface_fill.params.pattern == ipConcentricInternal;
         params.layer_height      = layerm->layer()->height;
         params.lateral_lattice_angle_1   = surface_fill.params.lateral_lattice_angle_1;
         params.lateral_lattice_angle_2   = surface_fill.params.lateral_lattice_angle_2;
         params.infill_overhang_angle   = surface_fill.params.infill_overhang_angle;
         params.gyroid_optimized          = surface_fill.params.gyroid_optimized;
+        params.adaptive_infill_mode             = surface_fill.params.adaptive_infill_mode;
+        params.adaptive_infill_interior_density     = float(0.01 * surface_fill.params.adaptive_infill_interior_density);
+        params.adaptive_infill_gradient    = surface_fill.params.adaptive_infill_gradient;
         params.smooth_factor             = surface_fill.params.smooth_factor;
 
 		// BBS
@@ -1347,24 +2047,22 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
 		params.no_extrusion_overlap = surface_fill.params.overlap;
         auto &region_config = layerm->region().config();
         params.config               = &region_config;
+        params.arc_anchor_regions   = &surface_fill.arc_anchor_regions;
+        params.arc_root_anchor_regions =
+            &surface_fill.arc_root_anchor_regions;
+        params.arc_obstacle_paths   = &surface_fill.arc_obstacle_paths;
+        params.arc_support_paths    = &surface_fill.arc_support_paths;
+        params.arc_support_widths   = &surface_fill.arc_support_widths;
+        params.arc_prior_paths      = &prior_arc_paths;
+        params.arc_obstacle_regions = &surface_fill.arc_obstacle_regions;
         params.pattern              = surface_fill.params.pattern;
         params.fill_order           = surface_fill.params.fill_order;
 
         // Orca: Checking the filling of a centered surface by drawing for each model parts
         bool is_top_or_bottom = params.extrusion_role == erTopSolidInfill || params.extrusion_role == erBottomSurface;
-        bool is_centered_infill = surface_fill.params.pattern == ipArchimedeanChords || surface_fill.params.pattern == ipOctagramSpiral;
         if (is_top_or_bottom) {
             params.center_of_surface_pattern = surface_fill.params.center_of_surface_pattern; // Orca: center of surface pattern
         }
-        // Orca: Each_Model centers the pattern on each model part's bbox; Each_Surface / Each_Assembly
-        // fall through to the default (whole-object) bounding box below.
-        bool is_per_model_center = is_top_or_bottom && params.center_of_surface_pattern == CenterOfSurfacePattern::Each_Model && is_centered_infill;
-        bool is_separate_infill = !is_top_or_bottom && surface_fill.params.separated_infills &&
-                                  (
-                                  is_separable_infill_pattern(surface_fill.params.pattern) ||
-                                  params.config->solid_infill_rotate_template != "" ||
-                                  params.config->sparse_infill_rotate_template != "" );
-
         if( surface_fill.params.pattern == ipLockedZag ) {
 			params.locked_zag = true;
             params.infill_lock_depth = surface_fill.params.infill_lock_depth;
@@ -1383,41 +2081,27 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
         } else if (surface_fill.params.pattern == ipZigZag) {
             params.symmetric_infill_y_axis = surface_fill.params.symmetric_infill_y_axis;
 
+        } else if (surface_fill.params.pattern == ip3DHoneycomb) {
+            params.infill_complete_top = surface_fill.params.infill_complete_top;
         }
 		if (surface_fill.params.pattern == ipGrid)
 			params.can_reverse = false;
 		for (ExPolygon& expoly : surface_fill.expolygons) {
 
-            // Orca: separate infill / per-model pattern centering.
-            //
-            // Center the pattern on each connected body of the object independently, so every piece
-            // is filled exactly as if it were sliced on its own: touching/overlapping parts merge
-            // into one body sharing a center, while separate parts and disconnected islands (even
-            // interleaved-but-not-touching ones, e.g. chain links) each get their own. The body each
-            // island belongs to, and its full bounding box, were resolved in 3D by PrintObject::
-            // infill() (lslices_separated_component_bboxes, aligned with this layer's lslices). We
-            // match this fill region to the island it overlaps most, then re-use the whole-object
-            // bounding box (origin-centered — identical extent to the default, so coverage and cost
-            // are unchanged) re-centered on that body.
-            if (is_per_model_center || is_separate_infill) {
-                double      best_overlap = 0.;
-                BoundingBox best_component;
-                for (size_t r = 0; r < this->lslices.size() && r < this->lslices_separated_component_bboxes.size(); ++ r) {
-                    const double overlap = area(intersection_ex(this->lslices[r], expoly));
-                    if (overlap > best_overlap) {
-                        best_overlap   = overlap;
-                        best_component = this->lslices_separated_component_bboxes[r];
-                    }
-                }
-                if (best_component.defined) {
-                    const Point c         = best_component.center();
-                    BoundingBox part_bbox = bbox; // origin-centered, whole-object extent (from above)
-                    part_bbox.translate(c.x(), c.y()); // re-center on this body
-                    f->set_bounding_box(part_bbox);
-                }
-            } // - End: separate infill / per-model pattern centering
+            // Orca: Reuse the body box and octree used for bridge anchoring, resetting them for each surface.
+            const int body = infill_body(*this, surface_fill, expoly);
+            f->set_bounding_box(body >= 0 ? this->object()->separated_body_bboxes()[body] : bbox);
+            f->adapt_fill_octree = octrees ? octrees->get(body) : nullptr;
 
-            f->no_overlap_expolygons = intersection_ex(surface_fill.no_overlap_expolygons, ExPolygons() = {expoly}, ApplySafetyOffset::Yes);
+            // Only the part of the layer-wide no-overlap area under this expolygon matters, so clip it to the
+            // expolygon's box first (padded past the safety offset, which grows the clip side). The result is
+            // identical; the cost is not: a layer split into many small fills, e.g. by colour painting,
+            // otherwise intersects every one of them with the whole layer.
+            BoundingBox no_overlap_bbox = get_extents(expoly);
+            no_overlap_bbox.offset(SCALED_EPSILON);
+            f->no_overlap_expolygons = intersection_ex(
+                ClipperUtils::clip_clipper_polygons_with_subject_bbox(surface_fill.no_overlap_expolygons, no_overlap_bbox),
+                ExPolygons() = {expoly}, ApplySafetyOffset::Yes);
             if (params.symmetric_infill_y_axis) {
                 params.symmetric_y_axis = f->extended_object_bounding_box().center().x();
                 expoly.symmetric_y(params.symmetric_y_axis);
@@ -1427,8 +2111,16 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
 			f->spacing = surface_fill.params.spacing;
 			surface_fill.surface.expolygon = std::move(expoly);
 
-			if(surface_fill.params.bridge && surface_fill.surface.is_external() && surface_fill.params.density > 99.0){
-				params.density = layerm->region().config().bridge_density.get_abs_value(1.0);
+            if (is_arc_fill(params.extrusion_role)) {
+                // Arc overlap controls the bonding pitch independently of the
+                // density of straight bridges. Sparse arcs cannot support each other.
+                params.density = 1.f;
+                params.dont_adjust = true;
+            } else if(surface_fill.params.bridge && surface_fill.surface.is_external() && surface_fill.params.density > 99.0){
+                params.density = layerm->region().config().bridge_density.get_abs_value(1.0);
+                const double overlap = layerm->region().config().bridge_line_overlap.get_abs_value(1.0);
+                if (overlap > 0.)
+                    params.density = 1. / (1. - std::clamp(overlap, 0., 0.2));
 				params.dont_adjust = true;
 			}
             if(surface_fill.surface.is_internal_bridge()){
@@ -1483,7 +2175,7 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
  * - For lightning/adaptive patterns, the respective generators are wired so their
  *   polylines match the final infill layout.
  */
-Polylines Layer::generate_sparse_infill_polylines_for_anchoring(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive::Octree* support_fill_octree,  FillLightning::Generator* lightning_generator) const
+Polylines Layer::generate_sparse_infill_polylines_for_anchoring(const FillAdaptive::RegionOctrees* fill_octrees, FillLightning::Generator* lightning_generator) const
 {
     LockRegionParam skin_inner_param;
     std::vector<SurfaceFill> surface_fills = group_fills(*this, skin_inner_param);
@@ -1501,6 +2193,7 @@ Polylines Layer::generate_sparse_infill_polylines_for_anchoring(FillAdaptive::Oc
         case ipCount: continue; break;
         case ipSupportBase: continue; break;
         case ipConcentricInternal: continue; break;
+        case ipArcOverhang: continue; break;
         case ipLightning:
 		case ipAdaptiveCubic:
         case ipSupportCubic:
@@ -1515,6 +2208,7 @@ Polylines Layer::generate_sparse_infill_polylines_for_anchoring(FillAdaptive::Oc
         case ipCubic:
         case ipLine:
         case ipConcentric:
+        case ipSpiralInset:
         case ipHoneycomb:
         case ipLateralHoneycomb:
         case ip3DHoneycomb:
@@ -1540,7 +2234,8 @@ Polylines Layer::generate_sparse_infill_polylines_for_anchoring(FillAdaptive::Oc
         f->z        = this->print_z;
         f->angle    = surface_fill.params.angle;
         f->fixed_angle = surface_fill.params.fixed_angle;
-        f->adapt_fill_octree   = (surface_fill.params.pattern == ipSupportCubic) ? support_fill_octree : adaptive_fill_octree;
+        const FillAdaptive::Octrees *octrees = fill_octrees ? fill_octrees->region(surface_fill.region_id) : nullptr;
+        f->adaptive_infill_field   = this->object()->adaptive_infill_field(surface_fill.params.adaptive_infill_mode);
         f->print_config        = &this->object()->print()->config();
         f->print_object_config = &this->object()->config();
 
@@ -1580,9 +2275,20 @@ Polylines Layer::generate_sparse_infill_polylines_for_anchoring(FillAdaptive::Oc
         params.infill_overhang_angle   = surface_fill.params.infill_overhang_angle;
         params.multiline         = surface_fill.params.multiline;
         params.gyroid_optimized          = surface_fill.params.gyroid_optimized;
+        params.adaptive_infill_mode             = surface_fill.params.adaptive_infill_mode;
+        params.adaptive_infill_interior_density     = float(0.01 * surface_fill.params.adaptive_infill_interior_density);
+        params.adaptive_infill_gradient    = surface_fill.params.adaptive_infill_gradient;
         params.smooth_factor             = surface_fill.params.smooth_factor;
+        // Orca: Match make_fills() when choosing the origin of plane-path patterns.
+        // Without the sparse extrusion role, the filler uses each surface's bounds
+        // instead of the object's bounds, so bridge anchors shift away from printed infill.
+        params.extrusion_role            = surface_fill.params.extrusion_role;
 
         for (ExPolygon &expoly : surface_fill.expolygons) {
+            // Orca: Match the per-body box and octree of make_fills() before generating physical anchors.
+            const int body = infill_body(*this, surface_fill, expoly);
+            f->set_bounding_box(body >= 0 ? this->object()->separated_body_bboxes()[body] : bbox);
+            f->adapt_fill_octree = octrees ? octrees->get(body) : nullptr;
             // Spacing is modified by the filler to indicate adjustments. Reset it for each expolygon.
             f->spacing                     = surface_fill.params.spacing;
             surface_fill.surface.expolygon = std::move(expoly);
@@ -1594,6 +2300,25 @@ Polylines Layer::generate_sparse_infill_polylines_for_anchoring(FillAdaptive::Oc
     }
 
     return sparse_infill_polylines;
+}
+
+// Returns the filament id (1-based) the region is ironed with, or -1 when the
+// region is not ironed. AllSolid always irons. TopSurfaces and TopmostOnly need
+// either some top shells or, in spiral mode, more than one bottom shell, and
+// TopmostOnly additionally needs the layer to be the topmost one.
+int Layer::choose_ironing_extruder(const PrintRegionConfig &cfg,
+                                   bool spiral_mode,
+                                   bool is_topmost_layer)
+{
+    if (cfg.ironing_type == IroningType::NoIroning)
+        return -1;
+    const bool gate = (cfg.ironing_type == IroningType::AllSolid)
+        || ((cfg.top_shell_layers > 0 || (spiral_mode && cfg.bottom_shell_layers > 1))
+            && (cfg.ironing_type == IroningType::TopSurfaces
+                || (cfg.ironing_type == IroningType::TopmostOnly && is_topmost_layer)));
+    if (!gate)
+        return -1;
+    return cfg.top_surface_filament_id;
 }
 
 // Create ironing extrusions over top surfaces.
@@ -1665,27 +2390,21 @@ void Layer::make_ironing()
 		if (! layerm->slices.empty()) {
 			IroningParams ironing_params;
 			const PrintRegionConfig &config = layerm->region().config();
-			if (config.ironing_type != IroningType::NoIroning &&
-			    (config.ironing_type == IroningType::AllSolid ||
-				    ((config.top_shell_layers > 0 || (this->object()->print()->config().spiral_mode && config.bottom_shell_layers > 1)) &&
-					    (config.ironing_type == IroningType::TopSurfaces ||
-					        (config.ironing_type == IroningType::TopmostOnly && layerm->layer()->upper_layer == nullptr))))) {
-				if (config.outer_wall_filament_id == config.top_surface_filament_id || config.wall_loops == 0) {
-					// Iron the whole face.
-					ironing_params.extruder = config.top_surface_filament_id;
-				} else {
-					// Iron just the infill.
-					ironing_params.extruder = config.top_surface_filament_id;
-				}
-			}
+            // Ironing would bridge the intentionally open cosmetic grooves.
+            if (config.cosmetic_top_relief.value && !config.buried_top_relief.value)
+                continue;
+			ironing_params.extruder = Layer::choose_ironing_extruder(
+				config,
+				/*spiral_mode=*/this->object()->print()->config().spiral_mode,
+				/*is_topmost_layer=*/layerm->layer()->upper_layer == nullptr);
 			if (ironing_params.extruder != -1) {
 				//TODO just_infill is currently not used.
 				ironing_params.just_infill 	= false;
 				// ORCA: Get filament-specific overrides if configured, otherwise use process values
 				size_t extruder_idx = ironing_params.extruder - 1;
-				ironing_params.line_spacing = (!config.filament_ironing_spacing.is_nil(extruder_idx)
+				ironing_params.line_spacing = std::max(IRONING_SPACING_MIN, !config.filament_ironing_spacing.is_nil(extruder_idx)
 					? config.filament_ironing_spacing.get_at(extruder_idx)
-					: config.ironing_spacing);
+					: config.ironing_spacing.value);
                 ironing_params.inset = (!config.filament_ironing_inset.is_nil(extruder_idx)
 					? config.filament_ironing_inset.get_at(extruder_idx)
 					: config.ironing_inset);
@@ -1742,7 +2461,7 @@ void Layer::make_ironing()
 
 		// Create the ironing extrusions for regions <i, j)
 		ExPolygons ironing_areas;
-		double nozzle_dmr = this->object()->print()->config().nozzle_diameter.get_at(ironing_params.extruder - 1);
+		double nozzle_dmr = nozzle_diameter_for_filament(this->object()->print()->config(), ironing_params.extruder, this->object()->print()->is_BBL_printer());
 		if (ironing_params.just_infill) {
 			//TODO just_infill is currently not used.
 			// Just infill.

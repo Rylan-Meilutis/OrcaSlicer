@@ -1,5 +1,12 @@
 #pragma once
+#include "Point.hpp"
+#include <math.h>
+#include <cmath>
+#include <cstddef>
 #include <string>
+#include <vector>
+#include <utility>
+#include <memory>
 #define calib_pressure_advance_dd
 
 #include "GCodeWriter.hpp"
@@ -12,6 +19,9 @@ namespace Slic3r {
 class GCode;
 class Model;
 class ModelObject;
+
+// Keep calibration bridges conventional without modifying the process preset.
+void disable_arc_overhangs_for_calibration(Model &model);
 
 enum class CalibMode : int {
     Calib_None = 0,
@@ -91,29 +101,15 @@ class CaliPresetInfo
 {
 public:
     int         tray_id;
-    int         extruder_id;
-    NozzleVolumeType nozzle_volume_type;
-    BedType     bed_type;
+    int         extruder_id = 0;
+    NozzleVolumeType nozzle_volume_type{nvtStandard};
+    BedType     bed_type{btDefault};
     float       nozzle_diameter;
     int         nozzle_pos_id{-1};
     std::string nozzle_sn;
     std::string filament_id;
     std::string setting_id;
     std::string name;
-
-    CaliPresetInfo &operator=(const CaliPresetInfo &other)
-    {
-        this->tray_id         = other.tray_id;
-        this->extruder_id     = other.extruder_id;
-        this->nozzle_volume_type = other.nozzle_volume_type;
-        this->nozzle_diameter = other.nozzle_diameter;
-        this->nozzle_pos_id   = other.nozzle_pos_id;
-        this->nozzle_sn       = other.nozzle_sn;
-        this->filament_id     = other.filament_id;
-        this->setting_id      = other.setting_id;
-        this->name            = other.name;
-        return *this;
-    }
 };
 
 struct PrinterCaliInfo
@@ -377,7 +373,10 @@ private:
 
     const Calib_Params &m_params;
 
-    GCodeWriter        m_writer;
+    // Belt printers get belt kinematics installed on it (_refresh_writer);
+    // shared_ptr keeps the class copyable — the writer is rebuilt by
+    // refresh_setup() before every use anyway.
+    std::shared_ptr<GCodeWriter> m_writer{std::make_shared<GCodeWriter>()};
     Vec3d              m_starting_point;
     bool               m_is_start_point_fixed = false;
 

@@ -4,7 +4,26 @@
 #include "format.hpp"
 #include "I18N.hpp"
 
-#include "libslic3r/LocalesUtils.hpp"
+#include "libslic3r/Config.hpp"
+#include <memory>
+#include <vector>
+#include <boost/algorithm/string/split.hpp>
+#include <boost/algorithm/string/classification.hpp>
+#include "libslic3r/Point.hpp"
+#include <exception>
+#include <wx/log.h>
+#include <cassert>
+#include "libslic3r/libslic3r.h"
+#include <algorithm>
+#include "libslic3r/Preset.hpp"
+#include "slic3r/GUI/wxExtensions.hpp"
+#include <wx/event.h>
+#include <boost/algorithm/string/constants.hpp>
+#include <cstddef>
+#include <wx/utils.h>
+#include <utility>
+#include <boost/filesystem/operations.hpp>
+#include <wx/string.h>
 #ifdef __APPLE__
 #include "slic3r/Utils/MacDarkMode.hpp"
 #endif
@@ -14,22 +33,30 @@
 #include <boost/algorithm/string/predicate.hpp>
 #include <boost/any.hpp>
 
+#include <wx/filename.h>
+#include <wx/filesys.h>
+
 #if __APPLE__
 #import <IOKit/pwr_mgt/IOPMLib.h>
 #elif _WIN32
 #define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <Windows.h>
 #include "boost/nowide/convert.hpp"
 #endif
 
 #include "AboutDialog.hpp"
 #include "MsgDialog.hpp"
-#include "format.hpp"
+#include "Plater.hpp"
 
 #include "WebUserLoginDialog.hpp"
 
 #include "libslic3r/Print.hpp"
+#include "libslic3r/Utils.hpp"
+
+namespace fs = boost::filesystem;
 
 namespace Slic3r {
 
@@ -114,6 +141,20 @@ void change_opt_value(DynamicPrintConfig& config, const t_config_option_key& opt
 {
 	try{
 
+        const auto numeric_value = [&value]() -> double {
+            if (value.type() == typeid(double))
+                return boost::any_cast<double>(value);
+            if (value.type() == typeid(float))
+                return boost::any_cast<float>(value);
+            if (value.type() == typeid(int))
+                return boost::any_cast<int>(value);
+            if (value.type() == typeid(long))
+                return boost::any_cast<long>(value);
+            if (value.type() == typeid(std::string))
+                return std::stod(boost::any_cast<const std::string &>(value));
+            throw boost::bad_any_cast();
+        };
+
         if (config.def()->get(opt_key)->type == coBools && config.def()->get(opt_key)->nullable) {
             const auto v = boost::any_cast<unsigned char>(value);
             auto vec_new = std::make_unique<ConfigOptionBoolsNullable>(1, v);
@@ -149,20 +190,19 @@ void change_opt_value(DynamicPrintConfig& config, const t_config_option_key& opt
             config.option<ConfigOptionFloatsOrPercents>(opt_key)->set_at(vec_new.get(), opt_index, opt_index);
 			break;}
 		case coPercent:
-			config.set_key_value(opt_key, new ConfigOptionPercent(boost::any_cast<double>(value)));
+			config.set_key_value(opt_key, new ConfigOptionPercent(numeric_value()));
 			break;
 		case coFloat:{
-			double& val = config.opt_float(opt_key);
-			val = boost::any_cast<double>(value);
+			config.set_key_value(opt_key, new ConfigOptionFloat(numeric_value()));
 			break;
 		}
 		case coPercents:{
-            auto vec_new = std::make_unique <ConfigOptionPercent>(boost::any_cast<double>(value));
+            auto vec_new = std::make_unique <ConfigOptionPercent>(numeric_value());
 			config.option<ConfigOptionPercents>(opt_key)->set_at(vec_new.get(), opt_index, opt_index);
 			break;
 		}
 		case coFloats:{
-            auto vec_new = std::make_unique<ConfigOptionFloat>(boost::any_cast<double>(value));
+            auto vec_new = std::make_unique<ConfigOptionFloat>(numeric_value());
 			config.option<ConfigOptionFloats>(opt_key)->set_at(vec_new.get(), opt_index, opt_index);
  			break;
 		}
@@ -256,18 +296,18 @@ void change_opt_value(DynamicPrintConfig& config, const t_config_option_key& opt
 	}
 }
 
-void show_error(wxWindow* parent, const wxString& message, bool monospaced_font)
+void show_error(wxWindow* parent, const wxString& message, bool has_code_excerpts)
 {
     wxGetApp().CallAfter([=] {
-        ErrorDialog msg(parent, message, monospaced_font);
+        ErrorDialog msg(parent, message, has_code_excerpts);
         msg.ShowModal();
     });
 }
 
-void show_error(wxWindow* parent, const char* message, bool monospaced_font)
+void show_error(wxWindow* parent, const char* message, bool has_code_excerpts)
 {
 	assert(message);
-	show_error(parent, wxString::FromUTF8(message), monospaced_font);
+	show_error(parent, wxString::FromUTF8(message), has_code_excerpts);
 }
 
 void show_error_id(int id, const std::string& message)
@@ -529,6 +569,11 @@ boost::filesystem::path into_path(const wxString &str)
 	return boost::filesystem::path(str.wx_str());
 }
 
+wxString file_url_from_path(const boost::filesystem::path &path)
+{
+	return wxFileSystem::FileNameToURL(wxFileName(from_path(path)));
+}
+
 void about()
 {
     AboutDialog dlg;
@@ -632,5 +677,27 @@ void desktop_open_any_folder( const std::string& path )
 #endif
 }
 
+
+bool desktop_open_project_attachment(wxWindow *parent, const boost::filesystem::path &path)
+{
+    // The auxiliary path is UTF-8, which is what boost::filesystem reads a narrow string as.
+    const boost::filesystem::path aux_root(wxGetApp().plater()->model().get_auxiliary_file_temp_path());
+    boost::system::error_code ec;
+    if (!is_absolute_path_within_root(path, aux_root) || !boost::filesystem::is_regular_file(path, ec))
+        return false;
+
+    // Attachments come with the project and carry no download mark, so the desktop would open them without a warning.
+    if (!is_safe_to_open_file_name(path.filename().string())) {
+        MessageDialog dlg(parent,
+                          wxString::Format(_L("\"%s\" is not a plain document, image or model file. Opening it may run it as a "
+                                              "program or script on this computer.\n\n"
+                                              "Only open attachments from projects you trust. Open it anyway?"),
+                                           from_path(path.filename())),
+                          _L("Open attachment"), wxICON_WARNING | wxYES_NO);
+        if (dlg.ShowModal() != wxID_YES)
+            return false;
+    }
+    return wxLaunchDefaultApplication(from_path(path), 0);
+}
 
 } }

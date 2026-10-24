@@ -1,8 +1,19 @@
 #include "OctoPrint.hpp"
+#include <boost/algorithm/string/trim.hpp>
 
 #include <algorithm>
+#include <chrono>
+#include <boost/optional/optional.hpp>
+#include "libslic3r/Config.hpp"
+#include "libslic3r/PrintConfig.hpp"
+#include "libslic3r/GCode/OctoPrintTiming.hpp"
+#include "libslic3r/GCode/LearnedTiming.hpp"
+#include <functional>
+#include <optional>
+#include "libslic3r/Exception.hpp"
 #include <sstream>
 #include <exception>
+#include <thread>
 #include <boost/format.hpp>
 #include <boost/log/trivial.hpp>
 #include <boost/property_tree/ptree.hpp>
@@ -11,21 +22,35 @@
 #include <boost/asio.hpp>
 #include <boost/algorithm/string/split.hpp>
 #include <boost/nowide/convert.hpp>
+#include <boost/nowide/fstream.hpp>
+#include <stdexcept>
+#include <mutex>
 
 #include <curl/curl.h>
+#include <nlohmann/json.hpp>
 
+#include <string>
+#include <utility>
+#include <wx/arrstr.h>
+#include <vector>
 #include <wx/progdlg.h>
+#include <wx/datetime.h>
+#include <wx/string.h>
 
+#include "PrintHost.hpp"
 #include "slic3r/GUI/GUI.hpp"
 #include "slic3r/GUI/I18N.hpp"
 #include "slic3r/GUI/GUI_App.hpp"
 #include "slic3r/GUI/format.hpp"
 #include "Http.hpp"
 #include "libslic3r/AppConfig.hpp"
+#include "libslic3r/OctoPrintSpoolCache.hpp"
+#include "libslic3r/GCode/SpoolManagerMetadata.hpp"
 #include "Bonjour.hpp"
 #include "slic3r/GUI/BonjourDialog.hpp"
+#include <boost/asio/ip/address.hpp>
+#include <cstddef>
 
-namespace fs = boost::filesystem;
 namespace pt = boost::property_tree;
 
 
@@ -129,10 +154,101 @@ OctoPrint::OctoPrint(DynamicPrintConfig *config) :
     m_host(config->opt_string("print_host")),
     m_apikey(config->opt_string("printhost_apikey")),
     m_cafile(config->opt_string("printhost_cafile")),
-    m_ssl_revoke_best_effort(config->opt_bool("printhost_ssl_ignore_revoke"))
+    m_ssl_revoke_best_effort(config->opt_bool("printhost_ssl_ignore_revoke")),
+    m_filament_plugin_endpoint(
+        config->option<ConfigOptionString>("octoprint_filament_plugin_endpoint") != nullptr ?
+            config->option<ConfigOptionString>("octoprint_filament_plugin_endpoint")->value : std::string())
 {}
 
 const char* OctoPrint::get_name() const { return "OctoPrint"; }
+
+OctoPrintTiming::Status OctoPrint::get_completed_print(const std::string &expected_sha1,
+    OctoPrintTiming::CompletedPrint &result, bool opted_in, const std::function<bool()> &cancelled) const
+{
+    using OctoPrintTiming::Status;
+    result = {};
+    if (!opted_in) return Status::Disabled;
+    if (cancelled && cancelled()) return Status::Cancelled;
+    // One bounded metadata refresh, no retries, downloads, discovery or logs
+    // containing host URLs, API keys or server response bodies.
+    const auto fetch = [&](const std::string &path, std::string &body) {
+        bool success = false;
+        auto http = Http::get(make_url(path));
+        set_auth(http);
+        http.timeout_connect(3).timeout_max(7).size_limit(1024 * 1024)
+            .on_progress([&](Http::Progress, bool &cancel) { if (cancelled && cancelled()) cancel = true; })
+            .on_complete([&](std::string response, unsigned) { body = std::move(response); success = true; })
+            .on_error([](std::string, std::string, unsigned) {})
+#ifdef WIN32
+            .ssl_revoke_best_effort(m_ssl_revoke_best_effort)
+#endif
+            .perform_sync();
+        return success;
+    };
+    std::string body;
+    if (!fetch("api/job", body)) return cancelled && cancelled() ? Status::Cancelled : Status::NetworkError;
+    std::string path;
+    try { path = OctoPrintTiming::selected_local_path(body); }
+    catch (const std::exception &) { return Status::InvalidResponse; }
+    if (path.empty()) return Status::NoCompletedJob;
+    if (cancelled && cancelled()) return Status::Cancelled;
+    if (!fetch("api/files/local/" + escape_path_by_element(boost::filesystem::path(path)), body))
+        return cancelled && cancelled() ? Status::Cancelled : Status::NetworkError;
+    if (cancelled && cancelled()) return Status::Cancelled;
+    return OctoPrintTiming::completed_print(body, expected_sha1, OctoPrintTiming::server_key(m_host), result);
+}
+
+OctoPrintTiming::RefreshResult OctoPrint::refresh_learned_timing(const std::string &local_filename,
+    const std::string &store_path, const std::string &setup_revision, bool opted_in,
+    const std::function<bool()> &cancelled) const
+{
+    using OctoPrintTiming::Status;
+    OctoPrintTiming::RefreshResult result;
+    if (!opted_in) { result.status = Status::Disabled; return result; }
+    if (setup_revision.empty() || setup_revision.size() > 256) return result;
+    const auto check = [&] { if (cancelled && cancelled()) throw std::runtime_error("cancelled"); };
+    std::optional<LearnedTimingFeatures> features;
+    try {
+        const auto hash = OctoPrintTiming::file_sha1(local_filename, check);
+        boost::nowide::ifstream input(local_filename);
+        features = extract_learned_timing_features(input,
+            OctoPrintTiming::server_key(m_host) + ':' + setup_revision, hash, check);
+        if (!features || OctoPrintTiming::file_sha1(local_filename, check) != hash) return result;
+    } catch (const std::exception &) {
+        result.status = cancelled && cancelled() ? Status::Cancelled : Status::InvalidSource;
+        return result;
+    }
+    try {
+        check();
+        const auto model = OctoPrintTiming::load(store_path);
+        result.estimate = model.estimate(*features);
+        result.accepted_samples = model.observations().size();
+    } catch (const std::exception &) {
+        result.status = cancelled && cancelled() ? Status::Cancelled : Status::StorageError;
+        return result;
+    }
+    OctoPrintTiming::CompletedPrint completed;
+    result.status = get_completed_print(features->gcode_hash, completed, true, cancelled);
+    if (result.status != Status::Success) return result;
+    // Serialize read/modify/write transactions across concurrent refresh jobs.
+    static std::mutex refresh_mutex;
+    const std::lock_guard<std::mutex> lock(refresh_mutex);
+    try {
+        check();
+        auto model = OctoPrintTiming::load(store_path);
+        LearnedTimingObservation observation{completed.job_id, *features, completed.active_seconds, true, true};
+        const bool added = model.add_observation(observation);
+        result.estimate = model.estimate(*features);
+        result.accepted_samples = model.observations().size();
+        check();
+        if (added) OctoPrintTiming::save(store_path, model);
+    } catch (const std::exception &) {
+        result.status = cancelled && cancelled() ? Status::Cancelled : Status::StorageError;
+        result.estimate.reset();
+        result.accepted_samples = 0;
+    }
+    return result;
+}
 
 #ifdef WIN32
 bool OctoPrint::test_with_resolved_ip(wxString &msg) const
@@ -261,8 +377,214 @@ wxString OctoPrint::get_test_failed_msg (wxString &msg) const
         , _L("Note: OctoPrint version 1.1.0 or higher is required."));
 }
 
+bool OctoPrint::get_selected_filament_spools(
+    std::vector<SpoolManagerMetadata::Filament> &slots, wxString &error, bool allow_cached) const
+{
+    slots.clear();
+    error.clear();
+    std::vector<SpoolManagerMetadata::Filament> inventory;
+    auto *app_config = GUI::wxGetApp().app_config;
+    const auto cache_key = OctoPrintSpoolCache::key(m_host, m_filament_plugin_endpoint);
+    if (get_filament_spools(slots, inventory, error, true)) {
+        error.clear();
+        if (app_config != nullptr) {
+            // Persist empty snapshots too: unloading all tools must invalidate
+            // older assignments, rather than resurrect them after a restart.
+            app_config->set("octoprint_loaded_spools", cache_key,
+                OctoPrintSpoolCache::encode(slots, GUI::into_u8(wxDateTime::Now().FormatISOCombined(' '))));
+            try {
+                app_config->save();
+            } catch (const std::exception &exception) {
+                BOOST_LOG_TRIVIAL(error) << "Could not persist OctoPrint spool snapshot: " << exception.what();
+                error = _L("Loaded materials were refreshed, but their offline snapshot could not be saved. Check available disk space and configuration-folder permissions.");
+            }
+        }
+    } else {
+        slots.clear();
+        std::string updated_at;
+        if (!allow_cached || app_config == nullptr || !OctoPrintSpoolCache::decode(
+                app_config->get("octoprint_loaded_spools", cache_key), slots, updated_at))
+            return false;
+        error = GUI::format_wxstr(_L("OctoPrint could not be refreshed. Using last known loaded spools from %1%. Verify the printer's loaded materials before continuing."),
+                                 GUI::from_u8(updated_at));
+    }
+    if (slots.empty()) {
+        error = _L("The OctoPrint filament provider has no spools assigned to its tools or slots.");
+        return false;
+    }
+    return true;
+}
+
+bool OctoPrint::get_filament_spools(
+    std::vector<SpoolManagerMetadata::Filament> &slots,
+    std::vector<SpoolManagerMetadata::Filament> &inventory,
+    wxString &error, bool require_assignments) const
+{
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+    const auto fetch = [this, deadline](const std::string &path, std::string &body, wxString &request_error,
+                              int attempts = 1) {
+        for (int attempt = 1; attempt <= attempts; ++attempt) {
+            const auto remaining = std::chrono::duration_cast<std::chrono::seconds>(
+                deadline - std::chrono::steady_clock::now()).count();
+            if (remaining <= 0) {
+                request_error = _L("Timed out refreshing OctoPrint loaded materials.");
+                return false;
+            }
+            bool success = false;
+            wxString attempt_error;
+            auto http = Http::get(make_url(path));
+            set_auth(http);
+            http.timeout_connect(std::min<long>(3, remaining)).timeout_max(std::min<long>(5, remaining));
+            http.on_complete([&body, &success](std::string response, unsigned) {
+                    body = std::move(response);
+                    success = true;
+                })
+                .on_error([this, &attempt_error](std::string response, std::string curl_error, unsigned status) {
+                    attempt_error = format_error(response, curl_error, status);
+                })
+#ifdef WIN32
+                .ssl_revoke_best_effort(m_ssl_revoke_best_effort)
+#endif
+                .perform_sync();
+            if (success)
+                return true;
+            request_error = std::move(attempt_error);
+            if (attempt < attempts)
+                std::this_thread::sleep_for(std::chrono::milliseconds(250 * attempt));
+        }
+        return false;
+    };
+
+    const auto try_provider = [&](const std::string &path, int attempts = 1,
+                                  const std::string &fallback_provider = std::string()) {
+        std::string body;
+        wxString request_error;
+        if (!fetch(path, body, request_error, attempts)) {
+            BOOST_LOG_TRIVIAL(debug) << "OctoPrint filament provider endpoint unavailable: " << path;
+            if (!request_error.empty())
+                error = std::move(request_error);
+            return false;
+        }
+        std::string selected_error;
+        const bool selected_ok = SpoolManagerMetadata::parse_selected_spools(
+            body, slots, selected_error, fallback_provider, true);
+        std::string inventory_error;
+        const bool inventory_ok = SpoolManagerMetadata::parse_spool_inventory(
+            body, inventory, inventory_error, fallback_provider);
+        if (!inventory_ok && selected_ok)
+            inventory.assign(slots.begin(), slots.end());
+        if (selected_ok || (!require_assignments && inventory_ok))
+            return true;
+        BOOST_LOG_TRIVIAL(debug) << "OctoPrint filament provider response was not usable at " << path
+                                 << ": " << selected_error << "; " << inventory_error;
+        error = GUI::from_u8(selected_error);
+        return false;
+    };
+
+    // An explicitly configured compatibility endpoint takes priority. This is
+    // also the extension point for plugins whose API is not known to Orca.
+    std::string custom_endpoint = m_filament_plugin_endpoint;
+    boost::algorithm::trim(custom_endpoint);
+    while (!custom_endpoint.empty() && custom_endpoint.front() == '/')
+        custom_endpoint.erase(custom_endpoint.begin());
+    if (!custom_endpoint.empty() && try_provider(custom_endpoint, 2))
+        return true;
+
+    if (try_provider(
+            "plugin/SpoolManager/loadSpoolsByQuery?selectedPageSize=100000&from=0&to=100000"
+            "&sortColumn=displayName&sortOrder=desc&filterName=&materialFilter=all&vendorFilter=all&colorFilter=all",
+            2))
+        return true;
+
+    if (try_provider("plugin/filamentmanager/selections"))
+        return true;
+
+    // mdziekon/octoprint-spoolman exposes inventory and assignments through
+    // separate OctoPrint APIs. Merge them into the same parser input so tool
+    // indices and empty slots retain their meaning.
+    std::string settings_body;
+    std::string inventory_body;
+    wxString settings_error;
+    wxString inventory_error;
+    if (fetch("api/settings", settings_body, settings_error) &&
+        fetch("plugin/Spoolman/spoolman/spools", inventory_body, inventory_error, 2)) {
+        try {
+            const nlohmann::json settings = nlohmann::json::parse(settings_body);
+            const nlohmann::json inventory_json = nlohmann::json::parse(inventory_body);
+            const nlohmann::json *plugin = nullptr;
+            if (const auto plugins = settings.find("plugins"); plugins != settings.end() && plugins->is_object()) {
+                for (const char *key : {"Spoolman", "spoolman"}) {
+                    const auto candidate = plugins->find(key);
+                    if (candidate != plugins->end() && candidate->is_object()) {
+                        plugin = &*candidate;
+                        break;
+                    }
+                }
+            }
+            const nlohmann::json *inventory_data = &inventory_json;
+            if (const auto data = inventory_json.find("data"); data != inventory_json.end() && data->is_object())
+                inventory_data = &*data;
+            if (plugin != nullptr) {
+                nlohmann::json combined;
+                combined["selectedSpoolIds"] = plugin->value("selectedSpoolIds", nlohmann::json::object());
+                combined["spools"] = inventory_data->value("spools", nlohmann::json::array());
+                std::string parse_error;
+                const std::string combined_text = combined.dump();
+                std::string inventory_parse_error;
+                const bool inventory_ok = SpoolManagerMetadata::parse_spool_inventory(
+                    combined_text, inventory, inventory_parse_error, "Spoolman");
+                if (SpoolManagerMetadata::parse_selected_spools(combined_text, slots, parse_error, {}, true) ||
+                    (!require_assignments && inventory_ok))
+                    return true;
+                error = GUI::from_u8(parse_error);
+            }
+        } catch (const std::exception &exception) {
+            error = GUI::from_u8(exception.what());
+        }
+    } else if (!inventory_error.empty()) {
+        error = std::move(inventory_error);
+    } else if (!settings_error.empty()) {
+        error = std::move(settings_error);
+    }
+
+    // RME compatibility is the provider-neutral final fallback.  Probe it
+    // only after the established SpoolManager, FilamentManager and Spoolman
+    // APIs have failed to return a usable assignment, so installing the
+    // compatibility plugin cannot silently override a dedicated provider.
+    // Accept both provisional endpoint names while its default implementation
+    // is being finalized.  The fallback provider name also makes per-roll
+    // mappings deterministic when the response itself omits `provider`.
+    if (try_provider("plugin/rme_compatibility/filament-report", 1,
+                     "RME compatibility") ||
+        try_provider("plugin/rme_compatibility/selected-spools", 1,
+                     "RME compatibility") ||
+        try_provider("plugin/rme_filament/selected-spools", 1,
+                     "RME compatibility"))
+        return true;
+
+    error = GUI::format_wxstr("%s: %s", _L("Could not load OctoPrint filament spool assignments"), error);
+    return false;
+}
+
 bool OctoPrint::upload(PrintHostUpload upload_data, ProgressFn prorgess_fn, ErrorFn error_fn, InfoFn info_fn) const
 {
+    const std::string serialized_filaments = upload_data.extended("spool_manager_filaments");
+    if (!serialized_filaments.empty() && !upload_data.use_3mf) {
+        try {
+            const std::vector<SpoolManagerMetadata::Filament> filaments =
+                nlohmann::json::parse(serialized_filaments).get<std::vector<SpoolManagerMetadata::Filament>>();
+            std::string metadata_error;
+            if (!SpoolManagerMetadata::update_gcode_file(upload_data.source_path, filaments, metadata_error)) {
+                error_fn(GUI::from_u8(metadata_error));
+                return false;
+            }
+        } catch (const std::exception &exception) {
+            error_fn(GUI::format_wxstr("%s: %s", _L("Invalid SpoolManager filament selection"),
+                                       GUI::from_u8(exception.what())));
+            return false;
+        }
+    }
+
 #ifndef WIN32
     return upload_inner_with_host(std::move(upload_data), prorgess_fn, error_fn, info_fn);
 #else

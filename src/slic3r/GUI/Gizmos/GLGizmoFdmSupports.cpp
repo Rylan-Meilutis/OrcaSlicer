@@ -1,6 +1,11 @@
 #include "GLGizmoFdmSupports.hpp"
+#include <exception>
+#include <igl/Hit.h>
+#include <wx/string.h>
 
 #include "libslic3r/Model.hpp"
+#include "libslic3r/AABBTreeIndirect.hpp"
+#include "libslic3r/TriangleMesh.hpp"
 //BBS
 #include "libslic3r/Layer.hpp"
 #include "libslic3r/Thread.hpp"
@@ -8,19 +13,125 @@
 //#include "slic3r/GUI/3DScene.hpp"
 #include "slic3r/GUI/GLCanvas3D.hpp"
 #include "slic3r/GUI/GUI_App.hpp"
+#include "slic3r/GUI/Shortcuts.hpp"
 #include "slic3r/GUI/ImGuiWrapper.hpp"
 #include "slic3r/GUI/Plater.hpp"
 #include "slic3r/GUI/GUI_ObjectList.hpp"
 #include "slic3r/GUI/format.hpp"
 #include "slic3r/GUI/GUI.hpp"
+#include "slic3r/GUI/MsgDialog.hpp"
 #include "slic3r/Utils/UndoRedo.hpp"
 #include "GLGizmoUtils.hpp"
 
+#include <boost/chrono/duration.hpp>
+#include <cstddef>
+#include <algorithm>
+#include <array>
+#include <cmath>
 #include <glad/gl.h>
 
 #include <boost/log/trivial.hpp>
+#include <string>
+#include "slic3r/GUI/Gizmos/GLGizmoPainterBase.hpp"
+#include <utility>
+#include "slic3r/GUI/Gizmos/GLGizmoBase.hpp"
+#include "libslic3r/Format/bbs_3mf.hpp"
+#include <imgui.h>
+#include <vector>
+#include "libslic3r/PrintConfig.hpp"
+#include <math.h>
+#include "libslic3r/Point.hpp"
+#include "libslic3r/TriangleMesh.hpp"
+#include "libslic3r/TriangleSelector.hpp"
+#include "slic3r/GUI/Event.hpp"
+#include <wx/busycursor.h>
+#include <memory>
+#include <mutex>
+#include "slic3r/GUI/GLModel.hpp"
+#include "libslic3r/ExtrusionEntity.hpp"
+#include "slic3r/GUI/3DScene.hpp"
+#include <wx/event.h>
+#include "libslic3r/Color.hpp"
+#include "libslic3r/Config.hpp"
+#include "libslic3r/CutUtils.hpp"
+#include "libslic3r/ExtrusionEntityCollection.hpp"
+#include "libslic3r/ObjectID.hpp"
+#include "libslic3r/Preset.hpp"
+#include "libslic3r/PresetBundle.hpp"
+#include "libslic3r/Print.hpp"
+#include "slic3r/GUI/Gizmos/GLGizmosCommon.hpp"
+#include "slic3r/GUI/Gizmos/GLGizmosManager.hpp"
+#include "slic3r/GUI/I18N.hpp"
+#include "slic3r/GUI/Selection.hpp"
+#include "slic3r/GUI/GUI_Utils.hpp"
+
+#include <limits>
 
 namespace Slic3r::GUI {
+
+namespace {
+
+struct AutoPaintMesh
+{
+    indexed_triangle_set              triangles;
+    AABBTreeIndirect::Tree<3, float> tree;
+};
+
+struct AutoPaintVolume
+{
+    indexed_triangle_set                     triangles;
+    Transform3d                              transform;
+    TriangleSelector::TriangleSplittingData existing_paint;
+};
+
+std::vector<Vec3f> support_spot_samples(const indexed_triangle_set &mesh, const stl_triangle_vertex_indices &face,
+                                        float spacing)
+{
+    const Vec3f &a = mesh.vertices[face[0]];
+    const Vec3f &b = mesh.vertices[face[1]];
+    const Vec3f &c = mesh.vertices[face[2]];
+    const float max_edge = std::max({(a - b).norm(), (b - c).norm(), (c - a).norm()});
+    const int divisions = std::max(1, int(std::ceil(max_edge / spacing)));
+
+    std::vector<Vec3f> samples;
+    samples.reserve(size_t(divisions * (divisions + 1) / 2));
+    for (int i = 0; i < divisions; ++i) {
+        for (int j = 0; j < divisions - i; ++j) {
+            // Sample cell centers rather than triangle edges. Edge samples are prone to
+            // hitting both adjacent facets and produce duplicated paint islands.
+            const float u = (float(i) + 1.f / 3.f) / float(divisions);
+            const float v = (float(j) + 1.f / 3.f) / float(divisions);
+            const float w = 1.f - u - v;
+            if (w >= 0.f)
+                samples.emplace_back(a * w + b * u + c * v);
+        }
+    }
+    if (samples.empty())
+        samples.emplace_back((a + b + c) / 3.f);
+    return samples;
+}
+
+bool has_close_vertical_support(const Vec3f &point, const std::vector<AutoPaintMesh> &meshes, float max_gap)
+{
+    if (point.z() <= max_gap)
+        return true;
+
+    const Vec3d origin = (point - Vec3f(0.f, 0.f, 0.02f)).cast<double>();
+    const Vec3d down(0., 0., -1.);
+    float nearest = std::numeric_limits<float>::max();
+    std::vector<igl::Hit<float>> hits;
+    for (const AutoPaintMesh &mesh : meshes) {
+        if (!AABBTreeIndirect::intersect_ray_all_hits(mesh.triangles.vertices, mesh.triangles.indices,
+                                                       mesh.tree, origin, down, hits))
+            continue;
+        for (const igl::Hit<float> &hit : hits)
+            if (hit.t > 0.04f)
+                nearest = std::min(nearest, hit.t);
+    }
+    return nearest <= max_gap;
+}
+
+} // namespace
 
 GLGizmoFdmSupports::GLGizmoFdmSupports(GLCanvas3D& parent, const std::string& icon_filename, unsigned int sprite_id)
     : GLGizmoPainterBase(parent, icon_filename, sprite_id), m_current_tool(ImGui::CircleButtonIcon)
@@ -34,16 +145,25 @@ void GLGizmoFdmSupports::on_shutdown()
     //BBS
     //wait the thread
     if (m_thread.joinable()) {
-        Print *print = m_print_instance.print_object->print();
-        if (print) {
+        const bool auto_paint_thread = m_auto_paint_running || m_auto_paint_ready;
+        Print *print = m_print_instance.print_object != nullptr ? m_print_instance.print_object->print() : nullptr;
+        if (!auto_paint_thread && print != nullptr) {
             BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << "cancel the print";
             print->cancel();
         }
         //join the thread
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << "try to join thread for 2000 ms";
+        m_cancel = true;
         auto ret = m_thread.try_join_for(boost::chrono::milliseconds(2000));
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << "join thread returns "<<ret;
+        if (!ret)
+            m_thread.join();
     }
+    m_auto_paint_running = false;
+    m_auto_paint_ready = false;
+    m_auto_paint_failed = false;
+    m_auto_paint_result.clear();
+    m_auto_paint_object_id = ObjectID{};
 
     m_print_instance.print_object = NULL;
     m_print_instance.model_instance = NULL;
@@ -68,6 +188,12 @@ void GLGizmoFdmSupports::on_opening()
 
     m_volume_ready = false;
     m_volume_valid = false;
+    m_cancel = false;
+    m_auto_paint_running = false;
+    m_auto_paint_ready = false;
+    m_auto_paint_failed = false;
+    m_auto_paint_result.clear();
+    m_auto_paint_object_id = ObjectID{};
 }
 
 std::string GLGizmoFdmSupports::on_get_name() const
@@ -78,51 +204,47 @@ std::string GLGizmoFdmSupports::on_get_name() const
 bool GLGizmoFdmSupports::on_init()
 {
     // BBS
-    m_shortcut_key = WXK_CONTROL_L;
+    m_shortcut = Shortcut::GizmoFdmSupports;
 
     m_desc["perform"]            = _L("Apply");
+    m_desc["autopaint"]          = _L("Automatic painting");
+    m_desc["autopaint_tooltip"]  = _L("Add localized support enforcers at or below the automatic painting angle where the model has no material underneath");
     m_desc["on_overhangs_only"]  = _L("On highlighted overhangs only");
     m_desc["remove_all"]         = _L("Erase all");
-    m_desc["highlight_by_angle"] = _L("Highlight overhangs");
+    m_desc["highlight_by_angle"] = _L("Automatic painting angle");
     m_desc["tool_type"]          = _L("Tool type");
     m_desc["gap_fill"]           = _L("Gap fill");
-    m_desc["reset_direction"]    = _L("Reset direction");
-    m_desc["clipping_of_view"]   = _L("Section view");
     m_desc["cursor_size"]        = _L("Brush size");
     m_desc["smart_fill_angle"]   = _L("Smart fill angle");
     m_desc["gap_area"]           = _L("Gap area");
 
 
     const wxString ctrl  = GUI::shortkey_ctrl_prefix();
-    const wxString alt   = GUI::shortkey_alt_prefix();
     const wxString shift = GUI::shortkey_shift_prefix();
 
     std::pair<wxString, wxString> enforce_shortcut  = {_L("Left mouse button"),         _L("Enforce supports")};
     std::pair<wxString, wxString> block_shortcut    = {_L("Right mouse button"),        _L("Block supports")};
     std::pair<wxString, wxString> remove_shortcut   = {shift + _L("Left mouse button"), _L("Erase")};
-    std::pair<wxString, wxString> clipping_shortcut = {alt + _L("Mouse wheel"),         m_desc["clipping_of_view"]};
 
     m_shortcuts_brush = {
         enforce_shortcut, 
         block_shortcut, 
         remove_shortcut,
-        {ctrl + _L("Mouse wheel"), m_desc["cursor_size"]},
-        clipping_shortcut
+        {ctrl + _L("Mouse wheel"), m_desc["cursor_size"]}
     };
 
     m_shortcuts_bucket_fill = {
         enforce_shortcut, 
         block_shortcut, 
         remove_shortcut,
-        {ctrl + _L("Mouse wheel"),  m_desc["smart_fill_angle"]},
-        clipping_shortcut
+        {ctrl + _L("Mouse wheel"),  m_desc["smart_fill_angle"]}
     };
 
     m_shortcuts_gap_fill = {
         {ctrl + _L("Mouse wheel"), _L("Gap area")}
     };
 
-    memset(&m_print_instance, 0, sizeof(m_print_instance));
+    m_print_instance = PrintInstance();
     return true;
 }
 
@@ -149,25 +271,14 @@ void GLGizmoFdmSupports::render_painter_gizmo()
     glsafe(::glDisable(GL_BLEND));
 }
 
-// BBS
-bool GLGizmoFdmSupports::on_key_down_select_tool_type(int keyCode) {
-    switch (keyCode)
-    {
-    case 'F':
-        m_current_tool = ImGui::FillButtonIcon;
-        break;
-    case 'S':
-        m_current_tool = ImGui::SphereButtonIcon;
-        break;
-    case 'C':
-        m_current_tool = ImGui::CircleButtonIcon;
-        break;
-    case 'G':
-        m_current_tool = ImGui::GapFillIcon;
-        break;
-    default:
-        return false;
-        break;
+bool GLGizmoFdmSupports::on_tool_shortcut(Shortcut shortcut)
+{
+    switch (shortcut) {
+    case Shortcut::PaintToolFill:    m_current_tool = ImGui::FillButtonIcon; break;
+    case Shortcut::PaintToolSphere:  m_current_tool = ImGui::SphereButtonIcon; break;
+    case Shortcut::PaintToolCircle:  m_current_tool = ImGui::CircleButtonIcon; break;
+    case Shortcut::PaintToolGapFill: m_current_tool = ImGui::GapFillIcon; break;
+    default: return false;
     }
     return true;
 }
@@ -190,6 +301,7 @@ void GLGizmoFdmSupports::on_render_input_window(float x, float y, float bottom_l
     init_print_instance();
     if (! m_c->selection_info()->model_object())
         return;
+    apply_auto_paint_result();
 
     float  scale       = m_parent.get_scale();
     #ifdef WIN32
@@ -200,13 +312,15 @@ void GLGizmoFdmSupports::on_render_input_window(float x, float y, float bottom_l
     // BBS
     wchar_t old_tool = m_current_tool;
 
-    int support_threshold_angle = get_selection_support_threshold_angle();
-    // when support painting tool is on, reset highlight threshold angle
+    const int support_threshold_angle = get_selection_support_threshold_angle();
+    // Seed the painter-local control from the process profile when the gizmo is
+    // opened. Subsequent edits belong to the painter and do not mutate or get
+    // overwritten by the process profile.
     if (m_support_threshold_angle == -1) {
-        m_highlight_by_angle_threshold_deg = support_threshold_angle;
+        m_highlight_by_angle_threshold_deg = support_threshold_angle > 0 ? float(support_threshold_angle) : 45.f;
         m_parent.set_slope_normal_angle(90.f - m_highlight_by_angle_threshold_deg);
     }
-    m_support_threshold_angle = support_threshold_angle;
+    m_support_threshold_angle = int(std::lround(m_highlight_by_angle_threshold_deg));
 
     const float approx_height = m_imgui->scaled(23.f);
     y = std::min(y, bottom_limit - approx_height);
@@ -222,11 +336,9 @@ void GLGizmoFdmSupports::on_render_input_window(float x, float y, float bottom_l
 
     // First calculate width of all the texts that are could possibly be shown. We will decide set the dialog width based on that:
     const float space_size = m_imgui->get_style_scaling() * 8;
-    const float clipping_slider_left    = m_imgui->calc_text_size(m_desc.at("clipping_of_view")).x + m_imgui->scaled(1.5f);
     const float cursor_slider_left      = m_imgui->calc_text_size(m_desc.at("cursor_size")).x + m_imgui->scaled(1.5f);
     const float gap_fill_slider_left    = m_imgui->calc_text_size(m_desc.at("gap_fill")).x + m_imgui->scaled(1.5f);
     const float highlight_slider_left   = m_imgui->calc_text_size(m_desc.at("highlight_by_angle")).x + m_imgui->scaled(1.5f);
-    const float reset_button_slider_left = m_imgui->calc_text_size(m_desc.at("reset_direction")).x + m_imgui->scaled(1.5f) + ImGui::GetStyle().FramePadding.x * 2;
     const float on_overhangs_only_width  = m_imgui->calc_text_size(m_desc["on_overhangs_only"]).x + m_imgui->scaled(1.5f);
     const float filter_btn_width        = m_imgui->calc_text_size(m_desc.at("perform")).x + m_imgui->scaled(1.5f);
     const float gap_area_txt_width = m_imgui->calc_text_size(m_desc.at("gap_area")).x + m_imgui->scaled(1.5f);
@@ -234,19 +346,16 @@ void GLGizmoFdmSupports::on_render_input_window(float x, float y, float bottom_l
     const float buttons_width           = filter_btn_width + m_imgui->scaled(1.5f);
     const float empty_button_width      = m_imgui->calc_button_size("").x;
 
-    const float tips_width           = m_imgui->calc_text_size(_L("Auto support threshold angle: ") + " 90 ").x + m_imgui->scaled(1.5f);
-    const float minimal_slider_width = m_imgui->scaled(4.f);
-
     float caption_max    = 0.f;
     float total_text_max = 0.f;
-    for (const auto &t : std::array<std::string, 5>{"enforce", "block", "remove", "cursor_size", "clipping_of_view"}) {
+    for (const auto &t : std::array<std::string, 4>{"enforce", "block", "remove", "cursor_size"}) {
         caption_max    = std::max(caption_max, m_imgui->calc_text_size(m_desc[t + "_caption"]).x);
         total_text_max = std::max(total_text_max, m_imgui->calc_text_size(m_desc[t]).x);
     }
     total_text_max += caption_max + m_imgui->scaled(1.f);
     caption_max += m_imgui->scaled(1.f);
 
-    const float sliders_left_width = std::max(gap_area_txt_width, std::max(smart_fill_angle_txt_width, std::max(reset_button_slider_left, std::max(std::max(cursor_slider_left, clipping_slider_left), std::max(highlight_slider_left, gap_fill_slider_left)))));
+    const float sliders_left_width = std::max(gap_area_txt_width, std::max(smart_fill_angle_txt_width, std::max(cursor_slider_left, std::max(highlight_slider_left, gap_fill_slider_left))));
     const float slider_icon_width  = m_imgui->get_slider_icon_size().x;
     const float max_tooltip_width = ImGui::GetFontSize() * 20.0f;
 
@@ -302,6 +411,13 @@ void GLGizmoFdmSupports::on_render_input_window(float x, float y, float bottom_l
         this->tool_changed(old_tool, m_current_tool);
 
     ImGui::Dummy(ImVec2(0.0f, ImGui::GetFontSize() * 0.1));
+
+    if (m_auto_paint_running)
+        m_imgui->text(_L("Analyzing support points..."));
+    else if (m_imgui->button(m_desc.at("autopaint"), m_desc.at("autopaint_tooltip")))
+        auto_generate();
+
+    ImGui::Separator();
 
     if (m_current_tool == ImGui::CircleButtonIcon) {
         m_cursor_type = TriangleSelector::CursorType::CIRCLE;
@@ -420,7 +536,7 @@ void GLGizmoFdmSupports::on_render_input_window(float x, float y, float bottom_l
 
     std::string format_str = std::string("%.f");
     ImGui::PushItemWidth(sliders_width);
-    wxString tooltip = _L("Highlight faces according to overhang angle.");
+    wxString tooltip = _L("Set the maximum slope angle used by Automatic painting. Faces at exactly this angle are included. This also controls overhang highlighting.");
     if (m_imgui->bbl_slider_float_style("##angle_threshold_deg", &m_highlight_by_angle_threshold_deg, 0.f, 90.f, format_str.data(), 1.0f, true, tooltip)) {
         m_parent.set_slope_normal_angle(90.f - m_highlight_by_angle_threshold_deg);
         if (!m_parent.is_using_slope()) {
@@ -428,44 +544,10 @@ void GLGizmoFdmSupports::on_render_input_window(float x, float y, float bottom_l
             m_parent.set_as_dirty();
         }
     }
-    if (ImGui::IsItemHovered()) {
-        ImGui::BeginTooltip();
-        if (m_support_threshold_angle != 0) {
-            wxString str_tooltip = (_L("Auto support threshold angle: ") + std::to_string(m_support_threshold_angle));
-            m_imgui->text_colored(ImGuiWrapper::COL_WINDOW_BG, str_tooltip);
-        } else {
-            wxString s_tooltip = (_L("No auto support"));
-            m_imgui->text_colored(ImGuiWrapper::COL_WINDOW_BG, s_tooltip);
-        }
-        ImGui::EndTooltip();
-    }
     ImGui::SameLine(drag_left_width + sliders_left_width);
     ImGui::PushItemWidth(1.5 * slider_icon_width);
     ImGui::BBLDragFloat("##angle_threshold_deg_input", &m_highlight_by_angle_threshold_deg, 0.05f, 0.0f, 0.0f, "%.2f");
 
-    ImGui::Separator();
-    if (m_c->object_clipper()->get_position() == 0.f) {
-        ImGui::AlignTextToFramePadding();
-        m_imgui->text(m_desc.at("clipping_of_view"));
-    }
-    else {
-        if (m_imgui->button(m_desc.at("reset_direction"))) {
-            wxGetApp().CallAfter([this]() {
-                    m_c->object_clipper()->set_position_by_ratio(-1., false);
-                });
-        }
-    }
-    auto clp_dist = float(m_c->object_clipper()->get_position());
-    ImGui::SameLine(sliders_left_width);
-    ImGui::PushItemWidth(sliders_width);
-    bool b_bbl_slider_float = m_imgui->bbl_slider_float_style("##clp_dist", &clp_dist, 0.f, 1.f, "%.2f", 1.0f, true);
-
-    ImGui::SameLine(drag_left_width + sliders_left_width);
-    ImGui::PushItemWidth(1.5 * slider_icon_width);
-    bool b_drag_input = ImGui::BBLDragFloat("##clp_dist_input", &clp_dist, 0.05f, 0.0f, 0.0f, "%.2f");
-
-    if (b_bbl_slider_float || b_drag_input) m_c->object_clipper()->set_position_by_ratio(clp_dist, true);
-    
     ImGui::Separator();
 
     render_tooltip_button(x, y);
@@ -540,12 +622,9 @@ int GLGizmoFdmSupports::get_selection_support_threshold_angle()
 
     const DynamicPrintConfig& obj_cfg = sel_info->model_object()->config.get();
     const DynamicPrintConfig& glb_cfg = wxGetApp().preset_bundle->prints.get_edited_preset().config;
-    bool enable_support = obj_cfg.option("enable_support") ? obj_cfg.opt_bool("enable_support") : glb_cfg.opt_bool("enable_support");
-    SupportType support_type = obj_cfg.option("support_type") ? obj_cfg.opt_enum<SupportType>("support_type") : glb_cfg.opt_enum<SupportType>("support_type");
     int support_threshold_angle = obj_cfg.option("support_threshold_angle") ? obj_cfg.opt_int("support_threshold_angle") : glb_cfg.opt_int("support_threshold_angle");
 
-    bool auto_support = enable_support && is_auto(support_type);
-    return auto_support ? support_threshold_angle : 0;
+    return support_threshold_angle;
 }
 
 void GLGizmoFdmSupports::select_facets_by_angle(float threshold_deg, bool block)
@@ -555,6 +634,11 @@ void GLGizmoFdmSupports::select_facets_by_angle(float threshold_deg, bool block)
     const ModelObject* mo = m_c->selection_info()->model_object();
     const ModelInstance* mi = mo->instances[selection.get_instance_idx()];
 
+    // Compute gravity direction accounting for build plate tilt
+    const Vec3d up_dir      = build_plate_tilt_up_direction();
+    const bool  has_tilt    = up_dir != Vec3d::UnitZ();
+    const Vec3d gravity_dir = -up_dir;
+
     int mesh_id = -1;
     for (const ModelVolume* mv : mo->volumes) {
         if (! mv->is_model_part())
@@ -563,16 +647,23 @@ void GLGizmoFdmSupports::select_facets_by_angle(float threshold_deg, bool block)
         ++mesh_id;
 
         const Transform3d trafo_matrix = mi->get_matrix_no_offset() * mv->get_matrix_no_offset();
-        Vec3f down  = (trafo_matrix.inverse() * (-Vec3d::UnitZ())).cast<float>().normalized();
-        Vec3f limit = (trafo_matrix.inverse() * Vec3d(std::sin(threshold), 0, -std::cos(threshold))).cast<float>().normalized();
-
-        float dot_limit = limit.dot(down);
+        Vec3f down  = (trafo_matrix.inverse() * gravity_dir).cast<float>().normalized();
+        float dot_limit;
+        if (!has_tilt) {
+            // Exact upstream computation: threshold derived from a tilted limit
+            // vector transformed into mesh space, so non-uniform/mirror/shear
+            // transforms behave identically to upstream.
+            Vec3f limit = (trafo_matrix.inverse() * Vec3d(std::sin(threshold), 0, -std::cos(threshold))).cast<float>().normalized();
+            dot_limit = limit.dot(down);
+        } else {
+            dot_limit = std::cos(threshold);
+        }
 
         // Now calculate dot product of vert_direction and facets' normals.
         int idx = 0;
         const indexed_triangle_set &its = mv->mesh().its;
         for (const stl_triangle_vertex_indices &face : its.indices) {
-            if (its_face_normal(its, face).dot(down) > dot_limit) {
+            if (its_face_normal(its, face).dot(down) >= dot_limit - 1e-6f) {
                 m_triangle_selectors[mesh_id]->set_facet(idx, block ? EnforcerBlockerType::BLOCKER : EnforcerBlockerType::ENFORCER);
                 m_triangle_selectors.back()->request_update_render_data();
             }
@@ -580,8 +671,176 @@ void GLGizmoFdmSupports::select_facets_by_angle(float threshold_deg, bool block)
         }
     }
 
-    Plater::TakeSnapshot snapshot(wxGetApp().plater(), block ? "Block supports by angle"
-                                                    : "Add supports by angle");
+    update_model_object();
+    m_parent.set_as_dirty();
+}
+
+void GLGizmoFdmSupports::auto_generate()
+{
+    if (m_auto_paint_running || m_auto_paint_ready)
+        return;
+
+    ModelObject *mo = m_c->selection_info()->model_object();
+    if (mo == nullptr)
+        return;
+
+    const Selection &selection = m_parent.get_selection();
+    const int instance_idx = selection.get_instance_idx();
+    if (instance_idx < 0 || instance_idx >= int(mo->instances.size()) || !mo->instances[instance_idx]->is_printable()) {
+        MessageDialog dialog(wxGetApp().plater(),
+            _L("Automatic painting requires a printable model instance."),
+            _L("Automatic painting"), wxOK | wxICON_WARNING);
+        dialog.ShowModal();
+        return;
+    }
+
+    const float threshold = m_highlight_by_angle_threshold_deg > 0.f ? m_highlight_by_angle_threshold_deg : 45.f;
+
+    const ModelInstance *instance = mo->instances[selection.get_instance_idx()];
+    std::vector<AutoPaintVolume> volumes;
+    std::vector<AutoPaintMesh> meshes;
+    volumes.reserve(mo->volumes.size());
+    meshes.reserve(mo->volumes.size());
+    for (const ModelVolume *volume : mo->volumes) {
+        if (!volume->is_model_part())
+            continue;
+        const Transform3d transform = instance->get_matrix_no_offset() * volume->get_matrix_no_offset();
+        volumes.push_back({volume->mesh().its, transform, volume->supported_facets.get_data()});
+
+        AutoPaintMesh data;
+        data.triangles = volume->mesh().its;
+        its_transform(data.triangles, transform, true);
+        data.tree = AABBTreeIndirect::build_aabb_tree_over_indexed_triangle_set(data.triangles.vertices,
+                                                                                data.triangles.indices);
+        meshes.emplace_back(std::move(data));
+    }
+
+    if (volumes.empty()) {
+        MessageDialog dialog(wxGetApp().plater(),
+            _L("Automatic painting could not find any model geometry to analyze."),
+            _L("Automatic painting"), wxOK | wxICON_WARNING);
+        dialog.ShowModal();
+        return;
+    }
+
+    Plater::TakeSnapshot snapshot(wxGetApp().plater(), "Automatic painting support areas",
+                                  UndoRedo::SnapshotType::GizmoAction);
+
+    const float threshold_rad = float(M_PI) / 180.f * threshold;
+    const float spot_radius = 1.5f;
+    const float spot_spacing = 6.f;
+    const float layer_height = m_print_instance.print_object != nullptr ?
+        float(m_print_instance.print_object->config().layer_height.value) : 0.2f;
+    const float supported_gap = std::max(0.5f, 2.f * layer_height);
+
+    if (m_thread.joinable()) {
+        m_cancel = true;
+        m_thread.join();
+    }
+    m_cancel = false;
+    m_auto_paint_ready = false;
+    m_auto_paint_failed = false;
+    m_auto_paint_running = true;
+    m_auto_paint_object_id = mo->id();
+    m_thread = create_thread([this, volumes = std::move(volumes), meshes = std::move(meshes), threshold_rad,
+                              spot_radius, spot_spacing, supported_gap]() mutable {
+        try {
+            std::vector<TriangleSelector::TriangleSplittingData> result;
+            result.reserve(volumes.size());
+            for (const AutoPaintVolume &volume : volumes) {
+                if (m_cancel)
+                    return;
+
+                TriangleMesh local_triangle_mesh(volume.triangles);
+                TriangleSelector selector(local_triangle_mesh);
+                selector.deserialize(volume.existing_paint, false);
+                Transform3d transform_no_translate = volume.transform;
+                transform_no_translate.translation() = Vec3d::Zero();
+                const Vec3f down = (volume.transform.linear().inverse() * (-Vec3d::UnitZ())).cast<float>().normalized();
+                const Vec3f limit = (volume.transform.linear().inverse() *
+                    Vec3d(std::sin(threshold_rad), 0., -std::cos(threshold_rad))).cast<float>().normalized();
+                const float dot_limit = limit.dot(down);
+
+                for (size_t face_idx = 0; face_idx < volume.triangles.indices.size(); ++face_idx) {
+                    if (m_cancel)
+                        return;
+                    const stl_triangle_vertex_indices &face = volume.triangles.indices[face_idx];
+                    // Match support generation's inclusive threshold. Exact-angle test
+                    // facets (for example a 15 degree overhang with a 15 degree
+                    // painter threshold) must not disappear due to strict comparison
+                    // or floating-point rounding.
+                    if (its_face_normal(volume.triangles, face).dot(down) < dot_limit - 1e-6f)
+                        continue;
+
+                    for (const Vec3f &local_point : support_spot_samples(volume.triangles, face, spot_spacing)) {
+                        if (m_cancel)
+                            return;
+                        const Vec3f world_point = (volume.transform * local_point.cast<double>()).cast<float>();
+                        if (has_close_vertical_support(world_point, meshes, supported_gap))
+                            continue;
+
+                        auto cursor = std::make_unique<TriangleSelector::Sphere>(
+                            local_point, local_point - down, spot_radius, volume.transform,
+                            TriangleSelector::ClippingPlane{});
+                        selector.select_patch(int(face_idx), std::move(cursor), EnforcerBlockerType::ENFORCER,
+                            transform_no_translate, true, 89.99f);
+                    }
+                }
+                result.emplace_back(selector.serialize());
+            }
+
+            if (m_cancel)
+                return;
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                m_auto_paint_result = std::move(result);
+            }
+        } catch (const std::exception &e) {
+            BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": automatic support painting failed: " << e.what();
+            m_auto_paint_failed = true;
+        } catch (...) {
+            BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": automatic support painting failed with an unknown error";
+            m_auto_paint_failed = true;
+        }
+        m_auto_paint_running = false;
+        m_auto_paint_ready = true;
+    });
+    m_parent.set_as_dirty();
+}
+
+void GLGizmoFdmSupports::apply_auto_paint_result()
+{
+    if (!m_auto_paint_ready.exchange(false))
+        return;
+    if (m_thread.joinable())
+        m_thread.join();
+
+    if (m_auto_paint_failed.exchange(false)) {
+        MessageDialog dialog(wxGetApp().plater(),
+            _L("Automatic support painting failed while analyzing the model."),
+            _L("Automatic painting"), wxOK | wxICON_ERROR);
+        dialog.ShowModal();
+        return;
+    }
+
+    ModelObject *mo = m_c->selection_info()->model_object();
+    if (mo == nullptr || mo->id() != m_auto_paint_object_id)
+        return;
+
+    std::vector<TriangleSelector::TriangleSplittingData> result;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        result = std::move(m_auto_paint_result);
+    }
+    if (result.size() != m_triangle_selectors.size()) {
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": volume count changed while automatic support painting was running";
+        return;
+    }
+
+    for (size_t i = 0; i < result.size(); ++i) {
+        m_triangle_selectors[i]->deserialize(result[i], true);
+        m_triangle_selectors[i]->request_update_render_data(true);
+    }
     update_model_object();
     m_parent.set_as_dirty();
 }
@@ -635,7 +894,8 @@ void GLGizmoFdmSupports::update_from_model_object(bool first_update)
         const TriangleMesh* mesh = &mv->mesh();
         m_triangle_selectors.emplace_back(std::make_unique<TriangleSelectorPatch>(*mesh, ebt_colors));
         // Reset of TriangleSelector is done inside TriangleSelectorGUI's constructor, so we don't need it to perform it again in deserialize().
-        m_triangle_selectors.back()->deserialize(mv->supported_facets.get_data(), false);
+        // The colour table has NONE/ENFORCER/BLOCKER only: a higher state in the file is reset to NONE.
+        m_triangle_selectors.back()->deserialize(mv->supported_facets.get_data(), false, EnforcerBlockerType::BLOCKER);
         m_triangle_selectors.back()->request_update_render_data();
 
         //BBS: add timestamp logic

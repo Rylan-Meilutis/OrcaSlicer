@@ -1,12 +1,21 @@
 #ifndef slic3r_GUI_BackgroundSlicingProcess_hpp_
 #define slic3r_GUI_BackgroundSlicingProcess_hpp_
 
+#include <exception>
+#include <cassert>
+#include <cstddef>
+#include "libslic3r/Config.hpp"
+#include "libslic3r/Polygon.hpp"
+#include <memory>
+#include <functional>
 #include <string>
 #include <condition_variable>
 #include <mutex>
 
 #include <boost/thread.hpp>
 
+#include <utility>
+#include <vector>
 #include <wx/event.h>
 
 #include "libslic3r/PrintBase.hpp"
@@ -14,7 +23,13 @@
 #include "libslic3r/Format/SL1.hpp"
 #include "slic3r/Utils/PrintHost.hpp"
 #include "libslic3r/GCode/GCodeProcessor.hpp"
+#include "libslic3r/GCode/SpoolManagerMetadata.hpp"
 #include "PartPlate.hpp"
+
+namespace Slic3r { class Polygon; }
+namespace Slic3r { class Print; }
+namespace Slic3r::GUI { class PartPlate; }
+namespace Slic3r::GUI { class Plater; }
 
 namespace boost { namespace filesystem { class path; } }
 
@@ -153,6 +168,10 @@ public:
 	// Set print host upload job data to be enqueued to the PrintHostJobQueue
 	// after current print slicing is complete
 	void schedule_upload(Slic3r::PrintHostJob upload_job);
+    // Call while stopped, after scheduling the export/upload. Ownership keeps
+    // the mapped print alive through cancellation and final post-processing.
+    void set_dispatch_print(std::unique_ptr<Print> print, std::vector<SpoolManagerMetadata::Filament> spools,
+                            bool reuse_gcode = false, std::vector<int> tools = {});
 	// Clear m_export_path.
 	void reset_export();
 	// Once the G-code export is scheduled, the apply() methods will do nothing.
@@ -245,9 +264,20 @@ private:
 	// but once set, it cannot be re-set.
 	std::string 				m_export_path;
 	bool 						m_export_path_on_removable_media = false;
+	// Read from the preferences when the export is scheduled, as the background thread may not read them.
+	bool 						m_export_statistics = false;
 	// Print host upload job to schedule after slicing is complete, used by schedule_upload(),
 	// empty by default (ie. no upload to schedule)
 	PrintHostJob                m_upload_job;
+    std::unique_ptr<Print>      m_dispatch_print;
+    bool                       m_dispatch_reuse_gcode = false;
+    std::vector<int>           m_dispatch_tools;
+    std::string                m_dispatch_output_path;
+    std::vector<SpoolManagerMetadata::Filament> m_dispatch_spools;
+    Print *export_print() const { return m_dispatch_print && !m_dispatch_reuse_gcode ? m_dispatch_print.get() : m_fff_print; }
+    const std::string &export_source_path() const {
+        return m_dispatch_print ? m_dispatch_output_path : m_temp_output_path;
+    }
 	// Thread, on which the background processing is executed. The thread will always be present
 	// and ready to execute the slicing process.
 	boost::thread		 		m_thread;

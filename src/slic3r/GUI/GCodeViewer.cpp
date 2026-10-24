@@ -1,38 +1,89 @@
 #include "libslic3r/libslic3r.h"
+#include <boost/algorithm/string/predicate.hpp>
 #include "GCodeViewer.hpp"
 
 #include "libslic3r/BuildVolume.hpp"
-#include "libslic3r/ClipperUtils.hpp"
 #include "libslic3r/Print.hpp"
 #include "libslic3r/Geometry.hpp"
+#include "libslic3r/TriangleMesh.hpp"
 #include "libslic3r/Model.hpp"
 #include "libslic3r/Utils.hpp"
 #include "libslic3r/LocalesUtils.hpp"
 #include "libslic3r/PresetBundle.hpp"
+#include "libslic3r/SequentialGantryGeometry.hpp"
+#include "libslic3r/IMEXHelpers.hpp"
+#include "libslic3r/IMEXZones.hpp"
 //BBS: add convex hull logic for toolpath check
-#include "libslic3r/Geometry/ConvexHull.hpp"
 
 #include "GUI_App.hpp"
-#include "MainFrame.hpp"
+#include "Shortcuts.hpp"
 #include "Plater.hpp"
 #include "Camera.hpp"
 #include "I18N.hpp"
-#include "GUI_Utils.hpp"
+#include "format.hpp"
 #include "GUI.hpp"
 #include "GLCanvas3D.hpp"
 #include "FilamentGroupPopup.hpp"
 #include "GLToolbar.hpp"
-#include "GUI_Preview.hpp"
-#include "libslic3r/Print.hpp"
-#include "libslic3r/Layer.hpp"
-#include "Widgets/ProgressDialog.hpp"
+#include "libslic3r/BeltTransform.hpp"
+#include "libslic3r/GCode/MachineFrameTransform.hpp"
 #include "MsgDialog.hpp"
+#include <boost/container_hash/hash.hpp>
+#include "slic3r/GUI/MeshUtils.hpp"
+#include <set>
+#include <string>
+#include "libvgcode/include/Types.hpp"
+#include <vector>
+#include <utility>
+#include <cstdio>
+#include "libslic3r/Technologies.hpp"
+#include <imgui.h>
+#include "slic3r/GUI/ImGuiWrapper.hpp"
+#include "slic3r/GUI/GLModel.hpp"
+#include "slic3r/GUI/GLShader.hpp"
+#include "slic3r/GUI/Gizmos/GLGizmoUtils.hpp"
+#include "libslic3r/Point.hpp"
+#include <math.h>
+#include "libvgcode/include/Viewer.hpp"
+#include "libvgcode/include/PathVertex.hpp"
+#include <cstddef>
+#include <cstring>
+#include "slic3r/GUI/LibVGCode/LibVGCodeWrapper.hpp"
+#include <cassert>
+#include <cstdint>
+#include <boost/algorithm/string/classification.hpp>
+#include <boost/algorithm/string/constants.hpp>
+#include "slic3r/GUI/IMSlider.hpp"
+#include "libslic3r/Config.hpp"
+#include "libslic3r/Preset.hpp"
+#include <exception>
+#include <iterator>
+#include "libslic3r/GCode/GCodeProcessor.hpp"
+#include "libvgcode/include/GCodeInputData.hpp"
+#include "libvgcode/include/ColorRange.hpp"
+#include <optional>
+#include "libslic3r_version.h"
+#include <wx/busycursor.h>
+#include "libslic3r/Slicing.hpp"
+#include "slic3r/GUI/3DScene.hpp"
+#include "libslic3r/Color.hpp"
+#include <map>
+#include <wx/event.h>
+#include <wx/string.h>
+#include <wx/slider.h>
+#include "libslic3r/PrintConfig.hpp"
+#include "slic3r/GUI/Event.hpp"
+#include <string_view>
+#include <functional>
+#include "libslic3r/CustomGCode.hpp"
+#include "libslic3r/ExtrusionEntity.hpp"
 
 #define IMGUI_DEFINE_MATH_OPERATORS
 
 #include <imgui/imgui_internal.h>
 
 #include <glad/gl.h>
+#include <boost/functional/hash.hpp>
 #include <boost/log/trivial.hpp>
 #include <boost/algorithm/string/split.hpp>
 #include <boost/nowide/cstdio.hpp>
@@ -43,8 +94,25 @@
 
 #include <array>
 #include <algorithm>
+#include <limits>
+#include <sstream>
 #include <cmath>
 #include <chrono>
+#include <cstdint>
+#include <unordered_set>
+#include <Eigen/Geometry>
+#include "libslic3r/AppConfig.hpp"
+#include "libslic3r/GCode/LearnedTiming.hpp"
+#include "libslic3r/BoundingBox.hpp"
+#include "libslic3r/CutUtils.hpp"
+#include "libslic3r/GCode/ToolOrdering.hpp"
+#include "libslic3r/ObjectID.hpp"
+#include "slic3r/GUI/Gizmos/GizmoObjectManipulation.hpp"
+#include "slic3r/GUI/PartPlate.hpp"
+
+using namespace std::string_view_literals;
+
+namespace Slic3r { class PrintBase; }
 
 
 namespace Slic3r {
@@ -85,6 +153,8 @@ static std::string get_view_type_string(libvgcode::EViewType view_type)
         return _u8L("Fan Speed");
     else if (view_type == libvgcode::EViewType::Temperature)
         return _u8L("Temperature");
+    else if (view_type == libvgcode::EViewType::ThermalStress)
+        return _u8L("Thermal stress");
     else if (view_type == libvgcode::EViewType::VolumetricFlowRate)
         return _u8L("Flow");
     else if (view_type == libvgcode::EViewType::ActualVolumetricFlowRate)
@@ -101,6 +171,32 @@ static std::string get_view_type_string(libvgcode::EViewType view_type)
     else if (view_type == libvgcode::EViewType::PressureAdvance)
         return _u8L("Pressure Advance");
     return "";
+}
+
+// ORCA: Stable, locale independent names used to persist a view type in the application config.
+// Keep these in sync with the entries of libvgcode::EViewType exposed in the preview combo box.
+static const std::vector<std::pair<std::string, libvgcode::EViewType>>& view_type_config_map()
+{
+    static const std::vector<std::pair<std::string, libvgcode::EViewType>> map = {
+        { "summary",                      libvgcode::EViewType::Summary },
+        { "feature_type",                 libvgcode::EViewType::FeatureType },
+        { "color_print",                  libvgcode::EViewType::ColorPrint },
+        { "speed",                        libvgcode::EViewType::Speed },
+        { "actual_speed",                 libvgcode::EViewType::ActualSpeed },
+        { "acceleration",                 libvgcode::EViewType::Acceleration },
+        { "jerk",                         libvgcode::EViewType::Jerk },
+        { "height",                       libvgcode::EViewType::Height },
+        { "width",                        libvgcode::EViewType::Width },
+        { "volumetric_flow_rate",         libvgcode::EViewType::VolumetricFlowRate },
+        { "actual_volumetric_flow_rate",  libvgcode::EViewType::ActualVolumetricFlowRate },
+        { "layer_time_linear",            libvgcode::EViewType::LayerTimeLinear },
+        { "layer_time_logarithmic",       libvgcode::EViewType::LayerTimeLogarithmic },
+        { "fan_speed",                    libvgcode::EViewType::FanSpeed },
+        { "temperature",                  libvgcode::EViewType::Temperature },
+        { "thermal_stress",               libvgcode::EViewType::ThermalStress },
+        { "pressure_advance",             libvgcode::EViewType::PressureAdvance },
+    };
+    return map;
 }
 
 // Find an index of a value in a sorted vector, which is in <z-eps, z+eps>.
@@ -230,20 +326,314 @@ int GCodeViewer::SequentialView::ActualSpeedImguiWidget::plot(const char* label,
 }
 #endif // ENABLE_ACTUAL_SPEED_DEBUG
 
-void GCodeViewer::SequentialView::Marker::init(std::string filename)
+void GCodeViewer::SequentialView::Marker::init(
+    const std::string& filename, bool is_gantry_model, const std::pair<float, float>& bed_x_bounds)
 {
+    if (m_model.is_initialized() && m_filename == filename &&
+        m_is_gantry_model == is_gantry_model && m_bed_x_bounds == bed_x_bounds)
+        return;
+
+    m_model.reset();
+    m_gantry_x_axis_model.reset();
+    m_is_gantry_model = is_gantry_model;
+    m_has_fixed_x_axis = false;
+    m_filename = filename;
+    m_bed_x_bounds = bed_x_bounds;
     if (filename.empty()) {
         m_model.init_from(stilized_arrow(16, 1.5f, 3.0f, 0.8f, 3.0f));
-    } else {
-        m_model.init_from_file(filename);
+        m_is_gantry_model = false;
+    } else if (m_is_gantry_model &&
+               boost::algorithm::istarts_with(
+                   boost::filesystem::path(filename).filename().string(), "prusa3d_") &&
+               boost::algorithm::iends_with(filename, "_gantry.stl") &&
+               bed_x_bounds.second > bed_x_bounds.first) {
+        try {
+            const Model source = Model::read_from_file(filename);
+            indexed_triangle_set carriage;
+            indexed_triangle_set x_axis;
+            const float bed_width = bed_x_bounds.second - bed_x_bounds.first;
+            const float axis_component_min_width = std::max(100.0f, bed_width * 0.6f);
+            const bool is_coreone_gantry = boost::algorithm::icontains(
+                boost::filesystem::path(filename).filename().string(), "coreone");
+            float source_axis_min_y = std::numeric_limits<float>::max();
+            float source_axis_min_z = std::numeric_limits<float>::max();
+            float source_axis_max_y = std::numeric_limits<float>::lowest();
+            float source_axis_max_z = std::numeric_limits<float>::lowest();
+
+            const auto append_face = [](indexed_triangle_set& destination,
+                                        const indexed_triangle_set& source,
+                                        const Vec3i32& face) {
+                const int vertex_offset = int(destination.vertices.size());
+                destination.vertices.emplace_back(source.vertices[face[0]]);
+                destination.vertices.emplace_back(source.vertices[face[1]]);
+                destination.vertices.emplace_back(source.vertices[face[2]]);
+                destination.indices.emplace_back(
+                    vertex_offset, vertex_offset + 1, vertex_offset + 2);
+            };
+
+            for (indexed_triangle_set& component : its_split(source.mesh().its)) {
+                const BoundingBoxf3 bbox = bounding_box(component);
+                if (bbox.size().x() > axis_component_min_width) {
+                    // The Prusa models repeat the rail along X so it remains
+                    // visible while the complete gantry marker moves and is
+                    // clipped by PrusaSlicer. With a stationary rail, retain
+                    // only the repeat intersecting the toolhead origin.
+                    if (bbox.min.x() > 0.0 || bbox.max.x() < 0.0)
+                        continue;
+
+                    // INDX stores each repeated rail as a separate, complete
+                    // component. Preserve the origin-crossing component as-is
+                    // so its depth, fastener holes, and side walls survive.
+                    if (bbox.size().x() <= bed_width + 100.0f) {
+                        its_merge(x_axis, component);
+                        continue;
+                    }
+
+                    // Prusa's gantry STLs may join the carriage to the X-axis
+                    // into one connected mesh. Identify the rail from faces
+                    // spanning a substantial portion of the bed, then include
+                    // the local rail faces occupying the same Y/Z envelope.
+                    float axis_min_y = std::numeric_limits<float>::max();
+                    float axis_min_z = std::numeric_limits<float>::max();
+                    float axis_max_y = std::numeric_limits<float>::lowest();
+                    float axis_max_z = std::numeric_limits<float>::lowest();
+                    for (const Vec3i32& face : component.indices) {
+                        const Vec3f& a = component.vertices[face[0]];
+                        const Vec3f& b = component.vertices[face[1]];
+                        const Vec3f& c = component.vertices[face[2]];
+                        const float face_min_x = std::min({ a.x(), b.x(), c.x() });
+                        const float face_max_x = std::max({ a.x(), b.x(), c.x() });
+                        if (face_max_x - face_min_x <= axis_component_min_width)
+                            continue;
+                        axis_min_y = std::min({ axis_min_y, a.y(), b.y(), c.y() });
+                        axis_min_z = std::min({ axis_min_z, a.z(), b.z(), c.z() });
+                        axis_max_y = std::max({ axis_max_y, a.y(), b.y(), c.y() });
+                        axis_max_z = std::max({ axis_max_z, a.z(), b.z(), c.z() });
+                    }
+
+                    const bool axis_envelope_valid =
+                        axis_min_y <= axis_max_y && axis_min_z <= axis_max_z;
+                    if (axis_envelope_valid) {
+                        source_axis_min_y = std::min(source_axis_min_y, axis_min_y);
+                        source_axis_min_z = std::min(source_axis_min_z, axis_min_z);
+                        source_axis_max_y = std::max(source_axis_max_y, axis_max_y);
+                        source_axis_max_z = std::max(source_axis_max_z, axis_max_z);
+                    }
+                    constexpr float envelope_tolerance = 0.5f;
+                    std::vector<bool> axis_faces(component.indices.size(), false);
+                    for (size_t face_idx = 0; face_idx < component.indices.size(); ++face_idx) {
+                        const Vec3i32& face = component.indices[face_idx];
+                        const Vec3f& a = component.vertices[face[0]];
+                        const Vec3f& b = component.vertices[face[1]];
+                        const Vec3f& c = component.vertices[face[2]];
+                        const float face_min_x = std::min({ a.x(), b.x(), c.x() });
+                        const float face_max_x = std::max({ a.x(), b.x(), c.x() });
+                        const Vec3f center = (a + b + c) / 3.0f;
+                        const bool spans_axis =
+                            face_max_x - face_min_x > axis_component_min_width;
+                        const bool inside_axis_envelope =
+                            axis_envelope_valid &&
+                            center.y() >= axis_min_y - envelope_tolerance &&
+                            center.y() <= axis_max_y + envelope_tolerance &&
+                            center.z() >= axis_min_z - envelope_tolerance &&
+                            center.z() <= axis_max_z + envelope_tolerance;
+                        axis_faces[face_idx] = spans_axis || inside_axis_envelope;
+                    }
+
+                    // Include one edge-adjacent ring around the detected rail
+                    // surfaces. Thin linear rails are commonly tessellated into
+                    // short triangles: their broad faces fall in the envelope,
+                    // while their narrow thickness faces do not. The adjacent
+                    // ring restores those side faces without flooding through
+                    // the connected carriage mesh.
+                    const auto edge_key = [](int first, int second) {
+                        const uint32_t low = uint32_t(std::min(first, second));
+                        const uint32_t high = uint32_t(std::max(first, second));
+                        return (uint64_t(low) << 32) | high;
+                    };
+                    std::unordered_set<uint64_t> axis_edges;
+                    for (size_t face_idx = 0; face_idx < component.indices.size(); ++face_idx) {
+                        if (!axis_faces[face_idx])
+                            continue;
+                        const Vec3i32& face = component.indices[face_idx];
+                        axis_edges.insert(edge_key(face[0], face[1]));
+                        axis_edges.insert(edge_key(face[1], face[2]));
+                        axis_edges.insert(edge_key(face[2], face[0]));
+                    }
+                    for (size_t face_idx = 0; face_idx < component.indices.size(); ++face_idx) {
+                        if (axis_faces[face_idx])
+                            continue;
+                        const Vec3i32& face = component.indices[face_idx];
+                        axis_faces[face_idx] =
+                            axis_edges.count(edge_key(face[0], face[1])) > 0 ||
+                            axis_edges.count(edge_key(face[1], face[2])) > 0 ||
+                            axis_edges.count(edge_key(face[2], face[0])) > 0;
+                    }
+
+                    for (size_t face_idx = 0; face_idx < component.indices.size(); ++face_idx) {
+                        if (!axis_faces[face_idx]) {
+                            append_face(carriage, component, component.indices[face_idx]);
+                            continue;
+                        }
+
+                        // A connected Core One mesh contains several overlapping
+                        // repeats of the rail. Keep one local repeat; compressing
+                        // all repeats into the bed width produced foreground bars
+                        // and hid the linear-rail fastener detail.
+                        const Vec3i32& face = component.indices[face_idx];
+                        const float center_x =
+                            (component.vertices[face[0]].x() +
+                             component.vertices[face[1]].x() +
+                             component.vertices[face[2]].x()) / 3.0f;
+                        const float repeat_half_width = 0.5f * (bed_width + 60.0f);
+                        if (bbox.size().x() <= 2.0f * repeat_half_width ||
+                            std::abs(center_x) <= repeat_half_width)
+                            append_face(x_axis, component, face);
+                    }
+                } else {
+                    its_merge(carriage, component);
+                }
+            }
+
+            if (is_coreone_gantry) {
+                // Core One's standard gantry STL connects the carriage to
+                // several overlapping rail repeats. Face classification is
+                // sufficient for removing those repeats from the carriage,
+                // but cannot reconstruct one watertight rail. The INDX asset
+                // contains the same rail and extrusion as separate components,
+                // including their depth and fastener holes, so use its single
+                // origin-crossing repeat for every Core One-family toolhead.
+                indexed_triangle_set clean_x_axis;
+                const boost::filesystem::path clean_axis_path =
+                    boost::filesystem::path(filename).parent_path() /
+                    "prusa3d_coreone_indx_gantry.stl";
+                const Model clean_axis_source =
+                    Model::read_from_file(clean_axis_path.string());
+                for (indexed_triangle_set& component :
+                     its_split(clean_axis_source.mesh().its)) {
+                    const BoundingBoxf3 bbox = bounding_box(component);
+                    if (bbox.size().x() > axis_component_min_width &&
+                        bbox.min.x() <= 0.0 && bbox.max.x() >= 0.0)
+                        its_merge(clean_x_axis, component);
+                }
+
+                if (!clean_x_axis.indices.empty()) {
+                    const bool source_axis_envelope_valid =
+                        source_axis_min_y <= source_axis_max_y &&
+                        source_axis_min_z <= source_axis_max_z;
+                    if (source_axis_envelope_valid) {
+                        const BoundingBoxf3 clean_bbox =
+                            bounding_box(clean_x_axis);
+                        const float y_offset =
+                            0.5f * (source_axis_min_y + source_axis_max_y) -
+                            0.5f * float(clean_bbox.min.y() + clean_bbox.max.y());
+                        const float z_offset =
+                            0.5f * (source_axis_min_z + source_axis_max_z) -
+                            0.5f * float(clean_bbox.min.z() + clean_bbox.max.z());
+                        for (Vec3f& vertex : clean_x_axis.vertices) {
+                            vertex.y() += y_offset;
+                            vertex.z() += z_offset;
+                        }
+                    }
+                    x_axis = std::move(clean_x_axis);
+                }
+            }
+
+            if (!carriage.indices.empty() && !x_axis.indices.empty()) {
+                const BoundingBoxf3 x_axis_bbox = bounding_box(x_axis);
+                constexpr float side_margin = 3.0f;
+                const float target_min = bed_x_bounds.first - side_margin;
+                const float target_max = bed_x_bounds.second + side_margin;
+                const float source_center =
+                    0.5f * float(x_axis_bbox.min.x() + x_axis_bbox.max.x());
+                const float target_center = 0.5f * (target_min + target_max);
+                for (Vec3f& vertex : x_axis.vertices)
+                    vertex.x() += target_center - source_center;
+
+                // Keep the rail at its original scale so its profile, fastener
+                // spacing, and screw holes are not distorted. PrusaSlicer clips
+                // its moving repeated model at the bed sides; do the equivalent
+                // once here for Orca's stationary X-axis model.
+                const auto clip_polygon = [](std::vector<Vec3f> polygon, float boundary, bool keep_greater) {
+                    std::vector<Vec3f> clipped;
+                    if (polygon.empty())
+                        return clipped;
+                    Vec3f previous = polygon.back();
+                    bool previous_inside =
+                        keep_greater ? previous.x() >= boundary : previous.x() <= boundary;
+                    for (const Vec3f& current : polygon) {
+                        const bool current_inside =
+                            keep_greater ? current.x() >= boundary : current.x() <= boundary;
+                        if (current_inside != previous_inside) {
+                            const float denominator = current.x() - previous.x();
+                            if (std::abs(denominator) > EPSILON) {
+                                const float t = (boundary - previous.x()) / denominator;
+                                clipped.emplace_back(previous + t * (current - previous));
+                            }
+                        }
+                        if (current_inside)
+                            clipped.emplace_back(current);
+                        previous = current;
+                        previous_inside = current_inside;
+                    }
+                    return clipped;
+                };
+
+                indexed_triangle_set clipped_x_axis;
+                for (const Vec3i32& face : x_axis.indices) {
+                    std::vector<Vec3f> polygon{
+                        x_axis.vertices[face[0]],
+                        x_axis.vertices[face[1]],
+                        x_axis.vertices[face[2]]
+                    };
+                    polygon = clip_polygon(std::move(polygon), target_min, true);
+                    polygon = clip_polygon(std::move(polygon), target_max, false);
+                    for (size_t idx = 1; idx + 1 < polygon.size(); ++idx) {
+                        const int vertex_offset = int(clipped_x_axis.vertices.size());
+                        clipped_x_axis.vertices.emplace_back(polygon[0]);
+                        clipped_x_axis.vertices.emplace_back(polygon[idx]);
+                        clipped_x_axis.vertices.emplace_back(polygon[idx + 1]);
+                        clipped_x_axis.indices.emplace_back(
+                            vertex_offset, vertex_offset + 1, vertex_offset + 2);
+                    }
+                }
+                x_axis = std::move(clipped_x_axis);
+
+                m_model.init_from(carriage);
+                m_gantry_x_axis_model.init_from(x_axis);
+                m_has_fixed_x_axis = true;
+            } else {
+                m_model.init_from(source.mesh());
+            }
+        } catch (const std::exception&) {
+            m_is_gantry_model = false;
+        }
+    } else if (!m_model.init_from_file(filename)) {
+        m_model.init_from(stilized_arrow(16, 1.5f, 3.0f, 0.8f, 3.0f));
+        m_is_gantry_model = false;
     }
-    m_model.set_color({ 1.0f, 1.0f, 1.0f, 0.5f });
+    if (!m_model.is_initialized()) {
+        m_model.init_from(stilized_arrow(16, 1.5f, 3.0f, 0.8f, 3.0f));
+        m_is_gantry_model = false;
+        m_has_fixed_x_axis = false;
+    }
+    m_model.set_color(default_color());
+    m_gantry_x_axis_model.set_color(default_color());
+}
+
+void GCodeViewer::SequentialView::Marker::clear()
+{
+    m_model.reset();
+    m_gantry_x_axis_model.reset();
+    m_filename.clear();
+    m_is_gantry_model = false;
+    m_has_fixed_x_axis = false;
 }
 
 //BBS: GUI refactor: add canvas size from parameters
 void GCodeViewer::SequentialView::Marker::render(int canvas_width, int canvas_height, const libvgcode::EViewType& view_type)
 {
-    if (!m_visible)
+    if (!m_visible || !m_model.is_initialized())
         return;
 
     GLShaderProgram* shader = wxGetApp().get_shader("gouraud_light");
@@ -252,6 +642,8 @@ void GCodeViewer::SequentialView::Marker::render(int canvas_width, int canvas_he
 
     glsafe(::glEnable(GL_BLEND));
     glsafe(::glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA));
+    const bool cull_face_was_enabled = glIsEnabled(GL_CULL_FACE);
+    glsafe(::glDisable(GL_CULL_FACE));
 
     shader->start_using();
     shader->set_uniform("emission_factor", 0.0f);
@@ -259,9 +651,12 @@ void GCodeViewer::SequentialView::Marker::render(int canvas_width, int canvas_he
     const Camera& camera = wxGetApp().plater()->get_camera();
     const Transform3d& view_matrix = camera.get_view_matrix();
     float scale_factor = m_scale_factor;
-    const Transform3d model_matrix = (Geometry::translation_transform((m_world_position + m_model_z_offset * Vec3f::UnitZ()).cast<double>()) *
-        Geometry::translation_transform(scale_factor * m_model.get_bounding_box().size().z() * Vec3d::UnitZ()) * Geometry::rotation_transform({ M_PI, 0.0, 0.0 })) *
-        Geometry::scale_transform(scale_factor);
+    const Transform3d model_matrix = m_is_gantry_model
+        ? Geometry::translation_transform(m_world_position.cast<double>())
+        : (Geometry::translation_transform((m_world_position + m_model_z_offset * Vec3f::UnitZ()).cast<double>()) *
+           Geometry::translation_transform(scale_factor * m_model.get_bounding_box().size().z() * Vec3d::UnitZ()) *
+           Geometry::rotation_transform({ M_PI, 0.0, 0.0 })) *
+          Geometry::scale_transform(scale_factor);
     shader->set_uniform("view_model_matrix", view_matrix * model_matrix);
     shader->set_uniform("projection_matrix", camera.get_projection_matrix());
     const Matrix3d view_normal_matrix = view_matrix.matrix().block(0, 0, 3, 3) * model_matrix.matrix().block(0, 0, 3, 3).inverse().transpose();
@@ -269,8 +664,23 @@ void GCodeViewer::SequentialView::Marker::render(int canvas_width, int canvas_he
 
     m_model.render();
 
+    if (m_has_fixed_x_axis) {
+        // The carriage follows X/Y/Z. The X-axis stays fixed in X and follows
+        // only Y/Z, matching the physical Prusa gantry.
+        const Vec3d axis_position(0.0, m_world_position.y(), m_world_position.z());
+        const Transform3d axis_matrix = Geometry::translation_transform(axis_position);
+        shader->set_uniform("view_model_matrix", view_matrix * axis_matrix);
+        const Matrix3d axis_normal_matrix =
+            view_matrix.matrix().block(0, 0, 3, 3) *
+            axis_matrix.matrix().block(0, 0, 3, 3).inverse().transpose();
+        shader->set_uniform("view_normal_matrix", axis_normal_matrix);
+        m_gantry_x_axis_model.render();
+    }
+
     shader->stop_using();
 
+    if (cull_face_was_enabled)
+        glsafe(::glEnable(GL_CULL_FACE));
     glsafe(::glDisable(GL_BLEND));
 }
 
@@ -318,6 +728,15 @@ static std::string to_string(libvgcode::EGCodeExtrusionRole role)
     case libvgcode::EGCodeExtrusionRole::Brim:                     { return _u8L("Brim"); }
     case libvgcode::EGCodeExtrusionRole::SupportTransition:        { return _u8L("Support transition"); }
     case libvgcode::EGCodeExtrusionRole::Mixed:                    { return _u8L("Mixed"); }
+    case libvgcode::EGCodeExtrusionRole::ArcOverhang:              { return _u8L("Arc overhang"); }
+    case libvgcode::EGCodeExtrusionRole::ArcBridge:                { return _u8L("Arc bridge"); }
+    case libvgcode::EGCodeExtrusionRole::NonplanarSurface:         { return _u8L("Non-planar top surface"); }
+    case libvgcode::EGCodeExtrusionRole::NonplanarSupport:         { return _u8L("Non-planar transition"); }
+    case libvgcode::EGCodeExtrusionRole::NonplanarInfill:          { return _u8L("Non-planar interlocking infill"); }
+    case libvgcode::EGCodeExtrusionRole::StaggeredPerimeter:       { return _u8L("Brick wall"); }
+    case libvgcode::EGCodeExtrusionRole::SmoothOuterWall:          { return _u8L("Smooth outer wall"); }
+    case libvgcode::EGCodeExtrusionRole::NonplanarInterlockingWall:{ return _u8L("Interlocking inner wall"); }
+    case libvgcode::EGCodeExtrusionRole::ShrinkageCompensation:   { return _u8L("Shrinkage compensation"); }
     default:                                                       { return _u8L("Unknown"); }
     }
 }
@@ -391,6 +810,13 @@ void GCodeViewer::SequentialView::Marker::render_position_window(const libvgcode
             case libvgcode::EViewType::Temperature:
                 sprintf(detail_buf, "%s%.0f", _u8L("Temperature: ").c_str(), vertex.temperature);
                 break;
+            case libvgcode::EViewType::ThermalStress: {
+                const std::string detail = is_extrusion && std::isfinite(vertex.thermal_stress_mpa) && vertex.thermal_stress_mpa >= 0.f ?
+                    GUI::format(_u8L("Final-state static tensile stress: %1% MPa"), vertex.thermal_stress_mpa) :
+                    _u8L("Thermal stress unavailable");
+                snprintf(detail_buf, sizeof(detail_buf), "%s", detail.c_str());
+                break;
+            }
             case libvgcode::EViewType::LayerTimeLinear:
             case libvgcode::EViewType::LayerTimeLogarithmic:
                 sprintf(detail_buf, "%s%.1f", _u8L("Layer Time: ").c_str(), vertex.layer_duration);
@@ -420,7 +846,7 @@ void GCodeViewer::SequentialView::Marker::render_position_window(const libvgcode
         if (properties_shown) {
             float label_w = 0.0f;
             float value_w = 0.0f;
-            properties_rows.reserve(13);
+            properties_rows.reserve(14);
             auto add_row = [&properties_rows, &label_w, &value_w](std::string label, std::string value) {
                  label_w = std::max(label_w, ImGui::CalcTextSize(label.c_str()).x);
                  value_w = std::max(value_w, ImGui::CalcTextSize(value.c_str()).x);
@@ -433,6 +859,27 @@ void GCodeViewer::SequentialView::Marker::render_position_window(const libvgcode
             add_row(_u8L("Width"), buff);
             if (is_extrusion) sprintf(buff, ("%.3f " + _u8L("mm")).c_str(), vertex.height); else strcpy(buff, NA_CSTR);
             add_row(_u8L("Height"), buff);
+            // ORCA: Length of the move ending at the current vertex. Arc moves (G2/G3) are discretized
+            // into several vertices sharing the same gcode line id, so accumulate the whole run to report
+            // the arc length instead of the length of a single chord.
+            if (vertex_id > 0 && (is_extrusion || vertex.is_travel() || vertex.is_wipe())) {
+                const size_t vertices_count = viewer->get_vertices_count();
+                size_t first_id = vertex_id;
+                while (first_id > 0 && viewer->get_vertex_at(first_id - 1).gcode_id == vertex.gcode_id)
+                    --first_id;
+                size_t last_id = vertex_id;
+                while (last_id + 1 < vertices_count && viewer->get_vertex_at(last_id + 1).gcode_id == vertex.gcode_id)
+                    ++last_id;
+                float length = 0.0f;
+                for (size_t i = std::max<size_t>(first_id, 1); i <= last_id; ++i) {
+                    length += (libvgcode::convert(viewer->get_vertex_at(i).position) -
+                               libvgcode::convert(viewer->get_vertex_at(i - 1).position)).norm();
+                }
+                sprintf(buff, ("%.3f " + _u8L("mm")).c_str(), length);
+            }
+            else
+                strcpy(buff, NA_CSTR);
+            add_row(_u8L("Length"), buff);
             sprintf(buff, "%d", vertex.layer_id + 1);
             add_row(_u8L("Layer"), buff);
             sprintf(buff, ("%.1f " + _u8L("mm/s")).c_str(), vertex.feedrate);
@@ -579,7 +1026,14 @@ void GCodeViewer::SequentialView::Marker::render_position_window(const libvgcode
                     ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
                 ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(9.f, 1.f) * m_scale);
                 ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.f, 0.f));
+
+                ImVec4 scroll_col    = ImVec4(0.77f, 0.77f, 0.77f, m_is_dark ? .6f : 1.0f); // same color with sliced plates toolbar scrollbar
+                ImGui::PushStyleColor(ImGuiCol_ScrollbarBg, ImVec4(0.f, 0.f, 0.f, 0.f)); // ORCA using background color with opacity creates a second color. This prevents secondary color
+                ImGui::PushStyleColor(ImGuiCol_ScrollbarGrabActive, scroll_col);
+                ImGui::PushStyleColor(ImGuiCol_ScrollbarGrabHovered, scroll_col);
+                ImGui::PushStyleColor(ImGuiCol_ScrollbarGrab, scroll_col);
                 ImGui::PushStyleColor(ImGuiCol_HeaderHovered , style.Colors[ImGuiCol_TableHeaderBg]);
+
                 const int hover_id = m_actual_speed_imgui_widget.plot("##ActualSpeedProfile", { -1.f, plot_height});
                 const ImGuiTableFlags table_flags = ImGuiTableFlags_Borders | (needs_scroll ? ImGuiTableFlags_ScrollY : 0);
                 if (ImGui::BeginTable("ToolPositionTable", 2, table_flags, ImVec2(0.0f, needs_scroll ? table_view_h : 0.0f))) {
@@ -607,7 +1061,7 @@ void GCodeViewer::SequentialView::Marker::render_position_window(const libvgcode
                     ImGui::EndTable();
                 }
                 ImGui::PopStyleVar(2);
-                ImGui::PopStyleColor(1);
+                ImGui::PopStyleColor(5);
                 imgui.end();
             }
 
@@ -764,6 +1218,19 @@ void GCodeViewer::SequentialView::GCodeWindow::load_gcode(const std::string& fil
     }
 }
 
+// Byte offset just past the first count characters of str, or its length if it is shorter.
+static size_t utf8_offset(const std::string& str, size_t count)
+{
+    const char* const begin = str.c_str();
+    const char* const end   = begin + str.size();
+    const char*       pos   = begin;
+    for (size_t i = 0; i < count && pos < end; ++i) {
+        unsigned int codepoint = 0;
+        pos += ImTextCharFromUtf8(&codepoint, pos, end);
+    }
+    return pos - begin;
+}
+
 //BBS: GUI refactor: move to right
 void GCodeViewer::SequentialView::GCodeWindow::render(float top, float bottom, float right, uint64_t curr_line_id) const
 {
@@ -771,27 +1238,37 @@ void GCodeViewer::SequentialView::GCodeWindow::render(float top, float bottom, f
     auto update_lines = [this](uint64_t start_id, uint64_t end_id) {
         std::vector<Line> ret;
         ret.reserve(end_id - start_id + 1);
+        // Orca: m_lines_ends indexes into a memory mapping, so it must be clamped to the mapping. If the
+        // file was modified behind our back (an in-place post-processing script that shrank it), an
+        // unchecked read is an access violation, which the caller's try/catch cannot catch on Windows.
+        const size_t file_size = m_file.size();
         for (uint64_t id = start_id; id <= end_id; ++id) {
             // read line from file
-            const size_t start        = id == 1 ? 0 : m_lines_ends[id - 2];
-            const size_t original_len = m_lines_ends[id - 1] - start;
-            const size_t len          = std::min(original_len, (size_t) 55);
+            // Keep one entry per id: render() indexes m_lines by (id - start_id).
+            const size_t start = id == 1 ? 0 : std::min(m_lines_ends[id - 2], file_size);
+            const size_t end   = std::min(m_lines_ends[id - 1], file_size);
+            const size_t original_len = end > start ? end - start : 0;
+            // A character is four bytes at most, so 55 of them always fit in 220.
+            const size_t len          = std::min(original_len, (size_t) 55 * 4);
             std::string  gline(m_file.data() + start, len);
 
-            // If original line is longer than 55 characters, truncate and append "..."
-            if (original_len > 55)
-                gline = gline.substr(0, 52) + "...";
+            // If original line is longer than 55 characters, truncate and append "...".
+            // The cut must land on a character boundary or it leaves half a character behind.
+            if (len < original_len || utf8_offset(gline, 55) < gline.size())
+                gline = gline.substr(0, utf8_offset(gline, 52)) + "...";
 
             std::string command, parameters, comment;
-            // extract comment
-            std::vector<std::string> tokens;
-            boost::split(tokens, gline, boost::is_any_of(";"), boost::token_compress_on);
-            command = tokens.front();
-            if (tokens.size() > 1)
-                comment = ";" + tokens.back();
+            const size_t comment_start = gline.find(';');
+            if (comment_start == std::string::npos)
+                command = gline;
+            else {
+                command = gline.substr(0, comment_start);
+                comment = gline.substr(comment_start);
+            }
 
             // extract gcode command and parameters
             if (!command.empty()) {
+                std::vector<std::string> tokens;
                 boost::split(tokens, command, boost::is_any_of(" "), boost::token_compress_on);
                 command = tokens.front();
                 if (tokens.size() > 1) {
@@ -958,13 +1435,22 @@ void GCodeViewer::SequentialView::GCodeWindow::stop_mapping_file()
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": finished mapping file " << m_filename;
     }
 }
-void GCodeViewer::SequentialView::render(const bool has_render_path, float legend_height, const libvgcode::Viewer* viewer, uint32_t gcode_id, int canvas_width, int canvas_height, int right_margin, const libvgcode::EViewType& view_type)
+void GCodeViewer::SequentialView::render_marker(const bool has_render_path, int canvas_width, int canvas_height, const libvgcode::EViewType& view_type)
 {
     if (has_render_path && m_show_marker) {
         // marker.set_world_offset(current_offset);
-        marker.render(canvas_width, canvas_height, view_type);
-        marker.render_position_window(viewer, canvas_width, canvas_height, view_type);
+        if (get_app_config()->get("preview_show_tool_model") != "0") {
+            marker.render(canvas_width, canvas_height, view_type);
+            for (auto& sec : m_imex_secondary_markers)
+                sec.render(canvas_width, canvas_height, view_type);
+        }
     }
+}
+
+void GCodeViewer::SequentialView::render_overlay(const bool has_render_path, float legend_height, const libvgcode::Viewer* viewer, uint32_t gcode_id, int canvas_width, int canvas_height, int right_margin, const libvgcode::EViewType& view_type)
+{
+    if (has_render_path && m_show_marker)
+        marker.render_position_window(viewer, canvas_width, canvas_height, view_type);
 
     //float bottom = wxGetApp().plater()->get_current_canvas3D()->get_canvas_size().get_height();
     // BBS
@@ -995,30 +1481,75 @@ GCodeViewer::~GCodeViewer()
     }
 }
 
+void GCodeViewer::refresh_marker_model()
+{
+    PresetBundle* preset_bundle = wxGetApp().preset_bundle;
+    if (preset_bundle == nullptr)
+        return;
+
+    const Preset& printer = preset_bundle->printers.get_edited_preset();
+    const auto* printer_notes_opt = printer.config.opt<ConfigOptionString>("printer_notes");
+    const auto* custom_geometry_opt = printer.config.opt<ConfigOptionString>("sequential_print_gantry_geometry");
+    const auto* custom_model_opt = printer.config.opt<ConfigOptionString>("sequential_print_gantry_model");
+    const bool show_gantry_in_preview =
+        get_app_config()->get("preview_tool_model") == "gantry";
+    const std::string printer_notes = printer_notes_opt == nullptr ? std::string() : printer_notes_opt->value;
+    const std::string custom_geometry = custom_geometry_opt == nullptr ? std::string() : custom_geometry_opt->value;
+    const std::string custom_model = custom_model_opt == nullptr ? std::string() : custom_model_opt->value;
+    const std::string signature = printer.name + '\n' +
+        (m_print_by_object ? "1\n" : "0\n") + (show_gantry_in_preview ? "1\n" : "0\n") +
+        printer_notes + '\n' + custom_geometry + '\n' + custom_model;
+    if (signature == m_marker_config_signature)
+        return;
+    m_marker_config_signature = signature;
+
+    if (m_print_by_object || show_gantry_in_preview) {
+        const SequentialGantryGeometry geometry = load_sequential_gantry_geometry(printer.config);
+        if (!geometry.model_path.empty()) {
+            std::pair<float, float> bed_x_bounds{ 0.0f, 0.0f };
+            if (const auto* printable_area = printer.config.opt<ConfigOptionPoints>("printable_area");
+                printable_area != nullptr && !printable_area->values.empty()) {
+                bed_x_bounds.first = bed_x_bounds.second = float(printable_area->values.front().x());
+                for (const Vec2d& point : printable_area->values) {
+                    bed_x_bounds.first = std::min(bed_x_bounds.first, float(point.x()));
+                    bed_x_bounds.second = std::max(bed_x_bounds.second, float(point.x()));
+                }
+            }
+            m_marker_filename = geometry.model_path;
+            m_sequential_view.marker.init(geometry.model_path, true, bed_x_bounds);
+            return;
+        }
+    }
+
+    const VendorProfile::PrinterModel* system_model = PresetUtils::system_printer_model(printer);
+    std::string filename;
+    if (system_model != nullptr) {
+        // system_printer_hotend_model() deliberately falls back to the bundled
+        // small nozzle when a printer (including the Prusa Core One family)
+        // does not provide a dedicated hotend asset.
+        filename = PresetUtils::system_printer_hotend_model(printer);
+    } else {
+        const auto* printer_model = printer.config.opt<ConfigOptionString>("printer_model");
+        if (printer_model != nullptr && !printer_model->value.empty())
+            filename = preset_bundle->get_hotend_model_for_printer_model(printer_model->value);
+    }
+
+    // "Nozzle only" is an explicit request for a tool-position marker. Keep
+    // it useful for custom and partially configured printers as well.
+    if (filename.empty())
+        filename = resources_dir() + "/profiles/hotend.stl";
+    m_marker_filename = filename;
+    m_sequential_view.marker.init(filename);
+}
+
 void GCodeViewer::init(ConfigOptionMode mode, PresetBundle* preset_bundle)
 {
     if (m_gl_data_initialized)
         return;
 
-    // initializes tool marker
-    std::string filename;
-    if (preset_bundle != nullptr) {
-        const Preset* curr = &preset_bundle->printers.get_selected_preset();
-        if (curr->is_system)
-            filename = PresetUtils::system_printer_hotend_model(*curr);
-        else {
-            auto *printer_model = curr->config.opt<ConfigOptionString>("printer_model");
-            if (printer_model != nullptr && ! printer_model->value.empty()) {
-                filename = preset_bundle->get_hotend_model_for_printer_model(printer_model->value);
-            }
-
-            if (filename.empty()) {
-                filename = preset_bundle->get_hotend_model_for_printer_model(PresetBundle::ORCA_DEFAULT_PRINTER_MODEL);
-            }
-        }
-    }
-
-    m_sequential_view.marker.init(filename);
+    // Initialize the regular hotend marker or the full gantry model used by
+    // print-by-object previews.
+    refresh_marker_model();
 
     // initializes point sizes
     std::array<int, 2> point_sizes;
@@ -1048,9 +1579,7 @@ void GCodeViewer::init(ConfigOptionMode mode, PresetBundle* preset_bundle)
     // Default view type at first slice.
     // May be overridden in load() once we know how many tools are actually used in the G-code.
     m_nozzle_nums = preset_bundle ? preset_bundle->get_printer_extruder_count() : 1;
-    auto it = std::find(view_type_items.begin(), view_type_items.end(), libvgcode::EViewType::FeatureType);
-    m_view_type_sel = (it != view_type_items.end()) ? std::distance(view_type_items.begin(), it) : 0;
-    set_view_type(libvgcode::EViewType::FeatureType);
+    apply_default_view_type();
 
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": finished");
 }
@@ -1069,6 +1598,73 @@ void GCodeViewer::set_scale(float scale)
         m_sequential_view.marker.m_scale = scale;
         m_sequential_view.gcode_window.m_scale = scale; // ORCA
     }
+}
+
+// ORCA: Preview default view type preference, see "preview_default_view_type" in the application config.
+std::string GCodeViewer::view_type_to_config_name(libvgcode::EViewType type)
+{
+    for (const auto& [name, value] : view_type_config_map()) {
+        if (value == type)
+            return name;
+    }
+    return std::string();
+}
+
+bool GCodeViewer::view_type_from_config_name(const std::string& name, libvgcode::EViewType& type)
+{
+    for (const auto& [config_name, value] : view_type_config_map()) {
+        if (config_name == name) {
+            type = value;
+            return true;
+        }
+    }
+    return false;
+}
+
+std::vector<std::pair<std::string, std::string>> GCodeViewer::default_view_type_choices()
+{
+    std::vector<std::pair<std::string, std::string>> choices = {
+        { "auto", _u8L("Automatic") },
+        { "last", _u8L("Last used") },
+    };
+    for (const auto& [name, type] : view_type_config_map())
+        choices.push_back({ name, get_view_type_string(type) });
+    return choices;
+}
+
+void GCodeViewer::select_view_type(libvgcode::EViewType type)
+{
+    auto it = std::find(view_type_items.begin(), view_type_items.end(), type);
+    m_view_type_sel = (it != view_type_items.end()) ? static_cast<int>(std::distance(view_type_items.begin(), it)) : 0;
+    set_view_type(type);
+}
+
+// ORCA: Pick the view type the preview opens with, following the "preview_default_view_type" preference:
+// a fixed view type, the one the user picked last ("last"), or the automatic choice ("auto", the default)
+// which shows Filament for multi material prints and Line Type for single material ones.
+// The default is only (re)applied when it actually changes, so a view type picked by hand survives a reslice.
+void GCodeViewer::apply_default_view_type()
+{
+    const std::string preference = wxGetApp().app_config->get("preview_default_view_type");
+
+    std::string key = preference;
+    libvgcode::EViewType type = libvgcode::EViewType::FeatureType;
+    if (preference == "last") {
+        if (!view_type_from_config_name(wxGetApp().app_config->get("preview_last_view_type"), type))
+            type = libvgcode::EViewType::FeatureType;
+    }
+    else if (!view_type_from_config_name(preference, type)) {
+        // "auto", or an unknown value written by a newer version
+        const bool multi_material = m_viewer.get_used_extruders_count() > 1;
+        type = multi_material ? libvgcode::EViewType::ColorPrint : libvgcode::EViewType::FeatureType;
+        key = multi_material ? "auto_multi_material" : "auto_single_material";
+    }
+
+    if (m_applied_default_view_type_key == key)
+        return;
+
+    m_applied_default_view_type_key = key;
+    select_view_type(type);
 }
 
 void GCodeViewer::update_by_mode(ConfigOptionMode mode)
@@ -1093,6 +1689,7 @@ void GCodeViewer::update_by_mode(ConfigOptionMode mode)
     view_type_items.push_back(libvgcode::EViewType::LayerTimeLogarithmic);
     view_type_items.push_back(libvgcode::EViewType::FanSpeed);
     view_type_items.push_back(libvgcode::EViewType::Temperature);
+    view_type_items.push_back(libvgcode::EViewType::ThermalStress);
 // ORCA: Add Pressure Advance visualization support
     view_type_items.push_back(libvgcode::EViewType::PressureAdvance);
     //if (mode == ConfigOptionMode::comDevelop) {
@@ -1122,12 +1719,69 @@ std::vector<int> GCodeViewer::get_plater_extruder()
     return m_plater_extruder;
 }
 
+// Belt printers: compute the full machine->model back-transform from the print
+// config, so the "designed" (upright) G-code preview maps each toolpath vertex
+// back to Cartesian space. The G-code forward pipeline is (BeltKinematics::
+// to_machine_coords):  gcode = MachineFrame( AxisRemap( X ) ), with X the model
+// already un-rotated to Cartesian by the back-transform. So the inverse is:
+//   model = AxisRemap^-1 . MachineFrame^-1
+// (origin-snap is a per-instance translation that only shifts position, not
+// orientation, so it is intentionally omitted.)
+static Transform3d compute_belt_back_transform(const PrintConfig& cfg)
+{
+    if (!cfg.belt_printer.value)
+        return Transform3d::Identity();
+
+    MachineFrameTransform mft;
+    mft.init_from_config(cfg);
+    const Transform3d mf_inv = mft.is_active() ? Transform3d(mft.transform().inverse())
+                                               : Transform3d::Identity();
+
+    // Forward G-code axis remap as an affine matrix (out_i = sign * in[r_i % 3], plus a
+    // build-volume offset for Rev axes). This is the matrix form of the per-point
+    // GCodeWriter::apply_axis_remap (row convention: each OUTPUT axis selects an input
+    // axis + sign) and MUST stay in sync with it. The build-volume max matches what the
+    // writer is fed in GCode.cpp (printable_area max + printable_height). (Follow-up:
+    // precompute this matrix once in GCodeWriter and share it with apply_axis_remap to
+    // remove the parallel encoding.)
+    Transform3d ar = Transform3d::Identity();
+    const int rr[3] = { int(cfg.gcode_remap_x.value), int(cfg.gcode_remap_y.value), int(cfg.gcode_remap_z.value) };
+    if (rr[0] != 0 || rr[1] != 1 || rr[2] != 2) {
+        BoundingBoxf bbox_bed(cfg.printable_area.values);
+        const Vec3d vmax(bbox_bed.max.x(), bbox_bed.max.y(), cfg.printable_height.value);
+        Matrix3d M = Matrix3d::Zero();
+        Vec3d    t = Vec3d::Zero();
+        for (int i = 0; i < 3; ++i) {
+            const int axis = rr[i] % 3;
+            if (rr[i] < 3)      M(i, axis) =  1.0;
+            else if (rr[i] < 6) M(i, axis) = -1.0;
+            else              { M(i, axis) = -1.0; t[i] = vmax[axis]; }
+        }
+        ar.linear()      = M;
+        ar.translation() = t;
+    }
+    const Transform3d ar_inv = ar.inverse();
+
+    return ar_inv * mf_inv;
+}
+
 //BBS: always load shell at preview
 void GCodeViewer::load_as_gcode(const GCodeProcessorResult& gcode_result, const Print& print, const std::vector<std::string>& str_tool_colors,
                 const std::vector<std::string>& str_color_print_colors, const BuildVolume& build_volume,
                 const std::vector<BoundingBoxf3>& exclude_bounding_box, ConfigOptionMode mode, bool only_gcode)
 {
     m_loaded_as_preview = false;
+    const bool print_by_object =
+        print.config().print_sequence == PrintSequence::ByObject;
+
+    // Belt printers: drive the designed/raw view UI (legend checkbox, hotkey B, canvas-toolbar
+    // menu item) from the G-code itself. Only BeltGCode writes the belt header, so its tilt
+    // (gcode_result.belt_tilt_angle, abs of the slicing rotation) says whether this is belt
+    // G-code; the selected printer does not, for a file opened from disk. The back-transform
+    // below still reads print.config(), which Plater::load_gcode() fills from the file's own
+    // config block (GCodeProcessor::export_config_for_render).
+    m_belt_view_enabled = gcode_result.belt_tilt_angle > 0.f;
+    m_belt_angle_deg    = gcode_result.belt_tilt_angle;
 
     const bool current_top_layer_only = m_viewer.is_top_layer_only_view_range();
     const bool required_top_layer_only = get_app_config()->get_bool("seq_top_layer_only");
@@ -1138,8 +1792,13 @@ void GCodeViewer::load_as_gcode(const GCodeProcessorResult& gcode_result, const 
     m_viewer.set_dim_previous_layers(get_app_config()->get_bool("preview_dim_previous_layers"));
     m_viewer.set_dim_previous_layers_brightness(0.01f * std::stoi(get_app_config()->get("preview_dim_previous_layers_brightness")));
 
-    // avoid processing if called with the same gcode_result
-    if (m_last_result_id == gcode_result.id && wxGetApp().is_editor()) {
+    // avoid processing if called with the same gcode_result.
+    // On a belt printer the toolpath geometry fed to libvgcode also depends on the
+    // designed/raw view state (the back-transform is applied in convert), so the
+    // same result is converted again only when that view has been toggled.
+    const bool same_belt_view = !m_belt_view_enabled || m_last_belt_show_designed == m_belt_show_designed;
+    if (m_last_result_id == gcode_result.id && wxGetApp().is_editor() && same_belt_view) {
+        m_print_by_object = print_by_object;
         //BBS: add logs
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": the same id %1%, return directly, result %2% ") % m_last_result_id % (&gcode_result);
 
@@ -1167,6 +1826,7 @@ void GCodeViewer::load_as_gcode(const GCodeProcessorResult& gcode_result, const 
 
     // release gpu memory, if used
     reset();
+    m_print_by_object = print_by_object;
 
     //BBS: add mutex for protection of gcode result
     wxGetApp().plater()->suppress_background_process(true);
@@ -1179,9 +1839,118 @@ void GCodeViewer::load_as_gcode(const GCodeProcessorResult& gcode_result, const 
         wxGetApp().plater()->schedule_background_process();
         return;
     }
+    m_plate_mass    = gcode_result.plate_mass;
+    m_thermal_analysis = gcode_result.thermal_analysis;
+    m_object_masses = gcode_result.object_masses;
+    m_body_masses   = gcode_result.body_masses;
+    m_support_masses = gcode_result.support_masses;
 
-    // convert data from PrusaSlicer format to libvgcode format
-    libvgcode::GCodeInputData data = libvgcode::convert(gcode_result, str_tool_colors, str_color_print_colors, m_viewer);
+    // convert data from PrusaSlicer format to libvgcode format.
+    // Belt printers: when the designed (upright) view is active, back-transform
+    // the toolpath geometry into model/Cartesian space using the general belt
+    // inverse (handles the mesh rotation, shear and axis remap). When off, the
+    // raw machine-frame G-code is shown (useful for checking the transform itself).
+    const bool is_belt = m_belt_view_enabled && print.config().belt_printer.value;
+    Transform3d belt_inv = (is_belt && m_belt_show_designed)
+        ? compute_belt_back_transform(print.config()) : Transform3d::Identity();
+    // Belt: move positions are stored as gcode_Z + belt_z_origin (the start G-code's
+    // purge-blob advance baked into the machine-Z origin by its G92 Z0 resets). Subtract
+    // that constant before the linear back-transform so every toolpath maps to the model's
+    // belt coordinate. Without it the back-transform mixes the offset with the gantry-Y
+    // term, leaving a per-move designed-Y error that min-corner anchoring cannot remove
+    // when a bridge/keel move happens to cancel it at the bbox minimum.
+    if (is_belt && m_belt_show_designed && gcode_result.belt_z_origin != 0.0f)
+        belt_inv = belt_inv * Transform3d(Eigen::Translation3d(Vec3d(0.0, 0.0, -double(gcode_result.belt_z_origin))));
+    const bool apply_belt = is_belt && m_belt_show_designed
+        && !belt_inv.matrix().isApprox(Transform3d::Identity().matrix());
+    if (apply_belt) {
+        // The linear belt back-transform recovers the print's shape and orientation but not
+        // the per-object placement/lift translation: the object's position on the belt, the
+        // BeltSliceStrategy min-Z lift, and the centering pre-translate are applied OUTSIDE
+        // build_forward_transform() (see PrintObjectSlice.cpp), so its linear inverse leaves
+        // them un-undone. Uncorrected, the upright toolpaths float a fixed offset from the
+        // model shell. Recover the translation generally — independent of the offset's exact
+        // source or the axis remap — by anchoring the back-transformed object body onto the
+        // upright model bounding box (the same space the shells render in).
+        BoundingBoxf3 model_bb;
+        for (const PrintObject* po : print.objects())
+            for (const ModelInstance* mi : po->model_object()->instances)
+                model_bb.merge(po->model_object()->instance_bounding_box(*mi));
+        // Build the anchor bbox from surface toolpaths only. After the belt_z_origin
+        // correction the surface back-transforms onto the model, but a few elevated
+        // features (bridges/overhangs over the chevron gap) are mis-mapped by the linear
+        // inverse to well outside the model body; if one becomes the bbox minimum it
+        // drags the min-corner anchor by ~20mm. Drop moves that land clearly outside the
+        // (correct) model bbox — a geometric filter, not a role guess.
+        // Tolerance around the model bbox for outlier rejection, and the minimum fraction
+        // of MOVES (by count) the clip must retain before we trust it over the full bbox.
+        // Count, not bbox extent: a single far-flung outlier move (e.g. a belt-entry purge
+        // that maps to y~0) inflates the full bbox so much that a size-fraction test would
+        // wrongly reject the clip and re-include the outlier, dragging the min-corner anchor
+        // by ~the offset. By count the clip keeps ~100% of moves here and ~0% only when the
+        // object is genuinely offset from the belt entry (the real fall-back-to-full case).
+        constexpr double ANCHOR_CLIP_MARGIN_MM   = 10.0;
+        constexpr double ANCHOR_CLIP_MIN_KEEP    = 0.5;
+        BoundingBoxf3 tp_bb_clip, tp_bb_full;
+        size_t n_filtered = 0, n_clip = 0;
+        const double y_lo = model_bb.defined ? model_bb.min.y() - ANCHOR_CLIP_MARGIN_MM : -1e30;
+        const double y_hi = model_bb.defined ? model_bb.max.y() + ANCHOR_CLIP_MARGIN_MM :  1e30;
+        // The anchor aligns the toolpath body onto the object-only model bbox, so it must be
+        // built from OBJECT-body toolpaths only. Support, skirt, brim and wipe-tower extrusions
+        // are not part of the model mesh and extend past it (support especially reaches well
+        // beyond the object on a belt), so including them drags tp_bb.min and shifts the whole
+        // back-transformed g-code off the mesh — but only when those features are present. That
+        // is the "g-code shifts vs mesh as soon as supports are enabled" bug. Filter them out.
+        auto is_object_body = [](ExtrusionRole r) {
+            return r != erSupportMaterial && r != erSupportMaterialInterface
+                && r != erSupportTransition
+                && r != erSkirt && r != erBrim && r != erWipeTower;
+        };
+        auto accumulate = [&](bool body_only) {
+            tp_bb_clip = BoundingBoxf3();
+            tp_bb_full = BoundingBoxf3();
+            n_filtered = 0;
+            n_clip     = 0;
+            for (const GCodeProcessorResult::MoveVertex& mv : gcode_result.moves)
+                if (mv.type == EMoveType::Extrude && mv.layer_id >= 1 // skip layer-0 prime/skirt
+                    && (!body_only || is_object_body(mv.extrusion_role))) {
+                    ++n_filtered;
+                    const Vec3d p = belt_inv * mv.position.cast<double>();
+                    tp_bb_full.merge(p);
+                    if (p.y() >= y_lo && p.y() <= y_hi) {
+                        tp_bb_clip.merge(p);
+                        ++n_clip;
+                    }
+                }
+        };
+        accumulate(/*body_only=*/true);
+        // Fallback: a plate with no object-body extrusions above layer 0 (e.g. a
+        // support-only object) would leave tp_bb undefined and silently skip the
+        // anchor. Re-accumulate over ALL extrude moves so the min-corner anchor is
+        // still computed rather than letting the preview float by the placement offset.
+        if (n_filtered == 0)
+            accumulate(/*body_only=*/false);
+        // Use the clipped bbox when it still holds the bulk of the moves (outliers removed).
+        // If the object sits far from the belt entry the toolpaths are grossly offset and the
+        // clip drops most of them — fall back to the full bbox so the min-corner anchor still
+        // recovers that gross translation rather than breaking.
+        const BoundingBoxf3& tp_bb =
+            (tp_bb_clip.defined && n_filtered > 0 &&
+             double(n_clip) >= ANCHOR_CLIP_MIN_KEEP * double(n_filtered)) ? tp_bb_clip : tp_bb_full;
+        if (model_bb.defined && tp_bb.defined) {
+            // Anchor the back-transformed toolpath body onto the upright model bbox by
+            // its MIN corner. (Center anchoring was tried and regressed when the toolpath
+            // and model bounding boxes differ in extent.) With the belt_z_origin
+            // correction above and the outlier-robust bbox below, the surface overlaps the
+            // shell to well under a millimetre when the object is at the belt entry; an
+            // object placed elsewhere in global-rotation mode still carries the placement
+            // translation, which this min-corner step recovers.
+            const Vec3d d = model_bb.min - tp_bb.min;
+            belt_inv = Transform3d(Eigen::Translation3d(d)) * belt_inv;
+        }
+    }
+    libvgcode::GCodeInputData data = libvgcode::convert(gcode_result, str_tool_colors, str_color_print_colors, m_viewer,
+        apply_belt ? &belt_inv : nullptr);
 
 //#define ENABLE_DATA_EXPORT 1
 //#if ENABLE_DATA_EXPORT
@@ -1279,6 +2048,26 @@ void GCodeViewer::load_as_gcode(const GCodeProcessorResult& gcode_result, const 
     m_viewer.reset_default_extrusion_roles_colors();
     m_viewer.load(std::move(data));
 
+    // Belt printers: libvgcode labels a layer with the height of its toolpaths, which
+    // on a tilted layer is wherever its last extrusion happened to end, and the layer
+    // slider looks its labels and the colour-change ticks up in that list assuming it
+    // increases.  Give it the layers' print Z instead (the slicer's layer Z, which
+    // increases along the belt), numbered the way libvgcode::convert() numbers the
+    // layers: consecutively over the moves that exist.
+    m_belt_layer_zs.clear();
+    if (is_belt) {
+        unsigned int src_layer_id = std::numeric_limits<unsigned int>::max();
+        for (size_t i = 1; i < gcode_result.moves.size(); ++ i) {
+            const GCodeProcessorResult::MoveVertex &mv = gcode_result.moves[i];
+            if (mv.layer_id != src_layer_id) {
+                src_layer_id = mv.layer_id;
+                m_belt_layer_zs.emplace_back(double(mv.print_z));
+            }
+        }
+        if (m_belt_layer_zs.size() != m_viewer.get_layers_count())
+            m_belt_layer_zs.clear();
+    }
+
 // #if !VGCODE_ENABLE_COG_AND_TOOL_MARKERS
 //     const size_t vertices_count = m_viewer.get_vertices_count();
 //     m_cog.reset();
@@ -1307,17 +2096,42 @@ void GCodeViewer::load_as_gcode(const GCodeProcessorResult& gcode_result, const 
             libvgcode::EGCodeExtrusionRole::WipeTower,
             // ORCA
             libvgcode::EGCodeExtrusionRole::BottomSurface, libvgcode::EGCodeExtrusionRole::InternalBridgeInfill, libvgcode::EGCodeExtrusionRole::Brim,
-            libvgcode::EGCodeExtrusionRole::SupportTransition, libvgcode::EGCodeExtrusionRole::Mixed
+            libvgcode::EGCodeExtrusionRole::SupportTransition, libvgcode::EGCodeExtrusionRole::Mixed,
+            libvgcode::EGCodeExtrusionRole::ArcOverhang,
+            libvgcode::EGCodeExtrusionRole::ArcBridge,
+            libvgcode::EGCodeExtrusionRole::NonplanarSurface,
+            libvgcode::EGCodeExtrusionRole::NonplanarSupport,
+            libvgcode::EGCodeExtrusionRole::NonplanarInfill,
+            libvgcode::EGCodeExtrusionRole::StaggeredPerimeter,
+            libvgcode::EGCodeExtrusionRole::SmoothOuterWall,
+            libvgcode::EGCodeExtrusionRole::NonplanarInterlockingWall,
+            libvgcode::EGCodeExtrusionRole::ShrinkageCompensation
             });
     m_paths_bounding_box = BoundingBoxf3(libvgcode::convert(bbox[0]).cast<double>(), libvgcode::convert(bbox[1]).cast<double>());
+    m_max_bounding_box = m_paths_bounding_box;
 
-    if (wxGetApp().is_editor())
-        m_contained_in_bed = wxGetApp().plater()->build_volume().all_paths_inside(gcode_result, m_paths_bounding_box);
+    if (wxGetApp().is_editor()) {
+        if (is_belt) {
+            // The moves are machine-frame coordinates (Z is belt travel), so the per-move
+            // test inside all_paths_inside() can never pass on a belt. Judge the
+            // back-transformed box instead, with room for the designed view's min-corner
+            // anchor, which is only accurate to a fraction of a millimetre.
+            BoundingBoxf3 bed = wxGetApp().plater()->build_volume().bounding_volume();
+            bed.offset(1.);
+            m_contained_in_bed = !m_paths_bounding_box.defined || (bed.contains(m_paths_bounding_box.min) && bed.contains(m_paths_bounding_box.max));
+        } else
+            m_contained_in_bed = wxGetApp().plater()->build_volume().all_paths_inside(gcode_result, m_paths_bounding_box);
+    }
 
     m_extruders_count = gcode_result.filaments_count;
 
     //BBS: move the id to the end of reset
+    if (m_last_result_id != gcode_result.id) {
+        m_learned_timing.reset();
+        m_learned_timing_status.clear();
+    }
     m_last_result_id = gcode_result.id;
+    m_last_belt_show_designed = m_belt_show_designed;
     m_gcode_result = &gcode_result;
     m_move_type_counts.fill(0);
     for (auto& move_type_times : m_move_type_times)
@@ -1348,31 +2162,14 @@ void GCodeViewer::load_as_gcode(const GCodeProcessorResult& gcode_result, const 
         m_custom_gcode_per_print_z = gcode_result.custom_gcode_per_print_z;
 
     m_max_print_height = gcode_result.printable_height;
+    m_machine_frame_transform_active = gcode_result.machine_frame_transform_active;
     m_z_offset = gcode_result.z_offset;
+
 
     // load_toolpaths(gcode_result, build_volume, exclude_bounding_box);
     
-    // ORCA: Apply smart default view type when extruder count changes.
-    // Multi-color: ColorPrint (Filament), Single-color: FeatureType (Line Type).
-    // User selections persist within same extruder count, defaults reapply on count change.
-    int current_count = m_viewer.get_used_extruders_count();
-    if (current_count > 1) {
-        if (m_last_extruder_count_default_applied != 2) {
-            auto it = std::find(view_type_items.begin(), view_type_items.end(), libvgcode::EViewType::ColorPrint);
-            if (it != view_type_items.end())
-                m_view_type_sel = std::distance(view_type_items.begin(), it);
-            set_view_type(libvgcode::EViewType::ColorPrint);
-            m_last_extruder_count_default_applied = 2;
-        }
-    } else {
-        if (m_last_extruder_count_default_applied != 1) {
-            auto it = std::find(view_type_items.begin(), view_type_items.end(), libvgcode::EViewType::FeatureType);
-            if (it != view_type_items.end())
-                m_view_type_sel = std::distance(view_type_items.begin(), it);
-            set_view_type(libvgcode::EViewType::FeatureType);
-            m_last_extruder_count_default_applied = 1;
-        }
-    }
+    // ORCA: Apply the default view type now that we know how many tools the G-code actually uses.
+    apply_default_view_type();
 
     // BBS: data for rendering color arrangement recommendation
     m_nozzle_nums = print.config().option<ConfigOptionFloats>("nozzle_diameter")->values.size();
@@ -1402,7 +2199,9 @@ void GCodeViewer::load_as_gcode(const GCodeProcessorResult& gcode_result, const 
     }
     else {*/
     //BBS: add only gcode mode
-    if (m_only_gcode_in_preview) {
+    // When the file's own settings were loaded into the presets, the bed already is the file's, with the
+    // model and texture of a user or custom printer too, which the lookup below cannot resolve.
+    if (m_only_gcode_in_preview && !wxGetApp().plater()->gcode_settings_loaded()) {
         Pointfs printable_area;
         //BBS: add bed exclude area
         Pointfs bed_exclude_area = Pointfs();
@@ -1495,6 +2294,10 @@ void GCodeViewer::load_as_gcode(const GCodeProcessorResult& gcode_result, const 
 void GCodeViewer::load_as_preview(libvgcode::GCodeInputData&& data)
 {
     m_loaded_as_preview = true;
+    m_plate_mass = {};
+    m_object_masses.clear();
+    m_body_masses.clear();
+    m_support_masses.clear();
 
     m_move_type_counts.fill(0);
     for (auto& move_type_times : m_move_type_times)
@@ -1549,19 +2352,35 @@ void GCodeViewer::reset_shell()
     m_shell_bounding_box = BoundingBoxf3();
 }
 
+void GCodeViewer::set_learned_timing(unsigned int result_id, const std::string &filename,
+                                   std::optional<LearnedTimingEstimate> estimate, std::string status, std::string context)
+{
+    if (m_last_result_id != result_id || !m_gcode_result || m_gcode_result->filename != filename) return;
+    m_learned_timing = std::move(estimate);
+    m_learned_timing_status = std::move(status);
+    m_learned_timing_context = std::move(context);
+}
+
 void GCodeViewer::reset()
 {
     //BBS: should also reset the result id
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": current result id %1% ")%m_last_result_id;
     m_last_result_id = -1;
+    m_learned_timing.reset();
+    m_learned_timing_status.clear();
+    m_learned_timing_context.clear();
+    m_thermal_analysis = {};
+    m_belt_layer_zs.clear();
     //BBS: add only gcode mode
     m_only_gcode_in_preview = false;
+    m_print_by_object = false;
 
     m_viewer.reset();
 
     m_paths_bounding_box = BoundingBoxf3();
     m_max_bounding_box = BoundingBoxf3();
     m_max_print_height = 0.0f;
+    m_machine_frame_transform_active = false;
     m_z_offset = 0.0f;
     m_extruders_count = 0;
     m_filament_diameters = std::vector<float>();
@@ -1572,22 +2391,550 @@ void GCodeViewer::reset()
     m_move_type_distances.fill(0.0f);
     m_print_statistics.reset();
     m_custom_gcode_per_print_z = std::vector<CustomGCode::Item>();
+    m_plate_mass = {};
+    m_object_masses.clear();
+    m_body_masses.clear();
+    m_support_masses.clear();
     m_left_extruder_filament.clear();
     m_right_extruder_filament.clear();
     m_sequential_view.gcode_window.reset();
     m_contained_in_bed = true;
 }
 
+// IDEX/IQEX: resolve where every secondary carriage marker sits, relative to the primary,
+// for one (printer preset, active mode, plate bed) triple. This parses the mode string
+// several times over and rebuilds the zone grid, and every one of its inputs is preset or
+// plate state, so render_scene() runs it only when GCodeViewer::ImexMarkerKey changes and replays
+// the returned plan on all the frames in between.
+//
+// `mode` is already resolved (the plate's mode beats the process preset). An empty
+// `carriages` list means "no secondary markers for this configuration" — IMEX off in this
+// mode, firmware-managed zones, or a mode whose roster has no zone-owning secondary.
+GCodeViewer::ImexMarkerPlan GCodeViewer::resolve_imex_marker_plan(const DynamicPrintConfig& printer_cfg,
+                                                                  const std::string&        mode,
+                                                                  const BoundingBoxf&       bed_extents)
+{
+    ImexMarkerPlan plan;
+
+    // Firmware-managed-zones centers the slice at bed origin, so prim_pos
+    // and the preview toolpaths sit in a shifted frame relative to the
+    // plate-local bed bounds the zone math uses. Computing secondaries here
+    // would place them off-bed. The firmware physically fans the centered
+    // toolpath out into the zones, so the centered preview with no
+    // secondaries is the honest representation.
+    if (imex_cfg_bool(printer_cfg, "imex_firmware_managed_zones"))
+        return plan;
+    if (mode.empty() || mode == kImexPrimaryMode)
+        return plan;
+
+    // Only the gantry grouping and the mirror axis are decided here; the zone grid itself comes
+    // from compute_imex_zone_layout() below, which reads the same keys through the same accessor.
+    const int tools_per_gantry = std::max(1, imex_cfg_int(printer_cfg, "imex_tools_per_gantry"));
+    plan.box_wx = (float)imex_cfg_float(printer_cfg, "imex_nozzle_clearance_x");
+    plan.box_wy = (float)imex_cfg_float(printer_cfg, "imex_nozzle_clearance_y");
+
+    // Parse "idx:P/C/M" via shared helpers — matches PartPlate::calc_imex_zones.
+    // The role travels as an ImexRole all the way to the marker placement
+    // below; there is no int encoding in between, so a role added to the enum
+    // cannot silently fall into the "not Mirror, therefore Copy" branch.
+    int pri_tool = -1;
+    std::vector<int> sec_tool_ids;
+    std::map<int, ImexRole> sec_tool_roles; // tool_id -> Copy or Mirror
+    std::set<int>     sec_aggregated;  // representatives standing in for a whole gantry
+    {
+        // Same lookup rule as PartPlate's zones and ghosts, and as the slicer:
+        // an unresolved mode, and a mode the tools array is too short to cover,
+        // both come back empty and leave the marker roster empty.
+        const std::string entry = find_imex_mode(printer_cfg, mode).active_tools;
+        pri_tool = imex_primary_tool_for_mode(entry);
+        // Aggregate per gantry via the same source of truth as PartPlate's
+        // zone/ghost aggregation: in Span modes only one tool prints per
+        // zone at a time, so a non-primary gantry collapses to one
+        // representative marker. Non-Span gantries keep per-tool markers.
+        const ImexGantryGrouping grouping =
+            group_imex_active_tools_by_gantry(entry, tools_per_gantry);
+        auto add_tool = [&](int phys_idx, ImexRole role, bool aggregated) {
+            if (phys_idx < 0 || phys_idx == pri_tool) return;
+            // Only Copy and Mirror print in a zone of their own, so only they
+            // get a marker. Exhaustive with no default so -Wswitch makes a new
+            // role answer "does this carriage get its own marker?" rather than
+            // defaulting into a Copy-shaped one.
+            switch (role) {
+            case ImexRole::Copy:
+            case ImexRole::Mirror:
+                break;
+            case ImexRole::Primary:  // not a secondary carriage
+            case ImexRole::Span:     // rides in the primary's zone
+                return;
+            }
+            sec_tool_roles[phys_idx] = role;
+            sec_tool_ids.push_back(phys_idx);
+            if (aggregated) sec_aggregated.insert(phys_idx);
+        };
+        // Out-of-grid tool indices (a stale mode string carried over from a
+        // printer with more tools) are handled inconsistently by the code we
+        // must agree with: compute_imex_zone_layout drops them, so they own no
+        // zone, while calc_imex_ghosts still bakes a ghost for them. No single
+        // policy matches both, so the marker roster is left exactly as it was
+        // and such a tool simply falls back to the first zone below. Clamping
+        // pri_tool instead is a trap: the -1 sentinel truncates to gantry 0 in
+        // imex_mirror_axis_for and flips the marker to the opposite mirror
+        // axis from the ghost. It is also why the layout's own `primary_head`
+        // cannot stand in for `pri_tool` here — the layout reports -1 for an
+        // off-grid primary, this roster has to keep the authored index.
+        for (const auto& grp : grouping.groups) {
+            // Markers: an aggregated non-primary gantry shows only its rep.
+            if (grp.aggregate && grp.gantry_index != grouping.primary_gantry)
+                add_tool(grp.representative_phys, grp.representative_role, true);
+            else
+                for (const auto& [phys_idx, role] : grp.tools)
+                    add_tool(phys_idx, role, false);
+        }
+    }
+    const int sec_count = (int)sec_tool_ids.size();
+    if (sec_count == 0)
+        return plan;
+
+    // The zone grid is not re-derived here: this is the same call
+    // PartPlate::calc_imex_zones() makes, with the same printer config and the
+    // same bed extents, so the preview and the plate cannot place a tool
+    // differently for the same mode. The T0-corner flips, the active
+    // column/row sets and the zone pitch all live inside the library; the
+    // markers need nothing from it but `head_zone_centers`.
+    // `mode` is already resolved (per-plate mode beats the process preset),
+    // so it goes in as the plate mode with no process fallback.
+    const ImexZoneLayout zone_layout =
+        compute_imex_zone_layout(printer_cfg, mode, std::string(), bed_extents);
+
+    // Centre of zone (0,0), the fallback for any head the layout gave no zone —
+    // a mode string naming a tool outside this printer's grid. Zone indices are
+    // dense, so the lowest centre on each axis IS zone 0's. An empty layout
+    // means one undivided zone, whose centre is the bed's.
+    Vec2d zone0_center = bed_extents.center();
+    if (!zone_layout.head_zone_centers.empty()) {
+        zone0_center = zone_layout.head_zone_centers.begin()->second;
+        for (const auto& head_center : zone_layout.head_zone_centers) {
+            zone0_center.x() = std::min(zone0_center.x(), head_center.second.x());
+            zone0_center.y() = std::min(zone0_center.y(), head_center.second.y());
+        }
+    }
+    auto zone_center_of = [&](int tid) -> Vec2d {
+        auto it = zone_layout.head_zone_centers.find(tid);
+        return (it == zone_layout.head_zone_centers.end()) ? zone0_center : it->second;
+    };
+    const Vec2d pri_center = zone_center_of(pri_tool);
+
+    // An aggregated gantry's zone is a full-X row strip with no column of its
+    // own, so its marker tracks primary's X. calc_imex_ghosts() reaches the same
+    // zero X offset by putting both frames on the bed centreline; for a single
+    // marker, pinning the centre says it directly.
+    auto sec_center_of = [&](int tid) -> Vec2d {
+        Vec2d c = zone_center_of(tid);
+        if (sec_aggregated.count(tid))
+            c.x() = pri_center.x();
+        return c;
+    };
+
+    // Primary carriage box: seeded from whether primary holds the leftmost zone
+    // column, then turned by any secondary sitting to one side of it.
+    plan.pri_box_offset_x = (pri_center.x() <= zone0_center.x()) ? 0.0f : -plan.box_wx;
+    plan.pri_box_offset_y = -plan.box_wy;
+    for (int i = 0; i < sec_count; ++i) {
+        const Vec2d sc = sec_center_of(sec_tool_ids[i]);
+        if      (sc.x() > pri_center.x()) { plan.pri_box_offset_x = 0.0f;         }
+        else if (sc.x() < pri_center.x()) { plan.pri_box_offset_x = -plan.box_wx; }
+        if      (sc.y() > pri_center.y()) { plan.pri_box_offset_y = 0.0f;         }
+        else if (sc.y() < pri_center.y()) { plan.pri_box_offset_y = -plan.box_wy; }
+    }
+
+    plan.pri_head = pri_tool;
+    plan.carriages.reserve(sec_count);
+    for (int i = 0; i < sec_count; ++i) {
+        const int   sec_tool   = sec_tool_ids[i];
+        const Vec2d sec_center = sec_center_of(sec_tool);
+        const ImexRole sec_role = sec_tool_roles[sec_tool];
+
+        // A carriage stays inside its own zone; a Mirror reflects its
+        // zone-relative offset about that zone's centerline, on the axis of the
+        // boundary it shares with primary — the same rule the ghosts use:
+        //   Copy                  → tracks primary on both axes.
+        //   Mirror, same gantry   → reflect X (zones sit side by side).
+        //   Mirror, other gantry  → reflect Y (zones sit front-to-back); X
+        //                           tracks primary, since the part off that
+        //                           gantry is a Y-reflection of the tool
+        //                           directly behind it.
+        // The axis comes from the shared helper, so the markers can never drift
+        // out of step with the plate ghosts.
+        const bool is_mirror    = (sec_role == ImexRole::Mirror);
+        const bool cross_gantry = imex_mirror_axis_for(pri_tool, sec_tool,
+                                                       tools_per_gantry) == ImexMirrorAxis::Y;
+
+        // Tracking an axis translates by the gap between the two zone centres.
+        // Mirroring it reflects primary about the midpoint of those centres —
+        // the zones being equal-sized, that midpoint is the boundary between
+        // them, so the carriage still lands inside its own zone. Both are a
+        // single term applied to the live primary position each frame:
+        // `term - pos` when mirrored, `pos + term` when tracked.
+        ImexMarkerPlan::Carriage carriage;
+        carriage.phys_head = sec_tool;
+        carriage.mirror_x = is_mirror && !cross_gantry;
+        carriage.mirror_y = is_mirror &&  cross_gantry;
+        carriage.x_term   = carriage.mirror_x ? (float)(sec_center.x() + pri_center.x())
+                                              : (float)(sec_center.x() - pri_center.x());
+        carriage.y_term   = carriage.mirror_y ? (float)(sec_center.y() + pri_center.y())
+                                              : (float)(sec_center.y() - pri_center.y());
+
+        // The box shows the side a toolhead could COLLIDE from, not merely which
+        // way its body hangs. Tools sharing a gantry share an X rail and can
+        // actually run into each other, and only in a same-gantry (X-axis) mirror
+        // do they converge — so that is the one case where the secondary's box
+        // flips to face the primary. Tools on different gantries cannot collide
+        // in X at all, so a cross-gantry mirror keeps the primary's facing, the
+        // same as a Copy. Do not "fix" this to follow carriage geometry: a box on
+        // the far side would point away from the only tool it can hit.
+        if (is_mirror && !cross_gantry) {
+            if      (sec_center.x() > pri_center.x()) carriage.box_offset_x = -plan.box_wx;
+            else if (sec_center.x() < pri_center.x()) carriage.box_offset_x = 0.0f;
+            else                                      carriage.box_offset_x = plan.pri_box_offset_x;
+        } else {
+            carriage.box_offset_x = plan.pri_box_offset_x;
+        }
+        // Y follows the same collision rule: face the gantry you could hit. A tool
+        // on ANOTHER row faces the primary's row; a tool on the primary's OWN row
+        // shares its gantry and can only hit the same other gantry, so it faces
+        // wherever the primary faces. The old `else` hardcoded -imex_box_wy, which
+        // happens to equal pri_box_offset_y on the rear-* layouts (primary's row
+        // sits above the others, so the loop above settles on -box_wy anyway)
+        // — hence a no-op there. On the front-* layouts the primary flips to 0.0f
+        // and the hardcoded value pointed the same-gantry secondary away from the
+        // only tools it could run into.
+        if      (sec_center.y() > pri_center.y()) carriage.box_offset_y = -plan.box_wy;
+        else if (sec_center.y() < pri_center.y()) carriage.box_offset_y = 0.0f;
+        else                                      carriage.box_offset_y = plan.pri_box_offset_y;
+
+        plan.carriages.push_back(carriage);
+    }
+
+    return plan;
+}
+
 //BBS: GUI refactor: add canvas width and height
-void GCodeViewer::render(int canvas_width, int canvas_height, int right_margin)
+void GCodeViewer::render_scene(int canvas_width, int canvas_height)
 {
     glsafe(::glEnable(GL_DEPTH_TEST));
     render_shells(canvas_width, canvas_height);
 
-    if (m_viewer.get_extrusion_roles().empty())
+    if (m_viewer.get_extrusion_roles_count() == 0)
         return;
 
     render_toolpaths();
+
+    refresh_marker_model();
+    // Keep the selected nozzle visible at the final move as well.
+    m_sequential_view.m_show_marker = m_sequential_view.marker.has_model() && !m_no_render_path;
+    const libvgcode::PathVertex& curr_vertex = m_viewer.get_current_vertex();
+    m_sequential_view.marker.set_world_position(libvgcode::convert(curr_vertex.position));
+    m_sequential_view.marker.set_z_offset(m_z_offset + 0.5f);
+
+    // IDEX/IQEX: compute all carriage positions; update secondary nozzle markers;
+    // carriage_box_draws is populated for toolhead footprint rendering after render_marker().
+    // Okabe-Ito colorblind-safe palette — excludes orange (#E69F00) and sky blue (#56B4E9)
+    // which are used by the bed zone fills, ensuring the markers contrast against the background.
+    // It identifies the carriages in the views that colour by anything but filament; in Filament
+    // view a carriage takes its own head's filament colour instead, so a marker, the ghost of
+    // what it prints and the toolpaths under it all agree on what is loaded there.
+    static const std::array<ColorRGBA, 4> s_carriage_colors = {{
+        { 1.000f, 1.000f, 1.000f, 0.65f },   // primary      — white
+        { 0.941f, 0.894f, 0.259f, 0.65f },   // secondary 1  — yellow       (#F0E442)
+        { 0.835f, 0.369f, 0.000f, 0.65f },   // secondary 2  — vermilion    (#D55E00)
+        { 0.800f, 0.475f, 0.655f, 0.65f },   // secondary 3  — reddish purple (#CC79A7)
+    }};
+    struct CarriageDraw { Vec3f pos; ColorRGBA color; float box_offset_x = 0.0f; float box_offset_y = 0.0f; };
+    std::vector<CarriageDraw> carriage_box_draws;
+    float imex_box_wx = 0.0f, imex_box_wy = 0.0f;
+    {
+        PresetBundle* preset_bundle = wxGetApp().preset_bundle;
+        bool imex_active = false;
+        if (preset_bundle && m_sequential_view.m_show_marker) {
+            const DynamicPrintConfig& printer_cfg = preset_bundle->printers.get_edited_preset().config;
+            auto* is_imex_opt = printer_cfg.opt<ConfigOptionBool>("is_imex");
+            if (is_imex_opt && is_imex_opt->value) {
+                const DynamicPrintConfig& process_cfg = preset_bundle->prints.get_edited_preset().config;
+                auto* mode_opt = process_cfg.opt<ConfigOptionString>("imex_parallel_mode");
+                std::string mode = mode_opt ? mode_opt->value : kImexPrimaryMode;
+                // Per-plate mode overrides the process preset.
+                PartPlateList& plate_list = wxGetApp().plater()->get_partplate_list();
+                PartPlate*     curr_plate = plate_list.get_curr_plate();
+                if (curr_plate) {
+                    // Same resolution the plate itself uses, rather than a fourth copy of it.
+                    const std::string plate_mode = curr_plate->get_effective_imex_mode();
+                    if (plate_mode != kImexPrimaryMode)
+                        mode = plate_mode;
+                }
+
+                // Bed X and Y bounds — read from the current plate's shape, which is
+                // in world/GL coordinates (same space as curr_vertex.position), and is
+                // the exact same source PartPlate::calc_imex_zones() hands to the library.
+                BoundingBoxf bed_extents;
+                {
+                    const Pointfs& plate_shape = curr_plate ? curr_plate->get_shape() : Pointfs{};
+                    if (!plate_shape.empty()) {
+                        bed_extents = get_extents(plate_shape);
+                    } else {
+                        // Fallback: use toolpath bounding box extent
+                        bed_extents = BoundingBoxf(Vec2d(m_paths_bounding_box.min.x(), m_paths_bounding_box.min.y()),
+                                                   Vec2d(m_paths_bounding_box.max.x(), m_paths_bounding_box.max.y()));
+                    }
+                }
+
+                // Cache guard. The marker plan below is resolved from preset/plate state only,
+                // so it is rebuilt when that state moves and reused otherwise — the sequential
+                // slider is sticky, and re-resolving the zone layout on every frame of the rest
+                // of the session showed up as a measurable per-frame cost. The comparison is
+                // deliberately made against the live config rather than against a freshly built
+                // key, so an unchanged frame allocates nothing at all.
+                static const std::vector<std::string> s_no_strings;
+                auto* names_opt  = printer_cfg.opt<ConfigOptionStrings>("imex_mode_names");
+                auto* tools_opt  = printer_cfg.opt<ConfigOptionStrings>("imex_mode_active_tools");
+                const std::vector<std::string>& mode_names   = names_opt ? names_opt->values : s_no_strings;
+                const std::vector<std::string>& active_tools = tools_opt ? tools_opt->values : s_no_strings;
+
+                ImexMarkerKey::Scalars key;
+                key.plate_index      = plate_list.get_curr_plate_index();
+                // Same accessor the plan is built from: a key holding a different fallback than
+                // the value actually laid out would compare equal across a real change.
+                key.gantry_count     = imex_cfg_int(printer_cfg, "imex_gantry_count");
+                key.tools_per_gantry = imex_cfg_int(printer_cfg, "imex_tools_per_gantry");
+                key.tool_layout      = (int)imex_cfg_enum<ImexToolLayout>(printer_cfg, "imex_tool_layout");
+                key.clearance_x      = imex_cfg_float(printer_cfg, "imex_nozzle_clearance_x");
+                key.clearance_y      = imex_cfg_float(printer_cfg, "imex_nozzle_clearance_y");
+                key.firmware_managed = imex_cfg_bool(printer_cfg, "imex_firmware_managed_zones");
+                key.bed_min_x        = bed_extents.min.x();
+                key.bed_min_y        = bed_extents.min.y();
+                key.bed_max_x        = bed_extents.max.x();
+                key.bed_max_y        = bed_extents.max.y();
+
+                if (!(m_imex_marker_key.s == key) || m_imex_marker_key.mode != mode ||
+                    m_imex_marker_key.mode_names != mode_names ||
+                    m_imex_marker_key.mode_active_tools != active_tools) {
+                    m_imex_marker_key = ImexMarkerKey{ key, mode, mode_names, active_tools };
+                    m_imex_marker_plan = resolve_imex_marker_plan(printer_cfg, mode, bed_extents);
+                    // The carriage roster — and with it the marker count — can change with any
+                    // of those inputs, so drop the markers and let the lazy init below rebuild
+                    // them. Their colours are restamped every frame regardless.
+                    m_sequential_view.m_imex_secondary_markers.clear();
+                }
+
+                const ImexMarkerPlan& plan      = m_imex_marker_plan;
+                const int             sec_count = (int)plan.carriages.size();
+
+                // Filament view colours the toolpaths by the filament printing them, so a
+                // carriage takes its own head's filament colour there and the palette
+                // everywhere else. get_imex_head_filament_color() answers UNPRINTABLE_COLOR
+                // for a head it cannot resolve, which is alpha 0.5 where a filament colour
+                // decodes opaque - that difference, not the black, is what distinguishes it,
+                // and a head with no filament keeps the palette rather than borrowing a
+                // colour that would read as a real assignment - the one point where a marker
+                // and the ghost of what it prints differ, the ghost having no palette to fall
+                // back to.
+                //
+                // The map and the pem are hoisted and each head resolved once, as
+                // PartPlate::update_imex_ghost_colors() does for the ghosts: both the marker
+                // and the toolhead box of a carriage want the same answer, and rebuilding it
+                // per draw parses the plate's map string and rebuilds the pem vector.
+                const bool color_by_filament = m_viewer.get_view_type() == libvgcode::EViewType::ColorPrint;
+                std::vector<ColorRGBA> carriage_colors(sec_count + 1);
+                if (sec_count > 0) {
+                    const ConfigOptionInts pem       = effective_physical_extruder_map(*preset_bundle);
+                    const auto             plate_map = curr_plate ? curr_plate->get_imex_head_filament_map()
+                                                                  : std::map<int, int>{};
+                    std::map<int, ColorRGBA> head_colors;
+                    auto color_for = [&](int phys_head, size_t palette_index) {
+                        const ColorRGBA fallback = s_carriage_colors[palette_index % s_carriage_colors.size()];
+                        if (!color_by_filament || curr_plate == nullptr || phys_head < 0)
+                            return fallback;
+                        auto hc = head_colors.find(phys_head);
+                        if (hc == head_colors.end())
+                            hc = head_colors.emplace(phys_head,
+                                     curr_plate->get_imex_head_filament_color(phys_head, pem, plate_map)).first;
+                        if (hc->second == GLVolume::UNPRINTABLE_COLOR)
+                            return fallback;
+                        ColorRGBA c = hc->second;
+                        c.a(fallback.a());   // as translucent as the palette makes them
+                        return c;
+                    };
+                    carriage_colors[0] = color_for(plan.pri_head, 0);
+                    for (int i = 0; i < sec_count; ++i)
+                        carriage_colors[i + 1] = color_for(plan.carriages[i].phys_head, i + 1);
+                }
+                if (sec_count > 0) {
+                    imex_active = true;
+                    imex_box_wx = plan.box_wx;
+                    imex_box_wy = plan.box_wy;
+
+                    // Lazy init secondary nozzle markers
+                    if ((int)m_sequential_view.m_imex_secondary_markers.size() != sec_count) {
+                        m_sequential_view.m_imex_secondary_markers.resize(sec_count);
+                        for (int i = 0; i < sec_count; ++i) {
+                            m_sequential_view.m_imex_secondary_markers[i].init(m_marker_filename);
+                        }
+                    }
+                    // Set every frame, not once at init: the view type and the filament palette
+                    // both change without the marker list being rebuilt. The primary marker is
+                    // one of the carriages here, so it is coloured alongside them - and restored
+                    // below when no mode is active, since it is the same marker every non-IMEX
+                    // preview draws.
+                    m_sequential_view.marker.set_color(carriage_colors[0]);
+                    for (int i = 0; i < sec_count; ++i)
+                        m_sequential_view.m_imex_secondary_markers[i].set_color(carriage_colors[i + 1]);
+
+                    const Vec3f prim_pos = libvgcode::convert(curr_vertex.position);
+                    carriage_box_draws.push_back({ prim_pos, carriage_colors[0],
+                                                   plan.pri_box_offset_x, plan.pri_box_offset_y });
+
+                    for (int i = 0; i < sec_count; ++i) {
+                        const ImexMarkerPlan::Carriage& carriage = plan.carriages[i];
+                        // Tracking an axis translates the primary by the gap between the two
+                        // zone centres; mirroring reflects it about the midpoint of those
+                        // centres — the zones being equal-sized, that midpoint is the boundary
+                        // between them, so the carriage still lands inside its own zone. Which
+                        // axis does which, and both terms, come from resolve_imex_marker_plan().
+                        const Vec3f sec_pos{ carriage.mirror_x ? carriage.x_term - prim_pos.x()
+                                                               : prim_pos.x() + carriage.x_term,
+                                             carriage.mirror_y ? carriage.y_term - prim_pos.y()
+                                                               : prim_pos.y() + carriage.y_term,
+                                             prim_pos.z() };
+                        m_sequential_view.m_imex_secondary_markers[i].set_world_position(sec_pos);
+                        m_sequential_view.m_imex_secondary_markers[i].set_z_offset(m_z_offset + 0.5f);
+                        carriage_box_draws.push_back({
+                            sec_pos, carriage_colors[i + 1],
+                            carriage.box_offset_x, carriage.box_offset_y });
+                    }
+                }
+            }
+        }
+        if (!imex_active) {
+            m_sequential_view.m_imex_secondary_markers.clear();
+            // The primary marker is the one every preview draws, so the carriage colour it may
+            // have been given has to come back off when no parallel mode is active.
+            m_sequential_view.marker.set_color(SequentialView::Marker::default_color());
+        }
+    }
+    m_sequential_view.render_marker(!m_no_render_path, canvas_width, sequential_view_height(canvas_height), m_viewer.get_view_type());
+
+    // IDEX/IQEX: render toolhead footprint boxes for each active carriage.
+    // Each box is imex_nozzle_clearance_x × imex_nozzle_clearance_y, sitting above the nozzle tip.
+    // Hidden when the user toggles off "Show IDEX/IQEX Toolhead Boxes" in the View menu — gives
+    // an unobstructed view of the toolpaths during sequential playback. Default-on; the absence
+    // of an app_config entry is also treated as on.
+    const bool show_toolhead_boxes = wxGetApp().app_config->get("show_imex_toolhead_boxes") != "false";
+    if (show_toolhead_boxes && !carriage_box_draws.empty() && imex_box_wx > 0.0f && imex_box_wy > 0.0f) {
+        // The mesh depends only on the two clearance dimensions, which a config edit can
+        // change without a G-code reload — so rebuild it when they move (or when it has not
+        // been built yet) rather than on every frame.
+        // Mesh origin: nozzle at x=0, centered in Y, Z starts at nozzle tip level.
+        // Per-carriage box_offset_x shifts the mesh left or right so the nozzle lands
+        // at the correct (collision-side) edge.
+        if (!m_imex_toolhead_box.is_initialized() ||
+            m_imex_box_mesh_wx != imex_box_wx || m_imex_box_mesh_wy != imex_box_wy) {
+            const float box_h = std::max(imex_box_wx, imex_box_wy);
+            indexed_triangle_set its = its_make_cube((double)imex_box_wx, (double)imex_box_wy, (double)box_h);
+            // No vertex pre-shifting — box_offset_x/y in the per-carriage transform
+            // positions the nozzle at the correct collision-side edge.
+            m_imex_toolhead_box.reset();
+            m_imex_toolhead_box.init_from(its);
+            m_imex_box_mesh_wx = imex_box_wx;
+            m_imex_box_mesh_wy = imex_box_wy;
+        }
+
+        GLShaderProgram* shader = wxGetApp().get_shader("gouraud_light");
+        if (shader) {
+            glsafe(::glEnable(GL_BLEND));
+            glsafe(::glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA));
+            shader->start_using();
+            shader->set_uniform("emission_factor", 0.0f);
+            const Camera& camera = wxGetApp().plater()->get_camera();
+            shader->set_uniform("projection_matrix", camera.get_projection_matrix());
+            const Transform3d& view_matrix = camera.get_view_matrix();
+            for (const auto& draw : carriage_box_draws) {
+                const Transform3d model_matrix = Geometry::translation_transform(
+                    (draw.pos + Vec3f(draw.box_offset_x, draw.box_offset_y, m_z_offset)).cast<double>());
+                shader->set_uniform("view_model_matrix", view_matrix * model_matrix);
+                const Matrix3d view_normal_matrix =
+                    view_matrix.matrix().block(0, 0, 3, 3) *
+                    model_matrix.matrix().block(0, 0, 3, 3).inverse().transpose();
+                shader->set_uniform("view_normal_matrix", view_normal_matrix);
+                m_imex_toolhead_box.set_color(draw.color);
+                m_imex_toolhead_box.render();
+            }
+            shader->stop_using();
+            glsafe(::glDisable(GL_BLEND));
+        }
+    }
+}
+
+size_t GCodeViewer::shadow_casters_signature() const
+{
+    size_t hash = m_viewer.get_vertices_count();
+    const libvgcode::Interval& visible = m_viewer.get_view_visible_range();
+    const libvgcode::Interval& layers  = m_viewer.get_layers_view_range();
+    for (size_t value : { size_t(visible[0]), size_t(visible[1]), size_t(layers[0]), size_t(layers[1]) })
+        boost::hash_combine(hash, value);
+    for (double value : { m_paths_bounding_box.min.x(), m_paths_bounding_box.min.y(), m_paths_bounding_box.min.z(),
+                          m_paths_bounding_box.max.x(), m_paths_bounding_box.max.y(), m_paths_bounding_box.max.z() })
+        boost::hash_combine(hash, value);
+    boost::hash_combine(hash, m_viewer.is_top_layer_only_view_range());
+    for (size_t i = 0; i < libvgcode::GCODE_EXTRUSION_ROLES_COUNT; ++i)
+        boost::hash_combine(hash, m_viewer.is_extrusion_role_visible(libvgcode::EGCodeExtrusionRole(i)));
+    boost::hash_combine(hash, m_viewer.is_option_visible(libvgcode::EOptionType::Travels));
+    boost::hash_combine(hash, m_viewer.is_option_visible(libvgcode::EOptionType::Wipes));
+    for (float value : m_clipping_plane)
+        boost::hash_combine(hash, value);
+    return hash;
+}
+
+void GCodeViewer::render_shadow_casters(const Transform3d& light_view_matrix, const Transform3d& light_projection_matrix, const Vec3d& light_position)
+{
+    if (!has_data())
+        return;
+
+    m_viewer.render_shadow_casters(
+        libvgcode::convert(static_cast<Matrix4f>(light_view_matrix.matrix().cast<float>())),
+        libvgcode::convert(static_cast<Matrix4f>(light_projection_matrix.matrix().cast<float>())),
+        libvgcode::convert(static_cast<Vec3f>(light_position.cast<float>())));
+}
+
+void GCodeViewer::set_shadow_map(int texture_unit, const Transform3d& light_view_projection, float intensity, float texel_size)
+{
+    m_viewer.set_shadow_map(texture_unit,
+        libvgcode::convert(static_cast<Matrix4f>(light_view_projection.matrix().cast<float>())),
+        intensity, texel_size);
+}
+
+void GCodeViewer::set_light_top_dir(const Vec3d& direction)
+{
+    m_viewer.set_light_top_dir(libvgcode::convert(static_cast<Vec3f>(direction.cast<float>())));
+}
+
+void GCodeViewer::set_tone(float exposure, float saturation)
+{
+    m_viewer.set_tone(exposure, saturation);
+}
+
+void GCodeViewer::set_clipping_plane(const ClippingPlane& plane)
+{
+    // Flipped to match ClippingPlane::distance().
+    const Vec3f normal = -plane.get_normal().cast<float>();
+    m_clipping_plane = plane.is_active() ?
+        std::array<float, 4>{ normal.x(), normal.y(), normal.z(), float(plane.get_offset()) } :
+        std::array<float, 4>{ 0.0f, 0.0f, 0.0f, 1.0f };
+    m_viewer.set_clipping_plane(m_clipping_plane);
+}
+
+void GCodeViewer::render_overlay(int canvas_width, int canvas_height, int right_margin)
+{
+    if (m_viewer.get_extrusion_roles().empty())
+        return;
 
     float legend_height = 0.0f;
     render_legend(legend_height, canvas_width, canvas_height, right_margin);
@@ -1597,16 +2944,7 @@ void GCodeViewer::render(int canvas_width, int canvas_height, int right_margin)
         m_user_mode = wxGetApp().get_mode();
     }
 
-    //BBS fixed bottom_margin for space to render horiz slider
-    int bottom_margin = SLIDER_BOTTOM_MARGIN * GCODE_VIEWER_SLIDER_SCALE;
-    auto current = m_viewer.get_view_visible_range();
-    auto endpoints = m_viewer.get_view_full_range();
-    m_sequential_view.m_show_marker = m_sequential_view.m_show_marker || (current.back() != endpoints.back() && !m_no_render_path);
-    const libvgcode::PathVertex& curr_vertex = m_viewer.get_current_vertex();
-    m_sequential_view.marker.set_world_position(libvgcode::convert(curr_vertex.position));
-    m_sequential_view.marker.set_z_offset(m_z_offset + 0.5f);
-    // BBS fixed buttom margin. m_moves_slider.pos_y
-    m_sequential_view.render(!m_no_render_path, legend_height, &m_viewer, m_viewer.get_current_vertex().gcode_id, canvas_width, canvas_height - bottom_margin * m_scale, right_margin * m_scale, m_viewer.get_view_type());
+    m_sequential_view.render_overlay(!m_no_render_path, legend_height, &m_viewer, m_viewer.get_current_vertex().gcode_id, canvas_width, sequential_view_height(canvas_height), right_margin * m_scale, m_viewer.get_view_type());
 
 #if VGCODE_ENABLE_COG_AND_TOOL_MARKERS
     if (is_legend_shown()) {
@@ -1645,6 +2983,14 @@ void GCodeViewer::render(int canvas_width, int canvas_height, int right_margin)
 
     //BBS render slider
     render_slider(canvas_width, canvas_height);
+}
+
+int GCodeViewer::sequential_view_height(int canvas_height) const
+{
+    //BBS fixed bottom_margin for space to render horiz slider
+    const int bottom_margin = SLIDER_BOTTOM_MARGIN * GCODE_VIEWER_SLIDER_SCALE;
+    // BBS fixed buttom margin. m_moves_slider.pos_y
+    return canvas_height - bottom_margin * m_scale;
 }
 
 #define ENABLE_CALIBRATION_THUMBNAIL_OUTPUT 0
@@ -2309,7 +3655,14 @@ void GCodeViewer::load_shells(const Print& print, bool initialized, bool force_p
 void GCodeViewer::render_toolpaths()
 {
     const Camera& camera = wxGetApp().plater()->get_camera();
-    const libvgcode::Mat4x4 converted_view_matrix = libvgcode::convert(static_cast<Matrix4f>(camera.get_view_matrix().matrix().cast<float>()));
+    Matrix4f view = camera.get_view_matrix().matrix().cast<float>();
+    // Belt "designed" (upright) view is produced by back-transforming the toolpath
+    // GEOMETRY into model space at load time (see load_as_gcode ->
+    // compute_belt_back_transform -> libvgcode::convert). The camera is left untouched
+    // here; transforming the view as well would double-apply the inverse. Baking the
+    // transform into the geometry (not the camera) also keeps the bed and toolpaths in
+    // the same frame so they stay aligned.
+    const libvgcode::Mat4x4 converted_view_matrix = libvgcode::convert(view);
     const libvgcode::Mat4x4 converted_projetion_matrix = libvgcode::convert(static_cast<Matrix4f>(camera.get_projection_matrix().matrix().cast<float>()));
 #if VGCODE_ENABLE_COG_AND_TOOL_MARKERS
     m_viewer.set_cog_marker_scale_factor(m_cog_marker_fixed_screen_size ? 10.0f * m_cog_marker_size * camera.get_inv_zoom() : m_cog_marker_size);
@@ -2574,7 +3927,7 @@ void GCodeViewer::render_all_plates_stats(const std::vector<const GCodeProcessor
         }
         return ret;
     };
-    auto calculate_offsets = [max_width, window_padding](const std::vector<std::pair<std::string, std::vector<::string>>>& title_columns, float extra_size = 0.0f) {
+    auto calculate_offsets = [max_width, window_padding](const std::vector<std::pair<std::string, std::vector<std::string>>>& title_columns, float extra_size = 0.0f) {
         const ImGuiStyle& style = ImGui::GetStyle();
         std::vector<float> offsets;
         offsets.push_back(max_width(title_columns[0].second, title_columns[0].first, extra_size) + 3.0f * style.ItemSpacing.x + style.WindowPadding.x);
@@ -2592,7 +3945,7 @@ void GCodeViewer::render_all_plates_stats(const std::vector<const GCodeProcessor
 
         return ret;
     };
-    auto append_item = [icon_size, &imgui, imperial_units, &window_padding, &draw_list, this](const ColorRGBA& color, const std::vector<std::pair<std::string, float>>& columns_offsets)
+    auto append_item = [icon_size, &imgui, &window_padding, &draw_list, this](const ColorRGBA& color, const std::vector<std::pair<std::string, float>>& columns_offsets)
     {
         // render icon
         ImVec2 pos = ImVec2(ImGui::GetCursorScreenPos().x + window_padding * 3, ImGui::GetCursorScreenPos().y);
@@ -2627,7 +3980,7 @@ void GCodeViewer::render_all_plates_stats(const std::vector<const GCodeProcessor
         }
         ImGui::Separator();
     };
-    auto get_used_filament_from_volume = [this, imperial_units, &filament_diameters, &filament_densities](double volume, int extruder_id) {
+    auto get_used_filament_from_volume = [imperial_units, &filament_diameters, &filament_densities](double volume, int extruder_id) {
         double koef = imperial_units ? 1.0 / GizmoObjectManipulation::in_to_mm : 0.001;
         std::pair<double, double> ret = { koef * volume / (PI * sqr(0.5 * filament_diameters[extruder_id])),
                                             volume * filament_densities[extruder_id] * 0.001 };
@@ -2721,7 +4074,7 @@ void GCodeViewer::render_all_plates_stats(const std::vector<const GCodeProcessor
         }
         ::sprintf(buff, "%.2f", longest_str);
 
-        std::vector<std::pair<std::string, std::vector<::string>>> title_columns;
+        std::vector<std::pair<std::string, std::vector<std::string>>> title_columns;
         if (displayed_columns & ColumnData::Model) {
             title_columns.push_back({ _u8L("Filament"), {""} });
             title_columns.push_back({ _u8L("Model"), {buff} });
@@ -2818,6 +4171,7 @@ void GCodeViewer::render_all_plates_stats(const std::vector<const GCodeProcessor
         char buf[64];
         ::sprintf(buf, "%.2f", total_cost_all_plates);
         imgui.text(buf);
+
     }
     ImGui::End();
     ImGui::PopStyleColor(6);
@@ -2883,27 +4237,6 @@ void GCodeViewer::render_legend_color_arr_recommen(float window_padding)
         }
     };
 
-    auto link_filament_group_wiki = [&](const std::string& label) {
-        ImVec2 wiki_part_size = ImGui::CalcTextSize(label.c_str());
-        ImColor HyperColor = ImColor(0, 150, 136, 255); // ORCA match color
-        ImGui::PushStyleColor(ImGuiCol_Text, HyperColor.Value);
-        imgui.text(label.c_str());
-        ImGui::PopStyleColor();
-
-        // ORCA use underline to match hyperlink style
-        ImVec2 lineEnd = ImGui::GetItemRectMax();
-        lineEnd.y -= 2.0f;
-        ImVec2 lineStart = lineEnd;
-        lineStart.x = ImGui::GetItemRectMin().x;
-        ImGui::GetWindowDrawList()->AddLine(lineStart, lineEnd, HyperColor);
-        // click behavior
-        if (ImGui::IsMouseHoveringRect(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(), true)) {
-            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-                open_filament_group_wiki();
-            }
-        }
-    };
-
     auto draw_dash_line = [&](ImDrawList* draw_list, int dash_length = 5, int gap_length = 3) {
         ImVec2 p1 = ImGui::GetCursorScreenPos();
         ImVec2 p2 = ImVec2(p1.x + ImGui::GetContentRegionAvail().x, p1.y);
@@ -2953,8 +4286,8 @@ void GCodeViewer::render_legend_color_arr_recommen(float window_padding)
                 for (int j = idx; j < extruder_filaments.size() && j < idx + line_capacity; ++j) {
                     auto text_info = imgui.calculate_filament_group_text_size(get_filament_display_type(extruder_filaments[j]));
                     auto text_size = std::get<0>(text_info);
-                    filament_group_item_align_width = max(filament_group_item_align_width, text_size.x);
-                    text_line_height = max(text_line_height, text_size.y);
+                    filament_group_item_align_width = std::max(filament_group_item_align_width, text_size.x);
+                    text_line_height = std::max(text_line_height, text_size.y);
                 }
                 container_height += (three_words_width * 1.3f + text_line_height );
             }
@@ -2977,7 +4310,7 @@ void GCodeViewer::render_legend_color_arr_recommen(float window_padding)
     else
         tips_count = 5;
 
-    float AMS_container_height = ams_item_height + line_height * tips_count + line_height;
+    float AMS_container_height = ams_item_height + line_height * tips_count + line_height + window_padding * 2.f;
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0)); // this shold be 0 since its child of gcodeviewer
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 1, 1, 1));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(window_padding * 3, 0));
@@ -2992,10 +4325,6 @@ void GCodeViewer::render_legend_color_arr_recommen(float window_padding)
         ImGui::Dummy({window_padding, window_padding});
         ImGui::PushStyleColor(ImGuiCol_Separator, ImVec4(1.0f,1.0f,1.0f,0.6f));
         imgui.bold_text(_u8L("Filament Grouping"));
-        ImGui::SameLine();
-        std::string tip_str = _u8L("Why this grouping");
-        ImGui::SetCursorPosX(ImGui::GetWindowContentRegionWidth() - window_padding - ImGui::CalcTextSize(tip_str.c_str()).x);
-        link_filament_group_wiki(tip_str);
         ImGui::Separator();
         ImGui::PopStyleColor();
         ImGui::Dummy({window_padding, window_padding});
@@ -3065,17 +4394,17 @@ void GCodeViewer::render_legend_color_arr_recommen(float window_padding)
             imgui.text(_u8L("Current grouping of slice result is not optimal."));
             wxString tip;
             if (delta_weight_to_best >= 0 && delta_change_to_best >= 0)
-                tip = from_u8((boost::format(_u8L("Increase %1%g filament and %2% changes compared to optimal grouping."))
-                    % number_format(delta_weight_to_best)
-                    % delta_change_to_best).str());
+                tip = format_wxstr(_L_PLURAL("Increase %1%g filament and %2% change compared to optimal grouping.",
+                                             "Increase %1%g filament and %2% changes compared to optimal grouping.", delta_change_to_best),
+                                   number_format(delta_weight_to_best), delta_change_to_best);
             else if (delta_weight_to_best >= 0 && delta_change_to_best < 0)
-                tip = from_u8((boost::format(_u8L("Increase %1%g filament and save %2% changes compared to optimal grouping."))
-                    % number_format(delta_weight_to_best)
-                    % std::abs(delta_change_to_best)).str());
+                tip = format_wxstr(_L_PLURAL("Increase %1%g filament and save %2% change compared to optimal grouping.",
+                                             "Increase %1%g filament and save %2% changes compared to optimal grouping.", std::abs(delta_change_to_best)),
+                                   number_format(delta_weight_to_best), std::abs(delta_change_to_best));
             else if (delta_weight_to_best < 0 && delta_change_to_best >= 0)
-                tip = from_u8((boost::format(_u8L("Save %1%g filament and increase %2% changes compared to optimal grouping."))
-                    % number_format(std::abs(delta_weight_to_best))
-                    % delta_change_to_best).str());
+                tip = format_wxstr(_L_PLURAL("Save %1%g filament and increase %2% change compared to optimal grouping.",
+                                             "Save %1%g filament and increase %2% changes compared to optimal grouping.", delta_change_to_best),
+                                   number_format(std::abs(delta_weight_to_best)), delta_change_to_best);
 
             imgui.text_wrapped(tip, parent_width);
             ImGui::PopStyleColor(1);
@@ -3084,22 +4413,25 @@ void GCodeViewer::render_legend_color_arr_recommen(float window_padding)
             ImGui::Dummy({window_padding, window_padding});
             wxString tip;
             if (delta_weight_to_single_ext >= 0 && delta_change_to_single_ext >= 0)
-                tip = from_u8((boost::format(_u8L("Save %1%g filament and %2% changes compared to a printer with one nozzle."))
-                    % number_format(delta_weight_to_single_ext)
-                    % delta_change_to_single_ext).str());
+                tip = format_wxstr(_L_PLURAL("Save %1%g filament and %2% change compared to a printer with one nozzle.",
+                                             "Save %1%g filament and %2% changes compared to a printer with one nozzle.", delta_change_to_single_ext),
+                                   number_format(delta_weight_to_single_ext), delta_change_to_single_ext);
             else if (delta_weight_to_single_ext >= 0 && delta_change_to_single_ext < 0)
-                tip = from_u8((boost::format(_u8L("Save %1%g filament and increase %2% changes compared to a printer with one nozzle."))
-                    % number_format(delta_weight_to_single_ext)
-                    % std::abs(delta_change_to_single_ext)).str());
+                tip = format_wxstr(_L_PLURAL("Save %1%g filament and increase %2% change compared to a printer with one nozzle.",
+                                             "Save %1%g filament and increase %2% changes compared to a printer with one nozzle.", std::abs(delta_change_to_single_ext)),
+                                   number_format(delta_weight_to_single_ext), std::abs(delta_change_to_single_ext));
             else if (delta_weight_to_single_ext < 0 && delta_change_to_single_ext >= 0)
-                tip = from_u8((boost::format(_u8L("Increase %1%g filament and save %2% changes compared to a printer with one nozzle."))
-                    % number_format(std::abs(delta_weight_to_single_ext))
-                    % delta_change_to_single_ext).str());
+                tip = format_wxstr(_L_PLURAL("Increase %1%g filament and save %2% change compared to a printer with one nozzle.",
+                                             "Increase %1%g filament and save %2% changes compared to a printer with one nozzle.", delta_change_to_single_ext),
+                                   number_format(std::abs(delta_weight_to_single_ext)), delta_change_to_single_ext);
 
             imgui.text_wrapped(tip, parent_width);
         }
 
         ImGui::Dummy({window_padding, window_padding});
+        GLGizmoUtils::render_wiki_guide_button(*wxGetApp().plater()->get_current_canvas3D(), m_scale,"https://e.bambulab.com/t?c=mOkvsXkJ9pldGYp9");
+        ImGui::SameLine();
+
         if (!is_optimal_group) {
             link_text_set_to_optional(_u8L("Set to Optimal"));
             ImGui::SameLine();
@@ -3108,10 +4440,7 @@ void GCodeViewer::render_legend_color_arr_recommen(float window_padding)
         }
         link_text(_u8L("Regroup filament"));
 
-        ImGui::SameLine();
-        std::string wiki_str = _u8L("Wiki Guide"); // ORCA
-        ImGui::SetCursorPosX(ImGui::GetWindowContentRegionWidth() - window_padding - ImGui::CalcTextSize(wiki_str.c_str()).x);
-        link_filament_group_wiki(wiki_str);
+        ImGui::Dummy({window_padding, window_padding});
 
         ImGui::EndChild();
     }
@@ -3212,7 +4541,7 @@ void GCodeViewer::render_legend(float &legend_height, int canvas_width, int canv
     //ImVec2(pos_rect.x + ImGui::GetWindowWidth() + ImGui::GetFrameHeight(),pos_rect.y + ImGui::GetFrameHeight() + window_padding * 2.5),
     //ImGui::GetColorU32(ImVec4(0,0,0,0.3)));
 
-    auto append_item = [icon_size, &imgui, imperial_units, &window_padding, &draw_list, this](
+    auto append_item = [icon_size, &imgui, &window_padding, &draw_list, this](
         EItemType type,
         const ColorRGBA& color,
         const std::vector<std::pair<std::string, float>>& columns_offsets,
@@ -3347,7 +4676,7 @@ void GCodeViewer::render_legend(float &legend_height, int canvas_width, int canv
         return ret;
     };
 
-    auto calculate_offsets = [&imgui, max_width, window_padding, this](const std::vector<std::pair<std::string, std::vector<::string>>>& title_columns, float extra_size = 0.0f) {
+    auto calculate_offsets = [max_width, this](const std::vector<std::pair<std::string, std::vector<std::string>>>& title_columns, float extra_size = 0.0f) {
             const ImGuiStyle& style = ImGui::GetStyle();
             std::vector<float> offsets;
             // ORCA increase spacing for more readable format. Using direct number requires much less code change in here. GetTextLineHeight for additional spacing for icon_size
@@ -3370,14 +4699,23 @@ void GCodeViewer::render_legend(float &legend_height, int canvas_width, int canv
         std::vector<std::pair<ColorRGBA, std::pair<double, double>>> ret;
         ret.reserve(custom_gcode_per_print_z.size());
 
+        // Loop invariant, but built lazily: this lambda runs once per extruder on every frame
+        // and most prints reach neither colour change below, so fetching it up front would cost
+        // more than the per-item fetch it replaces.
+        std::vector<float> zs;
+        bool zs_built = false;
+
         for (const auto& item : custom_gcode_per_print_z) {
             if (extruder_id + 1 != static_cast<unsigned char>(item.extruder))
                 continue;
 
-            if (item.type != ColorChange)
+            if (item.type != CustomGCode::ColorChange)
                 continue;
 
-            const std::vector<float> zs = m_viewer.get_layers_zs();
+            if (!zs_built) {
+                zs = m_viewer.get_layers_zs();
+                zs_built = true;
+            }
             auto lower_b = std::lower_bound(zs.begin(), zs.end(),
                 static_cast<float>(item.print_z - epsilon()));
             if (lower_b == zs.end())
@@ -3398,16 +4736,18 @@ void GCodeViewer::render_legend(float &legend_height, int canvas_width, int canv
         return ret;
     };
 
+    // Whole sentences: the bare "up to"/"above"/"from"/"to" these used to be glued from gave a
+    // translator no context, and left the unit and the numbers stuck in English word order.
     auto upto_label = [](double z) {
         char buf[64];
         ::sprintf(buf, "%.2f", z);
-        return _u8L("up to") + " " + std::string(buf) + " " + _u8L("mm");
+        return format(_u8L("up to %1% mm"), buf);
     };
 
     auto above_label = [](double z) {
         char buf[64];
         ::sprintf(buf, "%.2f", z);
-        return _u8L("above") + " " + std::string(buf) + " " + _u8L("mm");
+        return format(_u8L("above %1% mm"), buf);
     };
 
     auto fromto_label = [](double z1, double z2) {
@@ -3415,7 +4755,7 @@ void GCodeViewer::render_legend(float &legend_height, int canvas_width, int canv
         ::sprintf(buf1, "%.2f", z1);
         char buf2[64];
         ::sprintf(buf2, "%.2f", z2);
-        return _u8L("from") + " " + std::string(buf1) + " " + _u8L("to") + " " + std::string(buf2) + " " + _u8L("mm");
+        return format(_u8L("from %1% to %2% mm"), buf1, buf2);
     };
 
     auto role_time_and_percent = [this, total_estimated_time](libvgcode::EGCodeExtrusionRole role) {
@@ -3500,6 +4840,10 @@ void GCodeViewer::render_legend(float &legend_height, int canvas_width, int canv
                 m_view_type_sel = i;
                 set_view_type(view_type_items[m_view_type_sel]);
                 reset_visible(view_type_items[m_view_type_sel]);
+                // ORCA: remember the pick so the "Last used" preview default can restore it
+                const std::string view_type_name = view_type_to_config_name(view_type_items[m_view_type_sel]);
+                if (!view_type_name.empty())
+                    wxGetApp().app_config->set("preview_last_view_type", view_type_name);
                 update_moves_slider();
             #if ENABLE_ENHANCED_IMGUI_SLIDER_FLOAT
                 imgui.set_requires_extra_frame();
@@ -3531,6 +4875,35 @@ void GCodeViewer::render_legend(float &legend_height, int canvas_width, int canv
         ImGui::PopStyleColor(7);
         ImGui::PopStyleVar(2);
         return;
+    }
+
+    // Visibility is independent of the selected nozzle/gantry asset and of
+    // the position readout. Missing preferences preserve the existing default.
+    bool show_tool_model = get_app_config()->get("preview_show_tool_model") != "0";
+    ImGui::Dummy({ window_padding, 0.0f });
+    ImGui::SameLine();
+    if (imgui.checkbox(_L("Show nozzle/toolhead"), show_tool_model)) {
+        get_app_config()->set("preview_show_tool_model", show_tool_model ? "1" : "0");
+        wxGetApp().plater()->get_current_canvas3D()->set_as_dirty();
+        wxGetApp().plater()->get_current_canvas3D()->request_extra_frame();
+    }
+
+    if (m_gcode_result != nullptr && m_viewer.get_vertices_count() > 0) {
+        const auto *targets = m_gcode_result->temperature_targets_at(m_viewer.get_current_vertex().gcode_id);
+        if (targets != nullptr && (targets->bed.has_value() || !targets->tools.empty())) {
+            ImGui::Separator();
+            imgui.text(_u8L("Temperature targets (℃)"));
+            char value[32];
+            if (targets->bed.has_value()) {
+                std::snprintf(value, sizeof(value), "%.0f", *targets->bed);
+                imgui.text(_u8L("Bed") + ": " + value);
+            }
+            for (const auto &[tool, temperature] : targets->tools) {
+                std::snprintf(value, sizeof(value), "%.0f", temperature);
+                imgui.text(_u8L("Tool") + " " + std::to_string(tool + 1) +
+                    " (T" + std::to_string(tool) + "): " + value);
+            }
+        }
     }
 
     // data used to properly align items in columns when showing time
@@ -3716,6 +5089,7 @@ void GCodeViewer::render_legend(float &legend_height, int canvas_width, int canv
     }
     case libvgcode::EViewType::FanSpeed:       { imgui.title(_u8L("Fan speed (%)")); break; }
     case libvgcode::EViewType::Temperature:    { imgui.title(_u8L("Temperature (℃)")); break; }
+    case libvgcode::EViewType::ThermalStress:  { imgui.title(_u8L("Tensile thermal stress (MPa)")); break; }
 // ORCA: Add Pressure Advance visualization support
     case libvgcode::EViewType::PressureAdvance:{ imgui.title(_u8L("Pressure Advance")); break; }
     case libvgcode::EViewType::VolumetricFlowRate:
@@ -3757,7 +5131,7 @@ void GCodeViewer::render_legend(float &legend_height, int canvas_width, int canv
         total_filaments.push_back(buffer);
 
 
-        std::vector<std::pair<std::string, std::vector<::string>>> title_columns;
+        std::vector<std::pair<std::string, std::vector<std::string>>> title_columns;
         if (displayed_columns & ColumnData::Model) {
             title_columns.push_back({ _u8L("Filament"), {""} });
             title_columns.push_back({ _u8L("Model"), total_filaments });
@@ -3835,7 +5209,7 @@ void GCodeViewer::render_legend(float &legend_height, int canvas_width, int canv
                 columns_offsets.push_back({ distance_text, offsets[3] });
             if (full_layout && !count_text.empty())
                 columns_offsets.push_back({ count_text, distance_text.empty() ? offsets[3] : offsets[4] });
-            append_item(EItemType::Rect, color, columns_offsets, true, offsets.back()/*ORCA checkbox_pos*/, visible, [this, type, visible]() {
+            append_item(EItemType::Rect, color, columns_offsets, true, offsets.back()/*ORCA checkbox_pos*/, visible, [this, type]() {
                 m_viewer.toggle_option_visibility(type);
                 update_moves_slider();
                 });
@@ -3892,7 +5266,7 @@ void GCodeViewer::render_legend(float &legend_height, int canvas_width, int canv
             columns_offsets.push_back({used_filaments_length[i], offsets[3]});
             columns_offsets.push_back({used_filaments_weight[i], offsets[4]});
             append_item(EItemType::Rect, libvgcode::convert(m_viewer.get_extrusion_role_color(role)), columns_offsets,
-                true, offsets.back(), visible, [this, role, visible]() {
+                true, offsets.back(), visible, [this, role]() {
                     m_viewer.toggle_extrusion_role_visibility(role);
                     update_moves_slider();
                 });
@@ -3911,7 +5285,7 @@ void GCodeViewer::render_legend(float &legend_height, int canvas_width, int canv
                 columns_offsets.push_back({ travel_percent, offsets[2] });
                 columns_offsets.push_back({ travel_distance, offsets[3] }); // Usage column
                 columns_offsets.push_back({ travel_moves, offsets[4] });    // Usage column
-                append_item(EItemType::Rect, libvgcode::convert(m_viewer.get_option_color(libvgcode::EOptionType::Travels)), columns_offsets, true, offsets.back()/*ORCA checkbox_pos*/, visible, [this, item, visible]() {
+                append_item(EItemType::Rect, libvgcode::convert(m_viewer.get_option_color(libvgcode::EOptionType::Travels)), columns_offsets, true, offsets.back()/*ORCA checkbox_pos*/, visible, [this, item]() {
                         m_viewer.toggle_option_visibility(item);
                         update_moves_slider();
                     });
@@ -3930,7 +5304,7 @@ void GCodeViewer::render_legend(float &legend_height, int canvas_width, int canv
         append_headers({ {_u8L("Options"), offsets[0] }, { _u8L("Display"), offsets[1]} });
         const bool travel_visible = m_viewer.is_option_visible(libvgcode::EOptionType::Travels);
         ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.0f, 3.0f));
-        append_item(EItemType::None, libvgcode::convert(m_viewer.get_option_color(libvgcode::EOptionType::Travels)), { {_u8L("Travel"), offsets[0] }}, true, predictable_icon_pos/*ORCA checkbox_pos*/, travel_visible, [this, travel_visible]() {
+        append_item(EItemType::None, libvgcode::convert(m_viewer.get_option_color(libvgcode::EOptionType::Travels)), { {_u8L("Travel"), offsets[0] }}, true, predictable_icon_pos/*ORCA checkbox_pos*/, travel_visible, [this]() {
             m_viewer.toggle_option_visibility(libvgcode::EOptionType::Travels);
             // refresh(*m_gcode_result, wxGetApp().plater()->get_extruder_colors_from_plater_config(m_gcode_result));
             update_moves_slider();
@@ -3947,7 +5321,7 @@ void GCodeViewer::render_legend(float &legend_height, int canvas_width, int canv
         append_headers({ {_u8L("Options"), offsets[0] }, { _u8L("Display"), offsets[1]} });
         const bool travel_visible = m_viewer.is_option_visible(libvgcode::EOptionType::Travels);
         ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.0f, 3.0f));
-        append_item(EItemType::None, libvgcode::convert(m_viewer.get_option_color(libvgcode::EOptionType::Travels)), { {_u8L("Travel"), offsets[0] }}, true, predictable_icon_pos/*ORCA checkbox_pos*/, travel_visible, [this, travel_visible]() {
+        append_item(EItemType::None, libvgcode::convert(m_viewer.get_option_color(libvgcode::EOptionType::Travels)), { {_u8L("Travel"), offsets[0] }}, true, predictable_icon_pos/*ORCA checkbox_pos*/, travel_visible, [this]() {
             m_viewer.toggle_option_visibility(libvgcode::EOptionType::Travels);
             // refresh(*m_gcode_result, wxGetApp().plater()->get_extruder_colors_from_plater_config(m_gcode_result));
             update_moves_slider();
@@ -3964,7 +5338,7 @@ void GCodeViewer::render_legend(float &legend_height, int canvas_width, int canv
         append_headers({ {_u8L("Options"), offsets[0] }, { _u8L("Display"), offsets[1]} });
         const bool travel_visible = m_viewer.is_option_visible(libvgcode::EOptionType::Travels);
         ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.0f, 3.0f));
-        append_item(EItemType::None, libvgcode::convert(m_viewer.get_option_color(libvgcode::EOptionType::Travels)), { {_u8L("Travel"), offsets[0] }}, true, predictable_icon_pos/*ORCA checkbox_pos*/, travel_visible, [this, travel_visible]() {
+        append_item(EItemType::None, libvgcode::convert(m_viewer.get_option_color(libvgcode::EOptionType::Travels)), { {_u8L("Travel"), offsets[0] }}, true, predictable_icon_pos/*ORCA checkbox_pos*/, travel_visible, [this]() {
             m_viewer.toggle_option_visibility(libvgcode::EOptionType::Travels);
             update_moves_slider();
             });
@@ -3980,7 +5354,7 @@ void GCodeViewer::render_legend(float &legend_height, int canvas_width, int canv
         append_headers({ {_u8L("Options"), offsets[0] }, { _u8L("Display"), offsets[1]} });
         const bool travel_visible = m_viewer.is_option_visible(libvgcode::EOptionType::Travels);
         ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.0f, 3.0f));
-        append_item(EItemType::None, libvgcode::convert(m_viewer.get_option_color(libvgcode::EOptionType::Travels)), { {_u8L("Travel"), offsets[0] }}, true, predictable_icon_pos/*ORCA checkbox_pos*/, travel_visible, [this, travel_visible]() {
+        append_item(EItemType::None, libvgcode::convert(m_viewer.get_option_color(libvgcode::EOptionType::Travels)), { {_u8L("Travel"), offsets[0] }}, true, predictable_icon_pos/*ORCA checkbox_pos*/, travel_visible, [this]() {
             m_viewer.toggle_option_visibility(libvgcode::EOptionType::Travels);
             update_moves_slider();
             });
@@ -3989,6 +5363,50 @@ void GCodeViewer::render_legend(float &legend_height, int canvas_width, int canv
     }
     case libvgcode::EViewType::FanSpeed:                 { append_range(m_viewer.get_color_range(libvgcode::EViewType::FanSpeed), 0); break; }
     case libvgcode::EViewType::Temperature:              { append_range(m_viewer.get_color_range(libvgcode::EViewType::Temperature), 0); break; }
+    case libvgcode::EViewType::ThermalStress: {
+        const auto &range = m_viewer.get_color_range(libvgcode::EViewType::ThermalStress).get_range();
+        const bool available = range[0] <= range[1];
+        imgui.text(_u8L("Final-state static estimate. Layer selection does not simulate stress during printing."));
+        if (available)
+            append_range(m_viewer.get_color_range(libvgcode::EViewType::ThermalStress), 2);
+        else {
+            using Status = GCodeProcessorResult::ThermalAnalysis::Status;
+            const Status status = m_thermal_analysis.status;
+            switch (status) {
+            case Status::NotRun:
+                imgui.text(_u8L("Mechanical analysis has not run. Enable automatic warp mitigation and slice the project to request it."));
+                break;
+            case Status::UnsupportedMaterial:
+                imgui.text(_u8L("Mechanical analysis unavailable: a material has no compatible mechanical data."));
+                break;
+            case Status::InvalidThermalInputs:
+                imgui.text(_u8L("Mechanical analysis unavailable: the thermal inputs are incomplete."));
+                break;
+            case Status::BudgetExceeded:
+                imgui.text(_u8L("Mechanical analysis exceeded its resource limit; no stress estimate is shown."));
+                break;
+            case Status::Unconverged:
+                imgui.text(_u8L("Mechanical analysis did not converge; no stress estimate is shown."));
+                break;
+            case Status::InvalidGeometry:
+                imgui.text(_u8L("Mechanical analysis could not resolve the deposited geometry or its bed contact."));
+                break;
+            default:
+                imgui.text(_u8L("No converged mechanical analysis is available for this plate."));
+                break;
+            }
+        }
+        if (available) {
+            const auto &analysis = m_thermal_analysis;
+            if (analysis.status == GCodeProcessorResult::ThermalAnalysis::Status::Converged) {
+                imgui.text(_u8L("Published-property scenario envelope, not measured print stress."));
+                imgui.text(GUI::format(_u8L("Bonded-bed tensile demand: %1% N"), analysis.tensile_force_n));
+                imgui.text(GUI::format(_u8L("Stored elastic energy: %1% J"), analysis.elastic_energy_j));
+            }
+        }
+        imgui.text(_u8L("Gray: no mechanical sample. Stress is not an adhesion safety margin."));
+        break;
+    }
 // ORCA: Add Pressure Advance visualization support
     case libvgcode::EViewType::PressureAdvance:          { append_range(m_viewer.get_color_range(libvgcode::EViewType::PressureAdvance), 3); break; }
     case libvgcode::EViewType::LayerTimeLinear:          { append_range(m_viewer.get_color_range(libvgcode::EViewType::LayerTimeLinear), true); break; }
@@ -4100,7 +5518,13 @@ void GCodeViewer::render_legend(float &legend_height, int canvas_width, int canv
                 }
 
                 float checkbox_pos = std::max(predictable_icon_pos, color_print_offsets[_u8L("Display")]); // ORCA prefer predictable_icon_pos when header not reacing end
-                append_item(EItemType::Rect, libvgcode::convert(tool_colors[extruder_idx]), columns_offsets, false, checkbox_pos/*ORCA*/, true, [this, extruder_idx]() {});
+                append_item(EItemType::Rect, libvgcode::convert(tool_colors[extruder_idx]), columns_offsets,
+                    true, checkbox_pos, m_viewer.is_filament_visible(extruder_idx), [this, extruder_idx]() {
+                        m_viewer.toggle_filament_visibility(extruder_idx);
+                        update_moves_slider();
+                        wxGetApp().plater()->get_current_canvas3D()->set_as_dirty();
+                        wxGetApp().plater()->get_current_canvas3D()->request_extra_frame();
+                    });
             }
             i++;
         }
@@ -4524,16 +5948,18 @@ void GCodeViewer::render_legend(float &legend_height, int canvas_width, int canv
 
         // ORCA: Get layer Zs as doubles
         std::vector<double> layer_zs = get_layers_zs();
+        // loop invariant, same reason as the layer Zs above
+        const std::vector<float> layer_times = m_viewer.get_layers_estimated_times();
 
         for (Slic3r::CustomGCode::Item custom_gcode : custom_gcode_per_print_z) {
             ImGui::Dummy({window_padding, window_padding});
             ImGui::SameLine();
 
             switch (custom_gcode.type) {
-            case PausePrint: imgui.text(cgcode_pause_str); break;
-            case Template: imgui.text(cgcode_template_str); break;
-            case ToolChange: imgui.text(cgcode_toolchange_str); break;
-            case Custom: imgui.text(cgcode_custom_str); break;
+            case CustomGCode::PausePrint: imgui.text(cgcode_pause_str); break;
+            case CustomGCode::Template: imgui.text(cgcode_template_str); break;
+            case CustomGCode::ToolChange: imgui.text(cgcode_toolchange_str); break;
+            case CustomGCode::Custom: imgui.text(cgcode_custom_str); break;
             default: imgui.text(cgcode_unknown_str); break;
             }
             ImGui::SameLine(max_len);
@@ -4543,7 +5969,6 @@ void GCodeViewer::render_legend(float &legend_height, int canvas_width, int canv
             imgui.text(buf);
             ImGui::SameLine(max_len * 1.5);
 
-            std::vector<float> layer_times = m_viewer.get_layers_estimated_times();
             float custom_gcode_time = 0;
             if (layer > 0)
             {
@@ -4578,6 +6003,7 @@ void GCodeViewer::render_legend(float &legend_height, int canvas_width, int canv
         switch (time_mode_id)
         {
         case libvgcode::ETimeMode::Normal: { time_title += " [" + _u8L("Normal mode") + "]"; break; }
+        case libvgcode::ETimeMode::Stealth: { time_title += " [" + _u8L("Stealth mode") + "]"; break; }
         default: { assert(false); break; }
         }
     }
@@ -4591,8 +6017,13 @@ void GCodeViewer::render_legend(float &legend_height, int canvas_width, int canv
     std::string prepare_str = _u8L("Prepare time");
     std::string print_str = _u8L("Model printing time");
     std::string total_str = _u8L("Total time");
+    const auto &normal_estimate = m_print_statistics.modes[static_cast<size_t>(PrintEstimatedStatistics::ETimeMode::Normal)];
+    const auto &stealth_estimate = m_print_statistics.modes[static_cast<size_t>(PrintEstimatedStatistics::ETimeMode::Stealth)];
+    const bool show_both_estimates = normal_estimate.time > 0.0f && stealth_estimate.time > 0.0f;
+    const std::string normal_total_str = total_str + " [" + _u8L("Normal mode") + "]";
+    const std::string stealth_total_str = total_str + " [" + _u8L("Stealth mode") + "]";
     float max_len = window_padding + 2 * ImGui::GetStyle().ItemSpacing.x;
-    if (m_viewer.get_layers_estimated_times().empty())
+    if (m_viewer.get_layers_count() == 0)
         max_len += ImGui::CalcTextSize(total_str.c_str()).x;
     else {
         if (m_viewer.get_view_type() == libvgcode::EViewType::FeatureType)
@@ -4604,6 +6035,10 @@ void GCodeViewer::render_legend(float &legend_height, int canvas_width, int canv
             max_len += std::max(ImGui::CalcTextSize(print_str.c_str()).x,
                 (std::max(ImGui::CalcTextSize(prepare_str.c_str()).x, ImGui::CalcTextSize(total_str.c_str()).x)));
     }
+    if (show_both_estimates)
+        max_len = std::max(max_len, window_padding + 2 * ImGui::GetStyle().ItemSpacing.x +
+            std::max(ImGui::CalcTextSize(normal_total_str.c_str()).x,
+                     ImGui::CalcTextSize(stealth_total_str.c_str()).x));
     if (m_viewer.get_view_type() == libvgcode::EViewType::FeatureType) {
         //BBS display filament cost
         ImGui::Dummy({ window_padding, window_padding });
@@ -4650,9 +6085,39 @@ void GCodeViewer::render_legend(float &legend_height, int canvas_width, int canv
     imgui.text(short_time(get_time_dhms(time_mode.time - time_mode.prepare_time)));
     ImGui::Dummy({ window_padding, window_padding });
     ImGui::SameLine();
-    imgui.text(total_str + ":");
+    imgui.text((show_both_estimates ? normal_total_str : total_str) + ":");
     ImGui::SameLine(max_len);
-    imgui.text(short_time(get_time_dhms(time_mode.time)));
+    imgui.text(short_time(get_time_dhms(show_both_estimates ? normal_estimate.time : time_mode.time)));
+    // Show both totals even when rounding makes them identical. Switching the
+    // feature-time view should not be necessary to compare the two estimates.
+    if (show_both_estimates) {
+        ImGui::Dummy({ window_padding, window_padding });
+        ImGui::SameLine();
+        imgui.text(stealth_total_str + ":");
+        ImGui::SameLine(max_len);
+        imgui.text(short_time(get_time_dhms(stealth_estimate.time)));
+    }
+
+    if ((!m_learned_timing_status.empty() || m_learned_timing) &&
+        m_learned_timing_context != wxGetApp().plater()->learned_timing_context()) {
+        m_learned_timing.reset();
+        m_learned_timing_status.clear();
+    }
+    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 320.f * m_scale);
+    if (m_learned_timing) {
+        const auto &learned = *m_learned_timing;
+        imgui.text(GUI::format(_u8L("History-adjusted total (normal): %1%"), short_time(get_time_dhms(learned.seconds))));
+        imgui.text(GUI::format(_u8L("Observed range: %1%–%2%"),
+            short_time(get_time_dhms(learned.lower_seconds)), short_time(get_time_dhms(learned.upper_seconds))));
+        imgui.text(into_u8(format_wxstr(_L_PLURAL("Based on %1% compatible completed print.",
+            "Based on %1% compatible completed prints.", learned.sample_count), learned.sample_count)));
+        imgui.text(_u8L("Observed variation, not a confidence interval. The slicer estimate is unchanged."));
+    }
+    if (!m_learned_timing_status.empty()) imgui.text(m_learned_timing_status);
+    ImGui::PopTextWrapPos();
+    if (m_gcode_result && !m_gcode_result->filename.empty() &&
+        imgui.button(_u8L("Update learned time estimate…")))
+        wxGetApp().plater()->update_learned_time_estimate(m_last_result_id, m_gcode_result->filename);
 
     auto show_mode_button = [this, &imgui, can_show_mode_button](const std::string& label, libvgcode::ETimeMode mode) {
         if (can_show_mode_button(mode)) {
@@ -4694,6 +6159,7 @@ void GCodeViewer::render_legend(float &legend_height, int canvas_width, int canv
     if (m_nozzle_nums > 1 && (m_viewer.get_view_type() == libvgcode::EViewType::Summary || m_viewer.get_view_type() == libvgcode::EViewType::ColorPrint)) // ORCA show only on summary and filament tab
         render_legend_color_arr_recommen(window_padding);
 
+
     legend_height = ImGui::GetCurrentWindow()->Size.y;
     imgui.end();
     ImGui::PopStyleColor(7);
@@ -4727,4 +6193,3 @@ void GCodeViewer::render_slider(int canvas_width, int canvas_height) {
 
 } // namespace GUI
 } // namespace Slic3r
-

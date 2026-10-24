@@ -2,15 +2,23 @@
 ///|/
 ///|/ PrusaSlicer is released under the terms of the AGPLv3 or higher
 ///|/
+#include <Eigen/Geometry>
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <iterator>
 #include <cassert>
 #include <cinttypes>
+#include "libslic3r/Point.hpp"
+#include <string>
+#include "libslic3r/GCode/GCodeProcessor.hpp"
+#include <vector>
 
 #include "libslic3r/libslic3r.h"
 #include "LibVGCodeWrapper.hpp"
+
+#include <limits>
 #include "libslic3r/Print.hpp"
 #include "libslic3r/Color.hpp"
 #include "libslic3r/CustomGCode.hpp"
@@ -25,6 +33,10 @@
 #include "../../src/libvgcode/include/GCodeInputData.hpp"
 #include "../../src/libvgcode/include/PathVertex.hpp"
 #include "libvgcode/include/Types.hpp"
+#include "libslic3r/Config.hpp"
+#include "libslic3r/Model.hpp"
+#include "libslic3r/Slicing.hpp"
+#include "libslic3r/SurfaceCollection.hpp"
 
 namespace libvgcode {
 class Viewer;
@@ -92,6 +104,15 @@ Slic3r::ExtrusionRole convert(EGCodeExtrusionRole role)
     case EGCodeExtrusionRole::Brim:                     { return Slic3r::ExtrusionRole::erBrim; }
     case EGCodeExtrusionRole::SupportTransition:        { return Slic3r::ExtrusionRole::erSupportTransition; }
     case EGCodeExtrusionRole::Mixed:                    { return Slic3r::ExtrusionRole::erMixed; }
+    case EGCodeExtrusionRole::ArcOverhang:              { return Slic3r::ExtrusionRole::erArcOverhang; }
+    case EGCodeExtrusionRole::ArcBridge:                { return Slic3r::ExtrusionRole::erArcBridge; }
+    case EGCodeExtrusionRole::NonplanarSurface:         { return Slic3r::ExtrusionRole::erNonplanarSurface; }
+    case EGCodeExtrusionRole::NonplanarSupport:         { return Slic3r::ExtrusionRole::erNonplanarSupport; }
+    case EGCodeExtrusionRole::NonplanarInfill:          { return Slic3r::ExtrusionRole::erNonplanarInfill; }
+    case EGCodeExtrusionRole::StaggeredPerimeter:       { return Slic3r::ExtrusionRole::erStaggeredPerimeter; }
+    case EGCodeExtrusionRole::SmoothOuterWall:          { return Slic3r::ExtrusionRole::erSmoothOuterWall; }
+    case EGCodeExtrusionRole::NonplanarInterlockingWall:{ return Slic3r::ExtrusionRole::erNonplanarInterlockingWall; }
+    case EGCodeExtrusionRole::ShrinkageCompensation:    { return Slic3r::ExtrusionRole::erShrinkageCompensation; }
     default:                                            { return Slic3r::ExtrusionRole::erNone; }
     }
 }
@@ -121,6 +142,15 @@ EGCodeExtrusionRole convert(Slic3r::ExtrusionRole role)
     case Slic3r::ExtrusionRole::erBrim:                        { return EGCodeExtrusionRole::Brim; }
     case Slic3r::ExtrusionRole::erSupportTransition:           { return EGCodeExtrusionRole::SupportTransition; }
     case Slic3r::ExtrusionRole::erMixed:                       { return EGCodeExtrusionRole::Mixed; }
+    case Slic3r::ExtrusionRole::erArcOverhang:                 { return EGCodeExtrusionRole::ArcOverhang; }
+    case Slic3r::ExtrusionRole::erArcBridge:                   { return EGCodeExtrusionRole::ArcBridge; }
+    case Slic3r::ExtrusionRole::erNonplanarSurface:            { return EGCodeExtrusionRole::NonplanarSurface; }
+    case Slic3r::ExtrusionRole::erNonplanarSupport:            { return EGCodeExtrusionRole::NonplanarSupport; }
+    case Slic3r::ExtrusionRole::erNonplanarInfill:             { return EGCodeExtrusionRole::NonplanarInfill; }
+    case Slic3r::ExtrusionRole::erStaggeredPerimeter:          { return EGCodeExtrusionRole::StaggeredPerimeter; }
+    case Slic3r::ExtrusionRole::erSmoothOuterWall:             { return EGCodeExtrusionRole::SmoothOuterWall; }
+    case Slic3r::ExtrusionRole::erNonplanarInterlockingWall:   { return EGCodeExtrusionRole::NonplanarInterlockingWall; }
+    case Slic3r::ExtrusionRole::erShrinkageCompensation:       { return EGCodeExtrusionRole::ShrinkageCompensation; }
     default:                                                   { return EGCodeExtrusionRole::None; }
     }
 }
@@ -188,10 +218,38 @@ Slic3r::PrintEstimatedStatistics::ETimeMode convert(const ETimeMode& mode)
     }
 }
 
+// libvgcode finds where a path starts from a phantom vertex placed at the previous move's
+// position. Every move that is not an option marker (extrusions, travels, wipes, and Noop or
+// unmapped moves) starts a path when it is the first move, or when it differs from the previous
+// move in type, role or a value the preview colors by. convert() sizes its vertex array by
+// counting these, so the count and the fill must both use this test.
+static bool starts_path(const Slic3r::GCodeProcessorResult::MoveVertex& prev,
+                        const Slic3r::GCodeProcessorResult::MoveVertex& curr, bool first_move)
+{
+    const EOptionType option_type = move_type_to_option(convert(curr.type));
+    if (option_type != EOptionType::COUNT && option_type != EOptionType::Travels && option_type != EOptionType::Wipes)
+        return false;
+    return first_move || prev.type != curr.type || prev.extrusion_role != curr.extrusion_role
+        // ORCA: Split the path when a preview value changes.
+        || prev.mm3_per_mm != curr.mm3_per_mm || prev.acceleration != curr.acceleration || prev.jerk != curr.jerk;
+}
+
 GCodeInputData convert(const Slic3r::GCodeProcessorResult& result, const std::vector<std::string>& str_tool_colors,
-    const std::vector<std::string>& str_color_print_colors, const Viewer& viewer)
+    const std::vector<std::string>& str_color_print_colors, const Viewer& viewer,
+    const Slic3r::Transform3d* belt_xform)
 {
     GCodeInputData ret;
+
+    // Belt printers: optionally map each vertex DISPLAY position from machine
+    // (G-code) space back to model/Cartesian space using the general belt
+    // back-transform (handles any mesh rotation + shear + axis remap, not just
+    // 45 deg). Only the rendered position is transformed; layer_id, times and
+    // the volumetric/flow math below keep the original machine-space values.
+    auto xform_pos = [belt_xform](const Slic3r::Vec3f& v) -> Vec3 {
+        if (belt_xform != nullptr)
+            return convert(Slic3r::Vec3f((*belt_xform * v.cast<double>()).cast<float>()));
+        return convert(v);
+    };
 
     // collect tool colors
     ret.tools_colors.reserve(str_tool_colors.size());
@@ -207,61 +265,86 @@ GCodeInputData convert(const Slic3r::GCodeProcessorResult& result, const std::ve
     }
 
     const std::vector<Slic3r::GCodeProcessorResult::MoveVertex>& moves = result.moves;
-    ret.vertices.reserve(2 * moves.size());
+    // One vertex per move after the first, plus a phantom in front of every path start. Reserving
+    // the exact count leaves nothing to shrink afterwards, and shrinking would copy the whole array
+    // while both copies are alive.
+    size_t vertices_count = moves.empty() ? 0 : moves.size() - 1;
+    for (size_t i = 1; i < moves.size(); ++i)
+        if (starts_path(moves[i - 1], moves[i], i == 1))
+            ++vertices_count;
+    ret.vertices.reserve(vertices_count);
+    // libvgcode numbers its layers from the vertices it is given and expects them to
+    // arrive one layer after the other with consecutive ids: a layer without any move
+    // (a belt file can carry layer changes that print nothing) would leave a gap, and
+    // every later vertex would then be folded into the last layer created.  Renumber
+    // the ids consecutively over the moves that exist.
+    uint32_t src_layer_id = std::numeric_limits<uint32_t>::max();
+    uint32_t layer_id     = 0;
     for (size_t i = 1; i < moves.size(); ++i) {
         const Slic3r::GCodeProcessorResult::MoveVertex& curr = moves[i];
         const Slic3r::GCodeProcessorResult::MoveVertex& prev = moves[i - 1];
         const EMoveType curr_type = convert(curr.type);
-        const EOptionType option_type = move_type_to_option(curr_type);
-        if (option_type == EOptionType::COUNT || option_type == EOptionType::Travels || option_type == EOptionType::Wipes) {
-            if (ret.vertices.empty() || prev.type != curr.type || prev.extrusion_role != curr.extrusion_role
-                // ORCA: Split the path when a preview value changes.
-                || prev.mm3_per_mm != curr.mm3_per_mm || prev.acceleration != curr.acceleration || prev.jerk != curr.jerk) {
-                // to allow libvgcode to properly detect the start/end of a path we need to add a 'phantom' vertex
-                // equal to the current one with the exception of the position, which should match the previous move position,
-                // and the times, which are set to zero
+        if (curr.layer_id != src_layer_id) {
+            if (src_layer_id != std::numeric_limits<uint32_t>::max())
+                ++ layer_id;
+            src_layer_id = curr.layer_id;
+        }
+        if (starts_path(prev, curr, i == 1)) {
+            // to allow libvgcode to properly detect the start/end of a path we need to add a 'phantom' vertex
+            // equal to the current one with the exception of the position, which should match the previous move position,
+            // and the times, which are set to zero
 #if VGCODE_ENABLE_COG_AND_TOOL_MARKERS
-                const libvgcode::PathVertex vertex = { convert(prev.position), curr.height, curr.width, curr.feedrate, prev.actual_feedrate,
-                    curr.mm3_per_mm, curr.fan_speed, curr.temperature, 0.0f, convert(curr.extrusion_role), curr_type,
-                    static_cast<uint32_t>(curr.gcode_id), static_cast<uint32_t>(curr.layer_id),
-                    static_cast<uint8_t>(curr.extruder_id), static_cast<uint8_t>(curr.cp_color_id), { 0.0f, 0.0f },
-                    /* ORCA: Add Pressure Advance visualization support */ 0.0f, curr.pressure_advance,
-                    /* ORCA: Add Acceleration visualization support */ curr.acceleration,
-                    /* ORCA: Add Jerk visualization support */ curr.jerk };
+            const libvgcode::PathVertex vertex = { xform_pos(prev.position), curr.height, curr.width, curr.feedrate, prev.actual_feedrate,
+                curr.mm3_per_mm, curr.fan_speed, curr.temperature, 0.0f, convert(curr.extrusion_role), curr_type,
+                static_cast<uint32_t>(curr.gcode_id), layer_id,
+                static_cast<uint8_t>(curr.extruder_id), static_cast<uint8_t>(curr.cp_color_id), { 0.0f, 0.0f },
+                /* ORCA: Add Pressure Advance visualization support */ 0.0f, curr.pressure_advance,
+                /* ORCA: Add Acceleration visualization support */ curr.acceleration,
+                /* ORCA: Add Jerk visualization support */ curr.jerk };
 #else
-              const libvgcode::PathVertex vertex = { convert(prev.position), curr.height, curr.width, curr.feedrate, prev.actual_feedrate,
-                    curr.mm3_per_mm, curr.fan_speed, curr.temperature, convert(curr.extrusion_role), curr_type,
-                    static_cast<uint32_t>(curr.gcode_id), static_cast<uint32_t>(curr.layer_id),
-                    static_cast<uint8_t>(curr.extruder_id), static_cast<uint8_t>(curr.cp_color_id), { 0.0f, 0.0f },
-                    /* ORCA: Add Pressure Advance visualization support */ 0.0f, curr.pressure_advance,
-                    /* ORCA: Add Acceleration visualization support */ curr.acceleration,
-                    /* ORCA: Add Jerk visualization support */ curr.jerk };
+            const libvgcode::PathVertex vertex = { xform_pos(prev.position), curr.height, curr.width, curr.feedrate, prev.actual_feedrate,
+                curr.mm3_per_mm, curr.fan_speed, curr.temperature, convert(curr.extrusion_role), curr_type,
+                static_cast<uint32_t>(curr.gcode_id), layer_id,
+                static_cast<uint8_t>(curr.extruder_id), static_cast<uint8_t>(curr.cp_color_id), { 0.0f, 0.0f },
+                /* ORCA: Add Pressure Advance visualization support */ 0.0f, curr.pressure_advance,
+                /* ORCA: Add Acceleration visualization support */ curr.acceleration,
+                /* ORCA: Add Jerk visualization support */ curr.jerk };
 #endif // VGCODE_ENABLE_COG_AND_TOOL_MARKERS
-                ret.vertices.emplace_back(vertex);
-            }
+            ret.vertices.emplace_back(vertex);
+            if (result.thermal_stress_mpa.size() == moves.size())
+                ret.vertices.back().thermal_stress_mpa = result.thermal_stress_mpa[i];
         }
 
 #if VGCODE_ENABLE_COG_AND_TOOL_MARKERS
-        const libvgcode::PathVertex vertex = { convert(curr.position), curr.height, curr.width, curr.feedrate, curr.actual_feedrate,
+        const libvgcode::PathVertex vertex = { xform_pos(curr.position), curr.height, curr.width, curr.feedrate, curr.actual_feedrate,
             curr.mm3_per_mm, curr.fan_speed, curr.temperature,
             result.filament_densities[curr.extruder_id] * curr.mm3_per_mm * (curr.position - prev.position).norm(),
-            convert(curr.extrusion_role), curr_type, static_cast<uint32_t>(curr.gcode_id), static_cast<uint32_t>(curr.layer_id),
+            convert(curr.extrusion_role), curr_type, static_cast<uint32_t>(curr.gcode_id), layer_id,
             static_cast<uint8_t>(curr.extruder_id), static_cast<uint8_t>(curr.cp_color_id), curr.time,
             /* ORCA: Add Pressure Advance visualization support */ 0.0f, curr.pressure_advance,
             /* ORCA: Add Acceleration visualization support */ curr.acceleration,
             /* ORCA: Add Jerk visualization support */ curr.jerk };
 #else
-        const libvgcode::PathVertex vertex = { convert(curr.position), curr.height, curr.width, curr.feedrate, curr.actual_feedrate,
+        const libvgcode::PathVertex vertex = { xform_pos(curr.position), curr.height, curr.width, curr.feedrate, curr.actual_feedrate,
             curr.mm3_per_mm, curr.fan_speed, curr.temperature, convert(curr.extrusion_role), curr_type,
-            static_cast<uint32_t>(curr.gcode_id), static_cast<uint32_t>(curr.layer_id),
+            static_cast<uint32_t>(curr.gcode_id), layer_id,
             static_cast<uint8_t>(curr.extruder_id), static_cast<uint8_t>(curr.cp_color_id), curr.time,
             /* ORCA: Add Pressure Advance visualization support */ 0.0f, curr.pressure_advance,
             /* ORCA: Add Acceleration visualization support */ curr.acceleration,
             /* ORCA: Add Jerk visualization support */ curr.jerk };
 #endif // VGCODE_ENABLE_COG_AND_TOOL_MARKERS
         ret.vertices.emplace_back(vertex);
+        if (result.thermal_stress_mpa.size() == moves.size())
+            ret.vertices.back().thermal_stress_mpa = result.thermal_stress_mpa[i];
     }
+    assert(ret.vertices.size() == vertices_count);
+    // A no-op when the count above is exact; restores the exact fit if the count ever drifts.
     ret.vertices.shrink_to_fit();
+
+    // Note: the belt designed-view anchoring (recovering the per-object placement/
+    // lift translation the linear back-transform cannot) is folded into belt_xform
+    // by the caller (GCodeViewer::load_as_gcode), which anchors onto the upright
+    // model bounding box. Nothing extra to do here.
 
     ret.spiral_vase_mode = result.spiral_vase_mode;
 
@@ -312,9 +395,45 @@ static void convert_lines_to_vertices(const Slic3r::Lines& lines, const std::vec
     }
 }
 
+static void convert_contoured_path_to_vertices(const Slic3r::ExtrusionPath& extrusion_path, float print_z, size_t layer_id,
+    size_t extruder_id, size_t color_id, EGCodeExtrusionRole extrusion_role, const Slic3r::Point& shift,
+    std::vector<PathVertex>& vertices)
+{
+    if (extrusion_path.polyline.points.size() < 2)
+        return;
+
+    const auto position = [print_z, &shift](const Slic3r::Point3 &point) {
+        return convert(Slic3r::Vec3f(
+            float(unscale_(point.x() + shift.x())),
+            float(unscale_(point.y() + shift.y())),
+            float(print_z + unscale_(point.z()))));
+    };
+#if VGCODE_ENABLE_COG_AND_TOOL_MARKERS
+    libvgcode::PathVertex vertex = { position(extrusion_path.polyline.points.front()), extrusion_path.height,
+        extrusion_path.width, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, extrusion_role, EMoveType::Noop, 0,
+        static_cast<uint32_t>(layer_id), static_cast<uint8_t>(extruder_id), static_cast<uint8_t>(color_id), { 0.0f, 0.0f } };
+#else
+    libvgcode::PathVertex vertex = { position(extrusion_path.polyline.points.front()), extrusion_path.height,
+        extrusion_path.width, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, extrusion_role, EMoveType::Noop, 0,
+        static_cast<uint32_t>(layer_id), static_cast<uint8_t>(extruder_id), static_cast<uint8_t>(color_id), { 0.0f, 0.0f } };
+#endif // VGCODE_ENABLE_COG_AND_TOOL_MARKERS
+    vertices.emplace_back(vertex);
+    vertex.type = EMoveType::Extrude;
+    vertices.emplace_back(vertex);
+    for (size_t point_idx = 1; point_idx < extrusion_path.polyline.points.size(); ++point_idx) {
+        vertex.position = position(extrusion_path.polyline.points[point_idx]);
+        vertices.emplace_back(vertex);
+    }
+}
+
 static void convert_to_vertices(const Slic3r::ExtrusionPath& extrusion_path, float print_z, size_t layer_id, size_t extruder_id, size_t color_id,
     EGCodeExtrusionRole extrusion_role, const Slic3r::Point& shift, std::vector<PathVertex>& vertices)
 {
+    if (extrusion_path.z_contoured) {
+        convert_contoured_path_to_vertices(extrusion_path, print_z, layer_id, extruder_id, color_id,
+                                           extrusion_role, shift, vertices);
+        return;
+    }
     Slic3r::Polyline polyline = extrusion_path.polyline.to_polyline();
     polyline.remove_duplicate_points();
     polyline.translate(shift);
@@ -327,6 +446,12 @@ static void convert_to_vertices(const Slic3r::ExtrusionPath& extrusion_path, flo
 static void convert_to_vertices(const Slic3r::ExtrusionMultiPath& extrusion_multi_path, float print_z, size_t layer_id, size_t extruder_id,
     size_t color_id, EGCodeExtrusionRole extrusion_role, const Slic3r::Point& shift, std::vector<PathVertex>& vertices)
 {
+    if (std::any_of(extrusion_multi_path.paths.begin(), extrusion_multi_path.paths.end(),
+                    [](const Slic3r::ExtrusionPath &path) { return path.z_contoured; })) {
+        for (const Slic3r::ExtrusionPath &path : extrusion_multi_path.paths)
+            convert_to_vertices(path, print_z, layer_id, extruder_id, color_id, extrusion_role, shift, vertices);
+        return;
+    }
     Slic3r::Lines lines;
     std::vector<float> widths;
     std::vector<float> heights;
@@ -345,6 +470,12 @@ static void convert_to_vertices(const Slic3r::ExtrusionMultiPath& extrusion_mult
 static void convert_to_vertices(const Slic3r::ExtrusionLoop& extrusion_loop, float print_z, size_t layer_id, size_t extruder_id, size_t color_id,
     EGCodeExtrusionRole extrusion_role, const Slic3r::Point& shift, std::vector<PathVertex>& vertices)
 {
+    if (std::any_of(extrusion_loop.paths.begin(), extrusion_loop.paths.end(),
+                    [](const Slic3r::ExtrusionPath &path) { return path.z_contoured; })) {
+        for (const Slic3r::ExtrusionPath &path : extrusion_loop.paths)
+            convert_to_vertices(path, print_z, layer_id, extruder_id, color_id, extrusion_role, shift, vertices);
+        return;
+    }
     Slic3r::Lines lines;
     std::vector<float> widths;
     std::vector<float> heights;
@@ -830,4 +961,3 @@ GCodeInputData convert(const Slic3r::Print& print, const std::vector<std::string
 }
 
 } // namespace libvgcode
-

@@ -1,15 +1,18 @@
 #ifndef slic3r_CoolingBuffer_hpp_
 #define slic3r_CoolingBuffer_hpp_
 
-#include "../libslic3r.h"
+#include "../Point.hpp"
+#include <cstddef>
 #include <map>
 #include <string>
 #include <cfloat>
+#include <vector>
 
 namespace Slic3r {
 
 class GCode;
 class Layer;
+class FullPrintConfig;
 struct PerExtruderAdjustments;
 
 // A standalone G-code filter, to control cooling of the print.
@@ -18,7 +21,7 @@ struct PerExtruderAdjustments;
 //
 // The simple it sounds, the actual implementation is significantly more complex.
 // Namely, for a multi-extruder print, each material may require a different cooling logic.
-// For example, some materials may not like to print too slowly, while with some materials 
+// For example, some materials may not like to print too slowly, while with some materials
 // we may slow down significantly.
 //
 class CoolingBuffer {
@@ -27,11 +30,13 @@ public:
     void        reset(const Vec3d &position);
     void        set_current_extruder(unsigned int extruder_id, unsigned int nozzle_id) { m_current_extruder = extruder_id; m_current_nozzle = nozzle_id; }
     std::string process_layer(std::string &&gcode, size_t layer_id, bool flush);
+    static float hull_line_target_time(float previous_layer_time, float current_layer_time, float max_variation_percent);
 
 private:
 	CoolingBuffer& operator=(const CoolingBuffer&) = delete;
     std::vector<PerExtruderAdjustments> parse_layer_gcode(const std::string &gcode, std::vector<float> &current_pos) const;
     float       calculate_layer_slowdown(std::vector<PerExtruderAdjustments> &per_extruder_adjustments);
+    float       apply_hull_line_slowdown(std::vector<PerExtruderAdjustments> &per_extruder_adjustments, float layer_time);
     // Apply slow down over G-code lines stored in per_extruder_adjustments, enable fan if needed.
     // Returns the adjusted G-code.
     std::string apply_layer_cooldown(const std::string &gcode, size_t layer_id, float layer_time, std::vector<PerExtruderAdjustments> &per_extruder_adjustments);
@@ -51,13 +56,19 @@ private:
     // Highest of m_extruder_ids plus 1.
     unsigned int                m_num_extruders { 0 };
     const std::string           m_toolchange_prefix;
-    // Referencs GCode::m_config, which is FullPrintConfig. While the PrintObjectConfig slice of FullPrintConfig is being modified,
-    // the PrintConfig slice of FullPrintConfig is constant, thus no thread synchronization is required.
-    const PrintConfig          &m_config;
+    // References GCode::m_config. Arc-overhang cooling is a region setting, so
+    // the cooling filter needs the complete configuration rather than only its
+    // PrintConfig slice.
+    const FullPrintConfig      &m_config;
+    const GCode                &m_gcodegen;
     unsigned int                m_current_extruder;
     unsigned int                m_current_nozzle;
     //BBS: current fan speed
     int                         m_current_fan_speed;
+    float                       m_previous_layer_time { 0.f };
+    // Belt printers: the extrusion being processed lies in the first-layer band above the
+    // belt (between a ";_BELT_BAND_START" and a ";_BELT_BAND_END"). Kept across layers.
+    bool                        m_belt_band_active = false;
 };
 
 }

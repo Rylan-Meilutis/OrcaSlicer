@@ -6,13 +6,18 @@
 #define VGCODE_SETTINGS_HPP
 
 #include "../include/Types.hpp"
+#include <bitset>
 
+#include <array>
+#include <cstddef>
 #include <map>
 
 namespace libvgcode {
 
 struct Settings
 {
+        // PathVertex stores a uint8_t logical filament id, not a physical tool.
+        std::bitset<256> hidden_filaments;
 		//
 	  // Visualization parameters
 		//
@@ -73,6 +78,15 @@ struct Settings
 		        true, // Brim
 		        true, // SupportTransition
 		        true, // Mixed
+		        true, // ArcOverhang
+		        true, // ArcBridge
+		        true, // NonplanarSurface
+		        true, // NonplanarSupport
+		        true, // StaggeredPerimeter
+		        true, // NonplanarInfill
+		        true, // SmoothOuterWall
+		        true, // NonplanarInterlockingWall
+		        true, // ShrinkageCompensation
 		};
 };
 

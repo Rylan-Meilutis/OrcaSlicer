@@ -1,13 +1,19 @@
 #ifndef slic3r_ExtrusionEntity_hpp_
 #define slic3r_ExtrusionEntity_hpp_
 
+#include "Point.hpp"
 #include "libslic3r.h"
 #include "Polygon.hpp"
 #include "Polyline.hpp"
 
 #include <assert.h>
+#include <cstdint>
+#include <string>
+#include <cstddef>
 #include <string_view>
 #include <numeric>
+#include <vector>
+#include <utility>
 
 namespace Slic3r {
 
@@ -39,6 +45,26 @@ enum ExtrusionRole : uint8_t {
     erCustom,
     // Extrusion role for a collection with multiple extrusion roles.
     erMixed,
+    erArcOverhang,
+    erArcBridge,
+    // Preview-only role emitted for paths draped over a non-planar surface.
+    // The underlying path retains its functional extrusion role for speeds,
+    // flow, cooling, and custom role-change G-code.
+    erNonplanarSurface,
+    erNonplanarSupport,
+    // Preview-only role for vertically offset inner walls.
+    erStaggeredPerimeter,
+    // Preview-only role for sparse infill whose Z is modulated to interlock
+    // adjacent courses. Its functional role remains erInternalInfill.
+    erNonplanarInfill,
+    // Preview-only role for independently layered outer walls. Append new
+    // preview roles so cached numeric values of existing roles stay stable.
+    erSmoothOuterWall,
+    // Preview-only role for buried inner walls modulated within their owning
+    // layer to interlock adjacent courses.
+    erNonplanarInterlockingWall,
+    // Preview-only role for localized shrinkage-mitigation geometry.
+    erShrinkageCompensation,
     erCount
 };
 
@@ -74,6 +100,8 @@ inline bool is_infill(ExtrusionRole role)
 {
     return role == erBridgeInfill
         || role == erInternalBridgeInfill
+        || role == erArcOverhang
+        || role == erArcBridge
         || role == erInternalInfill
         || role == erSolidInfill
         || role == erTopSolidInfill
@@ -90,6 +118,8 @@ inline bool is_solid_infill(ExtrusionRole role)
 {
     return role == erBridgeInfill
         || role == erInternalBridgeInfill
+        || role == erArcOverhang
+        || role == erArcBridge
         || role == erSolidInfill
         || role == erTopSolidInfill
         || role == erBottomSurface
@@ -100,7 +130,19 @@ inline bool is_bridge(ExtrusionRole role)
 {
     return role == erBridgeInfill
         || role == erInternalBridgeInfill
+        || role == erArcOverhang
+        || role == erArcBridge
         || role == erOverhangPerimeter;
+}
+
+inline bool is_arc_fill(ExtrusionRole role)
+{
+    return role == erArcOverhang || role == erArcBridge;
+}
+
+inline bool is_bridge_or_arc_fill(ExtrusionRole role)
+{
+    return role == erBridgeInfill || role == erInternalBridgeInfill || is_arc_fill(role);
 }
 
 // Orca
@@ -173,6 +215,63 @@ public:
     float height;
     double smooth_speed = 0;
     bool z_contoured = false;
+    // The path follows the model's actual top surface. It shares the variable-Z
+    // transport machinery with Z contouring, but keeps normal bead volume.
+    bool nonplanar_surface = false;
+    // A geometrically planar foundation that belongs to the non-planar
+    // dependency graph. The graph still uses nonplanar_surface to preserve
+    // replacement ownership, while this explicit marker lets G-code and
+    // preview retain the path's ordinary structural role.
+    bool nonplanar_schedule_owned = false;
+    // Conventional material left after an accepted non-planar bead envelope
+    // clips its source course. It remains a planar anchor/remainder and must
+    // not be transformed again by the hybrid Z-contouring fallback.
+    bool nonplanar_replacement_remainder = false;
+    // A buried member of a multi-layer non-planar top shell. It follows the
+    // same model surface as the finishing skin, offset downward by one or more
+    // layer heights, and receives a separate preview role.
+    bool nonplanar_transition = false;
+    // Set only after the complete finishing patch has passed the same detailed
+    // toolhead-envelope test used by G-code emission. A validated patch must
+    // remain coherent; flattening individual segments would ruin its surface.
+    bool nonplanar_clearance_validated = false;
+    // The path is clear against completed lower layers but would collide with
+    // conventional geometry assigned to its own nominal layer. Emit it before
+    // that layer's walls/fill, while it is still the final extrusion inside
+    // its replacement footprint.
+    bool nonplanar_before_current_layer = false;
+    // A wall or other continuing feature that intersects a non-planar top
+    // surface. These courses follow the same surface-height field as the skin
+    // and then blend back to the ordinary horizontal layer plane.
+    bool nonplanar_feature_transition = false;
+    // One-based dependency order for a continuing feature transition. Zero
+    // means that the path is not part of an ordered feature course.
+    size_t nonplanar_feature_course = 0;
+    // This feature course is part of the slope-to-horizontal leveling run,
+    // rather than the portion that follows a buried non-planar skin. Preview
+    // processing uses this to expose every physical leveling course as its
+    // own layer without changing printer motion.
+    bool nonplanar_leveling_transition = false;
+    // Raised inner wall generated by the staggered-perimeter strength option.
+    // Its Point3 Z values are offsets from the nominal layer height.
+    bool staggered_perimeter = false;
+    // Half-height entry/exit bead used to place a staggered perimeter course
+    // onto, or return it from, the brick Z grid.  This is variable-Z geometry
+    // but it is not a non-planar surface and must not enable the expensive
+    // toolhead-clearance policy for every later path on the physical layer.
+    bool staggered_transition = false;
+    // Outer-wall course generated by native independent layer-height
+    // subdivision. It retains erExternalPerimeter for speeds and process
+    // behavior while receiving a dedicated preview role.
+    bool smooth_outer_wall = false;
+    // Sparse infill modulated in Z to interlock adjacent layers. Unlike the
+    // legacy ZAA path this retains the configured bead volume and uses true 3D
+    // path length for extrusion.
+    bool nonplanar_infill = false;
+    bool nonplanar_interlocking_wall = false;
+    // Preview-only marker for walls whose geometry was changed by localized
+    // shrinkage mitigation. The functional extrusion role remains unchanged.
+    bool shrinkage_compensation = false;
 
     ExtrusionPath() : mm3_per_mm(-1), width(-1), height(-1), m_role(erNone), m_no_extrusion(false) {}
     ExtrusionPath(ExtrusionRole role) : mm3_per_mm(-1), width(-1), height(-1), m_role(role), m_no_extrusion(false) {}
@@ -187,10 +286,25 @@ public:
         , height(rhs.height)
         , smooth_speed(rhs.smooth_speed)
         , z_contoured(rhs.z_contoured)
+        , nonplanar_surface(rhs.nonplanar_surface)
+        , nonplanar_schedule_owned(rhs.nonplanar_schedule_owned)
+        , nonplanar_replacement_remainder(rhs.nonplanar_replacement_remainder)
+        , nonplanar_transition(rhs.nonplanar_transition)
+        , nonplanar_clearance_validated(rhs.nonplanar_clearance_validated)
+        , nonplanar_before_current_layer(rhs.nonplanar_before_current_layer)
+        , nonplanar_feature_transition(rhs.nonplanar_feature_transition)
+        , nonplanar_feature_course(rhs.nonplanar_feature_course)
+        , nonplanar_leveling_transition(rhs.nonplanar_leveling_transition)
+        , staggered_perimeter(rhs.staggered_perimeter)
+        , staggered_transition(rhs.staggered_transition)
+        , smooth_outer_wall(rhs.smooth_outer_wall)
+        , nonplanar_infill(rhs.nonplanar_infill)
+        , nonplanar_interlocking_wall(rhs.nonplanar_interlocking_wall)
+        , shrinkage_compensation(rhs.shrinkage_compensation)
         , m_can_reverse(rhs.m_can_reverse)
         , m_role(rhs.m_role)
         , m_no_extrusion(rhs.m_no_extrusion)
-    {}
+    { this->inset_idx = rhs.inset_idx; }
     ExtrusionPath(ExtrusionPath &&rhs)
         : polyline(std::move(rhs.polyline))
         , overhang_degree(rhs.overhang_degree)
@@ -200,10 +314,25 @@ public:
         , height(rhs.height)
         , smooth_speed(rhs.smooth_speed)
         , z_contoured(rhs.z_contoured)
+        , nonplanar_surface(rhs.nonplanar_surface)
+        , nonplanar_schedule_owned(rhs.nonplanar_schedule_owned)
+        , nonplanar_replacement_remainder(rhs.nonplanar_replacement_remainder)
+        , nonplanar_transition(rhs.nonplanar_transition)
+        , nonplanar_clearance_validated(rhs.nonplanar_clearance_validated)
+        , nonplanar_before_current_layer(rhs.nonplanar_before_current_layer)
+        , nonplanar_feature_transition(rhs.nonplanar_feature_transition)
+        , nonplanar_feature_course(rhs.nonplanar_feature_course)
+        , nonplanar_leveling_transition(rhs.nonplanar_leveling_transition)
+        , staggered_perimeter(rhs.staggered_perimeter)
+        , staggered_transition(rhs.staggered_transition)
+        , smooth_outer_wall(rhs.smooth_outer_wall)
+        , nonplanar_infill(rhs.nonplanar_infill)
+        , nonplanar_interlocking_wall(rhs.nonplanar_interlocking_wall)
+        , shrinkage_compensation(rhs.shrinkage_compensation)
         , m_can_reverse(rhs.m_can_reverse)
         , m_role(rhs.m_role)
         , m_no_extrusion(rhs.m_no_extrusion)
-    {}
+    { this->inset_idx = rhs.inset_idx; }
     ExtrusionPath(const Polyline3 &polyline, const ExtrusionPath &rhs)
         : polyline(polyline)
         , overhang_degree(rhs.overhang_degree)
@@ -213,10 +342,25 @@ public:
         , height(rhs.height)
         , smooth_speed(rhs.smooth_speed)
         , z_contoured(rhs.z_contoured)
+        , nonplanar_surface(rhs.nonplanar_surface)
+        , nonplanar_schedule_owned(rhs.nonplanar_schedule_owned)
+        , nonplanar_replacement_remainder(rhs.nonplanar_replacement_remainder)
+        , nonplanar_transition(rhs.nonplanar_transition)
+        , nonplanar_clearance_validated(rhs.nonplanar_clearance_validated)
+        , nonplanar_before_current_layer(rhs.nonplanar_before_current_layer)
+        , nonplanar_feature_transition(rhs.nonplanar_feature_transition)
+        , nonplanar_feature_course(rhs.nonplanar_feature_course)
+        , nonplanar_leveling_transition(rhs.nonplanar_leveling_transition)
+        , staggered_perimeter(rhs.staggered_perimeter)
+        , staggered_transition(rhs.staggered_transition)
+        , smooth_outer_wall(rhs.smooth_outer_wall)
+        , nonplanar_infill(rhs.nonplanar_infill)
+        , nonplanar_interlocking_wall(rhs.nonplanar_interlocking_wall)
+        , shrinkage_compensation(rhs.shrinkage_compensation)
         , m_can_reverse(rhs.m_can_reverse)
         , m_role(rhs.m_role)
         , m_no_extrusion(rhs.m_no_extrusion)
-    {}
+    { this->inset_idx = rhs.inset_idx; }
     ExtrusionPath(Polyline3 &&polyline, const ExtrusionPath &rhs)
         : polyline(std::move(polyline))
         , overhang_degree(rhs.overhang_degree)
@@ -226,10 +370,25 @@ public:
         , height(rhs.height)
         , smooth_speed(rhs.smooth_speed)
         , z_contoured(rhs.z_contoured)
+        , nonplanar_surface(rhs.nonplanar_surface)
+        , nonplanar_schedule_owned(rhs.nonplanar_schedule_owned)
+        , nonplanar_replacement_remainder(rhs.nonplanar_replacement_remainder)
+        , nonplanar_transition(rhs.nonplanar_transition)
+        , nonplanar_clearance_validated(rhs.nonplanar_clearance_validated)
+        , nonplanar_before_current_layer(rhs.nonplanar_before_current_layer)
+        , nonplanar_feature_transition(rhs.nonplanar_feature_transition)
+        , nonplanar_feature_course(rhs.nonplanar_feature_course)
+        , nonplanar_leveling_transition(rhs.nonplanar_leveling_transition)
+        , staggered_perimeter(rhs.staggered_perimeter)
+        , staggered_transition(rhs.staggered_transition)
+        , smooth_outer_wall(rhs.smooth_outer_wall)
+        , nonplanar_infill(rhs.nonplanar_infill)
+        , nonplanar_interlocking_wall(rhs.nonplanar_interlocking_wall)
+        , shrinkage_compensation(rhs.shrinkage_compensation)
         , m_can_reverse(rhs.m_can_reverse)
         , m_role(rhs.m_role)
         , m_no_extrusion(rhs.m_no_extrusion)
-    {}
+    { this->inset_idx = rhs.inset_idx; }
 
     ExtrusionPath& operator=(const ExtrusionPath& rhs) {
         m_can_reverse = rhs.m_can_reverse;
@@ -240,9 +399,25 @@ public:
         this->height = rhs.height;
         this->smooth_speed = rhs.smooth_speed;
         this->z_contoured = rhs.z_contoured;
+        this->nonplanar_surface = rhs.nonplanar_surface;
+        this->nonplanar_schedule_owned = rhs.nonplanar_schedule_owned;
+        this->nonplanar_replacement_remainder = rhs.nonplanar_replacement_remainder;
+        this->nonplanar_transition = rhs.nonplanar_transition;
+        this->nonplanar_clearance_validated = rhs.nonplanar_clearance_validated;
+        this->nonplanar_before_current_layer = rhs.nonplanar_before_current_layer;
+        this->nonplanar_feature_transition = rhs.nonplanar_feature_transition;
+        this->nonplanar_feature_course = rhs.nonplanar_feature_course;
+        this->nonplanar_leveling_transition = rhs.nonplanar_leveling_transition;
+        this->staggered_perimeter = rhs.staggered_perimeter;
+        this->staggered_transition = rhs.staggered_transition;
+        this->smooth_outer_wall = rhs.smooth_outer_wall;
+        this->nonplanar_infill = rhs.nonplanar_infill;
+        this->nonplanar_interlocking_wall = rhs.nonplanar_interlocking_wall;
+        this->shrinkage_compensation = rhs.shrinkage_compensation;
         this->overhang_degree = rhs.overhang_degree;
         this->curve_degree = rhs.curve_degree;
         this->polyline = rhs.polyline;
+        this->inset_idx = rhs.inset_idx;
         return *this;
     }
     ExtrusionPath& operator=(ExtrusionPath&& rhs) {
@@ -254,9 +429,25 @@ public:
         this->height = rhs.height;
         this->smooth_speed = rhs.smooth_speed;
         this->z_contoured = rhs.z_contoured;
+        this->nonplanar_surface = rhs.nonplanar_surface;
+        this->nonplanar_schedule_owned = rhs.nonplanar_schedule_owned;
+        this->nonplanar_replacement_remainder = rhs.nonplanar_replacement_remainder;
+        this->nonplanar_transition = rhs.nonplanar_transition;
+        this->nonplanar_clearance_validated = rhs.nonplanar_clearance_validated;
+        this->nonplanar_before_current_layer = rhs.nonplanar_before_current_layer;
+        this->nonplanar_feature_transition = rhs.nonplanar_feature_transition;
+        this->nonplanar_feature_course = rhs.nonplanar_feature_course;
+        this->nonplanar_leveling_transition = rhs.nonplanar_leveling_transition;
+        this->staggered_perimeter = rhs.staggered_perimeter;
+        this->staggered_transition = rhs.staggered_transition;
+        this->smooth_outer_wall = rhs.smooth_outer_wall;
+        this->nonplanar_infill = rhs.nonplanar_infill;
+        this->nonplanar_interlocking_wall = rhs.nonplanar_interlocking_wall;
+        this->shrinkage_compensation = rhs.shrinkage_compensation;
         this->overhang_degree = rhs.overhang_degree;
         this->curve_degree = rhs.curve_degree;
         this->polyline = std::move(rhs.polyline);
+        this->inset_idx = rhs.inset_idx;
         return *this;
     }
 
@@ -389,19 +580,21 @@ public:
     ExtrusionPaths paths;
 
     ExtrusionMultiPath() {}
-    ExtrusionMultiPath(const ExtrusionMultiPath &rhs) : paths(rhs.paths), m_can_reverse(rhs.m_can_reverse) {}
-    ExtrusionMultiPath(ExtrusionMultiPath &&rhs) : paths(std::move(rhs.paths)), m_can_reverse(rhs.m_can_reverse) {}
+    ExtrusionMultiPath(const ExtrusionMultiPath &rhs) : ExtrusionEntity(rhs), paths(rhs.paths), m_can_reverse(rhs.m_can_reverse) {}
+    ExtrusionMultiPath(ExtrusionMultiPath &&rhs) : ExtrusionEntity(rhs), paths(std::move(rhs.paths)), m_can_reverse(rhs.m_can_reverse) {}
     ExtrusionMultiPath(const ExtrusionPaths &paths) : paths(paths) {}
     ExtrusionMultiPath(const ExtrusionPath &path) {this->paths.push_back(path); m_can_reverse = path.can_reverse(); }
 
     ExtrusionMultiPath &operator=(const ExtrusionMultiPath &rhs)
     {
+        this->inset_idx = rhs.inset_idx;
         this->paths   = rhs.paths;
         m_can_reverse = rhs.m_can_reverse;
         return *this;
     }
     ExtrusionMultiPath &operator=(ExtrusionMultiPath &&rhs)
     {
+        this->inset_idx = rhs.inset_idx;
         this->paths   = std::move(rhs.paths);
         m_can_reverse = rhs.m_can_reverse;
         return *this;
@@ -454,6 +647,10 @@ class ExtrusionLoop : public ExtrusionEntity
 {
 public:
     ExtrusionPaths paths;
+    // ORCA: Set on a loop extruded entirely in mid air and out of reach of the layer below: it has
+    // nothing to lean on until this layer is bridged, so the G-code writer holds it back until the
+    // infill is down. See defer_unsupported_loops() in PerimeterGenerator.cpp.
+    bool print_after_infill = false;
 
     ExtrusionLoop(ExtrusionLoopRole role = elrDefault) : m_loop_role(role) {}
     ExtrusionLoop(const ExtrusionPaths &paths, ExtrusionLoopRole role = elrDefault) : paths(paths), m_loop_role(role) {}

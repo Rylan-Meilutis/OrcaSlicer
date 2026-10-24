@@ -1,11 +1,37 @@
 #include "BackgroundSlicingProcess.hpp"
+#include "libslic3r/GCode/SpoolManagerMetadata.hpp"
+#include "libslic3r/GCode/ToolMapping.hpp"
+#include "libslic3r/Format/SlicedGCode.hpp"
 #include "GUI_App.hpp"
 #include "GUI.hpp"
+#include "MsgDialog.hpp"
 #include "MainFrame.hpp"
 #include "format.hpp"
 
+#include <cstddef>
+#include <exception>
+#include "libslic3r/AppConfig.hpp"
+#include "libslic3r/Config.hpp"
+#include <cstdint>
+#include <functional>
 #include <libslic3r/Exception.hpp>
+#include <utility>
+#include <string>
+#include <vector>
+#include <new>
+#include "libslic3r/GCode/ThumbnailData.hpp"
+#include "libslic3r/PrintConfig.hpp"
+#include "libslic3r/ThermoelasticGCode.hpp"
+#include "libslic3r/Zipper.hpp"
+#include <mutex>
+#include "libslic3r/PrintBase.hpp"
+#include <ostream>
+#include <ios>
+#include <memory>
+#include "libslic3r/Polygon.hpp"
 #include <wx/app.h>
+#include <wx/defs.h>
+#include <wx/event.h>
 #include <wx/panel.h>
 #include <wx/stdpaths.h>
 
@@ -18,6 +44,7 @@
 
 // Print now includes tbb, and tbb includes Windows. This breaks compilation of wxWidgets if included before wx.
 #include "libslic3r/Print.hpp"
+#include "libslic3r/GCode.hpp"
 #include "libslic3r/SLAPrint.hpp"
 #include "libslic3r/Utils.hpp"
 #include "PostProcessor.hpp"
@@ -26,6 +53,7 @@
 #include "libslic3r/libslic3r.h"
 
 #include <cassert>
+#include <algorithm>
 #include <stdexcept>
 #include <cctype>
 
@@ -33,10 +61,20 @@
 #include <boost/filesystem/operations.hpp>
 #include <boost/log/trivial.hpp>
 #include <boost/nowide/cstdio.hpp>
+#include <boost/nowide/fstream.hpp>
 #include "I18N.hpp"
 // #include "RemovableDriveManager.hpp"
 
+#include "libslic3r_version.h"
 #include "slic3r/GUI/Plater.hpp"
+#include "libslic3r/GCode/GCodeProcessor.hpp"
+#include "libslic3r/GCode/GCodeStatistics.hpp"
+#include "libslic3r/PresetBundle.hpp"
+#include "slic3r/GUI/PartPlate.hpp"
+#include "slic3r/Utils/PrintHost.hpp"
+#ifdef _WIN32
+#include <excpt.h>
+#endif
 
 namespace Slic3r {
 
@@ -96,7 +134,7 @@ std::pair<std::string, std::vector<size_t>> SlicingProcessCompletedEvent::format
     } catch (std::exception& ex) {
         error = ex.what();
     } catch (...) {
-        error = "Unknown C++ exception.";
+        error = _u8L("Unknown C++ exception.");
     }
     return std::make_pair(std::move(error), std::vector<size_t>{monospace});
 }
@@ -115,6 +153,10 @@ BackgroundSlicingProcess::~BackgroundSlicingProcess()
 {
     this->stop();
     this->join_background_thread();
+    if (!m_dispatch_output_path.empty()) {
+        boost::system::error_code ec;
+        boost::filesystem::remove(m_dispatch_output_path, ec);
+    }
     // BBS: move this logic to part plate
     // boost::nowide::remove(m_temp_output_path.c_str());
 }
@@ -192,12 +234,12 @@ std::string BackgroundSlicingProcess::output_filepath_for_project(const boost::f
 void BackgroundSlicingProcess::process_fff()
 {
     assert(m_print == m_fff_print);
-    PresetBundle& preset_bundle   = *wxGetApp().preset_bundle;
+    PresetBundle& preset_bundle   = *GUI::wxGetApp().preset_bundle;
     m_fff_print->is_BBL_printer() = preset_bundle.is_bbl_vendor();
     // BBS: add the logic to process from an existed gcode file
     if (m_print->finished()) {
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(" %1%: skip slicing, to process previous gcode file") % __LINE__;
-        m_fff_print->set_status(80, _utf8(L("Processing G-Code from previous file\u2026")));
+        m_fff_print->set_status(80, _utf8(L("Processing G-code from previous file\u2026" /* \u2026 -> ... */)));
         wxCommandEvent evt(m_event_slicing_completed_id);
         // Post the Slicing Finished message for the G-code viewer to update.
         // Passing the timestamp
@@ -257,16 +299,240 @@ void BackgroundSlicingProcess::process_fff()
         m_temp_output_path = this->get_current_plate()->get_tmp_gcode_path();
         m_fff_print->export_gcode(m_temp_output_path, m_gcode_result,
                                   [this](const ThumbnailsParams& params) { return this->render_thumbnails(params); });
-        // Orca: BBL printers post-process the g-code in place here and never re-parse it into a fresh
-        // GCodeProcessorResult, so m_gcode_result->nozzle_group_result (consumed by the H2C print-dispatch
-        // nozzle mapping) survives post-processing. No preservation guard is needed on this path.
+        // Orca: BBL printers post-process the g-code in place here, in the file the G-code viewer maps, so
+        // the preview re-reads its moves and line offsets from the edited file. The rest of m_gcode_result,
+        // including nozzle_group_result (consumed by the H2C print-dispatch nozzle mapping), is kept.
         if (m_fff_print->is_BBL_printer()) {
-            run_post_process_scripts(m_temp_output_path, false, "File", m_temp_output_path, m_fff_print->full_print_config());
+            if (run_post_process_scripts(m_temp_output_path, false, "File", m_temp_output_path, m_fff_print->full_print_config(),
+                    [this](const std::string &text) {
+                        m_print->throw_if_canceled();
+                        m_print->set_status(95, text);
+                    }))
+                m_fff_print->reload_gcode_moves(m_gcode_result);
         }
+
+        // Analyze the final processor geometry on the existing cancellable
+        // slicing worker, before the completed result is handed to the viewer.
+        // No second G-code file or mesh cache is written by this operation.
+        m_print->throw_if_canceled();
+        m_gcode_result->thermal_analysis = {};
+        if (m_fff_print->config().automatic_warp_mitigation.value) {
+            m_print->set_status(97, _u8L("Analyzing thermal stress and bed-contact demand"));
+            const auto analysis = Thermoelastic::analyze_configured_gcode(*m_gcode_result,
+                m_fff_print->full_print_config(), {},
+                [this](unsigned scenario, unsigned subdivision) {
+                    m_print->throw_if_canceled();
+                    // Refinement progress is work completed, not a fictitious
+                    // time estimate; the phase remains at 97% until it completes.
+                    m_print->set_status(97, GUI::format(
+                        _u8L("Analyzing thermal stress: scenario %1%, mesh subdivision %2%"),
+                        scenario + 1, subdivision));
+                }, [this] { m_print->throw_if_canceled(); });
+            using Status = GCodeProcessorResult::ThermalAnalysis::Status;
+            auto &summary = m_gcode_result->thermal_analysis;
+            switch (analysis.state) {
+            case Thermoelastic::AnalysisState::Converged: summary.status = Status::Converged; break;
+            case Thermoelastic::AnalysisState::UnsupportedMaterial: summary.status = Status::UnsupportedMaterial; break;
+            case Thermoelastic::AnalysisState::InvalidThermalInputs: summary.status = Status::InvalidThermalInputs; break;
+            case Thermoelastic::AnalysisState::BudgetExceeded: summary.status = Status::BudgetExceeded; break;
+            case Thermoelastic::AnalysisState::Unconverged: summary.status = Status::Unconverged; break;
+            case Thermoelastic::AnalysisState::InvalidGeometry: summary.status = Status::InvalidGeometry; break;
+            }
+            if (summary.status == Status::Converged) {
+                summary.scenario_count = static_cast<unsigned>(analysis.scenarios.size());
+                for (const auto &scenario : analysis.scenarios) {
+                    summary.tensile_force_n = std::max(summary.tensile_force_n, scenario.tensile_force_n);
+                    summary.elastic_energy_j = std::max(summary.elastic_energy_j, scenario.elastic_energy_j);
+                }
+            }
+        }
+        m_print->throw_if_canceled();
 
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": export gcode finished");
     }
     if (this->set_step_started(bspsGCodeFinalize)) {
+        if (m_dispatch_print && (!m_export_path.empty() || !m_upload_job.empty())) {
+            m_print->throw_if_canceled();
+            // Never overwrite the logical preview's memory-mapped G-code.
+            m_dispatch_output_path = (boost::filesystem::temp_directory_path() /
+                boost::filesystem::unique_path("orca-mapped-%%%%-%%%%.gcode")).string();
+            const auto check_dispatch_space = [&](const GCodeDispatchPlan *plan) {
+                boost::system::error_code error;
+                const auto space = boost::filesystem::space(
+                    boost::filesystem::path(m_dispatch_output_path).parent_path(), error);
+                if (error)
+                    throw Slic3r::ExportError(_u8L("Cannot check free disk space for the mapped print job. Check the temporary folder before exporting."));
+                constexpr std::uint64_t reserve = 1024ULL * 1024ULL * 1024ULL;
+                const auto insufficient = [] {
+                    throw Slic3r::ExportError(_u8L("Not enough free disk space for the mapped print job while retaining 1 GiB of system headroom. Free disk space and try exporting again."));
+                };
+                if (space.available < reserve) insufficient();
+                std::uint64_t budget = space.available - reserve;
+                // Spool annotation, upload staging, or a destination on the
+                // same volume temporarily requires a second complete copy.
+                budget /= 2;
+                const auto bytes = boost::filesystem::file_size(m_temp_output_path, error);
+                if (error)
+                    throw Slic3r::ExportError(_u8L("The sliced G-code cannot be read. Slice the plate again before exporting."));
+                if (bytes > budget) insufficient();
+                budget -= bytes;
+                if (plan)
+                    for (const auto &edit : plan->edits)
+                        if (edit.replacement.size() > edit.expected.size()) {
+                            const auto growth = edit.replacement.size() - edit.expected.size();
+                            if (growth > budget) insufficient();
+                            budget -= growth;
+                        }
+            };
+            GCodeProcessorResult result;
+            if (m_dispatch_reuse_gcode) {
+                const bool identity = can_reuse_identity_tool_mapping(m_fff_print->full_print_config(),
+                    m_dispatch_print->full_print_config(), m_dispatch_tools);
+                if (identity) {
+                    check_dispatch_space(nullptr);
+                    m_print->set_status(90, _u8L("Reusing sliced G-code for unchanged printer tools"));
+                    std::string error;
+                    if (copy_file(m_temp_output_path, m_dispatch_output_path, error) != SUCCESS)
+                        throw Slic3r::ExportError(error);
+                } else {
+                    boost::system::error_code size_error;
+                    const auto source_bytes = boost::filesystem::file_size(m_temp_output_path, size_error);
+                    if (size_error)
+                        throw Slic3r::ExportError(_u8L("The sliced G-code cannot be read. Slice the plate again before exporting."));
+                    boost::nowide::ifstream input(m_temp_output_path, std::ios::binary);
+                    if (!input)
+                        throw Slic3r::ExportError(_u8L("The sliced G-code cannot be opened for tool remapping."));
+                    GCodeDispatchPlan plan;
+                    bool certified = false;
+                    int last_percent = -1;
+                    const auto progress = [&](std::uint64_t bytes, int begin, int extent, const std::string &text) {
+                        m_print->throw_if_canceled();
+                        const int percent = begin + int(extent * std::min(1.,
+                            source_bytes == 0 ? 0. : double(bytes) / double(source_bytes)));
+                        if (percent != last_percent) {
+                            last_percent = percent;
+                            m_print->set_status(percent, text);
+                        }
+                    };
+                    try {
+                        if (!equivalent_tool_mapping_config(m_fff_print->full_print_config(),
+                                m_dispatch_print->full_print_config(), m_dispatch_tools) ||
+                            !m_gcode_result->dispatch_data ||
+                            boost::filesystem::path(m_export_path).extension() == ".3mf" ||
+                            (!m_upload_job.empty() && m_upload_job.upload_data.use_3mf))
+                            throw std::runtime_error("The mapped export needs normal regeneration.");
+                        std::string full_config;
+                        GCode::append_full_config(*m_dispatch_print, full_config);
+                        m_print->set_status(50, _u8L("Checking printer scripts for fast tool remapping"));
+                        plan = prepare_tool_mapped_gcode(input, *m_gcode_result->dispatch_data,
+                            m_dispatch_print->full_print_config(), m_dispatch_tools, full_config,
+                            [&](std::uint64_t bytes) {
+                                progress(bytes, 50, 25, _u8L("Checking printer scripts for fast tool remapping"));
+                            });
+                        certified = true;
+                    } catch (const CanceledException &) {
+                        throw;
+                    } catch (const std::bad_alloc &) {
+                        throw;
+                    } catch (const std::exception &) {
+                        m_print->throw_if_canceled();
+                        // Do not expose macro contents in logs or dialogs: a
+                        // user's custom script may contain connection secrets.
+                        BOOST_LOG_TRIVIAL(info) << "Fast tool remapping requires normal regeneration";
+                    }
+                    if (certified) {
+                        check_dispatch_space(&plan);
+                        input.clear();
+                        input.seekg(0);
+                        if (!input)
+                            throw Slic3r::ExportError(_u8L("The sliced G-code cannot be reopened for tool remapping."));
+                        // The only large allocation on disk is this private
+                        // output. No partial result is uploaded or published.
+                        boost::nowide::ofstream output(m_dispatch_output_path, std::ios::binary | std::ios::trunc);
+                        if (!output)
+                            throw Slic3r::ExportError(_u8L("Cannot create the mapped G-code file. Check free disk space and folder permissions."));
+                        last_percent = -1;
+                        apply_tool_mapped_gcode(input, output, plan, [&](std::uint64_t bytes) {
+                            progress(bytes, 80, 13, _u8L("Remapping printer tools without slicing again"));
+                        });
+                        output.close();
+                        if (!output)
+                            throw Slic3r::ExportError(_u8L("Cannot finish writing the mapped G-code file. Check free disk space."));
+                    } else {
+                        // A shared reply stays alive if cancellation releases
+                        // the worker while the modal is still being dismissed.
+                        struct Reply { bool regenerate = false; std::exception_ptr error; };
+                        const auto reply = std::make_shared<Reply>();
+                        m_print->set_status(75, _u8L("Waiting for confirmation to regenerate the mapped print job"));
+                        const bool answered = execute_ui_task([reply] {
+                            try {
+                                if (GUI::wxGetApp().is_closing()) return;
+                                GUI::MessageDialog confirm(GUI::wxGetApp().mainframe,
+                                    _L("This print job cannot safely reuse its existing G-code for the selected tools. Regenerate it now? Slicing and export progress will be shown."),
+                                    _L("Prepare mapped print job"), wxYES_NO | wxNO_DEFAULT | wxICON_QUESTION);
+                                confirm.SetButtonLabel(wxID_YES, _L("Regenerate"));
+                                confirm.SetButtonLabel(wxID_NO, _L("Cancel"));
+                                reply->regenerate = confirm.ShowModal() == wxID_YES && !GUI::wxGetApp().is_closing();
+                            } catch (...) { reply->error = std::current_exception(); }
+                        });
+                        if (!answered) {
+                            m_print->cancel();
+                            throw CanceledException();
+                        }
+                        m_print->throw_if_canceled();
+                        if (reply->error) std::rethrow_exception(reply->error);
+                        if (!reply->regenerate) {
+                            m_print->cancel();
+                            throw CanceledException();
+                        }
+                        m_dispatch_reuse_gcode = false;
+                    }
+                }
+            }
+            if (!m_dispatch_reuse_gcode) {
+                // Regeneration size is not known yet; reject an already full
+                // volume using the existing slice as a baseline estimate.
+                check_dispatch_space(nullptr);
+                m_print->set_status(0, _u8L("Preparing print job for mapped printer tools"));
+                m_dispatch_print->process();
+                m_print->set_status(80, _u8L("Generating G-code for mapped printer tools"));
+                m_dispatch_print->export_gcode(m_dispatch_output_path, &result,
+                    [this](const ThumbnailsParams &params) { return render_thumbnails(params); });
+            }
+            if (!m_dispatch_spools.empty()) {
+                m_print->set_status(94, _u8L("Writing selected spool information"));
+                std::string error;
+                if (!SpoolManagerMetadata::update_gcode_file(m_dispatch_output_path, m_dispatch_spools, error))
+                    throw Slic3r::ExportError(error);
+            }
+            if (boost::filesystem::path(m_export_path).extension() == ".3mf" ||
+                (!m_upload_job.empty() && m_upload_job.upload_data.use_3mf)) {
+                std::string output_name = m_upload_job.empty() ? m_export_path : m_upload_job.upload_data.upload_path.string();
+                run_post_process_scripts(m_dispatch_output_path, false,
+                    m_upload_job.empty() ? "File" : m_upload_job.printhost->get_name(), output_name,
+                    m_dispatch_print->full_print_config(), [this](const std::string &text) {
+                        m_print->throw_if_canceled();
+                        m_print->set_status(95, text);
+                    });
+                if (m_upload_job.empty())
+                    m_export_path = output_name;
+                else
+                    m_upload_job.upload_data.upload_path = output_name;
+                const std::string package_path = m_dispatch_output_path + ".3mf";
+                ScopeGuard remove_partial_package([&package_path] {
+                    boost::system::error_code error;
+                    boost::filesystem::remove(package_path, error);
+                });
+                m_print->set_status(96, _u8L("Packaging mapped G-code and thumbnails"));
+                if (!store_sliced_gcode_3mf(package_path, *export_print(),
+                        m_dispatch_reuse_gcode ? *m_gcode_result : result, m_dispatch_output_path))
+                    throw Slic3r::ExportError(_u8L("Failed to package the mapped print job."));
+                boost::filesystem::remove(m_dispatch_output_path);
+                m_dispatch_output_path = package_path;
+                remove_partial_package.reset();
+            }
+            m_print->throw_if_canceled();
+        }
         if (!m_export_path.empty()) {
             wxQueueEvent(GUI::wxGetApp().mainframe->m_plater, new wxCommandEvent(m_event_export_began_id));
             if (!m_fff_print->is_BBL_printer())
@@ -576,6 +842,8 @@ bool BackgroundSlicingProcess::stop()
         // Cancel any task planned by the background thread on UI thread.
         cancel_ui_task(m_ui_task);
         m_print->cancel();
+        if (m_dispatch_print)
+            m_dispatch_print->cancel();
         // Wait until the background processing stops by being canceled.
         m_condition.wait(lck, [this]() { return m_state == STATE_CANCELED; });
         // In the "Canceled" state. Reset the state to "Idle".
@@ -621,6 +889,8 @@ void BackgroundSlicingProcess::stop_internal()
         // Set the print state to canceled before unlocking the state_mutex(), so when the worker thread wakes up,
         // it throws the CanceledException().
         m_print->cancel_internal();
+        if (m_dispatch_print)
+            m_dispatch_print->cancel_internal();
         // Allow the worker thread to wake up if blocking on a milestone.
         m_print->state_mutex().unlock();
         // Wait until the background processing stops by being canceled.
@@ -701,7 +971,7 @@ StringObjectException BackgroundSlicingProcess::validate(std::vector<StringObjec
     assert(m_print != nullptr);
     assert(m_print == m_fff_print);
 
-    m_fff_print->is_BBL_printer() = wxGetApp().preset_bundle->is_bbl_vendor();
+    m_fff_print->is_BBL_printer() = GUI::wxGetApp().preset_bundle->is_bbl_vendor();
     return m_print->validate(warnings, collison_polygons, height_polygons);
 }
 
@@ -718,7 +988,9 @@ Print::ApplyStatus BackgroundSlicingProcess::apply(const Model& model, const Dyn
 
     // Orca: prevent resetting under gcode viewer mode
     if (invalidated != PrintBase::APPLY_STATUS_UNCHANGED) {
-        const auto plater = GUI::wxGetApp().mainframe->m_plater;
+        // Use the app’s plater accessor instead of going through mainframe, otherwise anything during startup that reaches apply() 
+        // (loading presets, config or input files, e.g. from the CLI) therefore dereferences a null `mainframe` and crashes.
+        const auto plater = GUI::wxGetApp().plater();
         if (plater && plater->only_gcode_mode()) {
             invalidated = PrintBase::APPLY_STATUS_UNCHANGED;
         }
@@ -754,6 +1026,7 @@ void BackgroundSlicingProcess::schedule_export(const std::string& path, bool exp
     this->invalidate_step(bspsGCodeFinalize);
     m_export_path                    = path;
     m_export_path_on_removable_media = export_path_on_removable_media;
+    m_export_statistics              = GUI::wxGetApp().app_config->get_bool("export_statistics");
 }
 
 void BackgroundSlicingProcess::schedule_upload(Slic3r::PrintHostJob upload_job)
@@ -773,12 +1046,42 @@ void BackgroundSlicingProcess::reset_export()
 {
     assert(!this->running());
     if (!this->running()) {
+        m_dispatch_print.reset();
+        m_dispatch_reuse_gcode = false;
+        m_dispatch_tools.clear();
+        m_dispatch_spools.clear();
+        m_upload_job = PrintHostJob{};
+        if (!m_dispatch_output_path.empty()) {
+            boost::system::error_code ec;
+            boost::filesystem::remove(m_dispatch_output_path, ec);
+            m_dispatch_output_path.clear();
+        }
         m_export_path.clear();
         m_export_path_on_removable_media = false;
         // invalidate_step expects the mutex to be locked.
         std::scoped_lock<std::mutex> lock(m_print->state_mutex());
         this->invalidate_step(bspsGCodeFinalize);
     }
+}
+
+void BackgroundSlicingProcess::set_dispatch_print(std::unique_ptr<Print> print,
+                                                std::vector<SpoolManagerMetadata::Filament> spools,
+                                                bool reuse_gcode, std::vector<int> tools)
+{
+    assert(!running());
+    print->set_status_callback([this](const PrintBase::SlicingStatus &status) {
+        m_print->throw_if_canceled();
+        // Object IDs in dispatch warnings belong to the private snapshot, not
+        // the editable plate. Forward progress only to the logical preview.
+        // Keep the extra export pass identifiable instead of making the
+        // already-sliced plate appear to restart without explanation.
+        if (status.percent >= 0)
+            m_print->set_status(status.percent, GUI::format(_L("Preparing mapped print job: %1%"), status.text));
+    });
+    m_dispatch_print = std::move(print);
+    m_dispatch_reuse_gcode = reuse_gcode;
+    m_dispatch_tools = std::move(tools);
+    m_dispatch_spools = std::move(spools);
 }
 
 bool BackgroundSlicingProcess::set_step_started(BackgroundSlicingProcessStep step)
@@ -810,11 +1113,11 @@ bool BackgroundSlicingProcess::invalidate_all_steps()
 // Copy the final G-code to target location (possibly a SD card, if it is a removable media, then verify that the file was written without an error).
 void BackgroundSlicingProcess::finalize_gcode()
 {
-    m_print->set_status(95, _u8L("Running post-processing scripts"));
+    m_print->set_status(95, _u8L("Preparing G-code export"));
 
     // Perform the final post-processing of the export path by applying the print statistics over the file name.
-    std::string export_path = m_fff_print->print_statistics().finalize_output_path(m_export_path);
-    std::string output_path = m_temp_output_path;
+    std::string export_path = export_print()->print_statistics().finalize_output_path(m_export_path);
+    std::string output_path = export_source_path();
     // Both output_path and export_path ar in-out parameters.
     // If post processed, output_path will differ from m_temp_output_path as run_post_process_scripts() will make a copy of the G-code to not
     // collide with the G-code viewer memory mapping of the unprocessed G-code. G-code viewer maps unprocessed G-code, because m_gcode_result
@@ -822,7 +1125,13 @@ void BackgroundSlicingProcess::finalize_gcode()
     // export_path may be changed by the post-processing script as well if the post processing script decides so, see GH #6042.
     // Runs both post-processing scripts and plugins on a single .pp copy of the G-code (make_copy = true),
     // so neither touches the original file the G-code viewer keeps memory-mapped.
-    bool post_processed = run_post_process_scripts(output_path, true, "File", export_path, m_fff_print->full_print_config());
+    const bool packaged_dispatch = m_dispatch_print && boost::filesystem::path(output_path).extension() == ".3mf";
+    bool post_processed = !packaged_dispatch &&
+        run_post_process_scripts(output_path, true, "File", export_path, export_print()->full_print_config(),
+            [this](const std::string &text) {
+                m_print->throw_if_canceled();
+                m_print->set_status(95, text);
+            });
 
     auto remove_post_processed_temp_file = [post_processed, &output_path]() {
         if (post_processed)
@@ -832,7 +1141,7 @@ void BackgroundSlicingProcess::finalize_gcode()
                 BOOST_LOG_TRIVIAL(error) << "Failed to remove temp file " << output_path << ": " << ex.what();
             }
     };
-    m_print->set_status(99, _utf8(L("Successfully executed post-processing script")));
+    m_print->set_status(99, _u8L("Copying G-code to the selected destination"));
 
     // FIXME localize the messages
     std::string error_message;
@@ -848,7 +1157,9 @@ void BackgroundSlicingProcess::finalize_gcode()
     case CopyFileResult::SUCCESS: break; // no error
     case CopyFileResult::FAIL_COPY_FILE:
         throw Slic3r::ExportError(GUI::format(
-            _L("Copying of the temporary G-code to the output G-code failed. Maybe the SD card is write locked?\nError message: %1%"),
+            m_export_path_on_removable_media ?
+                _L("Copying of the temporary G-code to the output G-code failed. Maybe the SD card is write locked?\nError message: %1%") :
+                _L("Copying of the temporary G-code to the output G-code failed.\nError message: %1%"),
             error_message));
         break;
     case CopyFileResult::FAIL_FILES_DIFFERENT:
@@ -877,6 +1188,8 @@ void BackgroundSlicingProcess::finalize_gcode()
         BOOST_LOG_TRIVIAL(error) << "Unexpected fail code(" << (int) copy_ret_val << ") durring copy_file() to " << export_path << ".";
         break;
     }
+    if (m_export_statistics)
+        export_gcode_statistics(*m_gcode_result, gcode_statistics_path(export_path));
 
     m_print->set_status(100, GUI::format(_L("G-code file exported to %1%"), export_path));
 }
@@ -924,6 +1237,8 @@ void BackgroundSlicingProcess::export_gcode()
         // throw Slic3r::ExportError(_utf8(L("Unknown error when exporting G-code.")));
         break;
     }
+    if (m_export_statistics)
+        export_gcode_statistics(*m_gcode_result, gcode_statistics_path(export_path));
 
     // BBS
     auto evt                  = new wxCommandEvent(m_event_export_finished_id, GUI::wxGetApp().mainframe->m_plater->GetId());
@@ -941,16 +1256,31 @@ void BackgroundSlicingProcess::prepare_upload()
     // Generate a unique temp path to which the gcode/zip file is copied/exported
     boost::filesystem::path source_path = boost::filesystem::temp_directory_path() /
                                           boost::filesystem::unique_path("." SLIC3R_APP_KEY ".upload.%%%%-%%%%-%%%%-%%%%");
+    // Only this generated path belongs to this operation. In the existing
+    // packaged-upload path source_path may later refer to somebody else's file.
+    ScopeGuard remove_partial_upload([staging_path = source_path] {
+        boost::system::error_code error;
+        boost::filesystem::remove(staging_path, error);
+    });
 
     if (m_print == m_fff_print) {
         if (m_upload_job.upload_data.use_3mf) {
-            source_path = m_upload_job.upload_data.source_path;
+            if (m_dispatch_print) {
+                m_print->set_status(97, _u8L("Preparing the packaged print job for upload"));
+                std::string error;
+                if (copy_file(m_dispatch_output_path, source_path.string(), error) != SUCCESS)
+                    throw Slic3r::ExportError(error);
+                // Metadata is already written inside the package, not its ZIP tail.
+                m_upload_job.upload_data.extended_info.erase("spool_manager_filaments");
+            } else
+                source_path = m_upload_job.upload_data.source_path;
         } else {
-            m_print->set_status(95, _utf8(L("Running post-processing scripts")));
+            m_print->set_status(95, _u8L("Copying G-code to the upload staging file"));
             std::string error_message;
-            if (copy_file(m_temp_output_path, source_path.string(), error_message) != SUCCESS)
-                throw Slic3r::RuntimeError(_utf8(L("Copying of the temporary G-code to the output G-code failed.")));
-            m_upload_job.upload_data.upload_path = m_fff_print->print_statistics().finalize_output_path(
+            if (copy_file(export_source_path(), source_path.string(), error_message) != SUCCESS)
+                throw Slic3r::RuntimeError(GUI::format(
+                    _L("Preparing G-code for upload failed.\nError message: %1%"), error_message));
+            m_upload_job.upload_data.upload_path = export_print()->print_statistics().finalize_output_path(
                 m_upload_job.upload_data.upload_path.string());
             // Orca: skip post-processing scripts for BBL printers as we have run them already in finalize_gcode()
             // todo: do we need to copy the file?
@@ -963,7 +1293,10 @@ void BackgroundSlicingProcess::prepare_upload()
                 // source_path_str is already a dedicated copy of the temp G-code (see copy_file above), not the
                 // memory-mapped original, so scripts and plugins can modify it in place (make_copy = false).
                 bool post_process = run_post_process_scripts(source_path_str, false, m_upload_job.printhost->get_name(), output_name_str,
-                                             m_fff_print->full_print_config());
+                    export_print()->full_print_config(), [this](const std::string &text) {
+                        m_print->throw_if_canceled();
+                        m_print->set_status(97, text);
+                    });
                 if (post_process)
                     m_upload_job.upload_data.upload_path = output_name_str;
             }
@@ -989,7 +1322,9 @@ void BackgroundSlicingProcess::prepare_upload()
 
     m_upload_job.upload_data.source_path = std::move(source_path);
 
+    m_print->throw_if_canceled();
     GUI::wxGetApp().printhost_job_queue().enqueue(std::move(m_upload_job));
+    remove_partial_upload.reset();
 }
 // Executed by the background thread, to start a task on the UI thread.
 ThumbnailsList BackgroundSlicingProcess::render_thumbnails(const ThumbnailsParams& params)
