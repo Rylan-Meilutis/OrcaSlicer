@@ -93,15 +93,18 @@ bool SlicingProcessCompletedEvent::critical_error() const
 
 bool SlicingProcessCompletedEvent::invalidate_plater() const
 {
-    if (critical_error()) {
-        try {
-            this->rethrow_exception();
-        } catch (const Slic3r::ExportError&) {
-            // Exception thrown by copying file does not ivalidate plater
-            return false;
-        } catch (...) {}
+    return error() && critical_error() && !export_failed();
+}
+
+bool SlicingProcessCompletedEvent::export_failed() const
+{
+    if (!error())
+        return false;
+    try {
+        this->rethrow_exception();
+    } catch (const Slic3r::ExportError&) {
         return true;
-    }
+    } catch (...) {}
     return false;
 }
 
@@ -303,12 +306,19 @@ void BackgroundSlicingProcess::process_fff()
         // the preview re-reads its moves and line offsets from the edited file. The rest of m_gcode_result,
         // including nozzle_group_result (consumed by the H2C print-dispatch nozzle mapping), is kept.
         if (m_fff_print->is_BBL_printer()) {
-            if (run_post_process_scripts(m_temp_output_path, false, "File", m_temp_output_path, m_fff_print->full_print_config(),
-                    [this](const std::string &text) {
-                        m_print->throw_if_canceled();
-                        m_print->set_status(95, text);
-                    }))
-                m_fff_print->reload_gcode_moves(m_gcode_result);
+            try {
+                if (run_post_process_scripts(m_temp_output_path, false, "File", m_temp_output_path, m_fff_print->full_print_config(),
+                        [this](const std::string &text) {
+                            m_print->throw_if_canceled();
+                            m_print->set_status(95, text);
+                        }))
+                    m_fff_print->reload_gcode_moves(m_gcode_result);
+            } catch (...) {
+                // A failed script or plugin may have left the G-code half edited, so the next run exports
+                // it again instead of reusing it.
+                m_fff_print->invalidate_gcode_export_from_worker();
+                throw;
+            }
         }
 
         // Analyze the final processor geometry on the existing cancellable
@@ -1092,7 +1102,6 @@ void BackgroundSlicingProcess::reset_export()
         m_dispatch_reuse_gcode = false;
         m_dispatch_tools.clear();
         m_dispatch_spools.clear();
-        m_upload_job = PrintHostJob{};
         if (!m_dispatch_output_path.empty()) {
             boost::system::error_code ec;
             boost::filesystem::remove(m_dispatch_output_path, ec);
@@ -1100,6 +1109,10 @@ void BackgroundSlicingProcess::reset_export()
         }
         m_export_path.clear();
         m_export_path_on_removable_media = false;
+        // A scheduled upload only leaves m_upload_job when prepare_upload() hands it to the print host
+        // job queue. If the run ended before that (a post-processing script or plugin failure, or a
+        // cancel), the job must not survive into the next plain slice, which would upload again.
+        m_upload_job = PrintHostJob();
         // invalidate_step expects the mutex to be locked.
         std::scoped_lock<std::mutex> lock(m_print->state_mutex());
         this->invalidate_step(bspsGCodeFinalize);
@@ -1320,7 +1333,7 @@ void BackgroundSlicingProcess::prepare_upload()
             m_print->set_status(95, _u8L("Copying G-code to the upload staging file"));
             std::string error_message;
             if (copy_file(export_source_path(), source_path.string(), error_message) != SUCCESS)
-                throw Slic3r::RuntimeError(GUI::format(
+                throw Slic3r::ExportError(GUI::format(
                     _L("Preparing G-code for upload failed.\nError message: %1%"), error_message));
             m_upload_job.upload_data.upload_path = export_print()->print_statistics().finalize_output_path(
                 m_upload_job.upload_data.upload_path.string());

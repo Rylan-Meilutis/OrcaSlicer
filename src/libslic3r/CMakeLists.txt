@@ -131,6 +131,8 @@ set(lisbslic3r_sources
     Emboss.hpp
     EmbossShape.hpp
     enum_bitmask.hpp
+    ExclusionVolumeGeometry.cpp
+    ExclusionVolumeGeometry.hpp
     Execution/Execution.hpp
     Execution/ExecutionSeq.hpp
     Execution/ExecutionTBB.hpp
@@ -223,6 +225,8 @@ set(lisbslic3r_sources
     Format/3mf.hpp
     Format/AMF.cpp
     Format/AMF.hpp
+    Format/ImportNames.cpp
+    Format/ImportNames.hpp
     Format/AssembleList.cpp
     Format/AssembleList.hpp
     Format/DRC.cpp
@@ -231,6 +235,7 @@ set(lisbslic3r_sources
     Format/SlicedGCode.cpp
     Format/SlicedGCode.hpp
     Format/bbs_3mf.hpp
+    Format/ProjectStrategy.hpp
     format.hpp
     Format/OBJ.cpp
     Format/OBJ.hpp
@@ -269,6 +274,10 @@ set(lisbslic3r_sources
     GCode/CoolingBuffer.hpp
     GCode/ArcCooling.hpp
     GCode/LocalExtrusionGroups.hpp
+    GCode/ExclusionVolumePathCheck.cpp
+    GCode/ExclusionVolumePathCheck.hpp
+    GCode/ExclusionVolumeTravelAvoidance.cpp
+    GCode/ExclusionVolumeTravelAvoidance.hpp
     GCode/TimelapsePosPicker.cpp
     GCode/TimelapsePosPicker.hpp
     GCode.cpp
@@ -396,6 +405,8 @@ set(lisbslic3r_sources
     GCode/RetractWhenCrossingPerimeters.hpp
     GCode/SeamPlacer.cpp
     GCode/SeamPlacer.hpp
+    GCode/SeamContour.cpp
+    GCode/SeamContour.hpp
     GCode/PreciseSeam.cpp
     GCode/PreciseSeam.hpp
     GCode/PreciseSeamInternal.hpp
@@ -558,8 +569,6 @@ set(lisbslic3r_sources
     SequentialGantryGeometry.cpp
     SequentialGantryGeometry.hpp
     Semver.cpp
-    Shape/TextShape.cpp
-    Shape/TextShape.hpp
     ShortEdgeCollapse.cpp
     ShortEdgeCollapse.hpp
     ShortestPath.cpp
@@ -906,20 +915,6 @@ target_link_libraries(libslic3r
         ZLIB::ZLIB
         OpenSSL::Crypto
     )
-
-if(NOT WIN32)
-    # OCCT's static targets name FreeType as a bare "freetype", which the macOS linker cannot
-    # find; this target maps that name to FREETYPE_LIBRARIES.
-    if (NOT TARGET freetype)
-        add_library(freetype INTERFACE IMPORTED GLOBAL)
-        target_link_libraries(freetype INTERFACE ${FREETYPE_LIBRARIES})
-    endif ()
-    # Link freetype for OCCT dependency (CAD operations need font rendering)
-    target_link_libraries(libslic3r PRIVATE ${FREETYPE_LIBRARIES})
-    if (NOT APPLE)
-        target_link_libraries(libslic3r PRIVATE fontconfig)
-    endif()
-endif()
 
 if (APPLE)
     find_library(FOUNDATION Foundation REQUIRED)

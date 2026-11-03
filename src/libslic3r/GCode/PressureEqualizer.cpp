@@ -44,7 +44,9 @@ static constexpr int max_look_back_limit = 128;
 // lines where some extruder pressure will remain (so we should equalize between these small travels)
 static constexpr long max_ignored_gap_between_extruding_segments = 3;
 
-PressureEqualizer::PressureEqualizer(const Slic3r::GCodeConfig &config) : m_use_relative_e_distances(config.use_relative_e_distances.value)
+PressureEqualizer::PressureEqualizer(const Slic3r::GCodeConfig &config)
+    : m_use_relative_e_distances(config.use_relative_e_distances.value),
+      m_high_precision(config.high_precision_gcode.value)
 {
     // Preallocate some data, so that output_buffer.data() will return an empty string.
     output_buffer.assign(32, 0);
@@ -533,7 +535,8 @@ void PressureEqualizer::output_gcode_line(const size_t line_idx)
         // than accidentally inheriting the last subdivision's reduced feed.
         if (line.type == GCODELINETYPE_ARC && !line.pos_provided[4] &&
             line.pos_start[4] > 0.f && m_output_feedrate != line.pos_start[4]) {
-            GCodeG1Formatter feedrate;
+            // Feedrate precision is identical in both coordinate modes.
+            GCodeG1Formatter feedrate(false);
             feedrate.emit_f(line.pos_start[4]);
             push_to_output(feedrate);
             m_output_feedrate = line.pos_start[4];
@@ -1003,7 +1006,9 @@ void PressureEqualizer::push_line_to_output(const size_t line_idx, float new_fee
     } else
         push_to_output(EXTRUDE_END_TAG.data(), EXTRUDE_END_TAG.length(), true);
 
-    GCodeG1Formatter feedrate_formatter;
+    // Supports keep the standard precision, see GCode::extrude_support().
+    const bool high_precision = m_high_precision && !is_support(line.extrusion_role);
+    GCodeG1Formatter feedrate_formatter(high_precision);
     feedrate_formatter.emit_f(new_feedrate);
     feedrate_formatter.emit_string(std::string(EXTRUDE_SET_SPEED_TAG.data(), EXTRUDE_SET_SPEED_TAG.length()));
     if (line.extrusion_role == ExtrusionRole::erExternalPerimeter)
@@ -1011,11 +1016,11 @@ void PressureEqualizer::push_line_to_output(const size_t line_idx, float new_fee
     push_to_output(feedrate_formatter);
     m_output_feedrate = new_feedrate;
 
-    GCodeG1Formatter extrusion_formatter;
+    GCodeG1Formatter extrusion_formatter(high_precision);
     for (size_t axis_idx = 0; axis_idx < 3; ++axis_idx)
         if (line.pos_provided[axis_idx])
-            extrusion_formatter.emit_axis(char('X' + axis_idx), line.pos_end[axis_idx], GCodeFormatter::XYZF_EXPORT_DIGITS);
-    extrusion_formatter.emit_axis('E', m_use_relative_e_distances ? (line.pos_end[3] - line.pos_start[3]) : line.pos_end[3], GCodeFormatter::E_EXPORT_DIGITS);
+            extrusion_formatter.emit_axis(char('X' + axis_idx), line.pos_end[axis_idx], GCodeFormatter::xyz_digits(high_precision));
+    extrusion_formatter.emit_e(m_use_relative_e_distances ? (line.pos_end[3] - line.pos_start[3]) : line.pos_end[3]);
 
     if (comment != nullptr)
         extrusion_formatter.emit_string(std::string(comment));

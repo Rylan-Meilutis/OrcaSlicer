@@ -82,9 +82,9 @@ TEST_CASE("Brick ramps span short tessellation edges and plan both endpoints tog
     // Translation phase chosen so the old three ramp samples all serialized
     // to the same XY. Test the actual formatter grid, not just native geometry.
     const auto serialized = [&a](const Point3 &point) {
-        return Vec3d(GCodeFormatter::quantize_xyzf(43.0759 + unscale_(point.x() - a.x())),
-                     GCodeFormatter::quantize_xyzf(18.50554 + unscale_(point.y() - a.y())),
-                     GCodeFormatter::quantize_xyzf(.4 + unscale_(point.z())));
+        return Vec3d(GCodeFormatter::quantize_xyz(43.0759 + unscale_(point.x() - a.x()), false),
+                     GCodeFormatter::quantize_xyz(18.50554 + unscale_(point.y() - a.y()), false),
+                     GCodeFormatter::quantize_xyz(.4 + unscale_(point.z()), false));
     };
     for (size_t i = 0; i < paths.size(); ++i) {
         CHECK_THAT(paths[i].height, Catch::Matchers::WithinAbs(original[i].height, 1e-12));

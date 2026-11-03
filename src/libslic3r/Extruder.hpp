@@ -18,6 +18,7 @@ public:
         // BBS
         if (m_share_extruder) {
             m_share_E = std::vector<double>(MAXIMUM_EXTRUDER_NUMBER, 0);
+            m_share_emitted_E = std::vector<double>(MAXIMUM_EXTRUDER_NUMBER, 0);
             m_share_retracted = std::vector<double>(MAXIMUM_EXTRUDER_NUMBER, 0);
         } else {
             m_E             = 0;
@@ -25,6 +26,8 @@ public:
         }
         m_restart_extra = 0;
         m_absolute_E    = 0;
+        m_E_rounding_carry = 0;
+        m_emitted_E = 0;
     }
 
     unsigned int id() const { return m_id; }
@@ -41,7 +44,13 @@ public:
     double retract(double length, double restart_extra);
     double unretract();
     double E() const { return m_share_extruder ? m_share_E[extruder_id()] : m_E; }
-    void   reset_E() { m_E = 0.; m_share_E[extruder_id()] = 0.; }
+    // E() plus extra, as written to the G-code for the current move. high_precision is the precision of that move,
+    // see GCodeWriter::high_precision().
+    double E_to_emit(bool high_precision, double extra = 0.);
+    // Predict the serialized extrusion delta of extrude(dE) followed by
+    // E_to_emit(), without consuming the relative-E rounding carry.
+    double preview_extrusion_delta(double dE, bool high_precision) const;
+    void   reset_E() { m_E = 0.; m_share_E[extruder_id()] = 0.; m_emitted_E = 0.; m_share_emitted_E[extruder_id()] = 0.; }
     // e_per_mm is extrusion_per_mm = geometric volume * (filament flow ratio / cross-sectional area)  [Doesn't account for print_flow_ratio, or modifiers like bridge flow ratio etc.]
     double e_per_mm(double mm3_per_mm) const { return mm3_per_mm * m_e_per_mm3; }
     // e_per_mm3 is extrusion_per_mm3 = filament flow ratio / cross-sectional area    [Doesn't account for print_flow_ratio, or modifiers like bridge flow ratio etc.]
@@ -64,7 +73,11 @@ public:
     double get_share_retracted_length() const { return m_share_retracted[extruder_id()]; }
     // Setters for the PlaceholderParser.
     // Set current extruder position. Only applicable with absolute extruder addressing.
-    void   set_position(double e) { m_E = e; }
+    void   set_position(double e) {
+        m_E = e;
+        if (m_share_extruder) m_share_emitted_E[extruder_id()] = e;
+        else m_emitted_E = e;
+    }
     // Sets current retraction value & restart extra filament amount if retracted > 0.
     void   set_retracted(double retracted, double restart_extra);
     
@@ -105,12 +118,18 @@ private:
     double       m_retracted;
     // When retracted, this value stores the extra amount of priming on deretraction.
     double       m_restart_extra;
+    // Rounding error of the relative E written so far, carried into the next move by E_to_emit().
+    double       m_E_rounding_carry{ 0. };
+    // Last serialized absolute E, which may have used a different precision
+    // from the next command. Prediction only; never changes extrusion output.
+    double       m_emitted_E{ 0. };
     double       m_e_per_mm3;
 
     // BBS.
     // Create shared E and retraction data for single extruder multi-material machine
     bool          m_share_extruder;
     static std::vector<double> m_share_E;
+    static std::vector<double> m_share_emitted_E;
     static std::vector<double> m_share_retracted;
 };
 

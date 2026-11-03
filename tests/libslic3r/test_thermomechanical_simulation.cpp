@@ -39,7 +39,7 @@ TEST_CASE("Deposition simulation qualifies reduced mechanics separately and abst
     const auto fine = simulate_deposition_grid(grid, activation, {material()}, {insulated()}, 0., 0.);
     REQUIRE(fine.mechanical.has_value());
     SimulationLimits limits;
-    limits.reduction.emplace();
+    limits.reduction = SimulationLimits::Reduction{};
     limits.reduction->displacement_relative_tolerance = 1e-12;
     limits.reduction->energy_relative_tolerance = 1e-12;
     const auto reduced = simulate_deposition_grid(grid, activation, {material()}, {insulated()}, 0., 0., limits);
@@ -368,7 +368,7 @@ TEST_CASE("Timed bed release changes heat exchange without resetting temperature
     CHECK_THROWS_AS(simulate_deposition_grid(grid, activation, {material()}, {bed}, 0., 2., bounded, {},
         release), ResourceLimit);
     SimulationLimits reduced;
-    reduced.reduction.emplace();
+    reduced.reduction = SimulationLimits::Reduction{};
     reduced.reduction->displacement_relative_tolerance = .01;
     reduced.reduction->energy_relative_tolerance = .01;
     CHECK_THROWS_AS(simulate_deposition_grid(grid, activation, {material()}, {bed}, 0., 2., reduced, {},
