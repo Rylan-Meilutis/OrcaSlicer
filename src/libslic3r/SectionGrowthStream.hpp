@@ -1,4 +1,6 @@
 #pragma once
+#include "ThermoelasticMesh.hpp"
+#include "ThermoelasticLayers.hpp"
 #include "ThermoelasticLocalSections.hpp"
 #include "ThermoelasticLocalTopology.hpp"
 #include "ThermoelasticSectionTopology.hpp"

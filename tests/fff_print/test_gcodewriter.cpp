@@ -172,7 +172,7 @@ TEST_CASE("Smart bed temperature ignores elevated interface material", "[GCodeWr
     const bool hotter_on_bed = std::find(first.begin(), first.end(), 1u) != first.end();
     REQUIRE(hotter_on_bed == interface_on_bed);
     const int expected_first = hotter_on_bed ? 85 : 60;
-    const int expected_normal = mode == "by_highest_temp" || hotter_on_bed ? 80 : 55;
+    const int expected_normal = hotter_on_bed ? 80 : 55;
     CHECK(output.find("; BED_PLACEHOLDER " + std::to_string(expected_first)) != std::string::npos);
     if (mode == "smart_bed_contact")
         CHECK(output.find("; BED_VECTOR " + std::to_string(expected_first) + " " +

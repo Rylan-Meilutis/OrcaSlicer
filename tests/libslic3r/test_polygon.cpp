@@ -1,15 +1,32 @@
 #include <algorithm>
+#include <array>
 #include <catch2/catch_all.hpp>
 #include <cstddef>
 #include "libslic3r/libslic3r.h"
 
 #include <catch2/catch_test_macros.hpp>
 #include "libslic3r/Point.hpp"
+#include "libslic3r/BoundingBox.hpp"
 #include "libslic3r/Polygon.hpp"
 #include "libslic3r/Line.hpp"
 #include "libslic3r/Polyline.hpp"
 
 using namespace Slic3r;
+
+TEST_CASE("Polygon bounds retain signed 64-bit coordinate ordering", "[Polygon][Regression]")
+{
+    const std::array<coord_t, 7> coordinates{{-5000000000LL, -3000000000LL, -2000000000LL,
+        0, 2000000000LL, 3000000000LL, 5000000000LL}};
+    for (const coord_t first : coordinates)
+        for (const coord_t second : coordinates) {
+            const Polygon polygon{{first, first}, {second, first}, {second, second}, {first, second}};
+            const auto bounds = get_extents(polygon);
+            CHECK(bounds.min.x() == std::min(first, second));
+            CHECK(bounds.min.y() == std::min(first, second));
+            CHECK(bounds.max.x() == std::max(first, second));
+            CHECK(bounds.max.y() == std::max(first, second));
+        }
+}
 
 SCENARIO("Converted Perl tests", "[Polygon]") {
     GIVEN("ccw_square") {

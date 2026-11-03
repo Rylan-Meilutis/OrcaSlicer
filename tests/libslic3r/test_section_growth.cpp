@@ -1,4 +1,6 @@
 #include <catch2/catch_test_macros.hpp>
+#include "libslic3r/ThermoelasticLayers.hpp"
+#include <utility>
 #include <catch2/matchers/catch_matchers.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 #include "libslic3r/SectionGrowth.hpp"

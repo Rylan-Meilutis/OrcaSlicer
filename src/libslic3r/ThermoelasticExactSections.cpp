@@ -1901,6 +1901,9 @@ std::array<Kernel::FT, 9> exact_xy_moments(const Set& occupied, const std::array
     const coord_t x0 = cell_start[0], y0 = cell_start[1];
     constexpr unsigned binomial[4][4]{{1,0,0,0},{1,1,0,0},{1,2,1,0},{1,3,3,1}};
     std::array<FT, 9> xy{};
+    // A default-constructed CGAL lazy number has no initialized interval.
+    // Accumulators need an explicit exact zero, including in Release builds.
+    xy.fill(FT(0));
     const auto integrate_ring = [&](const Polygon2& ring) {
         for (std::size_t edge = 0; edge < ring.size(); ++edge) {
             const auto& first = ring[edge];
@@ -2131,6 +2134,9 @@ ExactSectionMoments exact_section_vertical_surface_moments(const ExactSectionBou
         z_moments[r]=(power(z1,r+1)-power(z0,r+1))/FT(int(r+1))*FT(double(cell_size[2]))/
             (FT(1000000000)*FT(1000000000));
     std::array<FT,27> lower{},upper{},representative{};
+    lower.fill(FT(0));
+    upper.fill(FT(0));
+    representative.fill(FT(0));
     constexpr unsigned choose[3][3]{{1,0,0},{1,1,0},{1,2,1}};
     for (const auto& segment : ExactSectionBoundaryAccess::segments(boundary)) {
         charge(1);
@@ -2173,6 +2179,7 @@ ExactSectionMoments exact_section_vertical_surface_moments(const ExactSectionBou
         const FT length_lower(length_bounds[0]),length_upper(length_bounds[1]);
         const FT length_representative(std::clamp(length_estimate,length_bounds[0],length_bounds[1]));
         std::array<FT,9> xy{};
+        xy.fill(FT(0));
         for (unsigned q=0;q<3;++q)
             for (unsigned p=0;p<3;++p)
                 for (unsigned i=0;i<=p;++i)

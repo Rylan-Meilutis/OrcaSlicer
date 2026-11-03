@@ -13,6 +13,7 @@
 // header in, or its include guard suppresses the implementation. Same pattern as the other dev tools.
 #define NANOSVG_IMPLEMENTATION
 #include "nanosvg/nanosvg.h"
+#include "libslic3r/Format/ProjectStrategy.hpp"
 #include <algorithm>
 #include <boost/filesystem/operations.hpp>
 #include <boost/filesystem/path.hpp>

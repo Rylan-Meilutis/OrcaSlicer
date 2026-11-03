@@ -26,6 +26,7 @@
 #include <catch2/catch_message.hpp>
 #include <catch2/generators/catch_generators.hpp>
 #include "libslic3r/PresetBundle.hpp"
+#include "libslic3r/Preset.hpp"
 #include "libslic3r/IMEXHelpers.hpp"
 #include "libslic3r/ParallelResolve.hpp"
 #include "libslic3r/AppConfig.hpp"
@@ -366,6 +367,19 @@ TEST_CASE("Dispatch rejects duplicate missing and out of range tool assignments"
 namespace {
 
 namespace fs = boost::filesystem;
+
+// RME maps independent-tool materials at dispatch, so a generic tool changer uses
+// a logical palette (and the default host is OctoPrint). Native Bambu palettes
+// deliberately retain upstream nozzle-count padding. Exercise that policy
+// explicitly instead of relying on the generic printer defaults.
+void configure_fixed_palette_printer(PresetBundle &bundle, DynamicPrintConfig &config)
+{
+    VendorProfile::PrinterModel model;
+    model.name = "Native fixed-palette test printer";
+    bundle.vendors["BBL"].models = {model};
+    config.set_key_value("printer_model", new ConfigOptionString(model.name));
+    config.set_key_value("host_type", new ConfigOptionEnum<PrintHostType>(htPrusaLink));
+}
 
 // Whether a key is listed in a vector of keys (published_keys / skipped_keys).
 bool contains_key(const std::vector<std::string> &keys, const std::string &key)
@@ -1264,8 +1278,21 @@ TEST_CASE("Local reload reconciles filament slots and purge volumes while retain
           "[Preset][Bundle][Regression]")
 {
     LocalReloadFixture f;
+    const int palette_policy = GENERATE(0, 1, 2); // fixed, logical preset, logical physical host
+    const bool logical_palette = palette_policy != 0;
+    CAPTURE(palette_policy);
     DynamicPrintConfig printer_config(f.bundle.printers.get_selected_preset().config);
-    // A tool changer, whose filament slots follow its nozzle count.
+    if (palette_policy != 1)
+        configure_fixed_palette_printer(f.bundle, printer_config);
+    else
+        printer_config.set_key_value("host_type", new ConfigOptionEnum<PrintHostType>(htOctoPrint));
+    if (palette_policy == 2) {
+        DynamicPrintConfig host_config;
+        host_config.set_key_value("host_type", new ConfigOptionEnum<PrintHostType>(htOctoPrint));
+        host_config.set_key_value("preset_names", new ConfigOptionStrings({f.bundle.printers.get_selected_preset_name()}));
+        f.bundle.physical_printers.load_printer("", "Mapped print host", std::move(host_config), true);
+        REQUIRE(f.bundle.physical_printers.has_selection());
+    }
     printer_config.option<ConfigOptionFloats>("nozzle_diameter")->values = {0.4, 0.4};
     printer_config.option<ConfigOptionBool>("single_extruder_multi_material", true)->value = false;
     write_preset_with_inherits(printer_config, f.directory / PRESET_PRINTER_NAME / "Printer.json", "Printer", "");
@@ -1276,11 +1303,20 @@ TEST_CASE("Local reload reconciles filament slots and purge volumes while retain
     const ConfigOption* colour                                                         = f.bundle.project_config.option("filament_colour");
 
     REQUIRE(f.bundle.reload_local_bundle("", f.id, &f.error));
-    CHECK(f.bundle.filament_presets == std::vector<std::string>{f.prefix + "Filament", f.prefix + "Filament"});
-    check_double_vector(f.bundle.project_config.option<ConfigOptionFloats>("flush_multiplier")->values, {0.75, 1.});
-    check_double_vector(f.bundle.project_config.option<ConfigOptionFloats>("flush_volumes_vector")->values, {111., 222., 111., 222.});
-    check_double_vector(f.bundle.project_config.option<ConfigOptionFloats>("flush_volumes_matrix")->values,
-                        {0., 333., 333., 0., 0., 333., 333., 0.});
+    CHECK(f.bundle.uses_logical_filament_slots() == logical_palette);
+    CHECK(f.bundle.filament_presets == std::vector<std::string>(logical_palette ? 1 : 2, f.prefix + "Filament"));
+    if (logical_palette) {
+        // Purge multipliers and matrix planes remain per physical nozzle even
+        // when the project contains only one logical material.
+        check_double_vector(f.bundle.project_config.option<ConfigOptionFloats>("flush_multiplier")->values, {0.75, 1.});
+        check_double_vector(f.bundle.project_config.option<ConfigOptionFloats>("flush_volumes_vector")->values, {111., 222.});
+        check_double_vector(f.bundle.project_config.option<ConfigOptionFloats>("flush_volumes_matrix")->values, {0., 0.});
+    } else {
+        check_double_vector(f.bundle.project_config.option<ConfigOptionFloats>("flush_multiplier")->values, {0.75, 1.});
+        check_double_vector(f.bundle.project_config.option<ConfigOptionFloats>("flush_volumes_vector")->values, {111., 222., 111., 222.});
+        check_double_vector(f.bundle.project_config.option<ConfigOptionFloats>("flush_volumes_matrix")->values,
+                            {0., 333., 333., 0., 0., 333., 333., 0.});
+    }
     CHECK(f.bundle.project_config.option("filament_colour") == colour);
     CHECK(f.bundle.project_config.option<ConfigOptionStrings>("filament_colour")->values == std::vector<std::string>{"#123456"});
 }
@@ -3233,11 +3269,16 @@ TEST_CASE("Sizing the filament list to a multi-tool nozzle count keeps mixed slo
 // shared nozzles (single_extruder_multi_material, as on a Bambu Lab H2D) or giving each nozzle a
 // filament of its own (a tool changer).
 namespace {
-void select_multi_nozzle_printer(PresetBundle &bundle, size_t nozzle_count, bool single_extruder_multi_material)
+void select_multi_nozzle_printer(PresetBundle &bundle, size_t nozzle_count, bool single_extruder_multi_material,
+                                bool logical_palette = false)
 {
     Preset &printer = add_inmemory_preset(bundle.printers, single_extruder_multi_material ? "Shared Nozzle Printer" : "Tool Changer");
     printer.config.option<ConfigOptionFloats>("nozzle_diameter", true)->values = std::vector<double>(nozzle_count, 0.4);
     printer.config.option<ConfigOptionBool>("single_extruder_multi_material", true)->value = single_extruder_multi_material;
+    if (!logical_palette)
+        configure_fixed_palette_printer(bundle, printer.config);
+    else
+        printer.config.set_key_value("host_type", new ConfigOptionEnum<PrintHostType>(htOctoPrint));
     bundle.printers.select_preset_by_name(printer.name, true);
 }
 } // namespace
@@ -3258,9 +3299,9 @@ TEST_CASE("Deleting a filament on a shared-nozzle printer keeps it deleted", "[P
     CHECK(bundle.project_config.option<ConfigOptionStrings>("filament_colour")->values.size() == 1);
 }
 
-// Each tool of a tool changer carries its own filament, so the filament list never drops below the
-// tool count.
-TEST_CASE("A tool changer keeps a filament for every tool", "[Preset][Bundle]")
+// A native fixed-palette printer carries one filament per tool, unlike a logical
+// project palette whose materials are assigned to tools at dispatch.
+TEST_CASE("A fixed-palette printer keeps a filament for every tool", "[Preset][Bundle]")
 {
     PresetBundle bundle;
     select_multi_nozzle_printer(bundle, 4, false);
@@ -3268,25 +3309,27 @@ TEST_CASE("A tool changer keeps a filament for every tool", "[Preset][Bundle]")
 
     bundle.update_multi_material_filament_presets();
 
+    CHECK_FALSE(bundle.uses_logical_filament_slots());
     CHECK(bundle.filament_presets.size() == 4);
 }
 
 // The app config keeps each printer's filament list. The next start (load_selections) and a switch
 // back to the printer with remember_printer_config on (update_selections) restore it from there: a
-// shared-nozzle printer gets back the one filament it was left with, a tool changer still gets one
-// per tool.
+// shared-nozzle or logical-palette printer gets back the one filament it was left
+// with, while a fixed-palette tool changer still gets one per tool.
 TEST_CASE("A remembered one-filament list comes back at the printer's minimum length", "[Preset][Bundle]")
 {
     const bool   shared_nozzles = GENERATE(true, false);
     const bool   on_startup     = GENERATE(true, false);
+    const bool   logical_palette = GENERATE(false, true);
     const size_t nozzle_count   = shared_nozzles ? 2 : 4;
-    const size_t expected       = shared_nozzles ? 1 : nozzle_count;
-    CAPTURE(shared_nozzles, on_startup);
+    const size_t expected       = shared_nozzles || logical_palette ? 1 : nozzle_count;
+    CAPTURE(shared_nozzles, on_startup, logical_palette);
 
     AppConfig app_config;
     {
         PresetBundle bundle;
-        select_multi_nozzle_printer(bundle, nozzle_count, shared_nozzles);
+        select_multi_nozzle_printer(bundle, nozzle_count, shared_nozzles, logical_palette);
         add_inmemory_preset(bundle.filaments, "Test Filament");
         bundle.filaments.select_preset_by_name("Test Filament", true);
         // Set the one-filament list directly: set_num_filaments() runs the padding under test.
@@ -3296,7 +3339,7 @@ TEST_CASE("A remembered one-filament list comes back at the printer's minimum le
     }
 
     PresetBundle bundle;
-    select_multi_nozzle_printer(bundle, nozzle_count, shared_nozzles);
+    select_multi_nozzle_printer(bundle, nozzle_count, shared_nozzles, logical_palette);
     add_inmemory_preset(bundle.filaments, "Test Filament");
     if (on_startup)
         bundle.load_selections(app_config);
@@ -3305,6 +3348,7 @@ TEST_CASE("A remembered one-filament list comes back at the printer's minimum le
 
     CHECK(bundle.filament_presets.size() == expected);
     CHECK(bundle.project_config.option<ConfigOptionStrings>("filament_colour")->values.size() == expected);
+    CHECK(bundle.uses_logical_filament_slots() == logical_palette);
 }
 
 // A one-colour print for a shared-nozzle printer, as Bambu Studio saves it for an H2D or X2D, opens
@@ -6402,14 +6446,15 @@ TEST_CASE("Adding a filament preserves slots with incomplete mixed metadata", "[
     }
 }
 
-// On a tool changer the nozzle-count top-up in update_multi_material_filament_presets() grows
+// On a fixed-palette tool changer the nozzle-count top-up in update_multi_material_filament_presets() grows
 // filament_presets on its own, so a physical count derived from that list reports a slot no
 // per-filament array has yet. That is what made the extruder-count handler conclude there was
 // nothing to add and leave the new sidebar combo with no colour to draw.
 TEST_CASE("The physical filament count is not fooled by a lone filament_presets top-up", "[Preset][Bundle][FilamentMixer]")
 {
     PresetBundle bundle;
-    // The extruder-count handler that adds filaments runs on tool changers only.
+    configure_fixed_palette_printer(bundle, bundle.printers.get_edited_preset().config);
+    // The extruder-count handler adds filaments only on fixed-palette tool changers.
     bundle.printers.get_edited_preset().config.option<ConfigOptionBool>("single_extruder_multi_material", true)->value = false;
 
     SECTION("no mixed slots") {
@@ -6443,6 +6488,7 @@ TEST_CASE("The physical filament count is not fooled by a lone filament_presets 
 TEST_CASE("New filament colours are placed by array position", "[Preset][Bundle][FilamentMixer]")
 {
     PresetBundle bundle;
+    configure_fixed_palette_printer(bundle, bundle.printers.get_edited_preset().config);
     bundle.printers.get_edited_preset().config.option<ConfigOptionBool>("single_extruder_multi_material", true)->value = false;
     bundle.set_num_filaments(4u, std::string("#FF0000"));
     bundle.printers.get_edited_preset().config.option<ConfigOptionFloats>("nozzle_diameter", true)->values =

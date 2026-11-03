@@ -5843,8 +5843,7 @@ int GCode::get_highest_bed_temperature(const bool is_first_layer, const Print& p
     // The bed remains in contact with the first layer, not the tool currently
     // printing an elevated interface. Sequential prints collect every object's
     // first-layer tools in this same list.
-    const bool bed_contact_only = m_config.bed_temperature_formula == BedTempFormula::btfBedContact;
-    for (auto fidx : print.get_slice_used_filaments(is_first_layer || bed_contact_only)) {
+    for (auto fidx : print.get_slice_used_filaments(true)) {
         bed_temp = std::max(bed_temp, get_bed_temperature(fidx, is_first_layer, bed_type));
     }
     return bed_temp;

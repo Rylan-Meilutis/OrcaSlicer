@@ -1,4 +1,6 @@
 #pragma once
+#include "libslic3r.h"
+#include "Polygon.hpp"
 #include "ExPolygon.hpp"
 #include "Point.hpp"
 #include "BoundingBox.hpp"

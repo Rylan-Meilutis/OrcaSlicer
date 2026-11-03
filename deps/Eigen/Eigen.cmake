@@ -6,6 +6,8 @@ endif ()
 orcaslicer_add_cmake_project(Eigen
     URL https://gitlab.com/libeigen/eigen/-/archive/5.0.1/eigen-5.0.1.zip
     URL_HASH SHA256=0dbb1f9e3aaad66f352c03227d8c983f6f0b49e0b07e71a7300f4abcc01aee12
+    PATCH_COMMAND ${CMAKE_COMMAND} -DEIGEN_SOURCE_DIR=<SOURCE_DIR>
+        -P ${CMAKE_CURRENT_LIST_DIR}/patch_sse2_int64.cmake
     CMAKE_ARGS "${_eigen_extra_flags}"
         # Only the headers are consumed here. Everything below builds nothing we
         # use, and all three enable_language(Fortran): test/CMakeLists.txt:9,

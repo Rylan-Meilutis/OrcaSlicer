@@ -1,4 +1,5 @@
 #pragma once
+#include "ThermoelasticExactSections.hpp"
 #include "ThermoelasticLayers.hpp"
 #include "ThermoelasticMesh.hpp"
 #include "ThermoelasticToolpath.hpp"

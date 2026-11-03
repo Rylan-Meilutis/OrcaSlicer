@@ -1,4 +1,5 @@
 #include <catch2/catch_test_macros.hpp>
+#include "libslic3r/Format/ProjectStrategy.hpp"
 #include <catch2/catch_message.hpp>
 #include "libslic3r/Config.hpp"
 #include "libslic3r/ClipperUtils.hpp"

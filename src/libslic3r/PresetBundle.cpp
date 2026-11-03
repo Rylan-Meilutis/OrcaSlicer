@@ -1695,6 +1695,11 @@ bool PresetBundle::reload_local_bundle(const std::string& preset_folder, const s
         staged.prints           = prints;
         staged.filaments        = filaments;
         staged.printers         = printers;
+        // Palette policy consults the vendor registry and selected print host.
+        // Keep those lookups consistent with the live bundle while staging;
+        // preset vendor pointers still refer to the unchanged live registry.
+        staged.vendors          = vendors;
+        staged.physical_printers = physical_printers;
         staged.filament_presets = filament_presets;
         staged.project_config.apply_only(project_config, {"flush_volumes_matrix", "flush_volumes_vector", "flush_multiplier"});
         auto remove_target = [&](PresetCollection& collection) {

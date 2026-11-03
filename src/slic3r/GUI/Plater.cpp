@@ -1,4 +1,5 @@
 #include "Plater.hpp"
+#include "libslic3r/Format/ProjectStrategy.hpp"
 #include <boost/algorithm/string/case_conv.hpp>
 #include <boost/algorithm/string/constants.hpp>
 #include <boost/algorithm/string/replace.hpp>

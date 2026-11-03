@@ -1,4 +1,5 @@
 #pragma once
+#include "ThermoelasticMesh.hpp"
 #include "SectionGrowth.hpp"
 #include "SectionGrowthStream.hpp"
 #include "ThermoelasticLayers.hpp"

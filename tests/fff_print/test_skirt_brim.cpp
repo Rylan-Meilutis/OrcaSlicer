@@ -1,4 +1,5 @@
 #include <algorithm>
+#include "libslic3r/Format/ProjectStrategy.hpp"
 #include <catch2/catch_all.hpp>
 
 #include <catch2/catch_test_macros.hpp>

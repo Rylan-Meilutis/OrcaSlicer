@@ -256,6 +256,7 @@ TEST_CASE("The G-code header names the first object's filament when printing by 
 // bed to its temperature would soften the filament the part stands on, so only first layer filaments count.
 TEST_CASE("The highest temperature bed formula ignores filaments that start above the first layer", "[GCode]")
 {
+    const auto formula = GENERATE("by_highest_temp", "smart_bed_contact");
     // Filament 1: bed 65 on the first layer, 60 after it. Filament 2: bed 100. A 30 mm cap on a 10 mm tall stem prints
     // with filament 1 and is supported from the bed, the support with filament 1 and its interface under the cap
     // with filament 2.
@@ -265,7 +266,7 @@ TEST_CASE("The highest temperature bed formula ignores filaments that start abov
     cap.translate(0, 0, 10);
     mesh.merge(cap);
     DynamicPrintConfig config = Test::multifilament_config(2, {
-        {"bed_temperature_formula", "by_highest_temp"},
+        {"bed_temperature_formula", formula},
         {"enable_prime_tower", 0},
         {"enable_support", 1},
         {"support_filament", 1},

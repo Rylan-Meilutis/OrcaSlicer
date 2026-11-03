@@ -1,4 +1,6 @@
 #pragma once
+#include "ThermalHistory.hpp"
+#include "ThermoelasticSectionTopology.hpp"
 #include "SectionGrowth.hpp"
 #include "SectionIntegration.hpp"
 #include "SectionThermalAssembly.hpp"

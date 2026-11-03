@@ -1,4 +1,5 @@
 #include "NetworkAgentFactory.hpp"
+#include <wx/event.h>
 #include "CloudProvider.hpp"
 #include "IPrinterAgent.hpp"
 #include "ICloudServiceAgent.hpp"

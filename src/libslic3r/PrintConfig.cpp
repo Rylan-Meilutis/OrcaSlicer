@@ -3954,7 +3954,7 @@ void PrintConfigDef::init_fff_params()
 
     def = this->add("bed_temperature_formula", coEnum);
     def->label = L("Bed temperature type");
-    def->tooltip = L("Choose the first filament's bed temperature, the highest temperature of the printed filaments, or Smart mode. Smart mode uses the highest temperature of filaments on the bed-contact layer throughout the print, ignoring hotter materials used only above it, such as support interface. Explicit temperatures in custom G-code are not overridden.");
+    def->tooltip = L("Choose the first filament's bed temperature or the highest temperature of filaments on the bed-contact layer. Both Highest Temp and Smart mode ignore hotter materials used only above it, such as support interface. Smart mode also applies this selection to bed-temperature placeholders in custom G-code. Explicit temperatures in custom G-code are not overridden.");
     def->mode = comAdvanced;
     def->enum_keys_map = &ConfigOptionEnum<BedTempFormula>::get_enum_values();
     def->enum_values.push_back("by_first_filament");

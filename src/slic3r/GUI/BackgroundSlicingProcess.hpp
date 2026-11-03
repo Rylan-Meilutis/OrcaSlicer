@@ -24,7 +24,6 @@
 #include "slic3r/Utils/PrintHost.hpp"
 #include "libslic3r/GCode/GCodeProcessor.hpp"
 #include "libslic3r/GCode/SpoolManagerMetadata.hpp"
-#include "PartPlate.hpp"
 
 namespace Slic3r { class Polygon; }
 namespace Slic3r { class Print; }

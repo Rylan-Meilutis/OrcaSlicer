@@ -261,6 +261,9 @@ jobs:
       image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-50
       options: --privileged
       volumes:
+        # Populate a writable volume from the image's preinstalled SDKs. Updating
+        # deployments in the image's overlay filesystem can fail with EXDEV.
+        - /var/lib/flatpak
         - /usr/local/lib/android:/usr/local/lib/android
         - /usr/share/dotnet:/usr/share/dotnet
         - /opt/ghc:/opt/ghc1

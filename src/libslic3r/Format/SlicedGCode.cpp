@@ -1,4 +1,5 @@
 #include "SlicedGCode.hpp"
+#include "ProjectStrategy.hpp"
 #include "libslic3r/Config.hpp"
 #include "libslic3r/GCode/GCodeProcessor.hpp"
 #include "libslic3r/GCode/ToolMapping.hpp"

@@ -1,4 +1,5 @@
 #include "libslic3r/Config.hpp"
+#include "libslic3r/Format/ProjectStrategy.hpp"
 #include "libslic3r/libslic3r.h"
 #include "libslic3r/PresetBundle.hpp"
 #include "libslic3r/Model.hpp"

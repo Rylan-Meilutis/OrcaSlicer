@@ -1,4 +1,5 @@
 #include "ThermoelasticSourceOwnership.hpp"
+#include "libslic3r.h"
 #include "GCode/DepositionProvenance.hpp"
 #include "GCode/DepositionSection.hpp"
 #include "GCode/GCodeProcessor.hpp"
