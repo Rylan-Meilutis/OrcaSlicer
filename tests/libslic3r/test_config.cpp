@@ -2345,17 +2345,19 @@ TEST_CASE("normalize_fdm leaves feature filaments on Default", "[Config]") {
     CHECK_FALSE(config.has("bottom_surface_filament_id"));
 }
 
-TEST_CASE("silent_mode is no longer saved and is dropped on load", "[Config]") {
+TEST_CASE("RME retains the separate Stealth limits printer option", "[Config]") {
     DynamicPrintConfig full;
     full.apply(FullPrintConfig::defaults());
-    CHECK_FALSE(full.has("silent_mode"));
+    REQUIRE(full.has("silent_mode"));
+    CHECK_FALSE(full.opt_bool("silent_mode"));
 
-    // Projects saved before its removal still carry it.
+    // RME keeps this opt-in setting compatible with existing printer presets.
     ConfigSubstitutionContext ctxt(ForwardCompatibilitySubstitutionRule::Enable);
     DynamicPrintConfig        config;
-    config.set_deserialize("silent_mode", "0", ctxt);
-    CHECK_FALSE(config.has("silent_mode"));
-    CHECK(ctxt.unrecogized_keys == std::vector<std::string>{"silent_mode"});
+    config.set_deserialize("silent_mode", "1", ctxt);
+    REQUIRE(config.has("silent_mode"));
+    CHECK(config.opt_bool("silent_mode"));
+    CHECK(ctxt.unrecogized_keys.empty());
 }
 
 TEST_CASE("handle_legacy migrates every IDEX/IQEX key testers already have", "[Config]") {

@@ -1532,6 +1532,7 @@ inline constexpr float DEFAULT_FILAMENT_DENSITY = 1.245f;
         bool is_stealth_time_estimator_enabled() const {
             return m_time_processor.machines[static_cast<size_t>(PrintEstimatedStatistics::ETimeMode::Stealth)].enabled;
         }
+        void enable_stealth_time_estimator(bool enabled);
         void enable_machine_envelope_processing(bool enabled) { m_time_processor.machine_envelope_processing_enabled = enabled; }
         void reset();
 

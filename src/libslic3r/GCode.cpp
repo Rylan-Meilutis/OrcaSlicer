@@ -3262,6 +3262,8 @@ namespace DoExport {
         processor.initialize_from_context(nozzle_group_result);
         processor.initialize_result_moves();
         processor.apply_config(config);
+        processor.enable_stealth_time_estimator(
+            (config.gcode_flavor == gcfMarlinLegacy || config.gcode_flavor == gcfMarlinFirmware) && config.silent_mode);
         processor.configure_exclusion_volume_path_check(config);
     }
 
@@ -7955,7 +7957,7 @@ LayerResult GCode::process_layer(
                 if (owner == nullptr) continue;
                 for (size_t instance = 0; instance < owner->instances().size(); ++instance) {
                     if (single_object_instance_idx != size_t(-1) && instance != single_object_instance_idx) continue;
-                    gcode += generate_object_brim(print, *owner, instance, true, ltp.object_layer);
+                    gcode += generate_object_brim(print, *owner, instance, true, extruder_id, ltp.object_layer);
                 }
             }
             this->set_origin(saved_origin);

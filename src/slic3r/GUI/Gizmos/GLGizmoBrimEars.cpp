@@ -1,4 +1,5 @@
 #include "GLGizmoBrimEars.hpp"
+#include "../PartPlate.hpp"
 #include <cstddef>
 #include <Eigen/Geometry>
 #include <algorithm>

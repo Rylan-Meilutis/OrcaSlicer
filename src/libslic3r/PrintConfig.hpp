@@ -2089,6 +2089,7 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionStrings,             filament_change_extrusion_role_gcode))
     ((ConfigOptionFloatsNullable,      travel_speed))
     ((ConfigOptionFloatsNullable,      travel_speed_z))
+    ((ConfigOptionBool,                silent_mode))
     ((ConfigOptionString,              machine_pause_gcode))
     ((ConfigOptionString,              template_custom_gcode))
     //BBS
