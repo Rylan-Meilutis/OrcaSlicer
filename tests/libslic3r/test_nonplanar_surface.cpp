@@ -31,6 +31,49 @@
 
 using namespace Slic3r;
 
+TEST_CASE("Native closed wall seam rotation preserves every directed segment and flow",
+          "[NonplanarSurface][NativeWallSeam]")
+{
+    const Points3 points{{0, 0, 0}, {1000000, 0, 500000},
+        {1000000, 1000000, 200000}, {0, 1000000, 100000}, {0, 0, 0}};
+    ExtrusionPath first(erExternalPerimeter, 0.08, 0.4f, 0.2f);
+    first.polyline.points = {points[0], points[1], points[2]};
+    first.inset_idx = 2;
+    first.nonplanar_surface = true;
+    ExtrusionPath second(erExternalPerimeter, 0.07, 0.5f, 0.15f);
+    second.polyline.points = {points[2], points[3], points[4]};
+    second.inset_idx = 2;
+    second.nonplanar_surface = true;
+    ExtrusionLoop loop(ExtrusionPaths{first, second});
+    loop.inset_idx = 2;
+    const auto segments = [](const ExtrusionLoop &item) {
+        std::vector<std::array<double, 11>> result;
+        for (const ExtrusionPath &path : item.paths)
+            for (size_t i = 1; i < path.polyline.points.size(); ++i) {
+                const Point3 &a = path.polyline.points[i - 1], &b = path.polyline.points[i];
+                result.push_back({double(a.x()), double(a.y()), double(a.z()),
+                    double(b.x()), double(b.y()), double(b.z()), path.width, path.height,
+                    path.mm3_per_mm, double(path.role()), double(path.inset_idx)});
+            }
+        std::sort(result.begin(), result.end());
+        return result;
+    };
+    const auto original = segments(loop);
+    REQUIRE(rotate_native_nonplanar_wall_seam(loop));
+    CHECK(loop.first_point3() == points[1]);
+    CHECK(loop.last_point3() == points[1]);
+    CHECK(loop.inset_idx == 2);
+    CHECK(segments(loop) == original);
+    for (const ExtrusionPath &path : loop.paths)
+        CHECK(path.nonplanar_surface);
+    REQUIRE(rotate_native_nonplanar_wall_seam(loop));
+    CHECK(segments(loop) == original);
+    loop.paths.back().polyline.points.back().z() += 1;
+    const auto disconnected = segments(loop);
+    CHECK_FALSE(rotate_native_nonplanar_wall_seam(loop));
+    CHECK(segments(loop) == disconnected);
+}
+
 TEST_CASE("Non-planar transitions validate all legs and obey the machine ceiling",
           "[NonplanarSurface][NonplanarTransition][Regression]")
 {

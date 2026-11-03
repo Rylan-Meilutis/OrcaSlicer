@@ -215,6 +215,10 @@ public:
     float height;
     double smooth_speed = 0;
     bool z_contoured = false;
+    // Set by ContourZ only when it actually projects this path. Unlike the
+    // shared variable-Z transport flag, this identifies legacy top-contouring
+    // geometry whose lower surface is its original native layer bottom.
+    bool contour_z_generated = false;
     // The path follows the model's actual top surface. It shares the variable-Z
     // transport machinery with Z contouring, but keeps normal bead volume.
     bool nonplanar_surface = false;
@@ -286,6 +290,7 @@ public:
         , height(rhs.height)
         , smooth_speed(rhs.smooth_speed)
         , z_contoured(rhs.z_contoured)
+        , contour_z_generated(rhs.contour_z_generated)
         , nonplanar_surface(rhs.nonplanar_surface)
         , nonplanar_schedule_owned(rhs.nonplanar_schedule_owned)
         , nonplanar_replacement_remainder(rhs.nonplanar_replacement_remainder)
@@ -314,6 +319,7 @@ public:
         , height(rhs.height)
         , smooth_speed(rhs.smooth_speed)
         , z_contoured(rhs.z_contoured)
+        , contour_z_generated(rhs.contour_z_generated)
         , nonplanar_surface(rhs.nonplanar_surface)
         , nonplanar_schedule_owned(rhs.nonplanar_schedule_owned)
         , nonplanar_replacement_remainder(rhs.nonplanar_replacement_remainder)
@@ -342,6 +348,7 @@ public:
         , height(rhs.height)
         , smooth_speed(rhs.smooth_speed)
         , z_contoured(rhs.z_contoured)
+        , contour_z_generated(rhs.contour_z_generated)
         , nonplanar_surface(rhs.nonplanar_surface)
         , nonplanar_schedule_owned(rhs.nonplanar_schedule_owned)
         , nonplanar_replacement_remainder(rhs.nonplanar_replacement_remainder)
@@ -370,6 +377,7 @@ public:
         , height(rhs.height)
         , smooth_speed(rhs.smooth_speed)
         , z_contoured(rhs.z_contoured)
+        , contour_z_generated(rhs.contour_z_generated)
         , nonplanar_surface(rhs.nonplanar_surface)
         , nonplanar_schedule_owned(rhs.nonplanar_schedule_owned)
         , nonplanar_replacement_remainder(rhs.nonplanar_replacement_remainder)
@@ -399,6 +407,7 @@ public:
         this->height = rhs.height;
         this->smooth_speed = rhs.smooth_speed;
         this->z_contoured = rhs.z_contoured;
+        this->contour_z_generated = rhs.contour_z_generated;
         this->nonplanar_surface = rhs.nonplanar_surface;
         this->nonplanar_schedule_owned = rhs.nonplanar_schedule_owned;
         this->nonplanar_replacement_remainder = rhs.nonplanar_replacement_remainder;
@@ -429,6 +438,7 @@ public:
         this->height = rhs.height;
         this->smooth_speed = rhs.smooth_speed;
         this->z_contoured = rhs.z_contoured;
+        this->contour_z_generated = rhs.contour_z_generated;
         this->nonplanar_surface = rhs.nonplanar_surface;
         this->nonplanar_schedule_owned = rhs.nonplanar_schedule_owned;
         this->nonplanar_replacement_remainder = rhs.nonplanar_replacement_remainder;

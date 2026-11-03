@@ -14,6 +14,7 @@
 #include <catch2/generators/catch_generators.hpp>
 #include "catch2/catch_approx.hpp"
 #include "libslic3r/PrintConfig.hpp"
+#include "libslic3r/FilamentAssignment.hpp"
 #include "libslic3r/PrintConfigConstants.hpp"
 #include "libslic3r/LocalesUtils.hpp"
 #include "libslic3r/Preset.hpp"
@@ -44,6 +45,37 @@
 #include <vector>
 #include <utility>
 #include <catch2/matchers/catch_matchers_vector.hpp>
+
+TEST_CASE("Whole-part material edits clear uniform feature bindings without changing other settings", "[FilamentAssignment]")
+{
+    Slic3r::ModelConfig config;
+    config.set("extruder", 2);
+    config.set("wall_loops", 3);
+    const std::array<const char *, 6> keys{"outer_wall_filament_id", "inner_wall_filament_id",
+        "sparse_infill_filament_id", "internal_solid_filament_id", "top_surface_filament_id", "bottom_surface_filament_id"};
+    for (const char *key : keys)
+        config.set(key, 1);
+    Slic3r::clear_uniform_feature_filament_overrides(config);
+    for (const char *key : keys)
+        CHECK_FALSE(config.has(key));
+    CHECK(config.get().opt_int("extruder") == 2);
+    CHECK(config.get().opt_int("wall_loops") == 3);
+}
+
+TEST_CASE("Whole-part material edits preserve distinct and partial feature bindings", "[FilamentAssignment]")
+{
+    Slic3r::ModelConfig config;
+    config.set("outer_wall_filament_id", 1);
+    const auto partial = config.get();
+    Slic3r::clear_uniform_feature_filament_overrides(config);
+    CHECK(config.get() == partial);
+    for (const char *key : {"inner_wall_filament_id", "sparse_infill_filament_id", "internal_solid_filament_id",
+                           "top_surface_filament_id", "bottom_surface_filament_id"})
+        config.set(key, 2);
+    const auto mixed = config.get();
+    Slic3r::clear_uniform_feature_filament_overrides(config);
+    CHECK(config.get() == mixed);
+}
 
 TEST_CASE("Printer model validation override round trips in printer profile JSON",
           "[Config][PrinterModel][Regression]")

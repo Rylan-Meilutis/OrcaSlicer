@@ -53,6 +53,13 @@ std::string server_key(const std::string &host)
     return digest(hash);
 }
 
+std::string compatibility_context(const std::string &server, const std::string &revision,
+                                  const std::string &gcode_hash)
+{
+    if (!valid_hash(server) || !valid_hash(gcode_hash) || revision.size() > 256) return {};
+    return revision.empty() ? server + ":exact-file:" + gcode_hash : server + ':' + revision;
+}
+
 std::string selected_local_path(const std::string &body)
 {
     const auto file = parse(body).at("job").at("file");

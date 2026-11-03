@@ -353,7 +353,9 @@ public:
         eUploadGcode         = 7,
         eExportAllSlicedFile = 8,
         ePrintMultiMachine   = 9,
-        eExportDepositionStl = 10
+        eExportDepositionStl = 10,
+        eExportDepositionStep = 11,
+        eExportDepositionObj = 12
     };
 
     void update_layout();

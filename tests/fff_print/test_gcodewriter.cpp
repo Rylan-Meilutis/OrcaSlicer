@@ -2194,6 +2194,42 @@ static void configure_lift_writer(GCodeWriter &writer)
     writer.config.retract_lift_below.values = { 0.0 };
 }
 
+TEST_CASE("Native clearance uses serialized XYZ after exact plate offsets",
+          "[GCodeWriter][NonplanarQuantization]")
+{
+    GCodeWriter writer;
+    configure_lift_writer(writer);
+    const Vec2d offset(0.00037, -0.00049);
+    writer.set_xy_offset(offset.x(), offset.y());
+    const Vec3d target(1.23489, -2.34602, 18.4889);
+    const auto actual = writer.quantized_clearance_position(target);
+    REQUIRE(actual);
+    CHECK_THAT(actual->x(), Catch::Matchers::WithinAbs(1.235 + offset.x(), 1e-12));
+    CHECK_THAT(actual->y(), Catch::Matchers::WithinAbs(-2.346 + offset.y(), 1e-12));
+    CHECK_THAT(actual->z(), Catch::Matchers::WithinAbs(18.489, 1e-12));
+    const std::string emitted = writer.travel_to_xyz(target);
+    GCodeReader reader;
+    Vec3d parsed = Vec3d::Zero();
+    reader.parse_buffer(emitted, [&](GCodeReader &state, const GCodeReader::GCodeLine &line) {
+        if (line.cmd_is("G1"))
+            parsed = Vec3d(line.new_X(state), line.new_Y(state), line.new_Z(state));
+    });
+    CHECK_THAT(parsed.x() + offset.x(), Catch::Matchers::WithinAbs(actual->x(), 1e-6));
+    CHECK_THAT(parsed.y() + offset.y(), Catch::Matchers::WithinAbs(actual->y(), 1e-6));
+    CHECK_THAT(parsed.z(), Catch::Matchers::WithinAbs(actual->z(), 1e-6));
+    CHECK(writer.quantized_clearance_position({0., 0., 18.4889})->z() ==
+          writer.quantized_clearance_position({0., 0., 18.4891})->z());
+    CHECK(writer.quantized_clearance_position({0., 0., 19.1253})->z() !=
+          writer.quantized_clearance_position({0., 0., 19.1261})->z());
+    CHECK_FALSE(writer.quantized_clearance_position({0., 0., std::numeric_limits<double>::infinity()}));
+    writer.set_axis_remap(1, 0, 2);
+    CHECK_FALSE(writer.quantized_clearance_position(target));
+    writer.set_axis_remap(0, 1, 2);
+    PrintConfig config;
+    writer.set_kinematics(std::make_unique<BeltKinematics>(config));
+    CHECK_FALSE(writer.quantized_clearance_position(target));
+}
+
 // Largest X word in a chunk of emitted G-code, or lowest() if none.
 static double max_emitted_x(const std::string &gcode)
 {

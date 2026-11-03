@@ -57,6 +57,14 @@
 #include "libslic3r/Config.hpp"
 #include "libslic3r/Preset.hpp"
 #include <exception>
+#include <memory>
+#include <mutex>
+#include <stdexcept>
+#include <wx/weakref.h>
+#include "Jobs/Job.hpp"
+#include "Jobs/Worker.hpp"
+#include "libslic3r/ThermoelasticSectionPreview.hpp"
+#include "libslic3r/ThermoelasticGCodeSections.hpp"
 #include <iterator>
 #include "libslic3r/GCode/GCodeProcessor.hpp"
 #include "libvgcode/include/GCodeInputData.hpp"
@@ -812,7 +820,7 @@ void GCodeViewer::SequentialView::Marker::render_position_window(const libvgcode
                 break;
             case libvgcode::EViewType::ThermalStress: {
                 const std::string detail = is_extrusion && std::isfinite(vertex.thermal_stress_mpa) && vertex.thermal_stress_mpa >= 0.f ?
-                    GUI::format(_u8L("Final-state static tensile stress: %1% MPa"), vertex.thermal_stress_mpa) :
+                    GUI::format(_u8L("Static tensile stress: %1% MPa"), vertex.thermal_stress_mpa) :
                     _u8L("Thermal stress unavailable");
                 snprintf(detail_buf, sizeof(detail_buf), "%s", detail.c_str());
                 break;
@@ -1841,6 +1849,8 @@ void GCodeViewer::load_as_gcode(const GCodeProcessorResult& gcode_result, const 
     }
     m_plate_mass    = gcode_result.plate_mass;
     m_thermal_analysis = gcode_result.thermal_analysis;
+    m_analysis_source_filename = gcode_result.filename;
+    m_analysis_source_moves = gcode_result.moves.size();
     m_object_masses = gcode_result.object_masses;
     m_body_masses   = gcode_result.body_masses;
     m_support_masses = gcode_result.support_masses;
@@ -2294,6 +2304,15 @@ void GCodeViewer::load_as_gcode(const GCodeProcessorResult& gcode_result, const 
 void GCodeViewer::load_as_preview(libvgcode::GCodeInputData&& data)
 {
     m_loaded_as_preview = true;
+    m_gcode_result = nullptr;
+    m_last_result_id = -1;
+    m_learned_timing.reset();
+    m_learned_timing_status.clear();
+    m_learned_timing_context.clear();
+    m_thermal_analysis = {};
+    m_section_layer_analysis.reset();
+    m_analysis_source_filename.clear();
+    m_analysis_source_moves = 0;
     m_plate_mass = {};
     m_object_masses.clear();
     m_body_masses.clear();
@@ -2355,21 +2374,131 @@ void GCodeViewer::reset_shell()
 void GCodeViewer::set_learned_timing(unsigned int result_id, const std::string &filename,
                                    std::optional<LearnedTimingEstimate> estimate, std::string status, std::string context)
 {
-    if (m_last_result_id != result_id || !m_gcode_result || m_gcode_result->filename != filename) return;
+    if (m_last_result_id != result_id || m_analysis_source_filename != filename) return;
     m_learned_timing = std::move(estimate);
     m_learned_timing_status = std::move(status);
     m_learned_timing_context = std::move(context);
 }
 
+void GCodeViewer::request_section_layer_analysis(unsigned processor_layer_id, Thermoelastic::GCodeSectionScenario scenario)
+{
+    // This is a processor layer ID, not libvgcode's compacted display layer.
+    // A preview selection must be resolved through its source_move_id first.
+    // Defer out of ImGui rendering. The job owns the source and scenario and
+    // never retains a viewer/plate pointer while slicing may replace either.
+    auto* plater                 = wxGetApp().plater();
+    const unsigned int source_id = m_last_result_id;
+    const std::string filename   = m_analysis_source_filename;
+    plater->CallAfter([plater, source_id, filename, processor_layer_id, scenario = std::move(scenario)] {
+        if (wxGetApp().is_closing() || plater->IsBeingDeleted() || wxGetApp().IsScheduledForDestruction(plater) ||
+            !plater->get_ui_job_worker().is_idle() || plater->is_background_process_slicing())
+            return;
+        try {
+            auto* plate        = plater->get_partplate_list().get_curr_plate();
+            const auto* result = plate && plate->is_slice_result_valid() ? plate->get_slice_result() : nullptr;
+            if (!result)
+                return;
+            auto source = std::make_shared<GCodeProcessorResult>();
+            {
+                std::unique_lock<std::mutex> lock(result->result_mutex, std::try_to_lock);
+                if (!lock.owns_lock() || result->id != source_id || result->filename != filename || result->moves.size() > 2000000)
+                    return;
+                *source = *result;
+            }
+            auto outcome      = std::make_shared<Thermoelastic::SectionLayerPreview>();
+            outcome->layer_id = processor_layer_id;
+            wxWeakRef<Plater> alive(plater);
+            queue_job(
+                plater->get_ui_job_worker(),
+                [source, outcome, processor_layer_id, scenario](Job::Ctl& ctl) {
+                    ctl.update_status(0, _u8L("Analyzing selected-layer mechanical stress"));
+                    *outcome = Thermoelastic::preview_section_layer(
+                        *source, processor_layer_id, scenario, 2000000, 2000000, 200000, {},
+                        [&ctl](unsigned geometry_level, unsigned basis_run) {
+                            // These are refinement indices, not completed/total
+                            // work. Do not turn them into a fictitious percentage.
+                            ctl.update_status(0, GUI::format(
+                                _u8L("Mechanical analysis: geometry refinement %1%, basis solve %2%"),
+                                geometry_level + 1, basis_run + 1));
+                        },
+                        [&ctl] {
+                            if (ctl.was_canceled())
+                                throw std::runtime_error("Mechanical analysis canceled.");
+                        });
+                },
+                [alive, outcome, source_id, filename](bool canceled, std::exception_ptr& error) {
+                    if (canceled || !alive || wxGetApp().is_closing()) {
+                        error = nullptr;
+                        return;
+                    }
+                    auto* owner = alive.get();
+                    if (owner->IsBeingDeleted() || wxGetApp().IsScheduledForDestruction(owner)) {
+                        error = nullptr;
+                        return;
+                    }
+                    if (error) {
+                        outcome->state = Thermoelastic::SectionLayerPreview::State::SolverFailure;
+                        outcome->samples.clear();
+                        error = nullptr;
+                    }
+                    auto* canvas = owner->get_preview_canvas3D();
+                    try {
+                        if (canvas && canvas->get_gcode_viewer().set_section_layer_analysis(source_id, filename, std::move(*outcome))) {
+                            canvas->set_as_dirty();
+                            canvas->request_extra_frame();
+                        }
+                    } catch (const std::exception&) {
+                        show_error(owner, _L("Mechanical analysis could not update the preview. No new field was displayed."));
+                    }
+                });
+        } catch (const std::exception&) {
+            show_error(plater, _L("Mechanical analysis could not allocate its input snapshot. Close other projects and try again."));
+        }
+    });
+}
+
+bool GCodeViewer::set_section_layer_analysis(unsigned int result_id,
+                                             const std::string& filename,
+                                             Thermoelastic::SectionLayerPreview analysis)
+{
+    if (m_last_result_id != result_id || m_analysis_source_filename != filename || m_analysis_source_moves == 0)
+        return false;
+    std::vector<float> values(m_analysis_source_moves, -1.0f);
+    if (analysis.state == Thermoelastic::SectionLayerPreview::State::Ready) {
+        for (const auto& sample : analysis.samples) {
+            const double tensile_mpa = std::max(0., sample.maximum_principal_pa) * 1e-6;
+            if (sample.id >= values.size() || !std::isfinite(sample.maximum_principal_pa) ||
+                tensile_mpa > std::numeric_limits<float>::max()) {
+                // This is a failed result for the current slice, not a stale
+                // result from another slice. Clear its predecessor's colors.
+                analysis.state = Thermoelastic::SectionLayerPreview::State::SolverFailure;
+                std::fill(values.begin(), values.end(), -1.0f);
+                break;
+            }
+            values[sample.id] = static_cast<float>(tensile_mpa);
+        }
+    }
+    if (analysis.state != Thermoelastic::SectionLayerPreview::State::Ready)
+        analysis.samples.clear();
+    auto published = std::make_unique<Thermoelastic::SectionLayerPreview>(std::move(analysis));
+    m_viewer.set_thermal_stress_samples(values);
+    m_section_layer_analysis = std::move(published);
+    return true;
+}
+
 void GCodeViewer::reset()
 {
-    //BBS: should also reset the result id
+    // BBS: should also reset the result id
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": current result id %1% ")%m_last_result_id;
     m_last_result_id = -1;
+    m_gcode_result = nullptr;
     m_learned_timing.reset();
     m_learned_timing_status.clear();
     m_learned_timing_context.clear();
     m_thermal_analysis = {};
+    m_section_layer_analysis.reset();
+    m_analysis_source_filename.clear();
+    m_analysis_source_moves = 0;
     m_belt_layer_zs.clear();
     //BBS: add only gcode mode
     m_only_gcode_in_preview = false;
@@ -3118,7 +3247,7 @@ void GCodeViewer::enable_moves_slider(bool enable) const
 
 void GCodeViewer::update_moves_slider(bool set_to_max)
 {
-    if (m_gcode_result->moves.empty())
+    if (!m_gcode_result || m_gcode_result->moves.empty())
         return;
 
     const libvgcode::Interval& range = m_viewer.get_view_enabled_range();
@@ -4888,7 +5017,8 @@ void GCodeViewer::render_legend(float &legend_height, int canvas_width, int canv
         wxGetApp().plater()->get_current_canvas3D()->request_extra_frame();
     }
 
-    if (m_gcode_result != nullptr && m_viewer.get_vertices_count() > 0) {
+    if (m_viewer.get_view_type() != libvgcode::EViewType::ThermalStress &&
+        m_gcode_result != nullptr && m_viewer.get_vertices_count() > 0) {
         const auto *targets = m_gcode_result->temperature_targets_at(m_viewer.get_current_vertex().gcode_id);
         if (targets != nullptr && (targets->bed.has_value() || !targets->tools.empty())) {
             ImGui::Separator();
@@ -5089,7 +5219,7 @@ void GCodeViewer::render_legend(float &legend_height, int canvas_width, int canv
     }
     case libvgcode::EViewType::FanSpeed:       { imgui.title(_u8L("Fan speed (%)")); break; }
     case libvgcode::EViewType::Temperature:    { imgui.title(_u8L("Temperature (℃)")); break; }
-    case libvgcode::EViewType::ThermalStress:  { imgui.title(_u8L("Tensile thermal stress (MPa)")); break; }
+    case libvgcode::EViewType::ThermalStress:  { imgui.title(_u8L("Static tensile stress estimate (MPa)")); break; }
 // ORCA: Add Pressure Advance visualization support
     case libvgcode::EViewType::PressureAdvance:{ imgui.title(_u8L("Pressure Advance")); break; }
     case libvgcode::EViewType::VolumetricFlowRate:
@@ -5366,6 +5496,51 @@ void GCodeViewer::render_legend(float &legend_height, int canvas_width, int canv
     case libvgcode::EViewType::ThermalStress: {
         const auto &range = m_viewer.get_color_range(libvgcode::EViewType::ThermalStress).get_range();
         const bool available = range[0] <= range[1];
+        if (m_section_layer_analysis) {
+            const auto& analysis = *m_section_layer_analysis;
+            imgui.text(GUI::format(_u8L("Analyzed processor layer: %1%"), analysis.layer_id));
+            imgui.text(GUI::format(_u8L("Static contraction scenario at modeled time %1% s"), analysis.observation_time_s));
+            imgui.text(_u8L("Selected-layer geometry, not simulated cooling history or an adhesion safety margin."));
+            if (analysis.approximate_geometry && !analysis.geometry_history.empty()) {
+                const auto& geometry = analysis.geometry_history.back();
+                if (geometry.z_quantization_m > 0.) {
+                    imgui.text(_u8L("Original bead cross-sections are sampled on refined height intervals; printing paths are unchanged."));
+                    imgui.text(GUI::format(_u8L("Maximum interval-boundary shift in the final analysis: %1% µm"),
+                                          geometry.maximum_partition_shift_m * 1e6));
+                }
+                if (geometry.maximum_boundary_uncertainty_m > 0.)
+                    imgui.text(GUI::format(_u8L("Interface-grid representation allowance: %1% nm"),
+                                          geometry.maximum_boundary_uncertainty_m * 1e9));
+            }
+            if (analysis.state == Thermoelastic::SectionLayerPreview::State::Ready) {
+                if (available) append_range(m_viewer.get_color_range(libvgcode::EViewType::ThermalStress), 2);
+                imgui.text(GUI::format(_u8L("Paths with stress samples: %1% / %2%"), analysis.samples.size(),
+                                      analysis.samples.size() + analysis.unsampled_moves));
+                imgui.text(GUI::format(_u8L("Generalized bonded-bed tensile reaction: %1% N"), analysis.tensile_generalized_bed_force_n));
+                imgui.text(GUI::format(_u8L("Stored elastic energy: %1% J"), analysis.elastic_energy_j));
+            } else {
+                using State = Thermoelastic::SectionLayerPreview::State;
+                switch (analysis.state) {
+                case State::MissingLayer:
+                    imgui.text(_u8L("No model extrusion was found on the selected layer."));
+                    break;
+                case State::ResourceLimited:
+                    imgui.text(_u8L("Layer analysis exceeded its resource limits. No partial field is shown."));
+                    break;
+                case State::UnsupportedInput:
+                    imgui.text(_u8L("Layer analysis could not resolve its inputs or material contacts."));
+                    break;
+                case State::Unconverged:
+                    imgui.text(_u8L("Layer analysis did not converge. No partial field is shown."));
+                    break;
+                default:
+                    imgui.text(_u8L("Layer analysis failed. No new field is available."));
+                    break;
+                }
+            }
+            imgui.text(_u8L("Gray: no sample on this layer. Bed reaction is not local peeling traction."));
+            break;
+        }
         imgui.text(_u8L("Final-state static estimate. Layer selection does not simulate stress during printing."));
         if (available)
             append_range(m_viewer.get_color_range(libvgcode::EViewType::ThermalStress), 2);
@@ -6115,9 +6290,6 @@ void GCodeViewer::render_legend(float &legend_height, int canvas_width, int canv
     }
     if (!m_learned_timing_status.empty()) imgui.text(m_learned_timing_status);
     ImGui::PopTextWrapPos();
-    if (m_gcode_result && !m_gcode_result->filename.empty() &&
-        imgui.button(_u8L("Update learned time estimate…")))
-        wxGetApp().plater()->update_learned_time_estimate(m_last_result_id, m_gcode_result->filename);
 
     auto show_mode_button = [this, &imgui, can_show_mode_button](const std::string& label, libvgcode::ETimeMode mode) {
         if (can_show_mode_button(mode)) {

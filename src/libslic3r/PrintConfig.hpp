@@ -1586,6 +1586,7 @@ PRINT_CONFIG_CLASS_DEFINE(
 PRINT_CONFIG_CLASS_DEFINE(
     PrintRegionConfig,
 
+    ((ConfigOptionBool, manual_support))
     ((ConfigOptionInts,  print_extruder_id))
     ((ConfigOptionStrings,  print_extruder_variant))
     ((ConfigOptionInt,                  bottom_shell_layers))
@@ -2073,6 +2074,9 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionBool,                support_air_filtration))
     ((ConfigOptionBool,                support_cooling_filter))
     ((ConfigOptionBool,                cooling_filter_enabled))
+    ((ConfigOptionBool,                rme_indx_dock_fan_cooldown))
+    ((ConfigOptionBool,                support_rme_indx_dock_fan_cooldown))
+    ((ConfigOptionInt,                 rme_indx_dock_fan_cooldown_time))
     ((ConfigOptionEnum<PrinterStructure>,printer_structure))
     ((ConfigOptionBool,                support_chamber_temp_control))
     ((ConfigOptionEnumsGeneric,        extruder_type))
@@ -2377,6 +2381,7 @@ PRINT_CONFIG_CLASS_DERIVED_DEFINE(
     // BBS: move from PrintObjectConfig
     ((ConfigOptionBool, independent_support_layer_height))
     ((ConfigOptionBool,               combine_brims))
+    ((ConfigOptionInt,                brim_filament))
     // SoftFever
     ((ConfigOptionPercents,            filament_shrink))
     ((ConfigOptionPercents,            filament_shrinkage_compensation_z))

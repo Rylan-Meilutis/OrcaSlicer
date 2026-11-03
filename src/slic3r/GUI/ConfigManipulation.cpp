@@ -1364,6 +1364,7 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, in
     toggle_line("slowdown_for_curled_perimeters", has_overhang_speed, variant_index);
 
     toggle_line("flush_into_objects", !is_global_config);
+    toggle_line("manual_support", !is_global_config);
 
     toggle_line("support_interface_not_for_body",config->opt_int("support_interface_filament")&&!config->opt_int("support_filament"));
 

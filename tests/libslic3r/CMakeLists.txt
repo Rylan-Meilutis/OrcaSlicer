@@ -23,6 +23,26 @@ add_executable(${_TEST_NAME}_tests
     test_belt_brim.cpp
     test_warp_mitigation.cpp
     test_thermoelastic_solver.cpp
+    test_thermoelastic_reduction.cpp
+    test_thermoelastic_relaxation.cpp
+    test_thermoelastic_material.cpp
+    test_thermal_material_references.cpp
+    test_thermoelastic_thermal_strain.cpp
+    test_thermomechanical_simulation.cpp
+    test_thermoelastic_mesh.cpp
+    test_thermoelastic_layers.cpp
+    test_thermoelastic_boundary.cpp
+    test_thermoelastic_exact_sections.cpp
+    test_deposition_provenance.cpp
+    test_deposition_section.cpp
+    test_thermoelastic_section_topology.cpp
+    test_thermoelastic_sections.cpp
+    test_thermoelastic_sparse_factor.cpp
+    test_thermoelastic_section_study.cpp
+    test_thermoelastic_local_sections.cpp
+    test_thermoelastic_peeling.cpp
+    test_thermoelastic_homogenization.cpp
+    test_thermal_homogenization.cpp
     test_tool_mapping.cpp
     test_cooling_assistant.cpp
     test_buildvolume.cpp
@@ -30,6 +50,16 @@ add_executable(${_TEST_NAME}_tests
     test_calib.cpp
     test_octoprint_spool_cache.cpp
     test_indx_profile.cpp
+    test_thermal_history.cpp
+    test_section_integration.cpp
+    test_section_thermal_assembly.cpp
+    test_section_growth.cpp
+    test_section_growth_stream.cpp
+    test_section_thermal_sequence.cpp
+    test_section_thermal_stream.cpp
+    test_section_thermal_skin.cpp
+    test_thermal_deposition.cpp
+    test_thermomechanical_history.cpp
     test_learned_timing.cpp
     test_clipper_offset.cpp
     test_clipper_utils.cpp

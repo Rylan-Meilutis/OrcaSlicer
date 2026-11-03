@@ -34,6 +34,8 @@
 #include "libslic3r/GCodeReader.hpp"
 #include "libslic3r/Flow.hpp"
 #include "libslic3r/Layer.hpp"
+#include "libslic3r/BrickCourseRamps.hpp"
+#include "libslic3r/GCodeWriter.hpp"
 #include "libslic3r/Print.hpp"
 #include "libslic3r/TriangleMesh.hpp"
 #include "libslic3r/libslic3r.h"
@@ -41,6 +43,154 @@
 
 using namespace Slic3r;
 using namespace Slic3r::Test;
+
+TEST_CASE("Brick ramps span short tessellation edges and plan both endpoints together", "[Flow][BrickCourseRamps]")
+{
+    const bool split_fragment = GENERATE(false, true);
+    const bool two_ends = GENERATE(false, true);
+    const bool closed = GENERATE(false, true);
+    CAPTURE(split_fragment, two_ends, closed);
+    const coord_t offset = scale_(.1);
+    // Actual submicron first edge followed by a usable long edge from the
+    // saved-project ramp diagnostic. Units are native scaled coordinates.
+    const Point a(-76633977, -36007285), b(-76633790, -36006370), c(-76729098, -35466960);
+    const auto path = [offset](const Points &xy, bool raised) {
+        ExtrusionPath result(erPerimeter, .12, .45f, .3f);
+        for (const Point &point : xy) result.polyline.points.emplace_back(point, raised ? offset : 0);
+        result.staggered_perimeter = raised;
+        result.z_contoured = raised;
+        return result;
+    };
+    const Point margin(coord_t(scale_(1.)), coord_t(0));
+    ExtrusionPaths paths{path({a - margin, a}, false)};
+    if (split_fragment) {
+        paths.push_back(path({a, b}, true));
+        paths.push_back(path({b, c}, true));
+        // A course boundary can split one raised run into different scheduled
+        // bead sections. Ramp planning must not homogenize their flow metadata.
+        paths[1].width = .6f;
+        paths[2].width = .4f;
+        paths[2].height = .2f;
+        paths[2].mm3_per_mm = .08;
+    } else paths.push_back(path({a, b, c}, true));
+    if (two_ends) paths.push_back(path({c, c + margin}, false));
+    if (closed) std::rotate(paths.begin(), paths.begin() + 1, paths.end());
+    const ExtrusionPaths original = paths;
+    detail::smooth_staggered_transitions(paths, offset, closed);
+    coord_t maximum_z = 0;
+    bool saw_original_b = false;
+    // Translation phase chosen so the old three ramp samples all serialized
+    // to the same XY. Test the actual formatter grid, not just native geometry.
+    const auto serialized = [&a](const Point3 &point) {
+        return Vec3d(GCodeFormatter::quantize_xyzf(43.0759 + unscale_(point.x() - a.x())),
+                     GCodeFormatter::quantize_xyzf(18.50554 + unscale_(point.y() - a.y())),
+                     GCodeFormatter::quantize_xyzf(.4 + unscale_(point.z())));
+    };
+    for (size_t i = 0; i < paths.size(); ++i) {
+        CHECK_THAT(paths[i].height, Catch::Matchers::WithinAbs(original[i].height, 1e-12));
+        CHECK_THAT(paths[i].width, Catch::Matchers::WithinAbs(original[i].width, 1e-12));
+        CHECK_THAT(paths[i].mm3_per_mm, Catch::Matchers::WithinAbs(original[i].mm3_per_mm, 1e-12));
+        if (!paths[i].staggered_perimeter) {
+            CHECK(paths[i].polyline.points == original[i].polyline.points);
+            continue;
+        }
+        REQUIRE(paths[i].staggered_transition);
+        for (const Point3 &point : paths[i].polyline.points) {
+            maximum_z = std::max(maximum_z, point.z());
+            saw_original_b |= point.to_point() == b;
+            if (point.to_point() == a) CHECK(point.z() == 0);
+            if (point.to_point() == c) CHECK(point.z() == (two_ends ? 0 : offset));
+        }
+        for (const Line3 &line : paths[i].polyline.lines()) {
+            const double run = (line.b.to_point() - line.a.to_point()).cast<double>().norm();
+            // One native coordinate unit accounts for integer interpolation.
+            CHECK(std::abs(double(line.b.z() - line.a.z())) <= .5 * run + 1.);
+            const Vec3d from = serialized(line.a), to = serialized(line.b);
+            if (from.x() == to.x() && from.y() == to.y()) CHECK_THAT(from.z(), Catch::Matchers::WithinAbs(to.z(), 1e-12));
+        }
+    }
+    CHECK(maximum_z == offset);
+    CHECK(saw_original_b);
+}
+
+TEST_CASE("Whole brick fragments too short for a bounded ramp retain their explicit legacy geometry", "[Flow][BrickCourseRamps]")
+{
+    const bool two_ends = GENERATE(false, true);
+    const bool closed = GENERATE(false, true);
+    CAPTURE(two_ends, closed);
+    const coord_t offset = scale_(.1);
+    ExtrusionPath before(erPerimeter, .08, .45f, .2f);
+    before.polyline.points = {Point3(-1000000, 0, 0), Point3(0, 0, 0)};
+    ExtrusionPath tiny(erPerimeter, .12, .45f, .3f);
+    tiny.polyline.points = {Point3(Point(0, 0), offset), Point3(Point(1, 1), offset)};
+    tiny.staggered_perimeter = true;
+    tiny.z_contoured = true;
+    ExtrusionPaths paths{before, tiny};
+    if (two_ends) {
+        ExtrusionPath after(before);
+        after.polyline.points = {Point3(1, 1, 0), Point3(1000000, 1, 0)};
+        paths.push_back(after);
+    }
+    if (closed) std::rotate(paths.begin(), paths.begin() + 1, paths.end());
+    detail::smooth_staggered_transitions(paths, offset, closed);
+    Points3 legacy{Point3(0, 0, 0), Point3(Point(0, 0), offset / 2), Point3(Point(1, 1), offset)};
+    if (two_ends) legacy = {Point3(0, 0, 0), Point3(Point(0, 0), offset / 2),
+        Point3(Point(1, 1), offset / 2), Point3(1, 1, 0)};
+    CHECK(paths[closed ? paths.size() - 1 : 0].polyline.points == before.polyline.points);
+    const auto& actual = paths[closed ? 0 : 1];
+    CHECK(actual.polyline.points == legacy);
+    CHECK(actual.staggered_perimeter);
+    CHECK_THAT(actual.mm3_per_mm, Catch::Matchers::WithinAbs(tiny.mm3_per_mm, 1e-12));
+    CHECK_THAT(actual.height, Catch::Matchers::WithinAbs(tiny.height, 1e-12));
+}
+
+TEST_CASE("Brick ramp planning does not bridge disconnected raised fragments", "[Flow][BrickCourseRamps]")
+{
+    const coord_t offset = scale_(.1);
+    const auto path = [offset](Point a, Point b, bool raised) {
+        ExtrusionPath result(erPerimeter, .12, .45f, .3f);
+        result.polyline.points = {Point3(a, raised ? offset : 0), Point3(b, raised ? offset : 0)};
+        result.staggered_perimeter = raised;
+        result.z_contoured = raised;
+        return result;
+    };
+    ExtrusionPaths paths{path(Point(-1000000, 0), Point(0, 0), false),
+        path(Point(0, 0), Point(1, 1), true),
+        path(Point(1000000, 0), Point(2000000, 0), true),
+        path(Point(2000000, 0), Point(3000000, 0), false)};
+    detail::smooth_staggered_transitions(paths, offset, false);
+    // The first run is still too short; a disconnected long fragment cannot
+    // lend it length or create a new extruding connector across the gap.
+    const Points3 legacy{Point3(0, 0, 0), Point3(Point(0, 0), offset / 2), Point3(Point(1, 1), offset)};
+    CHECK(paths[1].polyline.points == legacy);
+    CHECK(paths[2].first_point() == Point(1000000, 0));
+    CHECK(paths[2].first_point3().z() == offset);
+    CHECK(paths[2].last_point3().z() == 0);
+    for (const Line3& line : paths[2].polyline.lines())
+        CHECK(std::abs(double(line.b.z() - line.a.z())) <=
+            .5 * (line.b.to_point() - line.a.to_point()).cast<double>().norm() + 1.);
+}
+
+TEST_CASE("Nonflat brick fragments keep their legacy endpoint ramp instead of being flattened", "[Flow][BrickCourseRamps]")
+{
+    const coord_t offset = scale_(.1);
+    ExtrusionPath before(erPerimeter, .08, .45f, .2f);
+    before.polyline.points = {Point3(-1000000, 0, 0), Point3(0, 0, 0)};
+    ExtrusionPath nonflat(erPerimeter, .12, .45f, .3f);
+    nonflat.polyline.points = {Point3(Point(0, 0), offset),
+        Point3(Point(1000000, 0), offset * 2), Point3(Point(2000000, 0), offset)};
+    nonflat.staggered_perimeter = true;
+    nonflat.z_contoured = true;
+    ExtrusionPaths paths{before, nonflat};
+    detail::smooth_staggered_transitions(paths, offset, false);
+    // A flat-course arclength profile would erase this preexisting high point.
+    CHECK(paths[1].polyline.points.front().z() == 0);
+    const Point3 peak(Point(1000000, 0), offset * 2);
+    CHECK(std::find(paths[1].polyline.points.begin(), paths[1].polyline.points.end(), peak) !=
+        paths[1].polyline.points.end());
+    CHECK(paths[1].last_point3() == nonflat.last_point3());
+    CHECK_THAT(paths[1].mm3_per_mm, Catch::Matchers::WithinAbs(nonflat.mm3_per_mm, 1e-12));
+}
 
 TEST_CASE("Feature flows use their selected tool nozzle diameters",
           "[Flow][MultiNozzle][FeatureTools]")
@@ -572,12 +722,55 @@ TEST_CASE("Brick walls retain their height and connectivity at changing material
                     if (!path.staggered_perimeter)
                         continue;
                     ++raised_paths;
-                    // A raised fragment must not silently lose its Z when a
-                    // second clipping pass inserts course-transition points.
+                    // A raised course must not lose its Z when clipping splits
+                    // it. A native-grid-sized fragment at a ramp toe can round
+                    // entirely to zero; qualify that exception against its
+                    // connected course, not merely the staggered preview flag.
                     REQUIRE_FALSE(path.polyline.points.empty());
                     const auto highest = std::max_element(path.polyline.points.begin(), path.polyline.points.end(),
                         [](const Point3 &a, const Point3 &b) { return a.z() < b.z(); });
-                    CHECK(highest->z() > 0);
+                    if (highest->z() == 0) {
+                        REQUIRE(path.staggered_transition);
+                        for (const Point3& point : path.polyline.points) CHECK(point.z() == 0);
+                        size_t first = i, last = i;
+                        for (size_t steps = 0; steps + 1 < paths.size(); ++steps) {
+                            if (!closed && first == 0) break;
+                            const size_t previous = (first + paths.size() - 1) % paths.size();
+                            if (!paths[previous].staggered_perimeter ||
+                                paths[previous].last_point3() != paths[first].first_point3()) break;
+                            first = previous;
+                        }
+                        for (size_t steps = 0; steps + 1 < paths.size(); ++steps) {
+                            if (!closed && last + 1 == paths.size()) break;
+                            const size_t next = (last + 1) % paths.size();
+                            if (next == first || !paths[next].staggered_perimeter ||
+                                paths[last].last_point3() != paths[next].first_point3()) break;
+                            last = next;
+                        }
+                        const size_t previous = (i + paths.size() - 1) % paths.size();
+                        const size_t next = (i + 1) % paths.size();
+                        const bool start_toe = first == i && (closed || i > 0) &&
+                            !paths[previous].staggered_perimeter && paths[previous].last_point3() == path.first_point3();
+                        const bool end_toe = last == i && (closed || i + 1 < paths.size()) &&
+                            !paths[next].staggered_perimeter && path.last_point3() == paths[next].first_point3();
+                        REQUIRE(start_toe != end_toe);
+                        REQUIRE(first != last);
+                        coord_t course_height = 0;
+                        for (size_t member = first;; member = (member + 1) % paths.size()) {
+                            REQUIRE(paths[member].staggered_perimeter);
+                            CHECK(paths[member].role() == path.role());
+                            for (const Point3& point : paths[member].polyline.points)
+                                course_height = std::max(course_height, point.z());
+                            if (member == last) break;
+                            REQUIRE(paths[member].last_point3() == paths[(member + 1) % paths.size()].first_point3());
+                        }
+                        const double offset = scale_(layer->height * .5);
+                        CHECK_THAT(double(course_height), Catch::Matchers::WithinAbs(offset, 1.));
+                        // Even at the shortest permitted ramp, the entire toe
+                        // must lie within half a native Z unit of the base.
+                        // This rejects genuinely flattened finite-length beads.
+                        CHECK(path.polyline.length() <= 1.);
+                    } else CHECK(highest->z() > 0);
                     REQUIRE(layer->upper_layer != nullptr);
                     const auto upper = offset_ex(to_expolygons(layer->upper_layer
                         ->get_region(region->region().print_object_region_id())->slices.surfaces), scale_(0.002));

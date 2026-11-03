@@ -7,6 +7,7 @@
 #include <boost/filesystem/path.hpp>
 #include <iterator>
 #include "libslic3r/Config.hpp"
+#include "libslic3r/PrintConfig.hpp"
 #include <string>
 #include <vector>
 #include <boost/filesystem.hpp>
@@ -17,6 +18,21 @@
 #include "libslic3r/GCode/RMEOutputPlan.hpp"
 
 using namespace Slic3r;
+
+TEST_CASE("Only RME INDX profiles opt into the dock-fan firmware contract", "[IndxProfile][DockFan]")
+{
+    DynamicPrintConfig defaults = DynamicPrintConfig::full_print_config();
+    CHECK_FALSE(defaults.opt_bool("support_rme_indx_dock_fan_cooldown"));
+    CHECK_FALSE(defaults.opt_bool("rme_indx_dock_fan_cooldown"));
+    CHECK(defaults.opt_int("rme_indx_dock_fan_cooldown_time") == 180);
+    std::ifstream input((boost::filesystem::path(PROFILES_DIR) / "Prusa" / "machine" /
+                         "Prusa CORE One INDX RME 0.4 nozzle.json").string());
+    REQUIRE(input.good());
+    const auto profile = nlohmann::json::parse(input);
+    CHECK(profile.at("support_rme_indx_dock_fan_cooldown") == "1");
+    CHECK(profile.at("rme_indx_dock_fan_cooldown") == "1");
+    CHECK(profile.at("rme_indx_dock_fan_cooldown_time") == "180");
+}
 
 TEST_CASE("RME INDX activates chamber control before waiting for bed heating", "[IndxProfile][INDX]")
 {

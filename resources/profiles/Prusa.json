@@ -1,6 +1,6 @@
 {
 	"name": "Prusa",
-    "version": "02.04.00.22",
+	"version": "02.04.00.24",
 	"force_update": "0",
 	"description": "Prusa configurations",
 	"machine_model_list": [
@@ -53,8 +53,16 @@
 			"sub_path": "machine/Prusa MINIIS.json"
 		},
 		{
+			"name": "Prusa MINI RME",
+			"sub_path": "machine/Prusa MINI RME.json"
+		},
+		{
 			"name": "Prusa MK3.5",
 			"sub_path": "machine/Prusa MK3.5.json"
+		},
+		{
+			"name": "Prusa MK3.5 RME",
+			"sub_path": "machine/Prusa MK3.5 RME.json"
 		},
 		{
 			"name": "Prusa MK3S",
@@ -3139,6 +3147,10 @@
 			"sub_path": "machine/Prusa CORE One L HF 0.8 nozzle.json"
 		},
 		{
+			"name": "Prusa MINI RME 0.4 nozzle",
+			"sub_path": "machine/Prusa MINI RME 0.4 nozzle.json"
+		},
+		{
 			"name": "Prusa MINIIS 0.25 nozzle",
 			"sub_path": "machine/Prusa MINIIS 0.25 nozzle.json"
 		},
@@ -3161,6 +3173,10 @@
 		{
 			"name": "Prusa MK3.5 0.8 nozzle",
 			"sub_path": "machine/Prusa MK3.5 0.8 nozzle.json"
+		},
+		{
+			"name": "Prusa MK3.5 RME 0.4 nozzle",
+			"sub_path": "machine/Prusa MK3.5 RME 0.4 nozzle.json"
 		},
 		{
 			"name": "Prusa CORE One HF 0.4 nozzle",

@@ -298,6 +298,9 @@ bool Print::invalidate_state_by_config_options(const ConfigOptionResolver & /* n
         "preheat_time",
         "preheat_steps",
         "machine_start_gcode",
+        "rme_indx_dock_fan_cooldown",
+        "support_rme_indx_dock_fan_cooldown",
+        "rme_indx_dock_fan_cooldown_time",
         "filament_start_gcode",
         "change_filament_gcode",
         "wipe",
@@ -372,6 +375,9 @@ bool Print::invalidate_state_by_config_options(const ConfigOptionResolver & /* n
             // These options only affect G-code export or they are just notes without influence on the generated G-code,
             // so there is nothing to invalidate.
             steps.emplace_back(psGCodeExport);
+        } else if (opt_key == "brim_filament") {
+            steps.emplace_back(psSkirtBrim);
+            steps.emplace_back(psWipeTower);
         } else if (steps_ignore.find(opt_key) != steps_ignore.end()) {
             // These steps have no influence on the G-code whatsoever. Just ignore them.
         } else if (
@@ -696,6 +702,9 @@ std::vector<unsigned int> Print::extruders(bool conside_custom_gcode) const
 {
     std::vector<unsigned int> extruders = this->object_extruders();
     append(extruders, this->support_material_extruders());
+    if (!m_config.belt_printer && m_config.brim_filament.value > 0 &&
+        static_cast<size_t>(m_config.brim_filament.value) <= m_config.filament_diameter.size() && this->has_brim())
+        extruders.push_back(static_cast<unsigned int>(m_config.brim_filament.value - 1));
 
     if (conside_custom_gcode)
         this->append_tool_change_extruders(extruders);
@@ -1916,6 +1925,12 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
         add_warning(std::move(w));
     };
 
+    if (m_config.brim_filament.value < 0 ||
+        static_cast<size_t>(m_config.brim_filament.value) > m_config.filament_diameter.size())
+        return {L("The selected brim filament is not available in this project."), nullptr, "brim_filament"};
+    if (m_config.brim_filament.value > 0 &&
+        m_config.filament_is_mixed.get_at(m_config.brim_filament.value - 1))
+        return {L("Select a physical filament for the brim."), nullptr, "brim_filament"};
     std::vector<unsigned int> extruders = this->extruders();
     unsigned int nozzles = m_config.nozzle_diameter.size();
 
@@ -3051,7 +3066,8 @@ Flow Print::brim_flow() const
         frPerimeter,
         // Flow::new_from_config_width takes care of the percent to value substitution
 		width,
-        (float)nozzle_diameter_for_filament(m_config, m_print_regions.front()->config().outer_wall_filament_id, this->is_BBL_printer()),
+        (float)nozzle_diameter_for_filament(m_config, m_config.brim_filament.value > 0 && !m_config.belt_printer ?
+            m_config.brim_filament.value : m_print_regions.front()->config().outer_wall_filament_id.value, this->is_BBL_printer()),
 		(float)this->skirt_first_layer_height());
 }
 
@@ -3211,6 +3227,10 @@ BoundingBox PrintObject::get_first_layer_bbox(float& a, float& layer_height, std
 std::map<ObjectID, unsigned int> getObjectExtruderMap(const Print& print) {
     std::map<ObjectID, unsigned int> objectExtruderMap;
     for (const PrintObject* object : print.objects()) {
+        if (!print.config().belt_printer && print.config().brim_filament.value > 0) {
+            objectExtruderMap.emplace(object->id(), print.config().brim_filament.value);
+            continue;
+        }
         // BBS
         if (object->object_first_layer_wall_extruders.empty()){
             unsigned int objectFirstLayerFirstExtruder = print.config().filament_diameter.size();

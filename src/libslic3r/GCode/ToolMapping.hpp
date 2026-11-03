@@ -11,10 +11,24 @@
 #include <optional>
 #include <random>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace Slic3r {
+
+enum class ToolMappingFailureReason { Unknown, Configuration, MissingCapture, UnsupportedMode, ScriptReplay, FileIntegrity, UnsupportedCommand, PackageMetadata, ResourceLimit };
+
+// Only reason() is suitable for user-facing diagnostics. what() can contain
+// private custom-script details and must not be shown or logged by the GUI.
+class ToolMappingFailure : public std::runtime_error {
+public:
+    ToolMappingFailure(ToolMappingFailureReason reason, const std::string &detail)
+        : std::runtime_error(detail), m_reason(reason) {}
+    ToolMappingFailureReason reason() const noexcept { return m_reason; }
+private:
+    ToolMappingFailureReason m_reason;
+};
 
 struct GCodeTemplateEnvironment {
     DynamicConfig parser_config, external_config;

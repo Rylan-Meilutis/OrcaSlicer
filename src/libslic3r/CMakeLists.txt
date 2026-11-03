@@ -276,16 +276,109 @@ set(lisbslic3r_sources
     GCode/FanMover.cpp
     GCode/FanMover.hpp
     GCode/GCodeProcessor.cpp
+    GCode/DepositionProvenance.cpp
+    GCode/DepositionProvenance.hpp
+    GCode/DepositionSection.cpp
+    GCode/DepositionSection.hpp
     ThermoelasticSolver.cpp
     ThermoelasticSolver.hpp
+    ThermoelasticReduction.hpp
+    ThermoelasticReduction.cpp
+    ThermoelasticPeeling.cpp
+    ThermoelasticPeeling.hpp
+    ThermoelasticRelaxation.cpp
+    ThermoelasticRelaxation.hpp
+    ThermoelasticMaterial.cpp
+    ThermoelasticMaterial.hpp
+    ThermalMaterialReferences.cpp
+    ThermalMaterialReferences.hpp
+    ThermoelasticThermalStrain.cpp
+    ThermoelasticThermalStrain.hpp
+    ThermomechanicalSimulation.cpp
+    ThermomechanicalSimulation.hpp
+    ThermalHistory.hpp
+    SectionIntegration.hpp
+    SectionIntegration.cpp
+    SectionThermalAssembly.hpp
+    SectionThermalAssembly.cpp
+    SectionThermalExposure.hpp
+    SectionThermalExposure.cpp
+    SectionThermalSkin.hpp
+    SectionThermalSkin.cpp
+    SectionThermalLoad.hpp
+    SectionThermalLoad.cpp
+    SectionGrowth.hpp
+    SectionGrowthStream.hpp
+    SectionGrowth.cpp
+    SectionThermalSequence.hpp
+    SectionThermalSequence.cpp
+    SectionGCodeHistory.hpp
+    SectionGCodeHistory.cpp
+    SectionAirflowScenario.hpp
+    SectionAirflowScenario.cpp
+    SectionCoolingStudy.hpp
+    SectionCoolingStudy.cpp
+    ThermalDeposition.hpp
+    ThermalDeposition.cpp
+    ThermoelasticToolpath.hpp
+    ThermoelasticToolpath.cpp
+    ThermomechanicalGCode.hpp
+    ThermomechanicalGCode.cpp
+    ThermomechanicalLayerPreview.hpp
+    ThermomechanicalLayerPreview.cpp
+    ThermalAirflow.cpp
+    ThermalAirflow.hpp
+    ThermalAirflowTiming.cpp
+    ThermalAirflowTiming.hpp
+    ThermalHistory.cpp
     ThermoelasticField.cpp
     ThermoelasticField.hpp
     ThermoelasticMesh.cpp
     ThermoelasticMesh.hpp
+    ThermoelasticLayers.cpp
+    ThermoelasticLayers.hpp
+    ThermoelasticSectionFootprint.hpp
+    ThermoelasticBoundary.cpp
+    ThermoelasticBoundary.hpp
+    ThermoelasticOwnership.cpp
+    ThermoelasticOwnership.hpp
+    ThermoelasticSourceOwnership.cpp
+    ThermoelasticSourceOwnership.hpp
+    ThermoelasticSourceDiagnostics.cpp
+    ThermoelasticSourceDiagnostics.hpp
+    ThermoelasticConflictOwnership.cpp
+    ThermoelasticConflictOwnership.hpp
+    ThermoelasticSectionTopology.cpp
+    ThermoelasticSectionTopology.hpp
+    ThermoelasticSections.cpp
+    ThermoelasticSections.hpp
+    ThermoelasticSectionContact.cpp
+    ThermoelasticSectionContact.hpp
+    ThermoelasticSparseFactor.cpp
+    ThermoelasticSparseFactor.hpp
+    ThermoelasticSectionPreview.cpp
+    ThermoelasticSectionPreview.hpp
+    ThermoelasticSectionStudy.cpp
+    ThermoelasticLocalSections.cpp
+    ThermoelasticLocalSections.hpp
+    ThermoelasticLocalTopology.cpp
+    ThermoelasticLocalTopology.hpp
+    ThermoelasticLocalStudy.cpp
+    ThermoelasticSectionStudy.hpp
+    ThermoelasticGCodeSections.cpp
+    ThermoelasticGCodeSections.hpp
+    ThermoelasticHomogenization.cpp
+    ThermoelasticHomogenization.hpp
+    PeriodicTetrahedralGeometry.cpp
+    PeriodicTetrahedralGeometry.hpp
+    ThermalHomogenization.cpp
+    ThermalHomogenization.hpp
     ThermoelasticGCode.cpp
     ThermoelasticGCode.hpp
     GCode/DepositionMesh.cpp
     GCode/DepositionMesh.hpp
+    GCode/DepositionGeometry.cpp
+    GCode/DepositionGeometry.hpp
     GCode/GCodeProcessor.hpp
     GCode/GCodeStatistics.cpp
     GCode/GCodeStatistics.hpp
@@ -656,6 +749,7 @@ unset(CMAKE_POLICY_DEFAULT_CMP0167)
 cmake_policy(POP)
 
 add_library(libslic3r_cgal STATIC
+    ThermoelasticExactSections.hpp ThermoelasticExactSections.cpp
     CutSurface.hpp CutSurface.cpp
     IntersectionPoints.hpp IntersectionPoints.cpp
     MeshBoolean.hpp MeshBoolean.cpp

@@ -12,6 +12,9 @@
 #include <cfloat>
 #include <algorithm>
 #include <string>
+#include <string_view>
+#include <stdexcept>
+#include <utility>
 
 #include "../PrintConfig.hpp"
 #include "../GCode.hpp"
@@ -99,6 +102,8 @@ PressureEqualizer::PressureEqualizer(const Slic3r::GCodeConfig &config) : m_use_
 
 void PressureEqualizer::process_layer(const std::string &gcode)
 {
+    std::string source_markers;
+    std::size_t marker_bytes = 0;
     if (!gcode.empty()) {
         const char *gcode_begin = gcode.c_str();
         while (*gcode_begin != 0) {
@@ -107,10 +112,27 @@ void PressureEqualizer::process_layer(const std::string &gcode)
             // Slic3r always generates end of lines in a Unix style.
             for (; *gcode_end != 0 && *gcode_end != '\n'; ++gcode_end);
 
-            m_gcode_lines.emplace_back();
-            if (!this->process_line(gcode_begin, gcode_end, m_gcode_lines.back())) {
+            const std::string_view line(gcode_begin, std::size_t(gcode_end-gcode_begin));
+            constexpr std::string_view prefix = ";_ORCA_INTERNAL_SOURCE:";
+            constexpr std::string_view section_prefix = ";_ORCA_INTERNAL_SECTION:";
+            if (line.substr(0,prefix.size()) == prefix || line.substr(0,section_prefix.size()) == section_prefix) {
+                // Keep the numerical line window identical to an uninstrumented
+                // export. Emit these boundaries before the following retained
+                // line, outside any subdivisions of that line.
+                marker_bytes += line.size()+1;
+                if (marker_bytes > 8*1024*1024)
+                    throw std::length_error("Pressure equalizer source marker budget exceeded.");
+                source_markers.append(line.data(),line.size());
+                source_markers += '\n';
+            } else {
+                m_gcode_lines.emplace_back();
+                if (!this->process_line(gcode_begin, gcode_end, m_gcode_lines.back())) {
                 // The line has to be forgotten. It contains comment marks, which shall be filtered out of the target g-code.
-                m_gcode_lines.pop_back();
+                    m_gcode_lines.pop_back();
+                } else {
+                    m_gcode_lines.back().source_markers = std::move(source_markers);
+                    source_markers.clear();
+                }
             }
             gcode_begin = gcode_end;
             if (*gcode_begin == '\n')
@@ -118,6 +140,7 @@ void PressureEqualizer::process_layer(const std::string &gcode)
         }
         assert(!this->opened_extrude_set_speed_block);
     }
+    m_layer_source_tails.push(std::move(source_markers));
     
     // at this point, we have an entire layer of gcode lines loaded into m_gcode_lines
     // now we will split the mix of travels and extrudes into segments of continous extrusion and process those
@@ -166,6 +189,10 @@ long PressureEqualizer::advance_segment_beyond_small_gap(const long idx_orig)
     double distance_traveled = 0.0;
     // start at beginning of gap, advance till extrusion found or gap too big
     for (auto idx_cur_pos = idx_orig + 1; idx_cur_pos < m_gcode_lines.size(); idx_cur_pos++) {
+        // Arcs retain their original feed and geometry. They are not a short
+        // travel gap across which linear-path smoothing can propagate rates.
+        if (m_gcode_lines[idx_cur_pos].type == GCODELINETYPE_ARC)
+            return idx_orig;
         // started extruding again! return segment extension
         if (m_gcode_lines[idx_cur_pos].extruding()) {
             return idx_cur_pos;
@@ -201,12 +228,23 @@ LayerResult PressureEqualizer::process_layer(LayerResult &&input)
 
     output_buffer_length      = 0;
     output_buffer_prev_length = 0;
+    m_output_source_markers.clear();
     for (size_t line_idx = 0; line_idx < next_layer_first_idx; ++line_idx)
         output_gcode_line(line_idx);
+    if (!m_layer_source_tails.front().empty())
+        m_output_source_markers.emplace_back(output_buffer_length, std::move(m_layer_source_tails.front()));
+    m_layer_source_tails.pop();
     m_gcode_lines.erase(m_gcode_lines.begin(), m_gcode_lines.begin() + int(next_layer_first_idx));
 
-    if (output_buffer_length > 0)
-        prev_layer_result->gcode = std::string(output_buffer.data());
+    // Reinsert boundaries only after numerical processing and removal of
+    // redundant speed lines. They cannot affect output-buffer look-behind.
+    std::size_t copied = 0;
+    for (const auto &marker : m_output_source_markers) {
+        prev_layer_result->gcode.append(output_buffer.data()+copied, marker.first-copied);
+        prev_layer_result->gcode += marker.second;
+        copied = marker.first;
+    }
+    prev_layer_result->gcode.append(output_buffer.data()+copied, output_buffer_length-copied);
 
     assert(!input.nop_layer_result || m_layer_results.empty());
     LayerResult out = *prev_layer_result;
@@ -322,8 +360,11 @@ bool PressureEqualizer::process_line(const char *line, const char *line_end, GCo
         switch (gcode) {
         case 0:
         case 1:
+        case 2:
+        case 3:
         {
-            // G0, G1: A FFF 3D printer does not make a difference between the two.
+            // Track arc endpoints, E and modal feed as well as linear moves.
+            // Leaving these stale makes the next subdivided G1 leave its path.
             buf.adjustable_flow = this->opened_extrude_set_speed_block;
             buf.extrude_set_speed_tag = found_extrude_set_speed_tag;
             buf.extrude_end_tag = found_extrude_end_tag;
@@ -357,7 +398,10 @@ bool PressureEqualizer::process_line(const char *line, const char *line_end, GCo
                     eatws(line);
                 }
             }
-            if (changed[3]) {
+            if (gcode == 2 || gcode == 3) {
+                buf.type = GCODELINETYPE_ARC;
+                buf.adjustable_flow = false;
+            } else if (changed[3]) {
                 // Extrusion, retract or unretract.
                 float diff = new_pos[3] - m_current_pos[3];
                 if (diff < 0) {
@@ -481,8 +525,22 @@ bool PressureEqualizer::process_line(const char *line, const char *line_end, GCo
 void PressureEqualizer::output_gcode_line(const size_t line_idx)
 {
     GCodeLine &line = m_gcode_lines[line_idx];
+    if (!line.source_markers.empty())
+        m_output_source_markers.emplace_back(output_buffer_length, line.source_markers);
     if (!line.modified) {
+        // A preceding subdivided G1 may have changed modal F. Arcs are not
+        // smoothed, so an omitted F must retain the original input feed rather
+        // than accidentally inheriting the last subdivision's reduced feed.
+        if (line.type == GCODELINETYPE_ARC && !line.pos_provided[4] &&
+            line.pos_start[4] > 0.f && m_output_feedrate != line.pos_start[4]) {
+            GCodeG1Formatter feedrate;
+            feedrate.emit_f(line.pos_start[4]);
+            push_to_output(feedrate);
+            m_output_feedrate = line.pos_start[4];
+        }
         push_to_output(line.raw.data(), line.raw_length, true);
+        if (line.pos_provided[4])
+            m_output_feedrate = line.pos_end[4];
         return;
     }
 
@@ -936,9 +994,11 @@ void PressureEqualizer::push_line_to_output(const size_t line_idx, float new_fee
     if (line_idx > 0 && output_buffer_length > 0) {
         const std::string prev_line_str = std::string(output_buffer.begin() + int(this->output_buffer_prev_length),
                                                       output_buffer.begin() + int(this->output_buffer_length) + 1);
-        if (is_just_line_with_extrude_set_speed_tag(prev_line_str))
+        if (is_just_line_with_extrude_set_speed_tag(prev_line_str)) {
             this->output_buffer_length = this->output_buffer_prev_length; // Remove the last line because it only sets the speed for an empty block of g-code lines, so it is useless.
-        else
+            for (auto it = m_output_source_markers.rbegin(); it != m_output_source_markers.rend() && it->first > output_buffer_length; ++it)
+                it->first = output_buffer_length;
+        } else
             push_to_output(EXTRUDE_END_TAG.data(), EXTRUDE_END_TAG.length(), true);
     } else
         push_to_output(EXTRUDE_END_TAG.data(), EXTRUDE_END_TAG.length(), true);
@@ -949,6 +1009,7 @@ void PressureEqualizer::push_line_to_output(const size_t line_idx, float new_fee
     if (line.extrusion_role == ExtrusionRole::erExternalPerimeter)
         feedrate_formatter.emit_string(std::string(EXTERNAL_PERIMETER_TAG.data(), EXTERNAL_PERIMETER_TAG.length()));
     push_to_output(feedrate_formatter);
+    m_output_feedrate = new_feedrate;
 
     GCodeG1Formatter extrusion_formatter;
     for (size_t axis_idx = 0; axis_idx < 3; ++axis_idx)

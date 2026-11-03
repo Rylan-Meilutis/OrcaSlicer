@@ -214,6 +214,11 @@ void Viewer::set_color_print_colors(const Palette& colors)
     m_impl->set_color_print_colors(colors);
 }
 
+void Viewer::set_thermal_stress_samples(const std::vector<float>& samples_mpa)
+{
+    m_impl->set_thermal_stress_samples(samples_mpa);
+}
+
 const ColorRange& Viewer::get_color_range(EViewType type) const
 {
     return m_impl->get_color_range(type);

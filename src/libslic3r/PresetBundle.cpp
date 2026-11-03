@@ -363,7 +363,7 @@ DynamicPrintConfig PresetBundle::construct_full_config(
     // BBS: add logic for settings check between different system presets
     out.erase("different_settings_to_system");
 
-    static const char *keys[] = {"support_filament", "support_interface_filament"};
+    static const char *keys[] = {"support_filament", "support_interface_filament", "brim_filament"};
     for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); ++i) {
         std::string key = std::string(keys[i]);
         auto       *opt = dynamic_cast<ConfigOptionInt *>(out.option(key, false));
@@ -5096,6 +5096,9 @@ unsigned int PresetBundle::sync_ams_list(std::vector<std::pair<DynamicPrintConfi
         }
 
         auto& print_config = this->prints.get_edited_preset().config;
+        if (auto *brim = print_config.option<ConfigOptionInt>("brim_filament");
+            brim && brim->value > int(filament_color_type->values.size()))
+            brim->value = 0;
         auto  support_filament_opt = print_config.option<ConfigOptionInt>("support_filament");
         auto support_interface_filament_opt = print_config.option<ConfigOptionInt>("support_interface_filament");
         if (support_filament_opt->value > int(filament_color_type->values.size()))
@@ -5962,7 +5965,7 @@ DynamicPrintConfig PresetBundle::full_fff_config(bool apply_extruder, std::optio
 
     capture_project_filament_roles(out);
     resolve_project_filament_bindings(out, project_default_filament_id);
-    static const char* keys[] = {"support_filament", "support_interface_filament", "wipe_tower_filament"};
+    static const char* keys[] = {"support_filament", "support_interface_filament", "wipe_tower_filament", "brim_filament"};
     for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); ++ i) {
         std::string key = std::string(keys[i]);
         auto *opt = dynamic_cast<ConfigOptionInt*>(out.option(key, false));

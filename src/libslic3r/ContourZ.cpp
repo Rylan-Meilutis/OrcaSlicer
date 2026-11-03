@@ -185,6 +185,7 @@ static bool contour_extrusion_path(LayerRegion *region, const sla::IndexedMesh &
 
 	path.polyline = std::move(polyline);
 	path.z_contoured = true;
+    path.contour_z_generated = true;
 	return true;
 }
 

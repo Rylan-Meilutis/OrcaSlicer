@@ -1052,6 +1052,32 @@ static std::set<int> belt_tools_for_role(const std::string &gcode, const std::st
     return tools;
 }
 
+TEST_CASE("Project brim filament prints brims on a tool with no model paths", "[SkirtBrim][BrimFilament]")
+{
+    auto config = multifilament_config(2, {
+        {"brim_type", "outer_only"}, {"brim_width", 3}, {"brim_object_gap", 0},
+        {"brim_filament", 2}, {"skirt_loops", 0}, {"enable_prime_tower", false},
+        {"machine_start_gcode", "T[initial_tool]\n"}, {"gcode_comments", true}
+    });
+    const auto sequence = GENERATE(std::string("by layer"), std::string("by object"));
+    CAPTURE(sequence);
+    config.set_deserialize_strict({{"print_sequence", sequence}});
+    Print print;
+    Model model;
+    init_print({cube(5)}, print, model, config);
+    const auto output = gcode(print);
+    CHECK(belt_tools_for_role(output, "brim") == std::set<int>{1});
+    CHECK(belt_tools_for_role(output, "perimeter") == std::set<int>{0});
+    CHECK(print.extruders() == std::vector<unsigned int>{0, 1});
+    config.set_deserialize_strict({{"brim_filament", 0}});
+    print.apply(model, config);
+    const auto automatic = gcode(print);
+    CHECK(belt_tools_for_role(automatic, "brim") == std::set<int>{0});
+    config.set_deserialize_strict({{"brim_filament", 3}});
+    print.apply(model, config);
+    CHECK(print.validate().opt_key == "brim_filament");
+}
+
 // Machine Z of the first extruding move whose role comment contains `role`, in file order;
 // numeric_limits<double>::max() when the role never extrudes.
 static double first_role_z(const std::string &gcode, const std::string &role)

@@ -151,6 +151,11 @@ std::string AdaptivePAProcessor::process_layer(std::string &&gcode) {
                 // Carry on searching for feedrates to find the maximum print speed
                 // until a feature change pattern or a wipe command is detected
                 while (std::getline(stream, next_line)) {
+                    // Private source boundaries do not occupy a numerical
+                    // lookahead position. The main loop preserves them verbatim.
+                    if (next_line.rfind(";_ORCA_INTERNAL_SOURCE:", 0) == 0 ||
+                        next_line.rfind(";_ORCA_INTERNAL_SECTION:", 0) == 0)
+                        continue;
                     line_counter++;
                     // Found an extrude move, set extrude move found flag and move to the next line
                     if ((!extrude_move_found) && next_line.find("G1 ") == 0 &&

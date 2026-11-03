@@ -2019,6 +2019,7 @@ bool PrintObject::invalidate_state_by_config_options(
             || opt_key == "make_overhang_printable_angle"
             || opt_key == "make_overhang_printable_hole_size"
             || opt_key == "interlocking_beam"
+            || opt_key == "manual_support"
             || opt_key == "rooting"
             || opt_key == "rooting_xy"
             || opt_key == "rooting_depth"

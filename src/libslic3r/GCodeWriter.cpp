@@ -1,4 +1,11 @@
 #include "GCodeWriter.hpp"
+#include "GCode/MachineKinematics.hpp"
+#include <optional>
+#include <typeinfo>
+#ifdef __APPLE__
+#include <boost/spirit/home/karma/generate.hpp>
+#include <boost/spirit/home/karma/numeric/int.hpp>
+#endif
 #include "Config.hpp"
 #include "Extruder.hpp"
 #include "Geometry.hpp"
@@ -90,6 +97,17 @@ void GCodeWriter::set_kinematics(std::unique_ptr<MachineKinematics> kinematics)
 bool GCodeWriter::has_axis_remap() const
 {
     return m_kinematics->must_emit_all_axes();
+}
+
+std::optional<Vec3d> GCodeWriter::quantized_clearance_position(const Vec3d &position) const
+{
+    const MachineKinematics *kinematics = m_kinematics.get();
+    if (!kinematics || typeid(*kinematics) != typeid(CartesianKinematics) ||
+        has_axis_remap() || !position.allFinite())
+        return std::nullopt;
+    return Vec3d(GCodeFormatter::quantize_xyzf(position.x() - m_x_offset) + m_x_offset,
+                 GCodeFormatter::quantize_xyzf(position.y() - m_y_offset) + m_y_offset,
+                 GCodeFormatter::quantize_xyzf(position.z()));
 }
 
 Vec3d GCodeWriter::apply_axis_remap(const Vec3d &pos) const

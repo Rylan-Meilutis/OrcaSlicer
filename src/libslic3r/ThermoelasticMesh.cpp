@@ -67,24 +67,40 @@ DepositionGrid voxelize_deposition(const std::vector<DepositedSegment> &segments
     Eigen::Vector3d origin = segments.front().start_m;
     for (const auto &segment : segments) {
         if (checkpoint) checkpoint();
+        const double end_height = segment.end_height_m.value_or(segment.height_m);
+        const double maximum_height = std::max(segment.height_m, end_height);
         if (!segment.start_m.allFinite() || !segment.end_m.allFinite() ||
-            !std::isfinite(segment.width_m) || !std::isfinite(segment.height_m) ||
-            segment.width_m <= 0. || segment.height_m <= 0. || segment.material >= materials.size())
+            !std::isfinite(segment.width_m) || !std::isfinite(segment.height_m) || !std::isfinite(end_height) ||
+            segment.width_m <= 0. || segment.height_m < 0. || end_height < 0. || maximum_height <= 0. ||
+            segment.material >= materials.size())
             throw std::invalid_argument("Invalid mechanical deposition segment.");
-        if (std::abs(segment.start_m.z() - segment.end_m.z()) > 1e-9)
-            throw std::invalid_argument("Nonplanar deposition requires a different mechanical discretization.");
-        if (segment.end_m.z() - segment.height_m < bed_z_m - 1e-9)
+        if ((segment.section != BeadSection::RectangularEnvelope &&
+             segment.section != BeadSection::RoundedRectangle) ||
+            (segment.section == BeadSection::RoundedRectangle && segment.width_m < maximum_height))
+            throw std::invalid_argument("Invalid mechanical bead cross-section.");
+        if ((segment.end_m.head<2>() - segment.start_m.head<2>()).squaredNorm() == 0. &&
+            std::abs(segment.start_m.z() - segment.end_m.z()) > 1e-9)
+            throw std::invalid_argument("Vertical deposition has no resolved bead footprint.");
+        if (std::min(segment.start_m.z() - segment.height_m, segment.end_m.z() - end_height) < bed_z_m - 1e-9)
             throw std::invalid_argument("Mechanical deposition extends below the bed.");
-        if (spacing_m.head<2>().maxCoeff() > segment.width_m / 2. || spacing_m.z() > segment.height_m / 2.)
+        // A zero-height scarf tip cannot be resolved by any finite grid. This
+        // is a sampling precondition, not a claim that the tip is resolved;
+        // independent grid refinement must qualify the resulting occupancy.
+        if (spacing_m.head<2>().maxCoeff() > segment.width_m / 2. || spacing_m.z() > maximum_height / 2.)
             throw std::invalid_argument("Mechanical grid does not resolve the deposited bead thickness.");
         origin.head<2>() = origin.head<2>().cwiseMin(
             (segment.start_m.head<2>().cwiseMin(segment.end_m.head<2>()).array() - segment.width_m / 2.).matrix());
     }
     origin.z() = bed_z_m;
-    std::map<std::array<int, 3>, std::size_t> occupied;
-    std::size_t visits = 0;
+    struct Occupancy {
+        std::size_t material;
+        DepositionGrid::Origin deposition;
+    };
+    std::map<std::array<int, 3>, Occupancy> occupied;
+    std::size_t visits = 0, active_segment = 0;
     const auto visit = [&] {
-        if (visits >= max_cell_visits) throw ResourceLimit("Mechanical raster work budget exceeded.");
+        if (visits >= max_cell_visits)
+            throw DepositionBudget("Mechanical raster work budget exceeded.",occupied.size(),visits,active_segment);
         if (++visits % 1024 == 0 && checkpoint) checkpoint();
     };
     const auto grid_index = [&](double coordinate, unsigned axis) {
@@ -93,14 +109,14 @@ DepositionGrid voxelize_deposition(const std::vector<DepositedSegment> &segments
             throw std::invalid_argument("Mechanical deposition grid coordinates overflow.");
         return int(std::max(0., index));
     };
-    for (const auto &segment : segments) {
+    for (std::size_t segment_index = 0; segment_index < segments.size(); ++segment_index) {
+        active_segment = segment_index;
+        const auto &segment = segments[segment_index];
         const Eigen::Vector2d start = segment.start_m.head<2>(), delta = segment.end_m.head<2>() - start;
         const unsigned major = std::abs(delta.x()) >= std::abs(delta.y()) ? 0 : 1, minor = 1 - major;
         const double radius = segment.width_m / 2., length_squared = delta.squaredNorm();
         const int first = grid_index(std::min(start[major], segment.end_m[major]) - radius, major);
         const int last = grid_index(std::max(start[major], segment.end_m[major]) + radius, major);
-        const int bottom = grid_index(segment.end_m.z() - segment.height_m, 2);
-        const int top = grid_index(segment.end_m.z(), 2);
         const double slope = delta[major] == 0. ? 0. : delta[minor] / delta[major];
         const double margin = radius * std::sqrt(1. + slope * slope);
         for (int i = first; i <= last; ++i) {
@@ -115,21 +131,37 @@ DepositionGrid voxelize_deposition(const std::vector<DepositedSegment> &segments
                 visit();
                 point[minor] = origin[minor] + (double(j) + .5) * spacing_m[minor];
                 const double projection = length_squared == 0. ? 0. : std::clamp((point - start).dot(delta) / length_squared, 0., 1.);
-                if ((point - start - projection * delta).squaredNorm() > radius * radius) continue;
+                const double distance_squared = (point - start - projection * delta).squaredNorm();
+                if (distance_squared > radius * radius) continue;
+                const double height = segment.height_m + projection *
+                    (segment.end_height_m.value_or(segment.height_m) - segment.height_m);
+                if (height <= 0.) continue;
+                const double side = segment.section == BeadSection::RoundedRectangle ?
+                    std::max(0., std::sqrt(distance_squared) - (segment.width_m - height) / 2.) : 0.;
+                // The same ruled cross-section as section_deposition: affine
+                // top and explicit affine thickness, with original end caps.
+                const double bead_top = segment.start_m.z() + projection * (segment.end_m.z() - segment.start_m.z());
+                const int bottom = grid_index(bead_top - height, 2);
+                const int top = grid_index(bead_top, 2);
                 for (int k = bottom; k <= top; ++k) {
                     visit();
                     const double z = origin.z() + (double(k) + .5) * spacing_m.z();
-                    if (z < segment.end_m.z() - segment.height_m || z >= segment.end_m.z()) continue;
+                    if (z < bead_top - height || z >= bead_top) continue;
+                    if (segment.section == BeadSection::RoundedRectangle) {
+                        const double vertical = z - (bead_top - height / 2.);
+                        if (side * side + vertical * vertical > height * height / 4.) continue;
+                    }
                     std::array<int, 3> index;
                     index[major] = i; index[minor] = j; index[2] = k;
                     const auto found = occupied.find(index);
                     if (found != occupied.end()) {
-                        if (found->second != segment.material)
+                        if (found->second.material != segment.material)
                             throw std::runtime_error("Mechanical grid cannot resolve a material interface.");
                     } else {
                         if (occupied.size() >= max_cells)
-                            throw ResourceLimit("Mechanical deposition exceeds the cell budget; analysis is unresolved.");
-                        occupied.emplace(index, segment.material);
+                            throw DepositionBudget("Mechanical deposition exceeds the cell budget; analysis is unresolved.",
+                                occupied.size(),visits,segment_index);
+                        occupied.emplace(index, Occupancy{segment.material, {segment_index, projection}});
                     }
                 }
             }
@@ -137,11 +169,13 @@ DepositionGrid voxelize_deposition(const std::vector<DepositedSegment> &segments
     }
     DepositionGrid grid{origin, spacing_m, {}};
     grid.voxels.reserve(occupied.size());
-    for (const auto &[index, material] : occupied) {
-        Voxel voxel = materials[material];
+    grid.deposition.reserve(occupied.size());
+    for (const auto &[index, occupancy] : occupied) {
+        Voxel voxel = materials[occupancy.material];
         voxel.index = index;
-        voxel.material = material;
+        voxel.material = occupancy.material;
         grid.voxels.push_back(voxel);
+        grid.deposition.push_back(occupancy.deposition);
     }
     return grid;
 }

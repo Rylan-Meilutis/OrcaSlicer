@@ -385,6 +385,9 @@ void BackgroundSlicingProcess::process_fff()
                         }
             };
             GCodeProcessorResult result;
+            const bool package_3mf = boost::filesystem::path(m_export_path).extension() == ".3mf" ||
+                (!m_upload_job.empty() && m_upload_job.upload_data.use_3mf);
+            bool remapped_package = false;
             if (m_dispatch_reuse_gcode) {
                 const bool identity = can_reuse_identity_tool_mapping(m_fff_print->full_print_config(),
                     m_dispatch_print->full_print_config(), m_dispatch_tools);
@@ -404,6 +407,7 @@ void BackgroundSlicingProcess::process_fff()
                         throw Slic3r::ExportError(_u8L("The sliced G-code cannot be opened for tool remapping."));
                     GCodeDispatchPlan plan;
                     bool certified = false;
+                    ToolMappingFailureReason fallback_reason = ToolMappingFailureReason::Unknown;
                     int last_percent = -1;
                     const auto progress = [&](std::uint64_t bytes, int begin, int extent, const std::string &text) {
                         m_print->throw_if_canceled();
@@ -416,11 +420,19 @@ void BackgroundSlicingProcess::process_fff()
                     };
                     try {
                         if (!equivalent_tool_mapping_config(m_fff_print->full_print_config(),
-                                m_dispatch_print->full_print_config(), m_dispatch_tools) ||
-                            !m_gcode_result->dispatch_data ||
-                            boost::filesystem::path(m_export_path).extension() == ".3mf" ||
-                            (!m_upload_job.empty() && m_upload_job.upload_data.use_3mf))
-                            throw std::runtime_error("The mapped export needs normal regeneration.");
+                                m_dispatch_print->full_print_config(), m_dispatch_tools))
+                            throw ToolMappingFailure(ToolMappingFailureReason::Configuration, "Mapped settings require regeneration.");
+                        if (!m_gcode_result->dispatch_data)
+                            throw ToolMappingFailure(ToolMappingFailureReason::MissingCapture, "Missing dispatch capture.");
+                        // Reject unsupported package metadata before writing
+                        // any mapped file, through the same cancellable
+                        // regeneration prompt as a rejected script preflight.
+                        if (package_3mf) {
+                            fallback_reason = ToolMappingFailureReason::PackageMetadata;
+                            validate_tool_mapped_sliced_gcode_3mf(*m_fff_print, *m_dispatch_print,
+                                *m_gcode_result, m_dispatch_tools);
+                            fallback_reason = ToolMappingFailureReason::Unknown;
+                        }
                         std::string full_config;
                         GCode::append_full_config(*m_dispatch_print, full_config);
                         m_print->set_status(50, _u8L("Checking printer scripts for fast tool remapping"));
@@ -434,12 +446,17 @@ void BackgroundSlicingProcess::process_fff()
                         throw;
                     } catch (const std::bad_alloc &) {
                         throw;
+                    } catch (const ToolMappingFailure &failure) {
+                        m_print->throw_if_canceled();
+                        fallback_reason = failure.reason();
                     } catch (const std::exception &) {
                         m_print->throw_if_canceled();
-                        // Do not expose macro contents in logs or dialogs: a
-                        // user's custom script may contain connection secrets.
-                        BOOST_LOG_TRIVIAL(info) << "Fast tool remapping requires normal regeneration";
                     }
+                    // Exception text can contain private custom scripts. Log
+                    // only the fixed diagnostic category, never what().
+                    if (!certified)
+                        BOOST_LOG_TRIVIAL(info) << "Fast tool remapping requires regeneration; reason="
+                            << static_cast<int>(fallback_reason);
                     if (certified) {
                         check_dispatch_space(&plan);
                         input.clear();
@@ -458,17 +475,39 @@ void BackgroundSlicingProcess::process_fff()
                         output.close();
                         if (!output)
                             throw Slic3r::ExportError(_u8L("Cannot finish writing the mapped G-code file. Check free disk space."));
+                        remapped_package = package_3mf;
                     } else {
                         // A shared reply stays alive if cancellation releases
                         // the worker while the modal is still being dismissed.
                         struct Reply { bool regenerate = false; std::exception_ptr error; };
                         const auto reply = std::make_shared<Reply>();
                         m_print->set_status(75, _u8L("Waiting for confirmation to regenerate the mapped print job"));
-                        const bool answered = execute_ui_task([reply] {
+                        const bool answered = execute_ui_task([reply, fallback_reason] {
                             try {
                                 if (GUI::wxGetApp().is_closing()) return;
+                                wxString reason;
+                                switch (fallback_reason) {
+                                case ToolMappingFailureReason::Configuration:
+                                    reason = _L("The selected tool settings could not be verified against this slice."); break;
+                                case ToolMappingFailureReason::MissingCapture:
+                                    reason = _L("The existing slice does not contain valid tool-remapping data."); break;
+                                case ToolMappingFailureReason::UnsupportedMode:
+                                    reason = _L("The selected printer mode or post-processing requires regeneration."); break;
+                                case ToolMappingFailureReason::ScriptReplay:
+                                    reason = _L("The printer scripts could not be safely replayed for the selected tools."); break;
+                                case ToolMappingFailureReason::FileIntegrity:
+                                    reason = _L("The existing G-code no longer matches its recorded slice."); break;
+                                case ToolMappingFailureReason::UnsupportedCommand:
+                                    reason = _L("The G-code contains a command that fast tool remapping does not support."); break;
+                                case ToolMappingFailureReason::PackageMetadata:
+                                    reason = _L("The sliced package contains metadata that cannot be safely remapped."); break;
+                                case ToolMappingFailureReason::ResourceLimit:
+                                    reason = _L("Fast tool remapping exceeded its processing limit."); break;
+                                default:
+                                    reason = _L("The existing G-code could not be safely remapped."); break;
+                                }
                                 GUI::MessageDialog confirm(GUI::wxGetApp().mainframe,
-                                    _L("This print job cannot safely reuse its existing G-code for the selected tools. Regenerate it now? Slicing and export progress will be shown."),
+                                    reason + "\n\n" + _L("Regenerate this print job now? Slicing and export progress will be shown."),
                                     _L("Prepare mapped print job"), wxYES_NO | wxNO_DEFAULT | wxICON_QUESTION);
                                 confirm.SetButtonLabel(wxID_YES, _L("Regenerate"));
                                 confirm.SetButtonLabel(wxID_NO, _L("Cancel"));
@@ -505,8 +544,7 @@ void BackgroundSlicingProcess::process_fff()
                 if (!SpoolManagerMetadata::update_gcode_file(m_dispatch_output_path, m_dispatch_spools, error))
                     throw Slic3r::ExportError(error);
             }
-            if (boost::filesystem::path(m_export_path).extension() == ".3mf" ||
-                (!m_upload_job.empty() && m_upload_job.upload_data.use_3mf)) {
+            if (package_3mf) {
                 std::string output_name = m_upload_job.empty() ? m_export_path : m_upload_job.upload_data.upload_path.string();
                 run_post_process_scripts(m_dispatch_output_path, false,
                     m_upload_job.empty() ? "File" : m_upload_job.printhost->get_name(), output_name,
@@ -524,8 +562,12 @@ void BackgroundSlicingProcess::process_fff()
                     boost::filesystem::remove(package_path, error);
                 });
                 m_print->set_status(96, _u8L("Packaging mapped G-code and thumbnails"));
-                if (!store_sliced_gcode_3mf(package_path, *export_print(),
-                        m_dispatch_reuse_gcode ? *m_gcode_result : result, m_dispatch_output_path))
+                const bool packaged = remapped_package
+                    ? store_tool_mapped_sliced_gcode_3mf(package_path, *m_fff_print, *m_dispatch_print,
+                        *m_gcode_result, m_dispatch_tools, m_dispatch_output_path)
+                    : store_sliced_gcode_3mf(package_path, *export_print(),
+                        m_dispatch_reuse_gcode ? *m_gcode_result : result, m_dispatch_output_path);
+                if (!packaged)
                     throw Slic3r::ExportError(_u8L("Failed to package the mapped print job."));
                 boost::filesystem::remove(m_dispatch_output_path);
                 m_dispatch_output_path = package_path;

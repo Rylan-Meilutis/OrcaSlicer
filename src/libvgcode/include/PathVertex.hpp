@@ -10,6 +10,8 @@
 #include <array>
 #include <cfloat>
 #include <cstdint>
+#include <cstddef>
+#include <limits>
 
 namespace libvgcode {
 
@@ -136,6 +138,10 @@ struct PathVertex
 
     // Negative means no converged mechanical sample, never zero stress.
     float thermal_stress_mpa{ -1.0f };
+
+    // Processor identity survives phantom path-start vertices. Not a G-code
+    // line number: one command may generate several physical moves.
+    size_t source_move_id{ std::numeric_limits<size_t>::max() };
 
     static const PathVertex DUMMY_PATH_VERTEX;
 };

@@ -12,6 +12,7 @@
 #include "libslic3r/GCode/FanMover.hpp"
 #include "libslic3r/GCode.hpp"
 #include "libslic3r/GCodeWriter.hpp"
+#include "libslic3r/GCodeReader.hpp"
 
 #include <algorithm>
 #include <cstddef>
@@ -26,6 +27,116 @@
 
 using namespace Slic3r;
 using namespace Slic3r::Test;
+
+namespace {
+const std::string source_one = ";_ORCA_INTERNAL_SOURCE:123:1\n";
+const std::string source_two = ";_ORCA_INTERNAL_SOURCE:123:2\n";
+const std::string source_clear = ";_ORCA_INTERNAL_SOURCE:123:0\n";
+
+std::size_t check_cooling_source_scopes(const std::string& marked, const std::string& plain)
+{
+    std::string stripped;
+    std::vector<int> events;
+    int active = 0;
+    std::size_t extrusions = 0;
+    GCodeReader reader;
+    reader.parse_buffer(marked, [&](GCodeReader& state, const GCodeReader::GCodeLine& line) {
+        const auto text = line.raw() + '\n';
+        if (text == source_one || text == source_two) {
+            CHECK(active == 0);
+            active = text == source_one ? 1 : 2;
+            events.push_back(active);
+        } else if (text == source_clear) {
+            CHECK(active != 0);
+            active = 0;
+            events.push_back(0);
+        } else {
+            stripped += text;
+            // Relative positive E commands are deposition in these fixtures.
+            if (line.cmd_is("G1") && line.has(X) && line.has(E) && line.e() > 0) {
+                ++extrusions;
+                REQUIRE(active != 0);
+                const float minimum = active == 1 ? 0.f : 10.f;
+                const float maximum = active == 1 ? 10.f : 20.f;
+                CHECK(state.x() >= minimum - 0.001f);
+                CHECK(line.new_X(state) <= maximum + 0.001f);
+                CHECK(line.new_X(state) > minimum);
+            }
+        }
+    });
+    CHECK(active == 0);
+    const std::vector<int> expected{1, 0, 2, 0};
+    CHECK(events == expected);
+    CHECK(stripped == plain);
+    return extrusions;
+}
+} // namespace
+
+TEST_CASE("Cooling preserves source scopes across buffered layers and slowdown", "[Cooling][DepositionProvenance]")
+{
+    const auto run = [](bool marked) {
+        PrintConfig config;
+        config.use_relative_e_distances.value = true;
+        config.fan_min_speed.values = {30};
+        config.fan_max_speed.values = {80};
+        config.close_fan_the_first_x_layers.values = {0};
+        config.initial_layer_fan_speed.values = {-1};
+        config.full_fan_speed_layer.values = {0};
+        config.slow_down_for_layer_cooling.values = {true};
+        config.slow_down_layer_time.values = {20};
+        config.slow_down_min_speed.values = {1};
+        config.dont_slow_down_outer_wall.values = {false};
+        GCode generator;
+        generator.apply_print_config(config);
+        generator.writer().set_extruders({0});
+        CoolingBuffer cooling(generator);
+        std::string first = "G1 X0 Y0 Z0.2 F600\n";
+        if (marked) first += source_one;
+        first += "G1 F600 ;_EXTRUDE_SET_SPEED\nG1 X10 E1\n;_EXTRUDE_END\n";
+        // Leave the first scope open across the buffered call boundary.
+        CHECK(cooling.process_layer(std::move(first), 1, false).empty());
+        std::string second;
+        if (marked) second += source_clear + source_two;
+        second += "G1 F600 ;_EXTRUDE_SET_SPEED\nG1 X20 E1\n;_EXTRUDE_END\n";
+        if (marked) second += source_clear;
+        return cooling.process_layer(std::move(second), 2, true);
+    };
+    const auto plain = run(false);
+    bool slowed = false;
+    GCodeReader reader;
+    reader.parse_buffer(plain, [&](GCodeReader&, const GCodeReader::GCodeLine& line) {
+        if (line.cmd_is("G1") && line.has(F) && line.f() < 600.f) slowed = true;
+    });
+    REQUIRE(slowed);
+    CHECK(check_cooling_source_scopes(run(true), plain) == 2);
+}
+
+TEST_CASE("Fan timing retains distinct source ownership when splitting buffered moves", "[Cooling][FanMover][DepositionProvenance]")
+{
+    const bool kickstart = GENERATE(false, true);
+    const auto run = [kickstart](bool marked) {
+        PrintConfig config;
+        config.use_relative_e_distances.value = true;
+        GCodeWriter writer;
+        writer.apply_print_config(config);
+        FanMover mover(writer, kickstart ? 0.f : 0.3f, false, true, false, kickstart ? 1.f : 0.f);
+        std::string first = "M106 S0\nG1 X0 Y0 F600\n";
+        if (marked) first += source_one;
+        first += "G1 X10 E1 F600\n";
+        std::string output = mover.process_gcode(first, false);
+        std::string second;
+        if (marked) second += source_clear;
+        second += "M106 S51\n";
+        if (marked) second += source_two;
+        second += "G1 X20 E1 F600\n";
+        if (marked) second += source_clear;
+        output += mover.process_gcode(second, false);
+        output += mover.process_gcode("", true);
+        return output;
+    };
+    const auto plain = run(false);
+    CHECK(check_cooling_source_scopes(run(true), plain) > 2);
+}
 
 TEST_CASE("Custom fan changes restore the active cooling request", "[Cooling][FanResume]")
 {

@@ -19,6 +19,7 @@
 #include <limits>
 #include <mutex>
 #include <sstream>
+#include <stdexcept>
 #include <type_traits>
 #include <unordered_map>
 
@@ -557,6 +558,82 @@ template<class Obstacles> const PrintedToolpathObstacle &obstacle_at(
         return obstacles[index];
 }
 
+double conservative_obstacle_top(const PrintedToolpathObstacle &obstacle)
+{
+    double top = obstacle.top_z;
+    for (double z : obstacle.centerline_z)
+        if (std::isfinite(z))
+            top = std::max(top, z);
+    return top;
+}
+
+// For a straight travel and a straight deposited bead, both XY positions and
+// heights are affine in their respective parameters (t,s). Clip the unit
+// parameter square by bead_z(s) > tool_z(t)+slice_height. Its affine image is
+// exactly the set of relative XY positions where material is above this slice.
+// This retains the actual slope, rather than raising the downhill endpoint to
+// the segment's maximum Z. At most five vertices are needed per bead segment.
+bool sloped_bead_overlaps_slice(const Vec3d &start, const Vec3d &end,
+    const SequentialGantrySlice &slice, const PrintedToolpathObstacle &obstacle,
+    double vertical_epsilon, double xy_clearance)
+{
+    for (size_t segment = 1; segment < obstacle.centerline.points.size(); ++segment) {
+        const double z0 = obstacle.centerline_z[segment - 1];
+        const double dz = obstacle.centerline_z[segment] - z0;
+        const auto above = [&](const Vec2d &parameter) {
+            return z0 + parameter.y() * dz - start.z() -
+                parameter.x() * (end.z() - start.z()) - slice.height - vertical_epsilon;
+        };
+        const std::vector<Vec2d> square{{0., 0.}, {1., 0.}, {1., 1.}, {0., 1.}};
+        if (std::none_of(square.begin(), square.end(), [&](const Vec2d &p) { return above(p) > 0.; }))
+            continue;
+        std::vector<Vec2d> clipped;
+        clipped.reserve(5);
+        for (size_t i = 0; i < square.size(); ++i) {
+            const Vec2d &a = square[i], &b = square[(i + 1) % square.size()];
+            const double da = above(a), db = above(b);
+            if (da >= 0.)
+                clipped.push_back(a);
+            if ((da < 0.) != (db < 0.))
+                clipped.push_back(a + (da / (da - db)) * (b - a));
+        }
+        Points relative;
+        const Vec2d bead_start = obstacle.centerline.points[segment - 1].cast<double>() * SCALING_FACTOR;
+        const Vec2d bead_end = obstacle.centerline.points[segment].cast<double>() * SCALING_FACTOR;
+        for (const Vec2d &parameter : clipped)
+            relative.emplace_back(Point::new_scale(bead_start + parameter.y() * (bead_end - bead_start) -
+                start.head<2>() - parameter.x() * (end.head<2>() - start.head<2>())));
+        Polygon envelope = Geometry::convex_hull(relative);
+        if (envelope.points.empty())
+            envelope.points = std::move(relative);
+        if (envelope.points.empty())
+            continue;
+        // Conversion to integer XY truncates each coordinate by less than one
+        // grid unit. Two units bound the resulting Euclidean error; this does
+        // not change the vertical contact tolerance or the physical geometry.
+        const double reach = scale_(0.5 * obstacle.line_width + xy_clearance) + 2.;
+        const double reach_squared = reach * reach;
+        for (const Polygon &shape : slice.polygons) {
+            if (std::any_of(envelope.points.begin(), envelope.points.end(),
+                    [&](const Point &p) { return shape.contains(p); }) ||
+                (envelope.points.size() >= 3 && std::any_of(shape.points.begin(), shape.points.end(),
+                    [&](const Point &p) { return envelope.contains(p); })))
+                return true;
+            for (size_t i = 0; i < envelope.points.size(); ++i) {
+                const Line relative_edge(envelope.points[i], envelope.points[(i + 1) % envelope.points.size()]);
+                for (const Line &edge : shape.lines()) {
+                    Point crossing;
+                    if (edge.intersection(relative_edge, &crossing) ||
+                        std::min({edge.distance_to_squared(relative_edge.a), edge.distance_to_squared(relative_edge.b),
+                                  relative_edge.distance_to_squared(edge.a), relative_edge.distance_to_squared(edge.b)}) <= reach_squared)
+                        return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
 template<class Obstacles>
 ToolheadCollision check_toolhead_clearance_impl(
     const Vec3d                              &start,
@@ -572,11 +649,27 @@ ToolheadCollision check_toolhead_clearance_impl(
             const PrintedToolpathObstacle &obstacle = obstacle_at(obstacles, obstacle_idx);
             if (obstacle.empty())
                 continue;
+            if (!std::isfinite(obstacle.top_z) || !std::isfinite(obstacle.line_width))
+                return {ToolheadCollisionType::GantryGeometry, obstacle_idx, 0};
+            const double conservative_top = conservative_obstacle_top(obstacle);
+            const bool sloped = std::isfinite(obstacle.line_width) && obstacle.line_width > 0. &&
+                obstacle.centerline.points.size() >= 2 && start.allFinite() && end.allFinite() &&
+                std::isfinite(xy_clearance) &&
+                obstacle.centerline_z.size() == obstacle.centerline.points.size() &&
+                !obstacle.centerline_z.empty() &&
+                std::all_of(obstacle.centerline_z.begin(), obstacle.centerline_z.end(),
+                    [](double z) { return std::isfinite(z); }) &&
+                *std::max_element(obstacle.centerline_z.begin(), obstacle.centerline_z.end()) == obstacle.top_z;
             for (size_t slice_idx = 0; slice_idx < gantry.slices.size(); ++slice_idx) {
                 const SequentialGantrySlice &slice = gantry.slices[slice_idx];
+                if (sloped) {
+                    if (sloped_bead_overlaps_slice(start, end, slice, obstacle, vertical_epsilon, xy_clearance))
+                        return {ToolheadCollisionType::GantryGeometry, obstacle_idx, slice_idx};
+                    continue;
+                }
                 double from = 0., to = 0.;
                 if (!collision_interval(start.z(), end.z(), slice.height,
-                                        obstacle.top_z, vertical_epsilon, from, to))
+                                        conservative_top, vertical_epsilon, from, to))
                     continue;
                 const Point from_xy = segment_point(start, end, std::max(0., from));
                 const Point to_xy   = segment_point(start, end, std::min(1., to));
@@ -603,8 +696,11 @@ ToolheadCollision check_toolhead_clearance_impl(
         const PrintedToolpathObstacle &obstacle = obstacle_at(obstacles, obstacle_idx);
         if (obstacle.empty())
             continue;
+        if (!std::isfinite(obstacle.top_z) || !std::isfinite(obstacle.line_width))
+            return {ToolheadCollisionType::FallbackEnvelope, obstacle_idx, size_t(-1)};
+        const double conservative_top = conservative_obstacle_top(obstacle);
         double from = 0., to = 0.;
-        if (!collision_interval(start.z(), end.z(), 0., obstacle.top_z,
+        if (!collision_interval(start.z(), end.z(), 0., conservative_top,
                                 vertical_epsilon, from, to))
             continue;
 
@@ -613,7 +709,7 @@ ToolheadCollision check_toolhead_clearance_impl(
         const double z_from = start.z() + (end.z() - start.z()) * from;
         const double z_to   = start.z() + (end.z() - start.z()) * to;
         const double relative_height = std::clamp(
-            obstacle.top_z - std::min(z_from, z_to), 0., fallback.height);
+            conservative_top - std::min(z_from, z_to), 0., fallback.height);
         const double radius = fallback.radius + relative_height * std::tan(angle) + xy_clearance;
         BoundingBox centerline_bbox(Points{segment_point(start, end, from),
                                            segment_point(start, end, to)});
@@ -722,6 +818,9 @@ PrintedToolpathObstacle make_printed_toolpath_obstacle(
     double                    line_width)
 {
     PrintedToolpathObstacle obstacle;
+    if (!std::isfinite(line_width) ||
+        std::any_of(points.begin(), points.end(), [](const Vec3d &point) { return !point.allFinite(); }))
+        throw std::invalid_argument("Non-finite printed toolpath geometry");
     if (points.size() < 2 || line_width <= 0.)
         return obstacle;
 
@@ -732,6 +831,11 @@ PrintedToolpathObstacle make_printed_toolpath_obstacle(
         obstacle.top_z = std::max(obstacle.top_z, point.z());
     }
     obstacle.line_width = line_width;
+    if (std::any_of(points.begin(), points.end(), [&](const Vec3d &p) { return p.z() != points.front().z(); })) {
+        obstacle.centerline_z.reserve(points.size());
+        for (const Vec3d &point : points)
+            obstacle.centerline_z.push_back(point.z());
+    }
     obstacle.bbox = get_extents(obstacle.centerline.points);
     obstacle.bbox.offset(scale_(0.5 * line_width));
     return obstacle;

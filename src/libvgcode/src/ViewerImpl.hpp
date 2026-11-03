@@ -200,6 +200,7 @@ public:
     size_t get_color_print_colors_count() const { return m_color_print_colors.size(); }
     const Palette& get_color_print_colors() const { return m_color_print_colors; }
     void set_color_print_colors(const Palette& colors);
+    void set_thermal_stress_samples(const std::vector<float>& samples_mpa);
 
     const Color& get_extrusion_role_color(EGCodeExtrusionRole role) const;
     void set_extrusion_role_color(EGCodeExtrusionRole role, const Color& color);

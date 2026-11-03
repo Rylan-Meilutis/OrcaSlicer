@@ -625,6 +625,58 @@ TEST_CASE("Source-course projection uses print-space heights for translated mesh
     CHECK(out_of_reach.empty());
 }
 
+TEST_CASE("Native solid courses fill their own roof domain without a source raster",
+          "[Fill][NonplanarSurface][NativeSolidCourse]")
+{
+    const std::string pattern = GENERATE(std::string("rectilinear"), std::string("monotonic"));
+    Print print;
+    Test::init_and_process_print({make_cube(12., 12., 1.)}, print, {
+        {"layer_height", 0.2}, {"initial_layer_print_height", 0.2},
+        {"top_surface_z_mode", "disabled"}, {"nonplanar_top_surface_resolution", 0.2},
+        {"internal_solid_infill_pattern", pattern}, {"solid_infill_direction", 0.}
+    });
+    LayerRegion &region = *print.objects().front()->layers().front()->regions().front();
+    region.fills.clear();
+    indexed_triangle_set triangles;
+    triangles.vertices = {Vec3f(0, 0, 2), Vec3f(10, 0, 3),
+                          Vec3f(10, 10, 3), Vec3f(0, 10, 2)};
+    triangles.indices = {Vec3i32(0, 1, 2), Vec3i32(0, 2, 3)};
+    TriangleMesh surface(triangles);
+    sla::IndexedMesh mesh(surface);
+    mesh.ground_level_offset(-mesh.ground_level());
+    const ExPolygons domain{ExPolygon(Polygon(Points{
+        Point(scale_(0.), scale_(0.)), Point(scale_(10.), scale_(0.)),
+        Point(scale_(10.), scale_(10.)), Point(scale_(0.), scale_(10.))}))};
+    const NonplanarCourseProjection course{{3., 1.}, 3.};
+    bool complete = false;
+    ExtrusionEntityCollection generated;
+    generated.entities = generate_nonplanar_solid_course(region, mesh, domain, {1, 1},
+        domain, course, 3., 4., 0.2, 1, false, complete);
+    REQUIRE(complete);
+    REQUIRE_FALSE(generated.empty());
+    CHECK(region.fills.empty());
+    Polygons deposited;
+    for (const ExtrusionEntity *entity : generated.entities) {
+        CHECK(entity->role() == erSolidInfill);
+        entity->polygons_covered_by_width(deposited, 0.f);
+        const auto *path = dynamic_cast<const ExtrusionPath *>(entity);
+        REQUIRE(path != nullptr);
+        for (const Point3 &point : path->polyline.points)
+            CHECK_THAT(3. + unscale_(point.z()),
+                Catch::Matchers::WithinAbs(2. + 0.1 * unscale_(point.x()), 0.005));
+    }
+    // The interior must have no missing scanline; edge rounding belongs to
+    // wall/skin ownership rather than an invented square nozzle footprint.
+    const Flow flow = region.flow(frSolidInfill, 0.2);
+    CHECK(diff_ex(offset_ex(domain, -flow.scaled_width()), union_ex(deposited),
+        ApplySafetyOffset::Yes).empty());
+    generated.clear();
+    generated.entities = generate_nonplanar_solid_course(region, mesh, domain, {1, 1},
+        domain, course, 3., 0.1, 0.2, 1, false, complete);
+    CHECK_FALSE(complete);
+    CHECK(generated.empty());
+}
+
 TEST_CASE("Source-course projection does not turn failed scanlines into isolated fragments",
           "[Fill][NonplanarSurface][SourceCourseProjection][Regression]")
 {
@@ -641,7 +693,11 @@ TEST_CASE("Source-course projection does not turn failed scanlines into isolated
     // Both ends are reachable but the connected scanline leaves the reach
     // envelope in the middle. Neither surviving end may become a new path.
     source.polyline = Polyline3(Points3{
-        Point3(scale_(1.), scale_(1.), scale_(0.)), Point3(scale_(9.), scale_(1.), scale_(0.)),
+        Point3(scale_(1.), scale_(1.), scale_(0.)),
+        // A native corner below the former 0.005 mm simplification threshold
+        // must not disappear merely because its course acquires a Z field.
+        Point3(scale_(5.), scale_(1.001), scale_(0.)),
+        Point3(scale_(9.), scale_(1.), scale_(0.)),
         Point3(scale_(9.), scale_(2.), scale_(0.)), Point3(scale_(1.), scale_(2.), scale_(0.))});
     if (reverse)
         source.polyline.reverse();
@@ -684,6 +740,29 @@ TEST_CASE("Source-course projection does not turn failed scanlines into isolated
     REQUIRE(mixed.entities.size() == 1);
     CHECK(mixed.entities.front()->first_point() == neighbor.first_point());
     CHECK(mixed.entities.front()->last_point() == neighbor.last_point());
+    // A complete structural course cannot silently lose the inaccessible
+    // scanline while keeping a neighboring row. This differs from optional
+    // finishing-fragment discovery above.
+    const NonplanarCourseProjection course{{3., 1.}, 3.};
+    ExtrusionEntityCollection native;
+    bool projection_complete = true;
+    native.entities = project_nonplanar_source_course(
+        region, mesh, domain, {1, 1}, domain, 3., 2.3, &course, &projection_complete);
+    CHECK(native.empty());
+    CHECK_FALSE(projection_complete);
+    native.entities = project_nonplanar_source_course(
+        region, mesh, domain, {1, 1}, domain, 3., 4., &course, &projection_complete);
+    CHECK(projection_complete);
+    REQUIRE(native.entities.size() == 2);
+    const auto *native_path = dynamic_cast<const ExtrusionPath *>(native.entities.front());
+    REQUIRE(native_path != nullptr);
+    auto next_vertex = native_path->polyline.points.begin();
+    for (const Point3 &vertex : source.polyline.points) {
+        next_vertex = std::find_if(next_vertex, native_path->polyline.points.end(),
+            [&](const Point3 &point) { return point.to_point() == vertex.to_point(); });
+        REQUIRE(next_vertex != native_path->polyline.points.end());
+        ++next_vertex;
+    }
 }
 
 TEST_CASE("Native course projection preserves infill roles and follows its own height field",
@@ -5735,6 +5814,129 @@ TEST_CASE("A connected non-planar top surface transitions across upper layer ope
                 inspect_collection(inspect_collection, region->fills);
             }
     CHECK(isolated_open_nonplanar_walls == 0);
+}
+
+static void init_native_roof_print(Print &print, double angle, bool infill_first = false)
+{
+    Test::init_and_process_print({shallow_top_wedge(angle)}, print, {
+        {"top_surface_z_mode", "nonplanar_top_surface"}, {"nonplanar_top_surface", 1},
+        {"nonplanar_top_surface_max_angle", 45}, {"nonplanar_top_surface_layers", 5},
+        {"sparse_infill_density", 100}, {"sparse_infill_pattern", "rectilinear"},
+        {"internal_solid_infill_pattern", "rectilinear"}, {"top_surface_pattern", "rectilinear"},
+        {"wall_loops", 2}, {"zaa_enabled", 0}, {"layer_height", 0.2}, {"is_infill_first", infill_first},
+        {"initial_layer_print_height", 0.2}, {"min_layer_height", "0.07"}, {"max_layer_height", "0.3"}
+    });
+}
+
+TEST_CASE("Native non-planar roof planning retains a complete supported finishing interior",
+          "[Fill][NonplanarSurface][NativeRoofCoverage]")
+{
+    const unsigned int original_log_level = get_logging_level();
+    ScopeGuard restore_log_level([original_log_level]() { set_logging_level(original_log_level); });
+    if (std::getenv("ORCA_NONPLANAR_REGRESSION_GCODE") != nullptr)
+        set_logging_level(4);
+    const double angle = GENERATE(3., 8.);
+    Print print;
+    init_native_roof_print(print, angle);
+    const auto paths = nonplanar_top_paths(print);
+    REQUIRE_FALSE(paths.empty()); // Rejection/fallback is not a successful roof.
+    Polygons deposited;
+    for (const ExtrusionPath &path : paths)
+        path.polygons_covered_by_width(deposited, 0.f);
+    const BoundingBox bounds = print.objects().front()->bounding_box();
+    const ExPolygons interior = offset_ex(ExPolygons{ExPolygon(bounds.polygon())}, -scale_(2.));
+    REQUIRE_FALSE(interior.empty());
+    CHECK(diff_ex(interior, union_ex(deposited), ApplySafetyOffset::Yes).empty());
+    const auto &layers = print.objects().front()->layers();
+    size_t first_owner = layers.size();
+    std::set<int> heights;
+    size_t wall_courses = 0;
+    ExPolygons anchor_footprint;
+    // Local flow splits an unchanged wall chain into several paths. Rejoin
+    // their XY centerlines so separate path endcaps do not replace loop joins
+    // in the footprint comparison.
+    const auto wall_footprint = [](const ExtrusionEntityCollection &collection) {
+        Polygons footprint;
+        std::optional<ExtrusionPath> chain;
+        const auto flush = [&]() {
+            if (chain) {
+                chain->polygons_covered_by_width(footprint, 0.f);
+                chain.reset();
+            }
+        };
+        for (const ExtrusionPath *path : test_extrusion_paths(collection)) {
+            if (!is_perimeter(path->role()) || path->polyline.points.empty())
+                continue;
+            if (chain && (chain->width != path->width || chain->inset_idx != path->inset_idx ||
+                chain->last_point3().to_point() != path->first_point3().to_point()))
+                flush();
+            if (!chain) {
+                chain = *path;
+                for (Point3 &point : chain->polyline.points)
+                    point.z() = 0;
+            } else {
+                for (size_t i = 1; i < path->polyline.points.size(); ++i)
+                    chain->polyline.points.emplace_back(path->polyline.points[i].x(), path->polyline.points[i].y(), coord_t(0));
+            }
+        }
+        flush();
+        return union_ex(footprint);
+    };
+    for (size_t owner = 0; owner < layers.size(); ++owner) {
+        Polygons walls;
+        for (const ExtrusionPath *path : test_extrusion_paths(layers[owner]->regions().front()->perimeters)) {
+            if (!path->nonplanar_surface || !is_perimeter(path->role()))
+                continue;
+            if (first_owner == layers.size()) {
+                first_owner = owner;
+                REQUIRE(owner > 0);
+                anchor_footprint = wall_footprint(layers[owner - 1]->regions().front()->perimeters);
+            }
+            CHECK(path->height >= 0.07 - 1e-5);
+            CHECK(path->height <= 0.3 + 1e-5);
+            heights.insert(int(std::lround(path->height * 10000)));
+            CHECK_THAT(path->mm3_per_mm,
+                Catch::Matchers::WithinAbs(Flow(path->width, path->height, 0.f).mm3_per_mm(), 1e-6));
+            if (owner == first_owner)
+                for (const Point3 &point : path->polyline.points) {
+                    const double height = layers[owner]->print_z + unscale_(point.z()) - layers[owner - 1]->print_z;
+                    CHECK(height >= 0.07 - 1e-5);
+                    CHECK(height <= 0.3 + 1e-5);
+                }
+            path->polygons_covered_by_width(walls, 0.f);
+        }
+        if (!walls.empty()) {
+            ++wall_courses;
+            for (const ExtrusionPath *fill : test_extrusion_paths(layers[owner]->regions().front()->fills))
+                CHECK((fill->nonplanar_surface || fill->nonplanar_schedule_owned));
+            // Every course retains the full dimensional wall footprint;
+            // interior planar stair-cut edges must not become new walls.
+            const ExPolygons actual = wall_footprint(layers[owner]->regions().front()->perimeters);
+            INFO("angle=" << angle << " owner=" << owner << " missing area="
+                 << area(diff_ex(anchor_footprint, actual, ApplySafetyOffset::Yes)) * SCALING_FACTOR * SCALING_FACTOR);
+            CHECK(diff_ex(actual, anchor_footprint, ApplySafetyOffset::Yes).empty());
+            CHECK(diff_ex(anchor_footprint, actual, ApplySafetyOffset::Yes).empty());
+        }
+    }
+    CHECK(wall_courses > 1);
+    CHECK(heights.size() > 1);
+}
+
+TEST_CASE("Native roof export must qualify actual nozzle-tip clearance",
+          "[.NonplanarExportQualification][NotWorking]")
+{
+    // Explicit qualification gate, not a passing fallback test. Native
+    // wall/infill endpoints still overlap the finite nozzle tip on slopes;
+    // safe scheduling/path redesign is required before enabling this mode.
+    Print print;
+    const bool infill_first = GENERATE(false, true);
+    const double angle = GENERATE(3., 8.);
+    CAPTURE(infill_first, angle);
+    init_native_roof_print(print, angle, infill_first);
+    REQUIRE_FALSE(nonplanar_top_paths(print).empty());
+    const std::string exported = Test::gcode(print);
+    REQUIRE_FALSE(exported.empty());
+    CHECK(exported.find("non-planar approach/departure") != std::string::npos);
 }
 
 TEST_CASE("Non-planar walls respect the configured wall sequence", "[Fill][NonplanarSurface][WallSequence]")

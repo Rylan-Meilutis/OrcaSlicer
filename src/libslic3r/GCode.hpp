@@ -23,6 +23,8 @@
 #include "GCode/GCodeProcessor.hpp"
 #include "GCode/ThumbnailData.hpp"
 #include "GCode/ToolMapping.hpp"
+#include "GCode/DepositionProvenance.hpp"
+#include "GCode/DepositionSection.hpp"
 #include "libslic3r/ObjectID.hpp"
 #include "GCode/ExtrusionProcessor.hpp"
 #include "SequentialGantryGeometry.hpp"
@@ -264,6 +266,8 @@ public:
     // throws std::runtime_exception on error,
     // throws CanceledException through print->throw_if_canceled().
     void            do_export(Print* print, const char* path, GCodeProcessorResult* result = nullptr, ThumbnailsGeneratorCallback thumbnail_cb = nullptr);
+    // Analysis-only, default off. Provenance never authorizes mechanical ownership.
+    void enable_deposition_provenance(bool enabled = true) { m_deposition_provenance_enabled = enabled; }
     void            export_layer_filaments(GCodeProcessorResult* result);
     //BBS: set offset for gcode writer
     void set_gcode_offset(double x, double y) { m_writer.set_xy_offset(x, y); m_processor.set_xy_offset(x, y);}
@@ -423,6 +427,10 @@ protected:
 
         void flush();
         void close();
+        void enable_provenance(std::uint64_t generation);
+        bool finish_provenance(std::shared_ptr<const DepositionProvenance> registry,
+                               const std::vector<std::uint32_t>& expected);
+        bool finish_sections(const DepositionSections& registry);
 
         // Write a string into a file.
         void write(const std::string& what) { this->write(what.c_str()); }
@@ -439,6 +447,10 @@ protected:
     private:
         FILE *f = nullptr;
         GCodeProcessor &m_processor;
+        std::unique_ptr<DepositionProvenanceCapture> m_provenance_capture;
+        std::unique_ptr<DepositionSectionCapture> m_section_capture;
+        std::string m_pending_line;
+        void write_plain(const std::string& data);
     };
 
     // Virtual hooks for belt printer subclass (BeltGCode).
@@ -873,6 +885,26 @@ protected:
     // Current layer processed. In sequential printing mode, only a single copy will be printed.
     // In non-sequential mode, all its copies will be printed.
     const Layer*                        m_layer;
+    bool m_deposition_provenance_enabled = false;
+    std::shared_ptr<DepositionProvenance> m_deposition_provenance;
+    std::shared_ptr<DepositionSections> m_deposition_sections;
+    bool m_deposition_sections_valid = true;
+    std::string m_deposition_sections_failure;
+    bool deposition_source_transformed() const;
+    void emit_deposition_section(std::string& gcode, const Vec3d& target, double extrusion,
+        const std::string& description, bool no_extrusion, double width,
+        double start_height, double end_height, bool xy_only = false,
+        const std::optional<Vec2d>& arc_offset = {}, bool arc_ccw = false,
+        const std::optional<std::array<double, 2>>& nominal_lower_z = {},
+        DepositionCommandSection::Transform transform = DepositionCommandSection::Transform::Ordinary,
+        DepositionCommandSection::Purpose purpose = DepositionCommandSection::Purpose::Model);
+    using DepositionSourceKey = std::array<std::uint64_t, 7>;
+    std::map<DepositionSourceKey, std::uint32_t> m_deposition_source_ids;
+    std::vector<std::uint32_t> m_deposition_expected_events;
+    std::optional<std::pair<std::uint64_t, std::uint64_t>> m_deposition_instance;
+    DepositionSource::Assignment m_deposition_assignment = DepositionSource::Assignment::Unknown;
+    void wrap_deposition_region(std::string& gcode, std::size_t begin, std::size_t region);
+    void record_deposition_events(const std::string& gcode);
     // m_layer is an object layer and it is being printed over raft surface.
     bool                                m_object_layer_over_raft;
     //double                              m_volumetric_speed;

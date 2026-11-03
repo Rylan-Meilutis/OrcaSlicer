@@ -5,6 +5,7 @@
 #include "libslic3r/GCode/GCodeProcessor.hpp"
 #include "libslic3r/GCode/ThumbnailData.hpp"
 #include "libslic3r/GCode/LearnedTiming.hpp"
+#include <memory>
 #include <optional>
 #include "IMSlider.hpp"
 #include "GLModel.hpp"
@@ -38,6 +39,11 @@
 #include <vector>
 
 namespace Slic3r {
+
+namespace Thermoelastic {
+struct SectionLayerPreview;
+struct GCodeSectionScenario;
+}
 
 class Print;
 class TriangleMesh;
@@ -220,8 +226,12 @@ private:
     // Belt printers: the print Z of each viewer layer, in the viewer's layer numbering.
     std::vector<double> m_belt_layer_zs;
     //BBS: save m_gcode_result as well
-    const GCodeProcessorResult* m_gcode_result;
+    const GCodeProcessorResult* m_gcode_result{ nullptr };
     GCodeProcessorResult::ThermalAnalysis m_thermal_analysis;
+    // Keep solver implementation headers out of this widely included GUI header.
+    std::unique_ptr<Thermoelastic::SectionLayerPreview> m_section_layer_analysis;
+    std::string m_analysis_source_filename;
+    std::size_t m_analysis_source_moves = 0;
     std::optional<LearnedTimingEstimate> m_learned_timing;
     std::string m_learned_timing_status;
     std::string m_learned_timing_context;
@@ -394,6 +404,12 @@ mutable bool m_no_render_path { false };
     bool m_loaded_as_preview{ false };
 
 public:
+    // Called only on the UI thread after an owned analysis snapshot completes.
+    // Rejects stale results from a previous slice without changing its colors.
+    bool set_section_layer_analysis(unsigned int result_id, const std::string& filename,
+                                    Thermoelastic::SectionLayerPreview analysis);
+    void request_section_layer_analysis(unsigned processor_layer_id,
+                                        Thermoelastic::GCodeSectionScenario scenario);
     GCodeViewer();
     ~GCodeViewer();
 

@@ -384,6 +384,32 @@ TEST_CASE("Fast dispatch refuses unproven commands and transformed macro spans",
     CHECK_THROWS_AS(prepare_tool_mapped_gcode(postprocessed, data, target, {1}, ""), std::runtime_error);
 }
 
+TEST_CASE("Fast dispatch reports fixed failure categories without exposing script details", "[ToolMapping]")
+{
+    DynamicPrintConfig target;
+    target.set_key_value("gcode_flavor", new ConfigOptionEnum<GCodeFlavor>(gcfMarlinFirmware));
+    GCodeDispatchData data;
+    const auto reason = [&](const std::string &text) {
+        std::istringstream input(text);
+        try {
+            prepare_tool_mapped_gcode(input, data, target, {1}, "");
+        } catch (const ToolMappingFailure &failure) {
+            return failure.reason();
+        }
+        return ToolMappingFailureReason::Unknown;
+    };
+    CHECK(reason("G1 X0\n") == ToolMappingFailureReason::MissingCapture);
+    std::istringstream seal_source("G1 X0\n");
+    seal_gcode_dispatch(seal_source, data);
+    CHECK(reason("G1 X1\n") == ToolMappingFailureReason::FileIntegrity);
+    CHECK(reason("M151 T500\n") == ToolMappingFailureReason::UnsupportedCommand);
+    CHECK(reason("T99\n") == ToolMappingFailureReason::UnsupportedCommand);
+    CHECK(reason(std::string(1024 * 1024 + 1, ';')) == ToolMappingFailureReason::ResourceLimit);
+    CHECK(reason("; ORCA_DISPATCH_BEGIN 0\n") == ToolMappingFailureReason::FileIntegrity);
+    target.set_key_value("post_process", new ConfigOptionStrings{"private-script.sh"});
+    CHECK(reason("G1 X0\n") == ToolMappingFailureReason::UnsupportedMode);
+}
+
 TEST_CASE("Bound tool substitution rejects stale or ambiguous bindings and cancels copying", "[ToolMapping]")
 {
     const auto rewrite = [](const std::string &text, const std::vector<GCodeToolBinding> &bindings,

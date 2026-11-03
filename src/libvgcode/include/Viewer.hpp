@@ -200,6 +200,12 @@ public:
     // the view type is EViewType::ColorPrint with the given one.
     //
     void set_color_print_colors(const Palette& colors);
+
+    // Replace mechanical samples without regenerating toolpaths. Indexed by
+    // processor move, not rendered vertex (which includes phantom vertices).
+    // Missing/negative/nonfinite values clear the sample. Main thread only;
+    // the GPU upload is deferred until the next render with its GL context.
+    void set_thermal_stress_samples(const std::vector<float>& samples_mpa);
     //
     // Get the color range for the given view type.
     // Valid view types are:

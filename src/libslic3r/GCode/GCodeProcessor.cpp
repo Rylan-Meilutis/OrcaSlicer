@@ -21,6 +21,10 @@
 #include "libslic3r/I18N.hpp"
 #include "libslic3r_version.h"
 #include "GCodeProcessor.hpp"
+#include "DepositionSection.hpp"
+#include <cstdint>
+#include <stdexcept>
+#include "DepositionProvenance.hpp"
 
 #include <algorithm>
 #include <array>
@@ -2718,6 +2722,16 @@ const GCodeProcessorResult::TemperatureTargets* GCodeProcessorResult::temperatur
     return index < temperature_targets.size() ? &temperature_targets[index] : nullptr;
 }
 
+const GCodeProcessorResult::DepositionZSpan* GCodeProcessorResult::deposition_z_for_move(std::size_t move_index) const noexcept
+{
+    const auto found = std::lower_bound(deposition_z_spans.begin(), deposition_z_spans.end(), move_index,
+        [](const DepositionZSpan& span, std::size_t index) { return span.move_index < index; });
+    if (found == deposition_z_spans.end() || found->move_index != move_index ||
+        (found + 1 != deposition_z_spans.end() && (found + 1)->move_index == move_index))
+        return nullptr;
+    return &*found;
+}
+
 void GCodeProcessorResult::reset() {
     //BBS: add mutex for protection of gcode result
     lock();
@@ -2725,6 +2739,12 @@ void GCodeProcessorResult::reset() {
     // moves and lines_ends grow with the print: free them, as no reset result reuses the capacity.
     clear_and_shrink(moves);
     dispatch_data.reset();
+    deposition_provenance.reset();
+    deposition_sections.reset();
+    deposition_z_spans.clear();
+    deposition_z_generation = 0;
+    deposition_sections_failure.clear();
+    native_ownership.reset();
     clear_and_shrink(thermal_stress_mpa);
     thermal_analysis = {};
     plate_mass = {};
@@ -3752,6 +3772,10 @@ void GCodeProcessor::enable_stealth_time_estimator(bool enabled)
 
 void GCodeProcessor::reset()
 {
+    m_deposition_source_id = 0;
+    m_deposition_section_id = 0;
+    m_section_children.clear();
+    m_section_children_valid = true;
     m_units = EUnits::Millimeters;
     m_global_positioning_type = EPositioningType::Absolute;
     m_e_local_positioning_type = EPositioningType::Absolute;
@@ -3975,6 +3999,257 @@ void GCodeProcessor::process_buffer(const std::string &buffer)
     m_parser.parse_buffer(buffer, [this](GCodeReader&, const GCodeReader::GCodeLine& line) {
         this->process_gcode_line(line, false);
     });
+}
+
+void GCodeProcessor::finish_deposition_sections(std::shared_ptr<const DepositionSections> registry)
+{
+    m_deposition_section_id = 0;
+    for (auto& move : m_result.moves) move.deposition_vertical_extrusion = false;
+    m_result.deposition_z_spans.clear();
+    m_result.deposition_z_generation = 0;
+    bool valid = registry && registry->sealed() && m_section_children_valid;
+    m_result.deposition_sections_failure = valid ? "" : "Missing section registry or child budget exceeded";
+    if (valid) {
+        // Time estimation inserts display-only vertices during parsing. Source
+        // IDs survive copies, but old vector indices do not. Recover physical
+        // children in their original order before looking up their geometry.
+        std::size_t child_index = 0;
+        for (std::size_t i = 0; i < m_result.moves.size(); ++i) {
+            const auto& move = m_result.moves[i];
+            if (move.internal_only || move.deposition_command_section_id == 0) continue;
+            if (child_index == m_section_children.size() ||
+                m_section_children[child_index].section != move.deposition_command_section_id) { valid = false; break; }
+            m_section_children[child_index++].move = i;
+        }
+        valid = valid && child_index == m_section_children.size();
+        if (!valid) m_result.deposition_sections_failure = "Section physical-child association changed during preview processing";
+    }
+    std::uint32_t current = 0;
+    std::optional<DepositionSectionChain> chain;
+    if (valid) for (const auto& child : m_section_children) {
+        if (child.section != current) {
+            if ((chain && !chain->complete()) || child.section != current + 1) {
+                m_result.deposition_sections_failure = chain && !chain->complete() ?
+                    "Incomplete section chain at command " + std::to_string(current) :
+                    "Missing/reordered section command: expected " + std::to_string(current + 1) + " got " + std::to_string(child.section);
+                valid = false; break;
+            }
+            const auto* parent = registry->section(child.section);
+            if (!parent) { m_result.deposition_sections_failure = "Unknown section command " + std::to_string(child.section); valid = false; break; }
+            chain.emplace(*parent);
+            current = child.section;
+        }
+        auto& move = m_result.moves.at(child.move);
+        if (move.type != EMoveType::Extrude) {
+            const auto* parent = registry->section(child.section);
+            if (move.type != EMoveType::Travel || !move.deposition_source_id ||
+                !std::isfinite(move.delta_extruder) || move.delta_extruder <= 0.f ||
+                (move.extrusion_role != erStaggeredPerimeter && move.extrusion_role != erPerimeter &&
+                 move.extrusion_role != erExternalPerimeter) ||
+                parent->transform != DepositionCommandSection::Transform::BrickCourse || parent->arc_direction != 0 ||
+                parent->nominal_lower_z || parent->start_height <= 0. || parent->start_height != parent->end_height ||
+                child.start[0] != child.end[0] || child.start[1] != child.end[1] || child.start[2] == child.end[2] ||
+                parent->start[0] != parent->end[0] || parent->start[1] != parent->end[1]) {
+                valid = false;
+                m_result.deposition_sections_failure = "Invalid vertical brick section child at command " + std::to_string(child.section);
+                break;
+            }
+        }
+        const auto heights = chain->append(child.start, child.end, move.extruder_id);
+        if (!heights) {
+            m_result.deposition_sections_failure = "Section child geometry or filament mismatch at command " +
+                std::to_string(child.section) + " move " + std::to_string(child.move);
+            const auto point = [](const std::array<double, 3>& p) {
+                return std::to_string(p[0]) + "," + std::to_string(p[1]) + "," + std::to_string(p[2]);
+            };
+            const auto& parent = *registry->section(child.section);
+            m_result.deposition_sections_failure += " parent=" + point(parent.start) + "->" + point(parent.end) +
+                " child=" + point(child.start) + "->" + point(child.end) +
+                " arc_direction=" + std::to_string(parent.arc_direction) +
+                " arc_center=" + point({parent.arc_center[0], parent.arc_center[1], parent.start[2]}) +
+                " filament=" + std::to_string(parent.filament) + "/" + std::to_string(move.extruder_id) +
+                " start_delta_nm=" + point({(child.start[0] - parent.start[0]) * 1e6,
+                    (child.start[1] - parent.start[1]) * 1e6, (child.start[2] - parent.start[2]) * 1e6}) +
+                " end_delta_nm=" + point({(child.end[0] - parent.end[0]) * 1e6,
+                    (child.end[1] - parent.end[1]) * 1e6, (child.end[2] - parent.end[2]) * 1e6});
+            valid = false; break;
+        }
+        move.deposition_design_heights = heights;
+        move.deposition_design_width = float(registry->section(child.section)->width);
+        move.deposition_command_section_id = child.section;
+    }
+    valid = valid && current == registry->size() && (!chain || chain->complete());
+    if (!valid && m_result.deposition_sections_failure.empty())
+        m_result.deposition_sections_failure = "Missing or incomplete final section command " + std::to_string(current);
+    std::shared_ptr<DepositionSections> parsed_sections;
+    const auto parsed_point = [&](const std::array<double, 3>& raw, std::uint32_t filament, bool precise_z = false) {
+        const Vec3f point = Vec3f(float(raw[0] + m_x_offset), float(raw[1] + m_y_offset), float(raw[2] - m_z_offset)) +
+            m_extruder_offsets.at(filament);
+        return std::array<double, 3>{point.x(), point.y(), precise_z ?
+            raw[2] - m_z_offset + double(m_extruder_offsets.at(filament).z()) : double(point.z())};
+    };
+    if (valid) {
+        // Publish parents in the SAME parsed frame as MoveVertex, not raw machine
+        // coordinates. This permits later independent membership verification
+        // without inferring a coordinate transform from the child being checked.
+        parsed_sections = std::make_shared<DepositionSections>(registry->generation());
+        for (std::uint32_t id = 1; id <= registry->size(); ++id) {
+            auto parent = *registry->section(id);
+            if (parent.filament >= m_extruder_offsets.size()) { valid = false; break; }
+            if (parent.arc_direction) {
+                const auto center = parsed_point({parent.arc_center[0], parent.arc_center[1], parent.start[2]}, parent.filament);
+                parent.arc_center = {center[0], center[1]};
+            }
+            parent.start = parsed_point(parent.start, parent.filament, bool(parent.nominal_lower_z));
+            parent.end = parsed_point(parent.end, parent.filament, bool(parent.nominal_lower_z));
+            if (parent.nominal_lower_z) {
+                for (auto& lower : *parent.nominal_lower_z)
+                    lower = lower - m_z_offset + double(m_extruder_offsets.at(parent.filament).z());
+                parent.start_height = parent.start[2] - (*parent.nominal_lower_z)[0];
+                parent.end_height = parent.end[2] - (*parent.nominal_lower_z)[1];
+            }
+            try { parsed_sections->add(parent); }
+            catch (const std::invalid_argument&) { valid = false; break; }
+        }
+        parsed_sections->seal();
+        current = 0;
+        chain.reset();
+        if (valid) for (const auto& child : m_section_children) {
+            auto& move = m_result.moves.at(child.move);
+            if (child.section != current) {
+                if (chain && !chain->complete()) { valid = false; break; }
+                chain.emplace(*parsed_sections->section(child.section));
+                current = child.section;
+            }
+            const auto* parent = parsed_sections->section(current);
+            const bool precise_z = bool(parent->nominal_lower_z);
+            const auto start = parsed_point(child.start, move.extruder_id, precise_z);
+            const auto end = parsed_point(child.end, move.extruder_id, precise_z);
+            if (precise_z) {
+                std::size_t previous = child.move;
+                while (previous > 0) {
+                    --previous;
+                    if (!m_result.moves[previous].internal_only && m_result.moves[previous].type != EMoveType::Seam)
+                        break;
+                }
+                const std::array<float, 2> preview_z{
+                    float(parsed_point(child.start, move.extruder_id)[2]),
+                    float(parsed_point(child.end, move.extruder_id)[2])};
+                if (previous == child.move || m_result.moves[previous].position.z() != preview_z[0] ||
+                    move.position.z() != preview_z[1] ||
+                    m_result.deposition_z_spans.size() == GCodeProcessorResult::maximum_deposition_z_spans) {
+                    valid = false;
+                    m_result.deposition_sections_failure = "Precise section Z projection or sparse record budget failed";
+                    break;
+                }
+                auto& spans = m_result.deposition_z_spans;
+                if (!spans.empty() && spans.back().move_index >= child.move) {
+                    valid = false;
+                    m_result.deposition_sections_failure = "Precise section Z records are not strictly ordered";
+                    break;
+                }
+                if (spans.size() == spans.capacity())
+                    spans.reserve(std::min(GCodeProcessorResult::maximum_deposition_z_spans,
+                        std::max(std::size_t(64), spans.capacity() * 2)));
+                spans.push_back({child.move, move.deposition_source_id, child.section, {start[2], end[2]}, preview_z});
+            }
+            const auto heights = chain->append(start,
+                {move.position.x(), move.position.y(), precise_z ? end[2] : double(move.position.z())}, move.extruder_id);
+            if (!heights) {
+                std::ostringstream detail;
+                detail.precision(17);
+                detail << "Section parsed-frame mismatch command " << current << " move " << child.move;
+                const auto transformed_start = parsed_point(child.start, move.extruder_id);
+                const auto transformed_end = parsed_point(child.end, move.extruder_id);
+                const auto* parent = parsed_sections->section(current);
+                for (std::size_t axis = 0; axis < 3; ++axis)
+                    detail << " axis" << axis << " parent=" << parent->start[axis] << "," << parent->end[axis]
+                           << " child=" << transformed_start[axis] << "," << move.position[axis]
+                           << " raw_end_transformed=" << transformed_end[axis];
+                m_result.deposition_sections_failure = detail.str();
+                valid = false; break;
+            }
+            move.deposition_design_heights = heights;
+        }
+        valid = valid && (!chain || chain->complete());
+        if (!valid && m_result.deposition_sections_failure.empty())
+            m_result.deposition_sections_failure = "Section parsed-frame verification failed at command " + std::to_string(current);
+    }
+    if (valid) {
+        m_result.deposition_z_generation = parsed_sections->generation();
+        m_result.deposition_sections = std::move(parsed_sections);
+    }
+    else {
+        m_result.deposition_sections.reset();
+        m_result.deposition_z_spans.clear();
+        m_result.deposition_z_generation = 0;
+        for (auto& move : m_result.moves) {
+            move.deposition_design_heights.reset();
+            move.deposition_design_width.reset();
+            move.deposition_command_section_id = 0;
+            move.deposition_vertical_extrusion = false;
+        }
+    }
+    m_section_children.clear();
+}
+
+void GCodeProcessor::finish_deposition_provenance(std::shared_ptr<const DepositionProvenance> registry)
+{
+    m_result.native_ownership.reset();
+    m_deposition_source_id = 0;
+    bool valid = registry && registry->sealed();
+    if (valid) {
+        for (auto &move : m_result.moves) {
+            move.deposition_vertical_extrusion = false;
+            if (move.deposition_source_id == 0) continue;
+            const auto *source = registry->source(move.deposition_source_id);
+            if (!source || source->logical_filament != move.extruder_id ||
+                (move.type == EMoveType::Travel && move.deposition_command_section_id &&
+                 (source->height != DepositionSource::Height::Transformed || !m_result.deposition_sections ||
+                  m_result.deposition_sections->generation() != registry->generation()))) {
+                valid = false;
+                break;
+            }
+        }
+    }
+    if (valid && !m_result.deposition_z_spans.empty()) {
+        // finalize() may insert display-only timing vertices after section
+        // publication. Rebind to the unchanged ordered physical child stream.
+        std::size_t next = 0, previous = 0;
+        for (std::size_t i = 0; i < m_result.moves.size(); ++i) {
+            const auto& move = m_result.moves[i];
+            if (move.internal_only || move.type == EMoveType::Seam) continue;
+            const auto* command = m_result.deposition_sections ?
+                m_result.deposition_sections->section(move.deposition_command_section_id) : nullptr;
+            if (move.type == EMoveType::Extrude && command && command->nominal_lower_z) {
+                if (next == m_result.deposition_z_spans.size()) { valid = false; break; }
+                auto& span = m_result.deposition_z_spans[next++];
+                if (span.command_id != move.deposition_command_section_id || span.source_id != move.deposition_source_id ||
+                    span.preview_z_mm[0] != m_result.moves[previous].position.z() || span.preview_z_mm[1] != move.position.z()) {
+                    valid = false;
+                    break;
+                }
+                span.move_index = i;
+            }
+            previous = i;
+        }
+        valid = valid && next == m_result.deposition_z_spans.size() &&
+            m_result.deposition_z_generation == registry->generation();
+    }
+    if (valid) {
+        for (auto& move : m_result.moves)
+            move.deposition_vertical_extrusion = !move.internal_only && move.type == EMoveType::Travel &&
+                move.deposition_source_id && move.deposition_command_section_id && bool(m_result.deposition_sections);
+        m_result.deposition_provenance = std::move(registry);
+    } else {
+        m_result.deposition_provenance.reset();
+        m_result.deposition_z_spans.clear();
+        m_result.deposition_z_generation = 0;
+        for (auto &move : m_result.moves) {
+            move.deposition_source_id = 0;
+            move.deposition_vertical_extrusion = false;
+        }
+    }
 }
 
 void GCodeProcessor::finalize(bool post_process)
@@ -5194,7 +5469,9 @@ void GCodeProcessor::process_G1(const GCodeReader::GCodeLine& line, const std::o
     std::array<std::optional<double>, 4> g1_axes = { std::nullopt, std::nullopt, std::nullopt, std::nullopt };
     if (line.has_x()) g1_axes[X] = (double)line.x();
     if (line.has_y()) g1_axes[Y] = (double)line.y();
-    if (line.has_z()) g1_axes[Z] = (double)line.z();
+    // Z participates in thin-layer geometry as well as preview. Keep textual
+    // precision independent of whether analysis metadata is being collected.
+    if (line.has_z()) g1_axes[Z] = line.precise_value(Z);
     if (line.has_e()) g1_axes[E] = (double)line.e();
     std::optional<double> g1_feedrate = std::nullopt;
     if (line.has_f()) g1_feedrate = (double)line.f();
@@ -5664,7 +5941,9 @@ void GCodeProcessor::process_G1(const std::array<std::optional<double>, 4>& axes
                 m_end_position[X] = pos.x(); m_end_position[Y] = pos.y(); m_end_position[Z] = pos.z();
             };
 
-            const Vec3f curr_pos(m_end_position[X], m_end_position[Y], m_end_position[Z]);
+            // A display-only seam must not round the parser's machine state
+            // through Vec3f, especially for precise Klipper coordinates.
+            const Vec3d curr_pos(m_end_position[X], m_end_position[Y], m_end_position[Z]);
             //BBS: m_result.moves.back().position has plate offset, must minus plate offset before calculate the real seam position
             const Vec3f new_pos = m_result.moves.back().position - m_extruder_offsets[filament_id] - plate_offset;
             const std::optional<Vec3f> first_vertex = m_seams_detector.get_first_vertex();
@@ -5673,7 +5952,9 @@ void GCodeProcessor::process_G1(const std::array<std::optional<double>, 4>& axes
             if ((new_pos - *first_vertex).squaredNorm() < 0.0625f) {
                 set_end_position(0.5f * (new_pos + *first_vertex) + m_z_offset * Vec3f::UnitZ());
                 store_move_vertex(EMoveType::Seam);
-                set_end_position(curr_pos);
+                m_end_position[X] = curr_pos.x();
+                m_end_position[Y] = curr_pos.y();
+                m_end_position[Z] = curr_pos.z();
             }
 
             m_seams_detector.activate(false);
@@ -5688,6 +5969,12 @@ void GCodeProcessor::process_G1(const std::array<std::optional<double>, 4>& axes
         add_object_mass(filament_id, area_filament_cross_section * delta_pos[E]);
 
     // store move
+    // Seam markers are visualization vertices inserted after the timing block
+    // was created. Keep its duration attached to the actual motion, not the
+    // marker which may now occupy the originally reserved move index.
+    for (auto &machine : m_time_processor.machines)
+        if (machine.enabled && !machine.blocks.empty() && machine.blocks.back().g1_line_id == m_g1_line_id)
+            machine.blocks.back().move_id = static_cast<unsigned int>(m_result.moves.size());
     store_move_vertex(type);
 }
 
@@ -6446,7 +6733,7 @@ void GCodeProcessor::process_G92(const GCodeReader::GCodeLine& line)
     }
 
     if (line.has_z()) {
-        m_origin[Z] = m_end_position[Z] - line.z() * lengths_scale_factor;
+        m_origin[Z] = m_end_position[Z] - line.precise_value(Z) * lengths_scale_factor;
         any_found = true;
         // Belt only: the start G-code's purge-blob advance + G92 Z0 resets leave a constant
         // machine-Z origin offset here; the designed-view back-transform subtracts it so
@@ -7437,6 +7724,13 @@ void GCodeProcessor::store_move_vertex(EMoveType type, EMovePathType path_type, 
     const bool has_y = delta_y > 0.0f;
     const bool has_z = delta_z > 0.0f;
     const bool has_e = delta_e > 0.0f;
+    // Capture only generator-scoped model-wall candidates. The full section
+    // chain and source registry must authenticate them before publication;
+    // ordinary Z travel, unretraction, wiping and custom G-code stay unchanged.
+    const bool vertical_section_candidate = type == EMoveType::Travel && !internal_only &&
+        m_deposition_section_id && m_deposition_source_id && !has_x && !has_y && has_z &&
+        m_end_position[E] > m_start_position[E] && !m_flushing && !m_wiping && !m_processing_start_custom_gcode &&
+        (m_extrusion_role == erStaggeredPerimeter || m_extrusion_role == erPerimeter || m_extrusion_role == erExternalPerimeter);
     if (type == EMoveType::Extrude && (has_x || has_y) && m_end_position[E] > m_start_position[E] &&
         m_extrusion_role != erCustom && m_extrusion_role != erNone && !m_processing_start_custom_gcode) {
         m_rme_output_plan.point(m_start_position[X], m_start_position[Y], m_width);
@@ -7496,6 +7790,22 @@ void GCodeProcessor::store_move_vertex(EMoveType type, EMovePathType path_type, 
     const float store_z = (m_processing_start_custom_gcode && m_result.belt_tilt_angle == 0.f)
         ? m_first_layer_height
         : m_end_position[Z] - m_z_offset;
+    if (m_deposition_section_id && (type == EMoveType::Extrude || vertical_section_candidate) && !internal_only) {
+        if (m_section_children.size() >= 1000000) m_section_children_valid = false;
+        else {
+            // Parent metadata uses the G1 parser's coordinate representation.
+            // Arc endpoints can retain doubles even in non-Klipper mode; bring
+            // them into that same float frame, also used by MoveVertex, before
+            // verifying the chain. This changes neither emitted motion nor the
+            // chain's geometric/order tolerances. Klipper keeps precise axes.
+            const auto coordinate = [&](double value) {
+                return m_flavor == gcfKlipper ? value : double(float(value));
+            };
+            m_section_children.push_back({m_result.moves.size(), m_deposition_section_id,
+                {coordinate(m_start_position[X]), coordinate(m_start_position[Y]), m_start_position[Z]},
+                {coordinate(m_end_position[X]), coordinate(m_end_position[Y]), m_end_position[Z]}});
+        }
+    }
     m_result.moves.push_back({
         m_last_line_id,
         type,
@@ -7525,7 +7835,11 @@ void GCodeProcessor::store_move_vertex(EMoveType type, EMovePathType path_type, 
         internal_only,
         m_object_label_id,
         m_print_z,
-        static_cast<unsigned int>(m_result.temperature_targets.size() - 1)
+        static_cast<unsigned int>(m_result.temperature_targets.size() - 1),
+        (type == EMoveType::Extrude || vertical_section_candidate) && m_extrusion_role != erNone && m_extrusion_role != erCustom &&
+            !m_processing_start_custom_gcode ? m_deposition_source_id : 0,
+        std::nullopt, std::nullopt,
+        (type == EMoveType::Extrude || vertical_section_candidate) ? m_deposition_section_id : 0
     });
 
     if (type == EMoveType::Seam) {

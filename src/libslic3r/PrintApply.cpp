@@ -1335,6 +1335,11 @@ void Print::update_shrinkage_compensation(size_t num_extruders, std::vector<int>
 
 Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_config, bool extruder_applied)
 {
+    return apply(model, std::move(new_full_config), extruder_applied, ApplyPurpose::Normal);
+}
+
+Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_config, bool extruder_applied, ApplyPurpose purpose)
+{
 #ifdef _DEBUG
     check_model_ids_validity(model);
 #endif /* _DEBUG */
@@ -1344,7 +1349,7 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
     // Normalize the config.
     resolve_project_filament_bindings(new_full_config, project_default_filament(model));
     if (const auto *automatic = new_full_config.option<ConfigOptionBool>("automatic_warp_mitigation");
-        automatic && automatic->value)
+        purpose == ApplyPurpose::Normal && automatic && automatic->value)
         apply_warp_mitigations(new_full_config, assess_warp_risk(new_full_config, model));
 	new_full_config.option("print_settings_id",            true);
 	new_full_config.option("filament_settings_id",         true);

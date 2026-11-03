@@ -6,6 +6,7 @@
 #include <array>
 #include <boost/filesystem/path.hpp>
 #include <cmath>
+#include <limits>
 #include "libslic3r/Polygon.hpp"
 #include "libslic3r/libslic3r.h"
 #include <string>
@@ -102,6 +103,55 @@ TEST_CASE("Fallback angle expands the toolhead envelope above the nozzle",
         Vec3d(0., 0., 1.), Vec3d(1., 0., 1.), {}, obstacles, angled);
     REQUIRE(collision);
     CHECK(collision.type == ToolheadCollisionType::FallbackEnvelope);
+}
+
+TEST_CASE("Sloped bead clearance retains endpoint heights and interior extrema",
+          "[SequentialGantryGeometry][SlopedObstacle]")
+{
+    const SequentialGantryGeometry gantry = square_toolhead(0., 0.1);
+    auto bead = make_printed_toolpath_obstacle({{0., 0., 1.}, {10., 0., 3.}}, 0.2);
+    REQUIRE(bead.centerline_z.size() == 2);
+    const auto collides = [&](const Vec3d &a, const Vec3d &b, const PrintedToolpathObstacle &item) {
+        return bool(check_toolhead_clearance(a, b, gantry, {item}));
+    };
+    CHECK_FALSE(collides({0., 0., 1.2}, {0., 0., 4.}, bead));
+    CHECK_FALSE(collides({0., 0., 4.}, {0., 0., 1.2}, bead));
+    CHECK(collides({10., 0., 2.}, {10., 0., 4.}, bead));
+    CHECK(collides({5., -1., 1.9}, {5., 1., 1.9}, bead));
+    CHECK_FALSE(collides({5., -1., 2.2}, {5., 1., 2.2}, bead));
+    // The finite nozzle footprint still intersects an uphill neighbor even
+    // at the last deposited endpoint: there is no last-bead exemption.
+    CHECK(collides({0., 0., 1.}, {0., 0., 4.}, bead));
+    auto unknown = bead;
+    unknown.centerline_z.clear();
+    CHECK(collides({0., 0., 1.2}, {0., 0., 4.}, unknown));
+    unknown.centerline_z = {1.}; // Invalid profile must stay conservative.
+    CHECK(collides({0., 0., 1.2}, {0., 0., 4.}, unknown));
+    unknown = bead;
+    unknown.centerline_z = {1., 2.}; // Max Z disagrees with the known envelope.
+    CHECK(collides({0., 0., 1.2}, {0., 0., 4.}, unknown));
+    unknown.centerline_z = {1., 4.}; // Never lower contradictory known heights.
+    CHECK(collides({10., 0., 3.5}, {10., 0., 5.}, unknown));
+    unknown.line_width = std::numeric_limits<double>::infinity();
+    CHECK(collides({0., 0., 1.2}, {0., 0., 4.}, unknown));
+    CHECK_THROWS(make_printed_toolpath_obstacle({{0., 0., 1.}, {1., 0., 1.}},
+        std::numeric_limits<double>::infinity()));
+    auto singleton = obstacle(3., -0.1, -0.1, 0.1, 0.1);
+    singleton.line_width = 0.2;
+    singleton.centerline.points = {Point(0, 0)};
+    singleton.centerline_z = {3.};
+    CHECK(collides({0., 0., 1.2}, {0., 0., 4.}, singleton));
+    const auto peak = make_printed_toolpath_obstacle({{0., 0., 1.}, {5., 0., 4.}, {10., 0., 1.}}, 0.2);
+    CHECK(collides({5., -1., 3.}, {5., 1., 3.}, peak));
+    CHECK_FALSE(collides({0., 0., 1.3}, {0., 0., 5.}, peak));
+    const auto flat = make_printed_toolpath_obstacle({{0., 0., 1.}, {10., 0., 1.}}, 0.2);
+    CHECK(flat.centerline_z.empty());
+    CHECK_FALSE(collides({0., 0., 1.}, {10., 0., 1.}, flat));
+    // Vertical travel maps to a line in relative XY, and a vertical bead to
+    // a point. Neither degeneracy may disappear through convex-hull creation.
+    const auto vertical = make_printed_toolpath_obstacle({{0., 0., 1.}, {0., 0., 3.}}, 0.2);
+    CHECK(collides({0., 0., 2.}, {0., 0., 4.}, vertical));
+    CHECK_FALSE(collides({1., 0., 2.}, {1., 0., 4.}, vertical));
 }
 
 TEST_CASE("Non-planar fallback cone starts at the largest configured nozzle",

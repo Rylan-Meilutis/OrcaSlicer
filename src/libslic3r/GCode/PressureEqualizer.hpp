@@ -11,6 +11,7 @@
 #include <cassert>
 
 #include <queue>
+#include <utility>
 
 namespace Slic3r {
 
@@ -81,6 +82,7 @@ private:
     // Internal data.
     // X,Y,Z,E,F
     float                           m_current_pos[5];
+    float                           m_output_feedrate = 0.f;
     size_t                          m_current_extruder;
     ExtrusionRole     m_current_extrusion_role;
     bool                            m_retracted;
@@ -105,6 +107,7 @@ private:
         GCODELINETYPE_UNRETRACT,
         GCODELINETYPE_TOOL_CHANGE,
         GCODELINETYPE_MOVE,
+        GCODELINETYPE_ARC,
         GCODELINETYPE_EXTRUDE,
     };
 
@@ -122,7 +125,7 @@ private:
 
         bool        moving_xy()     const { return fabs(pos_end[0] - pos_start[0]) > 0.f || fabs(pos_end[1] - pos_start[1]) > 0.f; }
         bool        moving_z ()     const { return fabs(pos_end[2] - pos_start[2]) > 0.f; }
-        bool        extruding()     const { return moving_xy() && pos_end[3] > pos_start[3]; }
+        bool        extruding()     const { return type != GCODELINETYPE_ARC && moving_xy() && pos_end[3] > pos_start[3]; }
         bool        retracting()    const { return pos_end[3] < pos_start[3]; }
         bool        deretracting()  const { return ! moving_xy() && pos_end[3] > pos_start[3]; }
 
@@ -147,6 +150,8 @@ private:
 
         // We try to keep the string buffer once it has been allocated, so it will not be reallocated over and over.
         std::vector<char>   raw;
+        // Private analysis markers belong to boundaries, not smoothing samples.
+        std::string         source_markers;
         size_t              raw_length;
         // If modified, the raw text has to be adapted by the new extrusion rate,
         // or maybe the line needs to be split into multiple lines.
@@ -205,6 +210,9 @@ private:
     inline void push_to_output(const char *text, size_t len, bool add_eol = true);
     // Push a G-code line to the output.
     void push_line_to_output(size_t line_idx, float new_feedrate, const char *comment);
+
+    std::queue<std::string> m_layer_source_tails;
+    std::vector<std::pair<std::size_t, std::string>> m_output_source_markers;
 
 public:
     std::queue<LayerResult*> m_layer_results;

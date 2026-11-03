@@ -12,6 +12,7 @@
 #include "CalibUtils.hpp"
 #include "Flashforge.hpp"
 #include "libslic3r/Config.hpp"
+#include "libslic3r/WarpMitigation.hpp"
 #include "libslic3r_version.h"
 
 #include <boost/assert/source_location.hpp>
@@ -49,6 +50,7 @@
 #include "libslic3r/Point.hpp"
 #include "libslic3r/GCode/GCodeProcessor.hpp"
 #include "libslic3r/GCode/DepositionMesh.hpp"
+#include "libslic3r/GCode/DepositionGeometry.hpp"
 #include "libslic3r/Technologies.hpp"
 #include "libslic3r/BoundingBox.hpp"
 #include "libslic3r/PrintBase.hpp"
@@ -462,55 +464,6 @@ bool uses_independent_tool_dispatch()
         wxGetApp().preset_bundle->get_printer_extruder_count() > 1 &&
         !config.opt_bool("single_extruder_multi_material");
 }
-
-class LearnedTimingDialog final : public DPIDialog
-{
-public:
-    LearnedTimingDialog(wxWindow *parent, const wxString &revision)
-        : DPIDialog(parent, wxID_ANY, _L("Update learned time estimate"), wxDefaultPosition,
-                    wxDefaultSize, wxDEFAULT_DIALOG_STYLE)
-    {
-        SetBackgroundColour(StateColor::darkModeColorFor(*wxWHITE));
-        auto *layout = new wxBoxSizer(wxVERTICAL);
-        auto *note = new wxStaticText(this, wxID_ANY,
-            _L("Read the selected OctoPrint file's latest print metadata and learn only if that attempt succeeded and its file exactly matches this G-code. No files are uploaded and no printer commands are sent. Timing records stay on this computer."));
-        note->Wrap(FromDIP(480));
-        layout->Add(note, 0, wxEXPAND | wxALL, FromDIP(12));
-        layout->Add(new wxStaticText(this, wxID_ANY, _L("Printer setup revision")), 0, wxLEFT | wxRIGHT, FromDIP(12));
-        m_revision = new ::TextInput(this, revision);
-        m_revision->GetTextCtrl()->SetMaxLength(256);
-        layout->Add(m_revision, 0, wxEXPAND | wxALL, FromDIP(12));
-        auto *hint = new wxStaticText(this, wxID_ANY,
-            _L("Enter your firmware/macro setup identifier and change it after firmware, calibration or macro changes. This is your declaration, not a detected printer revision."));
-        hint->Wrap(FromDIP(480));
-        layout->Add(hint, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, FromDIP(12));
-        auto *buttons = new DialogButtons(this, {"OK", "Cancel"});
-        buttons->GetOK()->SetLabel(_L("Read and learn"));
-        buttons->GetOK()->Enable(!setup_revision().empty());
-        m_revision->GetTextCtrl()->Bind(wxEVT_TEXT, [this, buttons](wxCommandEvent &event) {
-            buttons->GetOK()->Enable(!setup_revision().empty());
-            event.Skip();
-        });
-        layout->Add(buttons, 0, wxEXPAND | wxALL, FromDIP(12));
-        SetSizerAndFit(layout);
-        CenterOnParent();
-        wxGetApp().UpdateDlgDarkUI(this);
-    }
-    std::string setup_revision() const
-    {
-        return into_u8(m_revision->GetTextCtrl()->GetValue().Trim().Trim(false));
-    }
-protected:
-    void on_dpi_changed(const wxRect &) override
-    {
-        m_revision->Rescale();
-        GetSizer()->SetSizeHints(this);
-        Layout();
-    }
-    void on_sys_color_changed() override { wxGetApp().UpdateDlgDarkUI(this); }
-private:
-    ::TextInput *m_revision = nullptr;
-};
 
 class AutoMitigationDialog final : public DPIDialog
 {
@@ -3791,6 +3744,7 @@ Sidebar::Sidebar(Plater *parent)
     : wxPanel(parent, wxID_ANY, wxDefaultPosition, wxSize(39 * wxGetApp().em_unit(), -1)), p(new priv(parent))
 {
     Choice::register_dynamic_list("support_filament", &dynamic_physical_filament_list);
+    Choice::register_dynamic_list("brim_filament", &dynamic_physical_filament_list);
     Choice::register_dynamic_list("support_interface_filament", &dynamic_physical_filament_list);
     Choice::register_dynamic_list("outer_wall_filament_id", &dynamic_filament_list);
     Choice::register_dynamic_list("inner_wall_filament_id", &dynamic_filament_list);
@@ -4589,11 +4543,19 @@ Sidebar::Sidebar(Plater *parent)
     }
 
     {
-        auto *adjust_mitigations = new Button(p->scrolled, _L("Adjust auto mitigations…"));
+        scrolled_sizer->Add(create_sidebar_section_header(p->scrolled, _L("Project Settings"), p->project_settings_toggle, "settings"),
+                            0, wxEXPAND);
+        auto *project_content = new wxPanel(p->scrolled);
+        project_content->SetBackgroundColour(StateColor::darkModeColorFor(*wxWHITE));
+        auto *project_sizer = new wxBoxSizer(wxVERTICAL);
+        project_content->SetSizer(project_sizer);
+        project_content->Hide();
+        scrolled_sizer->Add(project_content, 0, wxEXPAND);
+        auto *adjust_mitigations = new Button(project_content, _L("Adjust auto mitigations…"));
         p->adjust_auto_mitigations = adjust_mitigations;
         adjust_mitigations->SetStyle(ButtonStyle::Regular, ButtonType::Parameter);
         adjust_mitigations->SetToolTip(_L("Edit active-plate mitigation and brim overrides without changing presets."));
-        scrolled_sizer->Add(adjust_mitigations, 0, wxEXPAND | wxALL, FromDIP(8));
+        project_sizer->Add(adjust_mitigations, 0, wxEXPAND | wxALL, FromDIP(8));
         adjust_mitigations->Bind(wxEVT_BUTTON, [this](wxCommandEvent &event) {
             event.Skip();
             CallAfter([this] {
@@ -4603,12 +4565,25 @@ Sidebar::Sidebar(Plater *parent)
                 if (!plate) return;
                 DynamicPrintConfig initial = wxGetApp().preset_bundle->full_config();
                 initial.apply(*plate->config());
+                // Match Print::apply rather than displaying the preset's inputs
+                // as if they were the generated Auto settings. Only user edits
+                // below are persisted, never this derived configuration.
+                resolve_project_filament_bindings(initial, project_default_filament(p->plater->model()));
+                if (initial.opt_bool("automatic_warp_mitigation"))
+                    apply_warp_mitigations(initial, assess_warp_risk(initial, p->plater->model()));
                 AutoMitigationDialog dialog(this, initial);
                 wxWeakRef<Sidebar> alive(this);
                 if (dialog.ShowModal() != wxID_OK || !alive || wxGetApp().is_closing()) return;
                 // A nested modal loop must not redirect edits to another plate.
                 if (plates.get_curr_plate() != plate) return;
-                const auto changed = initial.diff(dialog.edited);
+                auto changed = initial.diff(dialog.edited);
+                if (initial.opt_bool("automatic_warp_mitigation") && !dialog.edited.opt_bool("automatic_warp_mitigation")) {
+                    // Turning Auto off keeps the brim shown in the dialog;
+                    // otherwise unchanged fields would fall back to the preset.
+                    for (const char *key : {"brim_type", "brim_width", "brim_object_gap"})
+                        if (std::find(changed.begin(), changed.end(), key) == changed.end())
+                            changed.emplace_back(key);
+                }
                 if (changed.empty()) return;
                 p->plater->take_snapshot(_u8L("Adjust active-plate auto mitigations"));
                 plate->config()->apply_only(dialog.edited, changed);
@@ -4620,14 +4595,6 @@ Sidebar::Sidebar(Plater *parent)
                 p->plater->update();
             });
         });
-        scrolled_sizer->Add(create_sidebar_section_header(p->scrolled, _L("Project Settings"), p->project_settings_toggle, "settings"),
-                            0, wxEXPAND);
-        auto *project_content = new wxPanel(p->scrolled);
-        project_content->SetBackgroundColour(StateColor::darkModeColorFor(*wxWHITE));
-        auto *project_sizer = new wxBoxSizer(wxVERTICAL);
-        project_content->SetSizer(project_sizer);
-        project_content->Hide();
-        scrolled_sizer->Add(project_content, 0, wxEXPAND);
         p->project_settings_toggle->Bind(wxEVT_BUTTON, [this, project_content](wxCommandEvent &) {
             project_content->CallAfter([this, project_content] {
                 const bool expanded = !project_content->IsShown();
@@ -4764,7 +4731,8 @@ Sidebar::Sidebar(Plater *parent)
         p->area_bindings_content = new wxPanel(p->area_bindings_panel);
         wxWindow *content = p->area_bindings_content;
         auto *bindings_sizer = new wxBoxSizer(wxVERTICAL);
-        const auto &keys = project_filament_role_keys();
+        auto keys = project_filament_role_keys();
+        keys.emplace_back("brim_filament");
         for (size_t i = 0; i < keys.size(); ++i) {
             auto *row = new wxPanel(content);
             auto *row_sizer = new wxBoxSizer(wxHORIZONTAL);
@@ -4779,8 +4747,23 @@ Sidebar::Sidebar(Plater *parent)
             bindings_sizer->Add(row, 0, wxEXPAND | wxTOP | wxBOTTOM, FromDIP(1));
             p->area_binding_rows.push_back(row);
             p->area_binding_choices.push_back(choice);
-            choice->Bind(wxEVT_COMBOBOX, [this, i, choice](wxCommandEvent &) {
+            choice->Bind(wxEVT_COMBOBOX, [this, i, choice, key = keys[i]](wxCommandEvent &) {
                 auto *bundle = wxGetApp().preset_bundle;
+                if (key == "brim_filament") {
+                    auto *plate = p->plater->get_partplate_list().get_curr_plate();
+                    if (!plate) return;
+                    const int selected = choice->GetSelection();
+                    if (selected < 0) return;
+                    // The first entry restores inheritance; the second explicitly
+                    // selects automatic brims. Keep this out of the process preset.
+                    if (selected == 0) plate->config()->erase(key);
+                    else plate->config()->set_key_value(key, new ConfigOptionInt(selected - 1));
+                    p->plater->set_plater_dirty(true);
+                    p->plater->config_change_notification(*plate->config(), key);
+                    p->plater->update_project_dirty_from_presets();
+                    p->plater->update();
+                    return;
+                }
                 auto *slots = bundle->project_config.option<ConfigOptionInts>("project_filament_bindings", true);
                 slots->values.resize(project_filament_role_keys().size(), 0);
                 slots->values[i] = std::max(0, choice->GetSelection());
@@ -8438,23 +8421,38 @@ void Sidebar::update_area_bindings()
     const int automatic = project_default_filament(p->plater->model());
     bundle->project_default_filament_id = automatic;
     bool any = false;
-    const auto &keys = project_filament_role_keys();
+    auto keys = project_filament_role_keys();
+    keys.emplace_back("brim_filament");
     for (size_t i = 0; i < keys.size(); ++i) {
         const auto *role = config.option<ConfigOptionInt>(keys[i]);
-        const bool visible = role != nullptr && role->value == -1;
+        const bool brim = keys[i] == "brim_filament";
+        const bool visible = role != nullptr && (brim || role->value == -1);
         p->area_binding_rows[i]->Show(visible);
         any |= visible;
         if (!visible)
             continue;
         ComboBox *choice = p->area_binding_choices[i];
         choice->Clear();
-        choice->Append(wxString::Format(_L("Automatic (filament %d)"), automatic));
+        if (brim) {
+            choice->Append(role->value == 0 ? _L("Use process preset (Automatic)") :
+                format_wxstr(_L("Use process preset (filament %1%)"), role->value));
+            choice->Append(_L("Automatic"));
+            choice->SetToolTip(_L("Brim filament for the active plate, saved in the project without changing the process preset. Object overrides take precedence. Skirts and rafts are unchanged."));
+        } else
+            choice->Append(wxString::Format(_L("Automatic (filament %d)"), automatic));
         for (size_t slot = 0; slot < bundle->filament_presets.size(); ++slot) {
             const wxString label = wxString::Format("%d: ", int(slot) + 1) + from_u8(bundle->filament_presets[slot]);
             choice->Append(label, slot < icons.size() && icons[slot] != nullptr ? *icons[slot] : wxNullBitmap);
         }
-        const int selected = slots != nullptr && i < slots->values.size() ? slots->values[i] : 0;
-        choice->SetSelection(selected >= 0 && selected <= int(bundle->filament_presets.size()) ? selected : 0);
+        if (brim) {
+            auto *plate = p->plater->get_partplate_list().get_curr_plate();
+            const auto *override = plate ? plate->config()->option<ConfigOptionInt>("brim_filament") : nullptr;
+            const int selected = override ? override->value + 1 : 0;
+            choice->SetSelection(selected >= 0 && selected <= int(bundle->filament_presets.size()) + 1 ? selected : 0);
+        } else {
+            const int selected = slots != nullptr && i < slots->values.size() ? slots->values[i] : 0;
+            choice->SetSelection(selected >= 0 && selected <= int(bundle->filament_presets.size()) ? selected : 0);
+        }
     }
     p->area_bindings_panel->Show(any);
     // Hidden roles must not reserve their initial expanded height. Preserve
@@ -9322,7 +9320,8 @@ struct Plater::priv
                                      std::function<bool()> cancel_callback = {});
 
     fs::path get_export_file_path(GUI::FileType file_type);
-    wxString get_export_file(GUI::FileType file_type, const wxString& title = {}, bool published = false);
+    wxString get_export_file(GUI::FileType file_type, const wxString& title = {}, bool published = false,
+                             int* geometry_format = nullptr);
 
     // BBS
     void load_auxiliary_files();
@@ -12394,7 +12393,7 @@ fs::path Plater::priv::get_export_file_path(GUI::FileType file_type)
     return output_file;
 }
 
-wxString Plater::priv::get_export_file(GUI::FileType file_type, const wxString& title, bool published)
+wxString Plater::priv::get_export_file(GUI::FileType file_type, const wxString& title, bool published, int* geometry_format)
 {
     wxString wildcard;
     switch (file_type) {
@@ -12404,6 +12403,7 @@ wxString Plater::priv::get_export_file(GUI::FileType file_type, const wxString& 
         case FT_3MF:
         case FT_GCODE:
         case FT_OBJ:
+        case FT_STEP:
             wildcard = file_wildcards(file_type);
         break;
         default:
@@ -12449,14 +12449,27 @@ wxString Plater::priv::get_export_file(GUI::FileType file_type, const wxString& 
             dlg_title = _L("Export OBJ file:");
             break;
         }
+        case FT_STEP:
+        {
+            output_file.replace_extension("stp");
+            dlg_title = _L("Export STEP file:");
+            break;
+        }
         default: break;
     }
 
+    if (geometry_format) {
+        wildcard = _L("STL - separate beads (fast)") + " (*.stl)|*.stl;*.STL|" +
+            _L("STL - fused union (slower)") + " (*.stl)|*.stl;*.STL|" + file_wildcards(FT_STEP) + "|" + file_wildcards(FT_OBJ);
+        dlg_title = _L("Export geometry");
+        output_file.replace_extension("obj");
+    }
     std::string out_dir = (boost::filesystem::path(output_file).parent_path()).string();
 
     wxFileDialog dlg(q, dlg_title,
         is_shapes_dir(out_dir) ? from_u8(wxGetApp().app_config->get_last_dir()) : from_path(output_file.parent_path()), from_path(output_file.filename()),
-        wildcard, wxFD_SAVE | wxFD_OVERWRITE_PROMPT | wxPD_APP_MODAL);
+        wildcard, wxFD_SAVE | wxFD_OVERWRITE_PROMPT);
+    if (geometry_format) dlg.SetFilterIndex(3);
 
     int result = dlg.ShowModal();
     if (result == wxID_CANCEL)
@@ -12465,9 +12478,17 @@ wxString Plater::priv::get_export_file(GUI::FileType file_type, const wxString& 
         return wxEmptyString;
 
     wxString out_path = dlg.GetPath();
+    if (geometry_format) {
+        const int selected = dlg.GetFilterIndex();
+        if (selected < 0 || selected > 3) return wxEmptyString;
+        file_type = selected < 2 ? FT_STL : selected == 2 ? FT_STEP : FT_OBJ;
+        *geometry_format = selected;
+        output_file.replace_extension(selected < 2 ? "stl" : selected == 2 ? "stp" : "obj");
+    }
     fs::path path(into_path(out_path));
 #ifdef __WXMSW__
-    if (boost::iequals(path.extension().string(), output_file.extension().string()) == false) {
+    const bool step_extension = file_type == FT_STEP && boost::iequals(path.extension().string(), ".step");
+    if (!step_extension && !boost::iequals(path.extension().string(), output_file.extension().string())) {
         out_path += output_file.extension().string();
         boost::system::error_code ec;
         if (boost::filesystem::exists(into_u8(out_path), ec)) {
@@ -22635,6 +22656,25 @@ std::string Plater::learned_timing_context() const
     return server + ':' + wxGetApp().app_config->get("learned_timing_revisions", server);
 }
 
+void Plater::update_learned_time_estimate()
+{
+    auto *plate = get_partplate_list().get_curr_plate();
+    const auto *result = plate ? plate->get_slice_result() : nullptr;
+    if (!plate || !plate->is_slice_result_valid() || !result) {
+        show_error(this, _L("Slice the active plate before updating its learned print-time estimate."));
+        return;
+    }
+    unsigned int id;
+    std::string filename;
+    {
+        std::unique_lock<std::mutex> lock(result->result_mutex, std::try_to_lock);
+        if (!lock.owns_lock()) return;
+        id = result->id;
+        filename = result->filename;
+    }
+    update_learned_time_estimate(id, filename);
+}
+
 void Plater::update_learned_time_estimate(unsigned int result_id, const std::string &filename)
 {
     CallAfter([this, result_id, filename] {
@@ -22650,12 +22690,10 @@ void Plater::update_learned_time_estimate(unsigned int result_id, const std::str
         }
         const std::string revision_key = OctoPrintTiming::server_key(host_config.opt_string("print_host"));
         wxWeakRef<Plater> alive(this);
-        LearnedTimingDialog dialog(this, from_u8(wxGetApp().app_config->get("learned_timing_revisions", revision_key)));
-        if (dialog.ShowModal() != wxID_OK || !alive || wxGetApp().is_closing() ||
-            IsBeingDeleted() || wxGetApp().IsScheduledForDestruction(this) || !get_ui_job_worker().is_idle()) return;
-        const std::string revision = dialog.setup_revision();
-        if (revision.empty()) return;
-        wxGetApp().app_config->set("learned_timing_revisions", revision_key, revision);
+        // Configuration is read from the generated G-code. Existing declared
+        // setup identities remain compatible; otherwise the importer uses an
+        // exact-file cohort rather than pretending to detect external macros.
+        const std::string revision = wxGetApp().app_config->get("learned_timing_revisions", revision_key);
         const std::string context = revision_key + ':' + revision;
         const std::string store = (boost::filesystem::path(data_dir()) / "learned_timing.json").string();
         auto outcome = std::make_shared<OctoPrintTiming::RefreshResult>();
@@ -22698,7 +22736,7 @@ void Plater::update_learned_time_estimate(unsigned int result_id, const std::str
     });
 }
 
-void Plater::export_deposition_stl()
+void Plater::export_deposition_geometry()
 {
     // Defer native dialogs out of the export button's mouse-event stack.
     CallAfter([this] {
@@ -22720,18 +22758,41 @@ void Plater::export_deposition_stl()
             source_filename = source_result->filename;
         }
         wxWeakRef<Plater> alive(this);
+        int geometry_format = 0;
+        const wxString path = p->get_export_file(FT_STL, {}, false, &geometry_format);
+        if (!alive || wxGetApp().is_closing() || path.empty() || path == "<cancel>" || IsBeingDeleted() || wxGetApp().IsScheduledForDestruction(this))
+            return;
+        const FileType file_type = geometry_format < 2 ? FT_STL : geometry_format == 2 ? FT_STEP : FT_OBJ;
+        const bool separate = geometry_format != 1;
         MessageDialog confirmation(this,
-            _L("Export the G-code's extrusion paths as one nominal bead mesh, including infill, supports, brims and the prime tower. Choose the sampling resolution; smaller gaps may be lost. STL does not retain materials, deformation or bonding, and extruder-only purging has no reconstructible shape.\n\nDetailed exports can take several minutes and create files up to 32 GiB. Export keeps at least 30 GiB free and stops at resource limits without lowering resolution."),
-            _L("Export printed extrusion as STL"), wxYES_NO | wxCANCEL | wxICON_INFORMATION);
-        confirmation.SetButtonLabel(wxID_YES, _L("Export at 0.05 mm"), true);
-        confirmation.SetButtonLabel(wxID_NO, _L("Export at 0.1 mm"));
+            file_type == FT_OBJ ?
+            _L("Export the deposited paths as an indexed OBJ mesh, retaining infill, supports, brims and air gaps. Compact uses 8 angular samples per bead; detailed uses 16. Compact has coarser curved surfaces. Both retain separate beads, which may overlap and are not fused or bonded. Assign materials and interfaces in your simulation software.\n\nOutput is limited to 4 GiB, with at least 30 GiB of free disk space retained. No detail is silently removed to fit the limit.") : file_type == FT_STEP ?
+            _L("Export each extrusion segment as a separate nominal bead, retaining gaps, infill and support paths. Adjacent beads can overlap and are not fused or bonded. Arcs become multiple segments. Material properties must be assigned in the receiving application.\n\nCompact STEP uses AP242 tessellated solids and requires a compatible importer. CAD solids use faceted B-reps and can be much larger; full prints may exceed the export limit. Both use 16 angular samples per bead. Export keeps at least 30 GiB free and stops at 4 GiB without reducing detail.") : separate ?
+            _L("Export all extrusion paths as separate closed, faceted beads in one file, including infill, supports, brims and the prime tower. Arcs are split into segments. Gaps remain open, but adjacent beads can overlap and are not bonded or fused. Dimensions are nominal, not measured deposition. STL does not retain object or material identities. Material properties must be assigned in the receiving application.\n\nChoose 16 or 32 angular samples per bead. Detailed exports can create very large files. Export keeps at least 30 GiB free and stops at 4 GiB without reducing detail.") :
+            _L("Export the G-code's extrusion paths as one nominal bead mesh, including infill, supports, brims and the prime tower. Choose the sampling resolution; smaller gaps may be lost. STL does not retain materials, deformation or bonding, and extruder-only purging has no reconstructible shape.\n\nDetailed exports can take several minutes and create files up to 4 GiB. Export keeps at least 30 GiB free and stops at resource limits without lowering resolution."),
+            _L("Export printed extrusion"), wxYES_NO | wxCANCEL | wxICON_INFORMATION);
+        confirmation.SetButtonLabel(wxID_YES, file_type == FT_OBJ ? _L("Compact OBJ (8 samples)") : file_type == FT_STEP ? _L("Compact STEP") : separate ? _L("Export with 16 samples") : _L("Export at 0.05 mm"), true);
+        confirmation.SetButtonLabel(wxID_NO, file_type == FT_OBJ ? _L("Detailed OBJ (16 samples)") : file_type == FT_STEP ? _L("CAD solids") : separate ? _L("Export with 32 samples") : _L("Export at 0.1 mm"));
         const int choice = confirmation.ShowModal();
         if ((choice != wxID_YES && choice != wxID_NO) || !alive || wxGetApp().is_closing() ||
             IsBeingDeleted() || wxGetApp().IsScheduledForDestruction(this))
             return;
-        const wxString path = p->get_export_file(FT_STL);
-        if (!alive || wxGetApp().is_closing() || path.empty() || IsBeingDeleted() || wxGetApp().IsScheduledForDestruction(this))
-            return;
+        double path_tolerance = 0.;
+        if (separate) {
+            MessageDialog compact(this,
+                _L("Reduce file size by simplifying and joining continuous paths within each layer and material. Choose a 0.005 mm or 0.001 mm path tolerance, or keep the original paths. Joining adds up to the same tolerance again; cross-section faceting is additional. Gaps on this scale must be checked in the receiving application.\n\nSeparate paths can still overlap. This does not create bonded material interfaces or assign dielectric properties for simulation."),
+                _L("Compact extrusion paths"), wxYES_NO | wxCANCEL | wxICON_INFORMATION);
+            compact.SetButtonLabel(wxID_YES, _L("0.005 mm tolerance"), true);
+            compact.SetButtonLabel(wxID_NO, _L("0.001 mm tolerance"));
+            compact.AddButton(wxID_APPLY, _L("Original paths"));
+            compact.GetSizer()->SetSizeHints(&compact);
+            const int compact_choice = compact.ShowModal();
+            if (!alive || wxGetApp().is_closing() || IsBeingDeleted() || wxGetApp().IsScheduledForDestruction(this) ||
+                (compact_choice != wxID_YES && compact_choice != wxID_NO && compact_choice != wxID_APPLY))
+                return;
+            if (compact_choice != wxID_APPLY)
+                path_tolerance = compact_choice == wxID_YES ? .005 : .001;
+        }
         plate = get_partplate_list().get_curr_plate();
         if (!plate || plate->get_index() != plate_index || !plate->is_slice_result_valid() ||
             is_background_process_slicing() || !get_ui_job_worker().is_idle())
@@ -22740,6 +22801,9 @@ void Plater::export_deposition_stl()
         struct ExportState {
             DepositionMesh::Snapshot snapshot;
             DepositionMesh::Options options;
+            DepositionMesh::GeometryOptions geometry_options;
+            bool fused_stl = false;
+            DepositionMesh::GeometryFormat geometry_format = DepositionMesh::GeometryFormat::Obj;
             boost::filesystem::path target;
             boost::filesystem::path temporary;
             ~ExportState()
@@ -22750,10 +22814,19 @@ void Plater::export_deposition_stl()
         };
         try {
             auto state = std::make_shared<ExportState>();
+            state->fused_stl = !separate;
+            if (file_type == FT_STL) state->geometry_format = DepositionMesh::GeometryFormat::Stl;
+            if (file_type == FT_STEP)
+                state->geometry_format = choice == wxID_YES ? DepositionMesh::GeometryFormat::StepTessellated : DepositionMesh::GeometryFormat::Step;
             state->options.voxel_size_mm = choice == wxID_YES ? .05 : .1;
             state->options.max_memory_bytes = 1024ULL * 1024 * 1024;
-            state->options.max_output_bytes = 32ULL * 1024 * 1024 * 1024;
+            state->options.max_output_bytes = 4ULL * 1024 * 1024 * 1024;
             state->options.max_sample_visits = 50000000000ULL;
+            state->geometry_options.angular_samples = file_type == FT_OBJ ? (choice == wxID_YES ? 8 : 16) :
+                (file_type == FT_STEP || choice == wxID_YES ? 16 : 32);
+            state->geometry_options.path_tolerance_mm = path_tolerance;
+            state->geometry_options.join_paths = path_tolerance > 0.;
+            state->geometry_options.max_output_bytes = state->options.max_output_bytes;
             state->target = into_path(path);
             auto* result = plate->get_slice_result();
             if (!result || result != source_result) return;
@@ -22769,7 +22842,7 @@ void Plater::export_deposition_stl()
                     show_error(this, _L("The sliced G-code changed while choosing the export destination. Please start the export again."));
                     return;
                 }
-                state->snapshot = DepositionMesh::snapshot(*result, state->options, {});
+                state->snapshot = DepositionMesh::snapshot(*result, state->options, {}, !separate);
             }
             if (state->snapshot.unrepresented_motion_extrusion_moves != 0 ||
                 state->snapshot.unrepresented_stationary_extrusion_moves != 0) {
@@ -22781,46 +22854,52 @@ void Plater::export_deposition_stl()
                     return;
             }
             queue_job(get_ui_job_worker(), [state](Job::Ctl& ctl) {
-                ctl.update_status(0, _u8L("Reconstructing printed extrusion as STL"));
+                ctl.update_status(0, _u8L("Exporting printed extrusion geometry"));
                 const auto check_space = [&] {
                     boost::system::error_code ec;
                     std::uint64_t written = 0;
                     if (!state->temporary.empty()) {
                         written = boost::filesystem::file_size(state->temporary, ec);
-                        if (ec) throw std::runtime_error(_u8L("Could not verify the temporary STL file size."));
+                        if (ec) throw std::runtime_error(_u8L("Could not verify the temporary geometry file size."));
                     }
                     const auto space = boost::filesystem::space(state->target.parent_path(), ec);
                     constexpr std::uint64_t reserve = 30ULL * 1024ULL * 1024ULL * 1024ULL;
                     const auto remaining = state->options.max_output_bytes - std::min(written, state->options.max_output_bytes);
                     if (ec || space.available < reserve + remaining)
-                        throw std::runtime_error(_u8L("Not enough free disk space for the STL while retaining 30 GiB of system headroom."));
+                        throw std::runtime_error(_u8L("Not enough free disk space for the geometry export while retaining 30 GiB of system headroom."));
                 };
                 check_space();
                 auto last_space_check = std::chrono::steady_clock::now();
                 if (ctl.was_canceled()) return;
-                state->temporary = state->target.parent_path() / boost::filesystem::unique_path(".orca-extrusion-%%%%-%%%%-%%%%.stl.part");
+                state->temporary = state->target.parent_path() / boost::filesystem::unique_path(".orca-extrusion-%%%%-%%%%-%%%%.part");
                 boost::filesystem::ofstream output(state->temporary, std::ios::binary | std::ios::trunc);
-                if (!output) throw std::runtime_error(_u8L("Could not create the temporary STL file."));
+                if (!output) throw std::runtime_error(_u8L("Could not create the temporary geometry file."));
                 int last_progress = -1;
-                DepositionMesh::export_stl(state->snapshot, output, state->options,
-                    [&](int progress) {
+                const auto progress = [&](int progress) {
                         if (progress != last_progress) {
                             check_space();
                             last_progress = progress;
-                            ctl.update_status(progress, _u8L("Reconstructing printed extrusion as STL"));
+                            ctl.update_status(progress, _u8L("Exporting printed extrusion geometry"));
                         }
-                    }, [&] {
-                        if (ctl.was_canceled()) throw std::runtime_error("STL export canceled.");
+                    };
+                const auto checkpoint = [&] {
+                        if (ctl.was_canceled()) throw std::runtime_error("Geometry export canceled.");
                         const auto now = std::chrono::steady_clock::now();
                         if (now - last_space_check >= std::chrono::seconds(2)) {
                             check_space();
                             last_space_check = now;
                         }
-                    });
+                    };
+                if (state->fused_stl)
+                    DepositionMesh::export_stl(state->snapshot, output, state->options, progress, checkpoint);
+                else
+                    DepositionMesh::export_geometry(state->snapshot, output,
+                        state->geometry_format,
+                        state->geometry_options, progress, checkpoint);
                 output.flush();
-                if (!output) throw std::runtime_error(_u8L("Could not finish writing the STL file."));
+                if (!output) throw std::runtime_error(_u8L("Could not finish writing the geometry file."));
                 output.close();
-                if (!output) throw std::runtime_error(_u8L("Could not close the STL file."));
+                if (!output) throw std::runtime_error(_u8L("Could not close the geometry file."));
             }, [state, owner = this](bool canceled, std::exception_ptr& error) {
                 // Worker finalization runs on the main thread, including during shutdown.
                 if (canceled || wxGetApp().is_closing() || wxGetApp().plater() != owner) {
@@ -22836,16 +22915,16 @@ void Plater::export_deposition_stl()
                     if (ec) throw std::runtime_error(ec.message());
                     state->temporary.clear();
                     show_info(owner, format_wxstr(_L("Printed extrusion was exported to %1%. Check mesh resolution and material assignments before simulation."), from_path(state->target)),
-                              _L("STL export complete"));
+                              _L("Geometry export complete"));
                 } catch (const std::exception& e) {
-                    show_error(owner, format_wxstr(_L("Could not export printed extrusion as STL: %1%"), from_u8(e.what())));
+                    show_error(owner, format_wxstr(_L("Could not export printed extrusion: %1%"), from_u8(e.what())));
                 } catch (...) {
-                    show_error(owner, _L("Could not export printed extrusion as STL."));
+                    show_error(owner, _L("Could not export printed extrusion."));
                 }
                 error = nullptr;
             });
         } catch (const std::exception& e) {
-            show_error(this, format_wxstr(_L("Could not prepare printed extrusion for STL export: %1%"), from_u8(e.what())));
+            show_error(this, format_wxstr(_L("Could not prepare printed extrusion for export: %1%"), from_u8(e.what())));
         }
     });
 }
@@ -23642,7 +23721,7 @@ void Plater::on_filaments_delete(size_t num_filaments, size_t filament_id, int r
     sidebar().obj_list()->update_objects_list_filament_column_when_delete_filament(filament_id, num_filaments, replace_filament_id);
 
     // update global support filament
-    static const char *keys[] = {"support_filament", "support_interface_filament"};
+    static const char *keys[] = {"support_filament", "support_interface_filament", "brim_filament"};
     for (auto key : keys)
         if (p->config->has(key)) {
             if(p->config->opt_int(key) == filament_id + 1)

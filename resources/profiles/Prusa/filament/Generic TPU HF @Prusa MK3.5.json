@@ -81,6 +81,7 @@
 	],
 	"compatible_printers": [
 		"Prusa MK3.5 0.4 nozzle",
+		"Prusa MK3.5 RME 0.4 nozzle",
 		"Prusa MK3.5 0.25 nozzle",
 		"Prusa MK3.5 0.6 nozzle",
 		"Prusa MK3.5 0.8 nozzle"

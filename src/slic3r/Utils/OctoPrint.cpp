@@ -205,14 +205,14 @@ OctoPrintTiming::RefreshResult OctoPrint::refresh_learned_timing(const std::stri
     using OctoPrintTiming::Status;
     OctoPrintTiming::RefreshResult result;
     if (!opted_in) { result.status = Status::Disabled; return result; }
-    if (setup_revision.empty() || setup_revision.size() > 256) return result;
+    if (setup_revision.size() > 256) return result;
     const auto check = [&] { if (cancelled && cancelled()) throw std::runtime_error("cancelled"); };
     std::optional<LearnedTimingFeatures> features;
     try {
         const auto hash = OctoPrintTiming::file_sha1(local_filename, check);
         boost::nowide::ifstream input(local_filename);
         features = extract_learned_timing_features(input,
-            OctoPrintTiming::server_key(m_host) + ':' + setup_revision, hash, check);
+            OctoPrintTiming::compatibility_context(OctoPrintTiming::server_key(m_host), setup_revision, hash), hash, check);
         if (!features || OctoPrintTiming::file_sha1(local_filename, check) != hash) return result;
     } catch (const std::exception &) {
         result.status = cancelled && cancelled() ? Status::Cancelled : Status::InvalidSource;

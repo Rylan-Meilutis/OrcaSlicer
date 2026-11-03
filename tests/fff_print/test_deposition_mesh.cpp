@@ -4,6 +4,7 @@
 #include <catch2/matchers/catch_matchers.hpp>
 #include <catch2/generators/catch_generators.hpp>
 #include "libslic3r/GCode/DepositionMesh.hpp"
+#include "libslic3r/GCode/DepositionGeometry.hpp"
 #include "libslic3r/GCode/GCodeProcessor.hpp"
 #include "libslic3r/ExtrusionEntity.hpp"
 #include "libslic3r/PrintConfig.hpp"
@@ -479,7 +480,7 @@ TEST_CASE("Rounded arc endpoint extrusion is inventoried without dropping valid 
     CHECK_THAT(s.segments[1].end.x(),WithinAbs(2.,1e-6));
 }
 
-TEST_CASE("A saved G-code project can be benchmarked without writing an STL", "[.][DepositionMeshProject]")
+TEST_CASE("A saved G-code project can be benchmarked without writing geometry", "[.][DepositionMeshProject]")
 {
     const char *path=std::getenv("ORCA_DEPOSITION_GCODE");
     if(!path || !*path) SKIP("Set ORCA_DEPOSITION_GCODE to run this read-only project benchmark.");
@@ -505,10 +506,27 @@ TEST_CASE("A saved G-code project can be benchmarked without writing an STL", "[
     } buffer;
     std::ostream sink(&buffer);
     DepositionMesh::Options options;
+    const char* format = std::getenv("ORCA_DEPOSITION_FORMAT");
+    const bool obj = format && std::string(format) == "obj";
+    if (format && !obj && std::string(format) != "stl")
+        throw std::invalid_argument("Expected ORCA_DEPOSITION_FORMAT=obj or stl.");
+    DepositionMesh::GeometryOptions geometry_options;
+    if (const char* samples = std::getenv("ORCA_DEPOSITION_ANGULAR_SAMPLES"))
+        geometry_options.angular_samples = static_cast<unsigned>(std::stoul(samples));
+    if (const char* tolerance = std::getenv("ORCA_DEPOSITION_PATH_TOLERANCE"))
+        geometry_options.path_tolerance_mm = std::stod(tolerance);
+    if (const char* join = std::getenv("ORCA_DEPOSITION_JOIN_PATHS")) {
+        if (std::string(join) != "1" && std::string(join) != "0")
+            throw std::invalid_argument("Expected ORCA_DEPOSITION_JOIN_PATHS=0 or 1.");
+        geometry_options.join_paths = std::string(join) == "1";
+    }
     if(const char *resolution=std::getenv("ORCA_DEPOSITION_VOXEL")) options.voxel_size_mm=std::stod(resolution);
     if(const char *work=std::getenv("ORCA_DEPOSITION_MAX_VISITS")) options.max_sample_visits=std::stoull(work);
     if(const char *bytes=std::getenv("ORCA_DEPOSITION_MAX_BYTES")) options.max_output_bytes=std::stoull(bytes);
     if(const char *bytes=std::getenv("ORCA_DEPOSITION_MEMORY")) options.max_memory_bytes=std::stoull(bytes);
+    geometry_options.max_output_bytes = options.max_output_bytes;
+    if (obj && (std::getenv("ORCA_DEPOSITION_REGION") || std::getenv("ORCA_DEPOSITION_MINIMIZE")))
+        throw std::invalid_argument("OBJ project benchmark requires the full unfiltered snapshot.");
     const auto start=std::chrono::steady_clock::now();
     GCodeProcessor processor;
     processor.process_file(path);
@@ -520,7 +538,7 @@ TEST_CASE("A saved G-code project can be benchmarked without writing an STL", "[
         const auto &m=moves[i];
         minimum_width=std::min(minimum_width,m.width); minimum_height=std::min(minimum_height,m.height);
         const bool stationary=(m.position-moves[i-1].position).head<2>().squaredNorm()<1e-12f;
-        const bool small=options.voxel_size_mm>.5*std::min(double(m.width),double(m.height))+1e-7;
+        const bool small=!obj && options.voxel_size_mm>.5*std::min(double(m.width),double(m.height))+1e-7;
         if((stationary && degenerate++<3) || (small && undersized++<3))
             std::cout << "Deposition unresolved move: index=" << i << " gcode_id=" << m.gcode_id
                       << " previous_id=" << moves[i-1].gcode_id << " role=" << int(m.extrusion_role)
@@ -539,7 +557,7 @@ TEST_CASE("A saved G-code project can be benchmarked without writing an STL", "[
         }
     std::cout << "Deposition sloped move count=" << slopes << std::endl;
     try {
-        auto s=DepositionMesh::snapshot(processor.get_result(),options);
+        auto s=DepositionMesh::snapshot(processor.get_result(),options,{},!obj);
         if(const char *region=std::getenv("ORCA_DEPOSITION_REGION")) {
             std::string values(region);
             std::replace(values.begin(),values.end(),',',' ');
@@ -592,15 +610,21 @@ TEST_CASE("A saved G-code project can be benchmarked without writing an STL", "[
                   << " extruder_only=" << s.unrepresented_extruder_only_moves
                   << " unrepresented_motion_extrusion=" << s.unrepresented_motion_extrusion_moves
                   << " unrepresented_stationary_extrusion=" << s.unrepresented_stationary_extrusion_moves
-                  << " resolution_mm=" << options.voxel_size_mm << std::endl;
-        const auto report=DepositionMesh::export_stl(s,sink,options,[last=-1,&buffer,&start](int progress) mutable {
+                  << " format=" << (obj ? "obj_separate_nominal_beads" : "stl_voxel_union")
+                  << " resolution_mm=" << (obj ? 0. : options.voxel_size_mm)
+                  << " angular_samples=" << geometry_options.angular_samples
+                  << " path_tolerance_mm=" << geometry_options.path_tolerance_mm
+                  << " join_paths=" << geometry_options.join_paths << " output_sink=discard_no_geometry_file" << std::endl;
+        const auto progress_callback=[last=-1,&buffer,&start](int progress) mutable {
             if(progress%5==0 && progress!=last) {
                 std::cout << "Deposition benchmark progress=" << progress << " bytes=" << buffer.bytes
                           << " seconds=" << std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count()
                           << std::endl;
                 last=progress;
             }
-        });
+        };
+        const auto report=obj ? DepositionMesh::export_geometry(s,sink,DepositionMesh::GeometryFormat::Obj,
+            geometry_options,progress_callback) : DepositionMesh::export_stl(s,sink,options,progress_callback);
         std::cout << "Deposition benchmark: triangles=" << report.triangle_count
                   << " bytes=" << report.output_bytes << " sample_visits=" << report.sample_visits << std::endl;
         REQUIRE(buffer.bytes==report.output_bytes);

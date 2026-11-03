@@ -4,6 +4,25 @@ add_executable(${_TEST_NAME}_tests
 	test_helpers.cpp
 	test_helpers.hpp
 	test_cooling.cpp
+    test_pressure_equalizer.cpp
+    test_adaptive_pa_processor.cpp
+    test_deposition_provenance_export.cpp
+    test_deposition_section_export.cpp
+    test_deposition_provenance_project.cpp
+    test_thermoelastic_source_ownership.cpp
+    test_thermoelastic_source_diagnostics.cpp
+    test_thermoelastic_conflict_ownership.cpp
+	test_dock_fan.cpp
+    test_thermal_airflow.cpp
+    test_thermal_airflow_timing.cpp
+    test_thermomechanical_gcode.cpp
+    test_thermomechanical_layer_preview.cpp
+    test_thermoelastic_toolpath.cpp
+    test_thermoelastic_gcode_sections.cpp
+    test_section_gcode_history.cpp
+    test_section_airflow_scenario.cpp
+    test_section_cooling_study.cpp
+    test_thermoelastic_section_preview.cpp
 	test_extrusion_entity.cpp
 	test_extrusion_processor.cpp
 	test_fill.cpp
@@ -28,7 +47,9 @@ add_executable(${_TEST_NAME}_tests
 	test_skirt_brim.cpp
 	test_warp_mitigation.cpp
 	test_thermoelastic_gcode.cpp
+    test_thermoelastic_ownership.cpp
 	test_deposition_mesh.cpp
+	test_deposition_geometry.cpp
 	test_tool_dispatch.cpp
 	test_octoprint_timing.cpp
 	test_slicing_pipeline_hook.cpp

@@ -2,6 +2,7 @@
 // CuraEngine is released under the terms of the AGPLv3 or higher.
 
 #include "InterlockingGenerator.hpp"
+#include "libslic3r/Arachne/WallToolPaths.hpp"
 #include "libslic3r/Feature/Interlocking/VoxelUtils.hpp"
 #include "libslic3r/libslic3r.h"
 #include "libslic3r/Geometry.hpp"
@@ -66,10 +67,10 @@ void InterlockingGenerator::generate_interlocking_structure(PrintObject* print_o
 
     // Keep original ownership so rejected beam islands can be restored, not
     // deleted from the part. Thin-area expansion also changes this ownership.
-    std::vector<std::vector<ExPolygons>> original(print_object->num_printing_regions());
-    for (size_t r = 0; r < original.size(); ++r)
-        for (const Layer *layer : print_object->layers())
-            original[r].push_back(to_expolygons(layer->get_region(r)->slices.surfaces));
+    std::vector<std::vector<ExPolygons>> original(print_object->layer_count());
+    for (size_t z = 0; z < original.size(); ++z)
+        for (size_t r = 0; r < print_object->num_printing_regions(); ++r)
+            original[z].push_back(to_expolygons(print_object->get_layer(z)->get_region(r)->slices.surfaces));
 
     for (size_t region_a_index = 0; region_a_index < print_object->num_printing_regions(); region_a_index++) {
         const PrintRegion& region_a      = print_object->printing_region(region_a_index);
@@ -78,7 +79,7 @@ void InterlockingGenerator::generate_interlocking_structure(PrintObject* print_o
         for (size_t region_b_index = region_a_index + 1; region_b_index < print_object->num_printing_regions(); region_b_index++) {
             const PrintRegion& region_b      = print_object->printing_region(region_b_index);
             const auto         extruder_nr_b = region_b.extruder(FlowRole::frExternalPerimeter);
-            if (extruder_nr_a == extruder_nr_b) {
+            if (extruder_nr_a == extruder_nr_b || region_a.config().manual_support.value || region_b.config().manual_support.value) {
                 continue;
             }
 
@@ -90,29 +91,81 @@ void InterlockingGenerator::generate_interlocking_structure(PrintObject* print_o
         }
     }
 
+    restore_disconnected_material(print_object, original, throw_on_cancel);
+}
+
+void InterlockingGenerator::restore_disconnected_material(PrintObject* print_object,
+    const std::vector<std::vector<ExPolygons>>& original, const std::function<void()>& throw_on_cancel)
+{
+    // Structural joints transfer material ownership; they must not create
+    // exterior material or leave unowned pockets at clipped beam boundaries.
+    for (size_t z = 0; z < original.size(); ++z) {
+        throw_on_cancel();
+        ExPolygons footprint, assigned;
+        for (size_t r = 0; r < print_object->num_printing_regions(); ++r) {
+            append(footprint, original[z][r]);
+            append(assigned, to_expolygons(print_object->get_layer(z)->get_region(r)->slices.surfaces));
+        }
+        footprint = union_ex(footprint);
+        const auto missing = diff_ex(footprint, assigned);
+        // Do not repeatedly reclip unchanged curved surfaces for sub-micron
+        // integer-rounding slivers. The same tolerance bounds conservation
+        // checks; real unowned pockets and exterior additions still repair.
+        if (offset_ex(missing, -scaled(.001)).empty() &&
+            offset_ex(diff_ex(assigned, footprint), -scaled(.001)).empty())
+            continue;
+        for (size_t r = 0; r < print_object->num_printing_regions(); ++r) {
+            auto &slices = print_object->get_layer(z)->get_region(r)->slices;
+            slices.set(union_ex(intersection_ex(to_expolygons(slices.surfaces), footprint),
+                                intersection_ex(original[z][r], missing)), stInternal);
+        }
+    }
+    restore_disconnected_material_impl(print_object, original, throw_on_cancel, true);
+    // Expanding rejected cores can leave rounded boundary fragments. Recheck
+    // their exact geometry so no detached remainder survives the restoration.
+    restore_disconnected_material_impl(print_object, original, throw_on_cancel, false);
+}
+
+void InterlockingGenerator::restore_disconnected_material_impl(PrintObject* print_object,
+    const std::vector<std::vector<ExPolygons>>& original, const std::function<void()>& throw_on_cancel,
+    bool printable_connections)
+{
     // A clipped beam may form a stack entirely inside the other material.
     // Follow connectivity through all layers: a beam need not reach its own
     // material on every course, but its body must reach it somewhere. Combine
     // regions using the same extruder, including modifier-created regions.
     std::vector<ExPolygons> rejected(print_object->layer_count());
     std::unordered_set<unsigned int> checked_tools;
-    for (size_t r = 0; r < original.size(); ++r) {
+    for (size_t r = 0; r < print_object->num_printing_regions(); ++r) {
         const auto tool = print_object->printing_region(r).extruder(frExternalPerimeter);
         if (!checked_tools.insert(tool).second)
             continue;
         std::vector<ExPolygons> native(rejected.size()), generated(rejected.size());
-        for (size_t other = 0; other < original.size(); ++other) {
+        for (size_t other = 0; other < print_object->num_printing_regions(); ++other) {
             if (print_object->printing_region(other).extruder(frExternalPerimeter) != tool)
                 continue;
             for (size_t z = 0; z < rejected.size(); ++z) {
-                append(native[z], original[other][z]);
+                append(native[z], original[z][other]);
                 append(generated[z], to_expolygons(print_object->get_layer(z)->get_region(other)->slices.surfaces));
             }
         }
         std::vector<const ExPolygons *> layers;
-        for (auto &polygons : generated) {
+        std::vector<ExPolygons> envelopes(generated.size());
+        std::vector<float> radii(generated.size());
+        for (size_t z = 0; z < generated.size(); ++z) {
             throw_on_cancel();
-            polygons = union_ex(polygons);
+            auto &polygons = generated[z];
+            envelopes[z] = union_ex(polygons);
+            const auto &print_config = print_object->print()->config();
+            double minimum_width = *std::min_element(print_config.nozzle_diameter.values.begin(),
+                                                     print_config.nozzle_diameter.values.end()) / 3.;
+            if (print_object->config().wall_generator.value == PerimeterGeneratorType::Arachne)
+                minimum_width = Arachne::make_paths_params(int(z), print_object->config(), print_config).min_feature_size;
+            radii[z] = printable_connections ? float(scale_(minimum_width * .5)) : 0.f;
+            // Test cores, including overlap BETWEEN courses. Opening each
+            // course separately would still admit vanishing layer contacts.
+            // This only selects rejected additions; valid outlines stay intact.
+            polygons = offset_ex(envelopes[z], -radii[z]);
             layers.push_back(&polygons);
         }
         size_t count = 0;
@@ -127,17 +180,18 @@ void InterlockingGenerator::generate_interlocking_structure(PrintObject* print_o
         for (size_t z = 0; z < generated.size(); ++z)
             for (size_t i = 0; i < generated[z].size(); ++i)
                 if (!anchored[bodies[z][i]])
-                    rejected[z].push_back(std::move(generated[z][i]));
+                    append(rejected[z], diff_ex(intersection_ex(
+                        offset_ex(ExPolygons{generated[z][i]}, radii[z]), envelopes[z]), native[z]));
     }
     for (size_t z = 0; z < rejected.size(); ++z) {
         if (rejected[z].empty())
             continue;
         throw_on_cancel();
         rejected[z] = union_ex(rejected[z]);
-        for (size_t r = 0; r < original.size(); ++r) {
+        for (size_t r = 0; r < print_object->num_printing_regions(); ++r) {
             auto &slices = print_object->get_layer(z)->get_region(r)->slices;
             slices.set(union_ex(diff_ex(to_expolygons(slices.surfaces), rejected[z]),
-                                intersection_ex(original[r][z], rejected[z])), stInternal);
+                                intersection_ex(original[z][r], rejected[z])), stInternal);
         }
     }
 }
@@ -220,8 +274,13 @@ void InterlockingGenerator::handleThinAreas(const std::unordered_set<GridPoint3>
 
         // Expanded thin areas of the opposing polygon should 'eat into' the larger areas of the polygon,
         // and conversely, add the expansions to their own thin areas.
-        layer->get_region(region_a_index)->slices.set(closing_ex(diff_ex(union_ex(polys_a, thin_expansion_a), thin_expansion_b), close_gaps), stInternal);
-        layer->get_region(region_b_index)->slices.set(closing_ex(diff_ex(union_ex(polys_b, thin_expansion_b), thin_expansion_a), close_gaps), stInternal);
+        // Closing is only for the internal material boundary: applying it to
+        // the whole region otherwise fills native holes and exterior notches.
+        const ExPolygons footprint = union_ex(polys_a, polys_b);
+        layer->get_region(region_a_index)->slices.set(intersection_ex(
+            closing_ex(diff_ex(union_ex(polys_a, thin_expansion_a), thin_expansion_b), close_gaps), footprint), stInternal);
+        layer->get_region(region_b_index)->slices.set(intersection_ex(
+            closing_ex(diff_ex(union_ex(polys_b, thin_expansion_b), thin_expansion_a), close_gaps), footprint), stInternal);
     }
 }
 

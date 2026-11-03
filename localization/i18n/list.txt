@@ -1,4 +1,5 @@
 src/libslic3r/GCode/DepositionMesh.cpp
+src/libslic3r/GCode/DepositionGeometry.cpp
 src/slic3r/GUI/DeviceCore/DevBed.cpp
 src/slic3r/GUI/DeviceCore/DevBed.h
 src/slic3r/GUI/DeviceCore/DevConfig.h

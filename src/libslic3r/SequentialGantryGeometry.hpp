@@ -65,6 +65,9 @@ struct PrintedToolpathObstacle
     mutable Polygons polygons;
     BoundingBox bbox;
     Polyline centerline;
+    // Optional linear bead-top heights at each centerline point. Empty means
+    // only the conservative constant top_z envelope is known.
+    std::vector<double> centerline_z;
     double   line_width = 0.;
 
     PrintedToolpathObstacle() = default;

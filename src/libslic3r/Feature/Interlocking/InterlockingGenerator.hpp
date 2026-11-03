@@ -6,6 +6,7 @@
 
 #include "libslic3r/libslic3r.h"
 #include "libslic3r/Point.hpp"
+#include "libslic3r/ExPolygon.hpp"
 #include "VoxelUtils.hpp"
 #include <functional>
 #include <cstddef>
@@ -55,8 +56,15 @@ public:
      * Generate an interlocking structure between each two adjacent meshes.
      */
     static void generate_interlocking_structure(PrintObject* print_object, const std::function<void()>& throw_on_cancel);
+    // Original ownership is indexed by layer, then region. Restore detached
+    // additions to that ownership rather than leaving voids in the part.
+    static void restore_disconnected_material(PrintObject* print_object,
+        const std::vector<std::vector<ExPolygons>>& original, const std::function<void()>& throw_on_cancel);
 
 private:
+    static void restore_disconnected_material_impl(PrintObject* print_object,
+        const std::vector<std::vector<ExPolygons>>& original, const std::function<void()>& throw_on_cancel,
+        bool printable_connections);
     /*!
      * Generate an interlocking structure between two meshes
      */

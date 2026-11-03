@@ -3334,6 +3334,7 @@ void TabPrint::build()
         optgroup->append_single_option_line("flush_into_support", "multimaterial_settings_flush_options#flush-into-objects-support");
         optgroup = page->new_optgroup(L("Advanced"), L"advanced");
         optgroup->append_single_option_line("interlocking_beam", "multimaterial_settings_advanced#interlocking-beam");
+        optgroup->append_single_option_line("manual_support");
         optgroup->append_single_option_line("dissimilar_material_contact_speed");
         optgroup->append_single_option_line("toolchange_ordering", "multimaterial_settings_advanced#toolchange-ordering");
         optgroup->append_single_option_line("toolchange_cyclic_order", "multimaterial_settings_advanced#toolchange-order");
@@ -3400,6 +3401,7 @@ void TabPrint::build()
         optgroup = page->new_optgroup(L("Brim"), L"param_adhension");
         optgroup->append_single_option_line("brim_type", "others_settings_brim#type");
         optgroup->append_single_option_line("brim_width", "others_settings_brim#width");
+        optgroup->append_single_option_line("brim_filament");
         optgroup->append_single_option_line("leading_brim_length", "others_settings_brim#leading-length");
         optgroup->append_single_option_line("extra_brim_width", "others_settings_brim#extra-width");
         optgroup->append_single_option_line("brim_object_gap", "others_settings_brim#brim-object-gap");
@@ -5644,6 +5646,27 @@ void TabPrinter::build_fff()
         optgroup->append_single_option_line("z_offset", "printer_basic_information_printable_space#z-offset");
         optgroup->append_single_option_line("preferred_orientation", "printer_basic_information_printable_space#preferred-orientation");
 
+        {
+            auto timing = page->new_optgroup(L("Learned print time"), "param_dependencies_printers");
+            Line controls{"", ""};
+            controls.full_width = 1;
+            controls.append_widget([](wxWindow *parent) {
+                auto *sizer = new wxBoxSizer(wxHORIZONTAL);
+                auto *button = new Button(parent, _L("Update learned time estimate…"));
+                button->SetStyle(ButtonStyle::Regular, ButtonType::Parameter);
+                button->SetToolTip(_L("Learn from compatible completed prints on the selected OctoPrint printer. Slice the active plate first; its adjusted estimate appears in Preview."));
+                button->Bind(wxEVT_BUTTON, [button](wxCommandEvent &) {
+                    button->CallAfter([] {
+                        if (!wxGetApp().is_closing() && wxGetApp().plater())
+                            wxGetApp().plater()->update_learned_time_estimate();
+                    });
+                });
+                sizer->Add(button, 0);
+                return sizer;
+            });
+            timing->append_line(controls);
+        }
+
         optgroup = page->new_optgroup(L("Profile inheritance"), "param_dependencies_printers");
         optgroup->m_on_change = [this](const t_config_option_key& opt_key, const boost::any& value) {
             if (opt_key == "inherits")
@@ -5854,6 +5877,9 @@ void TabPrinter::build_fff()
         optgroup->append_single_option_line("support_chamber_temp_control", "printer_basic_information_accessory#support-controlling-chamber-temperature");
         optgroup->append_single_option_line("support_air_filtration", "printer_basic_information_accessory#support-air-filtration");
         optgroup->append_single_option_line("cooling_filter_enabled");
+        optgroup->append_single_option_line("rme_indx_dock_fan_cooldown");
+        optgroup->append_single_option_line("support_rme_indx_dock_fan_cooldown");
+        optgroup->append_single_option_line("rme_indx_dock_fan_cooldown_time");
 
         auto edit_custom_gcode_fn = [this](const t_config_option_key& opt_key) { edit_custom_gcode(opt_key); };
 
@@ -7023,6 +7049,9 @@ void TabPrinter::toggle_options()
         // The cooling filter and air filtration are alternative accessories: show only the one the printer supports.
         toggle_line("support_air_filtration", !m_config->opt_bool("support_cooling_filter"));
         toggle_line("cooling_filter_enabled", m_config->opt_bool("support_cooling_filter"));
+        toggle_option("rme_indx_dock_fan_cooldown", m_config->opt_bool("support_rme_indx_dock_fan_cooldown"));
+        toggle_option("rme_indx_dock_fan_cooldown_time", m_config->opt_bool("support_rme_indx_dock_fan_cooldown") &&
+                                                       m_config->opt_bool("rme_indx_dock_fan_cooldown"));
     }
 
 

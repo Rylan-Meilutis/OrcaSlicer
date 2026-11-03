@@ -5,6 +5,8 @@
 #include "libslic3r/ExtrusionEntity.hpp"
 #include "libslic3r/Flow.hpp"
 #include "libslic3r/Point.hpp"
+#include "libslic3r/Polygon.hpp"
+#include "libslic3r/ExtrusionEntityCollection.hpp"
 #include "libslic3r/Polyline.hpp"
 #include "libslic3r/Semver.hpp"
 #include "libslic3r/Surface.hpp"
@@ -18,6 +20,7 @@
 #include "libslic3r/Layer.hpp"
 #include "libslic3r/ClipperUtils.hpp"
 #include "libslic3r/ConnectedBodies.hpp"
+#include "libslic3r/Feature/Interlocking/InterlockingGenerator.hpp"
 #include "libslic3r/Format/bbs_3mf.hpp"
 #include "libslic3r/Preset.hpp"
 #include "libslic3r/PresetBundle.hpp"
@@ -53,6 +56,117 @@
 
 using namespace Slic3r;
 using namespace Slic3r::Test;
+
+TEST_CASE("Manual support excludes either side of structural contacts without changing slices", "[Multifilament][ManualSupport]")
+{
+    const std::string feature = GENERATE("rooting", "rooting_xy", "interlocking_beam");
+    const int marked = GENERATE(-1, 0, 1); // Object override, host part, donor part.
+    CAPTURE(feature, marked);
+    auto config = multifilament_config(2, {{"filament_type", "PLA;PETG"},
+        {"rooting", false}, {"rooting_xy", false}, {"interlocking_beam", false},
+        {"rooting_depth", 3.}, {"rooting_width", 1.2}, {"rooting_spacing", 6.}, {"rooting_skin", 0.8},
+        {"interlocking_depth", 1}, {"interlocking_beam_width", 0.8}, {"interlocking_beam_layer_count", 2},
+        {"layer_height", 0.2}, {"initial_layer_print_height", 0.2}, {"wall_loops", 3},
+        {"top_shell_layers", 3}, {"bottom_shell_layers", 3}, {"enable_prime_tower", false}});
+    Print native;
+    Model model;
+    init_print({make_cube(24., 32., 10.)}, native, model, config);
+    auto *object = model.objects.front();
+    object->volumes.front()->config.set("extruder", 1);
+    auto donor = make_cube(feature == "rooting" ? 12. : 8., 16., feature == "rooting" ? 4. : 10.);
+    donor.translate(feature == "rooting" ? 8. : 24., 8., feature == "rooting" ? 10. : 0.);
+    object->add_volume(donor)->config.set("extruder", 2);
+    if (marked < 0) object->config.set("manual_support", true);
+    else object->volumes[marked]->config.set("manual_support", true);
+    native.apply(model, config);
+    native.get_object(0)->slice();
+    config.set_deserialize_strict(feature, "1");
+    Print excluded;
+    excluded.apply(model, config);
+    excluded.get_object(0)->slice();
+    REQUIRE(excluded.get_object(0)->layer_count() == native.get_object(0)->layer_count());
+    for (std::size_t z = 0; z < native.get_object(0)->layer_count(); ++z) {
+        const auto *expected = native.get_object(0)->get_layer(z);
+        const auto *actual = excluded.get_object(0)->get_layer(z);
+        REQUIRE(actual->regions().size() == expected->regions().size());
+        for (std::size_t r = 0; r < actual->regions().size(); ++r) {
+            const auto a = to_expolygons(actual->get_region(r)->slices.surfaces);
+            const auto b = to_expolygons(expected->get_region(r)->slices.surfaces);
+            CHECK(area(diff_ex(a, b)) < scale_(0.001) * scale_(0.001));
+            CHECK(area(diff_ex(b, a)) < scale_(0.001) * scale_(0.001));
+        }
+    }
+    // A changed object/volume region flag must invalidate the already sliced
+    // result, rather than reusing the excluded contact geometry.
+    if (marked < 0) object->config.set("manual_support", false);
+    else object->volumes[marked]->config.set("manual_support", false);
+    excluded.apply(model, config);
+    CHECK_FALSE(excluded.get_object(0)->is_step_done(posSlice));
+    excluded.get_object(0)->slice();
+    // Positive control: the same contact actually generates structure when
+    // unmarked. Compare material outlines, not region indices after regrouping.
+    const auto material = [](const Layer *layer, unsigned tool) {
+        ExPolygons polygons;
+        for (const auto *region : layer->regions())
+            if (region->region().extruder(frExternalPerimeter) == tool)
+                append(polygons, to_expolygons(region->slices.surfaces));
+        return union_ex(polygons);
+    };
+    double changed_area = 0.;
+    REQUIRE(excluded.get_object(0)->layer_count() == native.get_object(0)->layer_count());
+    for (std::size_t z = 0; z < native.get_object(0)->layer_count(); ++z)
+        for (unsigned tool : {1u, 2u}) {
+            const auto a = material(excluded.get_object(0)->get_layer(z), tool);
+            const auto b = material(native.get_object(0)->get_layer(z), tool);
+            changed_area += area(diff_ex(a, b)) + area(diff_ex(b, a));
+        }
+    CHECK(changed_area > scale_(0.01) * scale_(0.01));
+}
+
+TEST_CASE("Manual support is a persisted region discriminator for same filament parts", "[Multifilament][ManualSupport]")
+{
+    PrintRegionConfig normal, support;
+    CHECK_FALSE(normal.manual_support.value);
+    const auto &preset_keys = Preset::print_options();
+    CHECK(std::find(preset_keys.begin(), preset_keys.end(), "manual_support") != preset_keys.end());
+    support.manual_support.value = true;
+    CHECK_FALSE(normal == support);
+    DynamicPrintConfig serialized;
+    serialized.set_deserialize_strict("manual_support", support.manual_support.serialize());
+    CHECK(serialized.opt_bool("manual_support"));
+    auto config = multifilament_config(1);
+    Print print;
+    Model model;
+    init_print({make_cube(4., 4., 2.)}, print, model, config);
+    auto second = make_cube(4., 4., 2.);
+    second.translate(4., 0., 0.);
+    model.objects.front()->add_volume(second)->config.set("manual_support", true);
+    print.apply(model, config);
+    REQUIRE(print.get_object(0)->num_printing_regions() == 2);
+    unsigned flagged = 0;
+    for (std::size_t r = 0; r < print.get_object(0)->num_printing_regions(); ++r)
+        if (print.get_object(0)->printing_region(r).config().manual_support.value) ++flagged;
+    CHECK(flagged == 1);
+}
+
+TEST_CASE("Explicit part false overrides inherited object manual support", "[Multifilament][ManualSupport]")
+{
+    auto config = multifilament_config(1);
+    Print print;
+    Model model;
+    init_print({make_cube(4., 4., 2.)}, print, model, config);
+    auto *object = model.objects.front();
+    object->config.set("manual_support", true);
+    auto cube = make_cube(4., 4., 2.);
+    cube.translate(4., 0., 0.);
+    object->add_volume(cube)->config.set("manual_support", false);
+    print.apply(model, config);
+    REQUIRE(print.get_object(0)->num_printing_regions() == 2);
+    unsigned marked = 0;
+    for (std::size_t r = 0; r < print.get_object(0)->num_printing_regions(); ++r)
+        if (print.get_object(0)->printing_region(r).config().manual_support.value) ++marked;
+    CHECK(marked == 1);
+}
 
 TEST_CASE("Dissimilar model contact speed only limits the contacting course", "[Multifilament][MaterialContactSpeed]")
 {
@@ -452,6 +566,8 @@ TEST_CASE("A supplied valid rooting project gains buried material without warnin
 
 TEST_CASE("XY roots branch into cliff contacts while preserving material skins", "[Multifilament][RootingXY]")
 {
+    // The oblique contact exercises integer-grid cracks at the clipped root
+    // attachment; printable connectivity must retain it without keeping islands.
     const double angle = GENERATE(0., PI / 6., PI / 2.);
     const std::string mode = GENERATE("plain", "beams", "elevated", "edge contact", "thin", "support", "same material", "large nozzle");
     const bool expect_roots = mode == "plain" || mode == "beams" || mode == "elevated" || mode == "edge contact";
@@ -1054,11 +1170,69 @@ TEST_CASE("Rooting reaches emitted toolpaths below the original interface", "[Mu
     CHECK_THAT(preview_lowest, Catch::Matchers::WithinAbs(lowest_upper_material, 0.001));
 }
 
+TEST_CASE("Detached structural additions restore native ownership without removing geometry", "[Multifilament][InterlockingConnectivity]")
+{
+    const bool thin_neck = GENERATE(false, true);
+    CAPTURE(thin_neck);
+    auto config = multifilament_config(2, {
+        {"filament_type", "ASA;TPU"}, {"rooting", false}, {"rooting_xy", false},
+        {"interlocking_beam", false}, {"automatic_warp_mitigation", false},
+        {"wall_generator", "arachne"}, {"min_feature_size", "25%"},
+        {"layer_height", .2}, {"initial_layer_print_height", .2},
+        {"elefant_foot_compensation", 0.}, {"enable_prime_tower", false}});
+    Print print;
+    Model model;
+    init_print({make_cube(20., 20., 1.)}, print, model, config);
+    auto donor = make_cube(2., 2., 1.);
+    donor.translate(20., 9., 0.);
+    model.objects.front()->volumes.front()->config.set("extruder", 1);
+    model.objects.front()->add_volume(donor)->config.set("extruder", 2);
+    print.apply(model, config);
+    auto &object = *print.get_object(0);
+    object.slice();
+    std::vector<std::vector<ExPolygons>> original;
+    const auto rectangle = [](double x0, double y0, double x1, double y1) {
+        return ExPolygons{ExPolygon(Polygon(Points{Point::new_scale(x0, y0), Point::new_scale(x1, y0),
+            Point::new_scale(x1, y1), Point::new_scale(x0, y1)}))};
+    };
+    const auto island = rectangle(4., 9., 6., 11.);
+    // The optional neck is connected in polygons but is below the explicit
+    // 100-micron minimum feature size (25% of the 0.4 mm nozzle).
+    const auto addition = thin_neck ? union_ex(island, rectangle(5., 9.99, 21., 10.01)) : island;
+    const auto outside = rectangle(21., 9., 23., 11.);
+    const auto unowned = rectangle(2., 2., 3., 3.);
+    for (auto *layer : object.layers()) {
+        auto &native = original.emplace_back();
+        for (auto *region : layer->regions()) {
+            native.push_back(to_expolygons(region->slices.surfaces));
+            region->slices.set(region->region().extruder(frExternalPerimeter) == 2 ?
+                union_ex(union_ex(native.back(), addition), outside) :
+                diff_ex(diff_ex(native.back(), addition), unowned), stInternal);
+        }
+    }
+    InterlockingGenerator::restore_disconnected_material(&object, original, [] {});
+    for (size_t z = 0; z < object.layer_count(); ++z) {
+        ExPolygons before, after;
+        for (size_t r = 0; r < object.num_printing_regions(); ++r) {
+            const auto *region = object.get_layer(z)->get_region(r);
+            const auto material = to_expolygons(region->slices.surfaces);
+            if (region->region().extruder(frExternalPerimeter) == 2)
+                CHECK(intersection_ex(material, island).empty());
+            append(before, original[z][r]);
+            append(after, material);
+        }
+        CHECK(offset_ex(diff_ex(before, after), -scaled(.001)).empty());
+        CHECK(offset_ex(diff_ex(after, before), -scaled(.001)).empty());
+    }
+}
+
 TEST_CASE("Beam interlocking keeps each material connected to its native body", "[Multifilament][InterlockingConnectivity]")
 {
     const double width = GENERATE(1.2, 4., 12.);
     const int avoidance = GENERATE(0, 2);
-    CAPTURE(width, avoidance);
+    const bool toolpaths = GENERATE(false, true);
+    const bool roots = GENERATE(false, true);
+    CAPTURE(width, avoidance, toolpaths, roots);
     auto config = multifilament_config(2, {
         {"filament_type", "ASA;TPU"}, {"rooting", false}, {"rooting_xy", false},
         {"interlocking_beam", false}, {"interlocking_beam_width", 0.8},
@@ -1076,18 +1250,39 @@ TEST_CASE("Beam interlocking keeps each material connected to its native body", 
     baseline.apply(model, config);
     baseline.get_object(0)->slice();
     config.set_deserialize_strict("interlocking_beam", "1");
+    config.set_deserialize_strict("rooting", roots ? "1" : "0");
     interlocked.apply(model, config);
     interlocked.get_object(0)->slice();
     const auto &before = baseline.get_object(0)->layers();
     const auto &after = interlocked.get_object(0)->layers();
     REQUIRE(before.size() == after.size());
+    // Check ownership conservation before surface classification replaces the
+    // raw slices with typed surfaces and removes narrow interface slivers.
+    for (size_t z = 0; z < after.size(); ++z) {
+        ExPolygons native, generated;
+        for (const auto *region : before[z]->regions())
+            append(native, to_expolygons(region->slices.surfaces));
+        for (const auto *region : after[z]->regions())
+            append(generated, to_expolygons(region->slices.surfaces));
+        CHECK(offset_ex(diff_ex(native, generated), -scaled(0.001)).empty());
+        CHECK(offset_ex(diff_ex(generated, native), -scaled(0.001)).empty());
+    }
+    if (toolpaths)
+        interlocked.process();
     for (unsigned tool : {1u, 2u}) {
         std::vector<ExPolygons> material(after.size());
         std::vector<const ExPolygons *> layers;
         for (size_t z = 0; z < after.size(); ++z) {
             for (const auto *region : after[z]->regions())
-                if (region->region().extruder(frExternalPerimeter) == tool)
-                    append(material[z], to_expolygons(region->slices.surfaces));
+                if (region->region().extruder(frExternalPerimeter) == tool) {
+                    if (toolpaths) {
+                        Polygons coverage;
+                        region->perimeters.polygons_covered_by_width(coverage, 0.f);
+                        region->fills.polygons_covered_by_width(coverage, 0.f);
+                        append(material[z], union_ex(coverage));
+                    } else
+                        append(material[z], to_expolygons(region->slices.surfaces));
+                }
             material[z] = union_ex(material[z]);
             layers.push_back(&material[z]);
         }
@@ -1105,16 +1300,6 @@ TEST_CASE("Beam interlocking keeps each material connected to its native body", 
         }
         CHECK(count > 0);
         CHECK(std::count(anchored.begin(), anchored.end(), false) == 0);
-    }
-    for (size_t z = 0; z < after.size(); ++z) {
-        ExPolygons native, generated;
-        for (const auto *region : before[z]->regions())
-            append(native, to_expolygons(region->slices.surfaces));
-        for (const auto *region : after[z]->regions())
-            append(generated, to_expolygons(region->slices.surfaces));
-        // Clipping/rotation can leave sub-micron rounding slivers, not holes.
-        CHECK(offset_ex(diff_ex(native, generated), -scaled(0.001)).empty());
-        CHECK(offset_ex(diff_ex(generated, native), -scaled(0.001)).empty());
     }
 }
 

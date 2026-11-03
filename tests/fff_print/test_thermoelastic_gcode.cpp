@@ -9,6 +9,7 @@
 #include "libslic3r/PrintConfig.hpp"
 #include "libslic3r/ThermoelasticGCode.hpp"
 #include "libslic3r/ThermoelasticMesh.hpp"
+#include "libslic3r/ThermalAirflow.hpp"
 #include "test_helpers.hpp"
 #include <Eigen/Core>
 #include <boost/nowide/fstream.hpp>
@@ -16,8 +17,11 @@
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
+#include <ios>
 #include <map>
+#include <optional>
 #include <set>
+#include <sstream>
 #include <string>
 #include <stdexcept>
 #include <utility>
@@ -25,6 +29,71 @@
 
 using namespace Slic3r;
 using Catch::Matchers::WithinAbs;
+
+TEST_CASE("Configured mechanics reports explicit airflow coverage independently of geometry", "[ThermoelasticGCode][ThermalAirflow]")
+{
+    using namespace Thermoelastic;
+    using ThermalHistory::FanRole;
+    using ThermalHistory::FirmwareFanPolicy;
+    GCodeProcessorResult gcode;
+    auto config = DynamicPrintConfig::full_print_config();
+    std::istringstream source("M106 S0\nM106 P6 S255\nM191 S40\nG1 X2 E1\n");
+    AirflowTraceInput input{source, {{0,FanRole::Part},{3,FanRole::Exhaust},{6,FanRole::Dock}}, FirmwareFanPolicy::RmeLegacy};
+    const auto result = analyze_configured_gcode(gcode, config, {}, {}, {}, {}, &input);
+    CHECK(result.state == AnalysisState::InvalidGeometry);
+    CHECK(result.airflow.state == AirflowTraceState::Complete);
+    CHECK(result.airflow.source_lines == 4);
+    REQUIRE(result.airflow.decoded_events.size() == result.airflow.events);
+    REQUIRE_FALSE(result.airflow.decoded_events.empty());
+    CHECK(result.airflow.decoded_events.front().line_id == 1);
+    CHECK(result.airflow.decoded_events.back().state == result.airflow.final_state);
+    CHECK(source.eof());
+    CHECK_FALSE(result.airflow.incorporated_in_thermal_scenarios);
+    CHECK_FALSE(result.airflow.unresolved_during_motion[static_cast<unsigned>(FanRole::Part)]);
+    CHECK_FALSE(result.airflow.unresolved_during_motion[static_cast<unsigned>(FanRole::Dock)]);
+    CHECK(result.airflow.unresolved_during_motion[static_cast<unsigned>(FanRole::Exhaust)]);
+    CHECK(result.airflow.final_state.pwm[static_cast<unsigned>(FanRole::Dock)].value() == 255.);
+    CHECK(analyze_configured_gcode(gcode, config).airflow.state == AirflowTraceState::NotProvided);
+
+    SECTION("Byte budget fails without claiming a complete source") {
+        source.clear(); source.seekg(0);
+        input.max_bytes = 9; // First fan command fits, the next does not.
+        const auto trace = analyze_configured_gcode(gcode, config, {}, {}, {}, {}, &input).airflow;
+        CHECK(trace.state == AirflowTraceState::BudgetExceeded);
+        CHECK(trace.events == 1);
+        CHECK(trace.decoded_events.empty());
+    }
+    SECTION("Event exhaustion never publishes a partial timeline") {
+        source.clear(); source.seekg(0);
+        input.max_events = 1;
+        const auto trace = analyze_configured_gcode(gcode, config, {}, {}, {}, {}, &input).airflow;
+        CHECK(trace.state == AirflowTraceState::BudgetExceeded);
+        CHECK(trace.decoded_events.empty());
+    }
+    SECTION("Oversized source line is bounded") {
+        source.str(std::string(70000, 'x')); source.clear();
+        CHECK(analyze_configured_gcode(gcode, config, {}, {}, {}, {}, &input).airflow.state == AirflowTraceState::BudgetExceeded);
+    }
+    SECTION("Bad source remains unavailable") {
+        source.clear(std::ios::badbit);
+        CHECK(analyze_configured_gcode(gcode, config, {}, {}, {}, {}, &input).airflow.state == AirflowTraceState::ReadError);
+    }
+    SECTION("Cancellation propagates and old stress is cleared") {
+        gcode.thermal_stress_mpa = {1.f};
+        CHECK_THROWS_AS(analyze_configured_gcode(gcode, config, {}, {}, [] { throw std::runtime_error("cancel"); }, {}, &input), std::runtime_error);
+        CHECK(gcode.thermal_stress_mpa.empty());
+    }
+    SECTION("Exception-enabled EOF is successful and stream starts at current position") {
+        source.str("discard\nM106 S123"); source.clear(); source.seekg(8);
+        source.exceptions(std::ios::failbit | std::ios::badbit);
+        const auto trace = analyze_configured_gcode(gcode, config, {}, {}, {}, {}, &input).airflow;
+        CHECK(trace.state == AirflowTraceState::Complete);
+        CHECK(trace.source_lines == 1);
+        REQUIRE(trace.decoded_events.size() == 1);
+        CHECK(trace.decoded_events.front().line_id == 1);
+        CHECK(trace.final_state.pwm[0].value() == 123.);
+    }
+}
 
 // Optional user-file coverage audit, not a physical validation or an adhesion
 // test. No output files are produced and the mesh resource limits stay fixed.
@@ -185,13 +254,70 @@ TEST_CASE("Equivalent ASA colors share cells only with identical thermal scenari
     CHECK(result.state == Thermoelastic::AnalysisState::InvalidGeometry);
 }
 
+TEST_CASE("Explicit mixed-material studies require matching complete material scenarios", "[ThermoelasticGCode]")
+{
+    auto config = DynamicPrintConfig::full_print_config();
+    config.set_deserialize_strict({{"filament_type", "ASA;TPU"}, {"chamber_temperature", "50,50"},
+        {"nozzle_temperature", "265,220"}, {"curr_bed_type", "Textured PEI Plate"},
+        {"textured_plate_temp", "110,110"}});
+    GCodeProcessorResult gcode;
+    gcode.moves.resize(4);
+    gcode.moves[0].position = Eigen::Vector3f(0.f, 0.f, .2f);
+    gcode.moves[1] = gcode.moves[0];
+    gcode.moves[1].position.x() = .4f;
+    gcode.moves[1].type = EMoveType::Extrude;
+    gcode.moves[1].extrusion_role = erPerimeter;
+    gcode.moves[1].width = .4f;
+    gcode.moves[1].height = .2f;
+    gcode.moves[2] = gcode.moves[0];
+    gcode.moves[2].position.x() = 2.f;
+    gcode.moves[2].type = EMoveType::Travel;
+    gcode.moves[3] = gcode.moves[1];
+    gcode.moves[3].position.x() = 2.4f;
+    gcode.moves[3].extruder_id = 1;
+    // Deliberately synthetic zero-eigenstrain controls; these constants are
+    // NOT claimed to describe printed TPU or the user's materials.
+    std::vector<std::optional<Thermoelastic::MaterialScenario>> materials{
+        Thermoelastic::MaterialScenario{"ASA", "Synthetic zero-strain fixture", 2.e9, .35, 0., 0., 100., 90.},
+        Thermoelastic::MaterialScenario{"TPU", "Synthetic zero-strain fixture", 2.e7, .3, 0., 0., 100., 90.}};
+    auto result = Thermoelastic::analyze_configured_gcode(gcode, config, {}, {}, {}, materials);
+    REQUIRE(result.state == Thermoelastic::AnalysisState::Converged);
+    REQUIRE(result.scenarios.size() == 4);
+    REQUIRE(gcode.thermal_stress_mpa.size() == gcode.moves.size());
+    CHECK_THAT(gcode.thermal_stress_mpa[1], WithinAbs(0., 1e-8));
+    CHECK_THAT(gcode.thermal_stress_mpa[3], WithinAbs(0., 1e-8));
+    materials[1]->filament_type = "PETG";
+    result = Thermoelastic::analyze_configured_gcode(gcode, config, {}, {}, {}, materials);
+    CHECK(result.state == Thermoelastic::AnalysisState::UnsupportedMaterial);
+    CHECK(gcode.thermal_stress_mpa.empty());
+    materials[1]->filament_type = "TPU";
+    materials[1]->provenance.clear();
+    CHECK_THROWS_AS(Thermoelastic::analyze_configured_gcode(gcode, config, {}, {}, {}, materials), std::invalid_argument);
+    materials[1]->provenance = "Synthetic fixture";
+    materials[1]->poisson = .5;
+    CHECK_THROWS_AS(Thermoelastic::analyze_configured_gcode(gcode, config, {}, {}, {}, materials), std::invalid_argument);
+    materials[1]->poisson = .3;
+    materials[1]->maximum_chamber_temperature_c = 40.;
+    result = Thermoelastic::analyze_configured_gcode(gcode, config, {}, {}, {}, materials);
+    CHECK(result.state == Thermoelastic::AnalysisState::InvalidThermalInputs);
+    CHECK(gcode.thermal_stress_mpa.empty());
+}
+
 TEST_CASE("Mechanical candidate ranking requires improvement beyond uncertainty in every scenario", "[ThermoelasticGCode]")
 {
     Thermoelastic::ConfiguredAnalysis baseline, candidate;
     baseline.state = candidate.state = Thermoelastic::AnalysisState::Converged;
+    baseline.scenario_parameters = candidate.scenario_parameters = {1., 2.e9, .35};
+    baseline.scenario_sources = candidate.scenario_sources = {"Synthetic comparator fixture"};
     baseline.scenarios = {{10., 2.}, {20., 4.}};
     candidate.scenarios = {{8., 1.5}, {15., 3.}};
     CHECK(Thermoelastic::mechanically_improves(baseline, candidate, .05));
+    candidate.scenario_parameters.back() = .34;
+    CHECK_FALSE(Thermoelastic::mechanically_improves(baseline, candidate, .05));
+    candidate.scenario_parameters = baseline.scenario_parameters;
+    candidate.scenario_sources = {"Different assumptions"};
+    CHECK_FALSE(Thermoelastic::mechanically_improves(baseline, candidate, .05));
+    candidate.scenario_sources = baseline.scenario_sources;
     candidate.scenarios[1].tensile_force_n = 19.9;
     CHECK_FALSE(Thermoelastic::mechanically_improves(baseline, candidate, .05));
     candidate.scenarios[1].tensile_force_n = 15.;
@@ -288,4 +414,54 @@ TEST_CASE("Sliced extrusion geometry can be assembled into a bonded mechanical m
     CHECK(analysis.bed.contact_area_total_m2 > 0.);
     CHECK_FALSE(analysis.converged);
     CHECK(gcode.thermal_stress_mpa.empty());
+}
+
+TEST_CASE("Display subdivisions and seam markers do not change mechanical deposition", "[ThermoelasticGCode]")
+{
+    GCodeProcessorResult clean;
+    clean.moves.resize(2);
+    clean.moves[0].position = Eigen::Vector3f(0.f, 0.f, .2f);
+    clean.moves[1] = clean.moves[0];
+    clean.moves[1].position.x() = 1.f;
+    clean.moves[1].type = EMoveType::Extrude;
+    clean.moves[1].extrusion_role = erPerimeter;
+    clean.moves[1].width = .4f;
+    clean.moves[1].height = .2f;
+    GCodeProcessorResult displayed;
+    displayed = clean;
+    auto internal = clean.moves[1];
+    internal.internal_only = true;
+    internal.position = Eigen::Vector3f(500.f, 500.f, 500.f);
+    internal.extruder_id = 200;
+    auto seam = internal;
+    seam.internal_only = false;
+    seam.type = EMoveType::Seam;
+    displayed.moves.insert(displayed.moves.begin() + 1, {internal, seam});
+    const std::vector<Thermoelastic::Voxel> materials{{{0,0,0}, 2.9e9, .35}};
+    const Eigen::Vector3d spacing(.0002,.0002,.0001);
+    const auto reference = Thermoelastic::analyze_gcode(clean, materials, spacing, 0., 50000, 4, .05);
+    const auto result = Thermoelastic::analyze_gcode(displayed, materials, spacing, 0., 50000, 4, .05);
+    REQUIRE(reference.converged);
+    REQUIRE(result.converged);
+    REQUIRE(result.mesh.nodes_m.size() == reference.mesh.nodes_m.size());
+    CHECK(result.mesh.elements.size() == reference.mesh.elements.size());
+    for (std::size_t i = 0; i < result.mesh.nodes_m.size(); ++i)
+        CHECK_THAT((result.mesh.nodes_m[i] - reference.mesh.nodes_m[i]).norm(), WithinAbs(0., 1e-15));
+    REQUIRE(displayed.thermal_stress_mpa.size() == displayed.moves.size());
+    CHECK(displayed.thermal_stress_mpa[1] < 0.f);
+    CHECK(displayed.thermal_stress_mpa[2] < 0.f);
+    CHECK_THAT(displayed.thermal_stress_mpa.back(), WithinAbs(clean.thermal_stress_mpa.back(), 1e-8));
+
+    auto config = DynamicPrintConfig::full_print_config();
+    config.set_deserialize_strict({{"filament_type", "ASA"}, {"chamber_temperature", "50"},
+        {"nozzle_temperature", "265"}, {"curr_bed_type", "Textured PEI Plate"},
+        {"textured_plate_temp", "110"}});
+    Thermoelastic::AnalysisLimits limits;
+    limits.max_nodes = 4;
+    const auto configured = Thermoelastic::analyze_configured_gcode(displayed, config, limits);
+    CHECK(configured.state == Thermoelastic::AnalysisState::BudgetExceeded);
+    CHECK(configured.unsupported_filaments.empty());
+    displayed.moves.erase(displayed.moves.begin(), displayed.moves.end() - 1);
+    CHECK(Thermoelastic::analyze_configured_gcode(displayed, config).state ==
+        Thermoelastic::AnalysisState::InvalidGeometry);
 }

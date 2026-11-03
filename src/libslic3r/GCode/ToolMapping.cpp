@@ -582,17 +582,17 @@ GCodeDispatchPlan prepare_tool_mapped_gcode(std::istream &source, const GCodeDis
     const DynamicPrintConfig &target, const std::vector<int> &tools, const std::string &full_config,
     const std::function<void(std::uint64_t)> &progress)
 {
-    if (!data.valid || !data.sealed || tools.empty()) throw std::runtime_error("Missing tool-dispatch certificate; regenerate the print job.");
+    if (!data.valid || !data.sealed || tools.empty()) throw ToolMappingFailure(ToolMappingFailureReason::MissingCapture, "Missing tool-dispatch certificate; regenerate the print job.");
     for (const char *key : {"post_process", "slicing_pipeline_plugin"})
         if (const auto *scripts = target.option<ConfigOptionStrings>(key))
             for (const auto &script : scripts->values)
-                if (!script.empty()) throw std::runtime_error("Post-processing requires normal tool-dispatch regeneration.");
+                if (!script.empty()) throw ToolMappingFailure(ToolMappingFailureReason::UnsupportedMode, "Post-processing requires normal tool-dispatch regeneration.");
     for (const char *key : {"is_imex", "single_extruder_multi_material", "enable_prime_tower", "enable_pre_heating", "enable_filament_dynamic_map"})
         if (const auto *enabled = target.option<ConfigOptionBool>(key); enabled && enabled->value)
-            throw std::runtime_error("This printer/toolpath mode requires normal tool-dispatch regeneration.");
+            throw ToolMappingFailure(ToolMappingFailureReason::UnsupportedMode, "This printer/toolpath mode requires normal tool-dispatch regeneration.");
     const auto *flavor = target.option<ConfigOptionEnum<GCodeFlavor>>("gcode_flavor");
     if (!flavor || (flavor->value != gcfMarlinLegacy && flavor->value != gcfMarlinFirmware))
-        throw std::runtime_error("This G-code dialect requires normal tool-dispatch regeneration.");
+        throw ToolMappingFailure(ToolMappingFailureReason::UnsupportedMode, "This G-code dialect requires normal tool-dispatch regeneration.");
     std::set<int> assigned;
     for (int tool : tools)
         if (tool < 0 || tool >= 256 || !assigned.insert(tool).second) throw std::invalid_argument("Invalid physical tool mapping.");
@@ -604,7 +604,7 @@ GCodeDispatchPlan prepare_tool_mapped_gcode(std::istream &source, const GCodeDis
         if (expected == replacement) return;
         const auto bytes = expected.size() + replacement.size() + sizeof(GCodeDispatchEdit);
         if (bytes > memory_limit - retained_bytes)
-            throw std::runtime_error("Tool-dispatch edit budget exceeded; regenerate the print job.");
+            throw ToolMappingFailure(ToolMappingFailureReason::ResourceLimit, "Tool-dispatch edit budget exceeded; regenerate the print job.");
         retained_bytes += bytes;
         plan.edits.push_back({offset, std::move(expected), std::move(replacement)});
     };
@@ -615,7 +615,7 @@ GCodeDispatchPlan prepare_tool_mapped_gcode(std::istream &source, const GCodeDis
         char ch;
         while (source.get(ch)) {
             line += ch;
-            if (line.size() > 1024 * 1024) throw std::runtime_error("G-code line exceeds dispatch budget.");
+            if (line.size() > 1024 * 1024) throw ToolMappingFailure(ToolMappingFailureReason::ResourceLimit, "G-code line exceeds dispatch budget.");
             if (ch == '\n') break;
         }
         if (source.bad() || (source.fail() && !source.eof())) throw std::runtime_error("Reading G-code dispatch input failed.");
@@ -628,7 +628,7 @@ GCodeDispatchPlan prepare_tool_mapped_gcode(std::istream &source, const GCodeDis
     const auto mapped_id = [&](std::string_view token, unsigned base) {
         const auto value = unsigned_token(token);
         if (value < base || value - base >= tools.size())
-            throw std::runtime_error("A native command addresses an uncaptured tool; regenerate the print job.");
+            throw ToolMappingFailure(ToolMappingFailureReason::UnsupportedCommand, "A native command addresses an uncaptured tool; regenerate the print job.");
         return std::to_string(std::uint64_t(tools[value - base]) + base);
     };
     std::string line;
@@ -640,23 +640,24 @@ GCodeDispatchPlan prepare_tool_mapped_gcode(std::istream &source, const GCodeDis
             if (!id_text.empty() && id_text.back() == '\n') id_text.remove_suffix(1);
             const auto id = unsigned_token(id_text);
             if (id >= data.templates.size() || !seen.insert(id).second)
-                throw std::runtime_error("Invalid or duplicate custom-script certificate.");
+                throw ToolMappingFailure(ToolMappingFailureReason::FileIntegrity, "Invalid or duplicate custom-script certificate.");
             const auto body_offset = plan.source_bytes;
             const std::string end = "; ORCA_DISPATCH_END " + std::to_string(id) + "\n";
             std::string body;
             bool ended = false;
             while (read_line(line)) {
                 if (line == end) { ended = true; break; }
-                if (body.size() + line.size() > memory_limit) throw std::runtime_error("Custom-script span exceeds dispatch budget.");
+                if (body.size() + line.size() > memory_limit) throw ToolMappingFailure(ToolMappingFailureReason::ResourceLimit, "Custom-script span exceeds dispatch budget.");
                 body += line;
             }
             if (!ended)
-                throw std::runtime_error("A custom script was changed after slicing; regenerate the print job.");
-            auto replayed = terminated(replay_tool_mapped_template(data.templates[id], target, tools));
+                throw ToolMappingFailure(ToolMappingFailureReason::FileIntegrity, "A custom script was changed after slicing; regenerate the print job.");
+            std::string replayed;
             try {
+                replayed = terminated(replay_tool_mapped_template(data.templates[id], target, tools));
                 replayed = retain_processed_macro_edits(terminated(data.templates[id].rendered), body, replayed);
             } catch (const std::runtime_error &error) {
-                throw std::runtime_error("Template " + data.templates[id].name + ": " + error.what());
+                throw ToolMappingFailure(ToolMappingFailureReason::ScriptReplay, "Template " + data.templates[id].name + ": " + error.what());
             }
             add_edit(body_offset, std::move(body), std::move(replayed));
             continue;
@@ -667,7 +668,7 @@ GCodeDispatchPlan prepare_tool_mapped_gcode(std::istream &source, const GCodeDis
             bool ended = false;
             while (read_line(line)) {
                 if (line == "; CONFIG_BLOCK_END\n") { ended = true; break; }
-                if (body.size() + line.size() > memory_limit) throw std::runtime_error("Configuration exceeds dispatch budget.");
+                if (body.size() + line.size() > memory_limit) throw ToolMappingFailure(ToolMappingFailureReason::ResourceLimit, "Configuration exceeds dispatch budget.");
                 body += line;
             }
             if (!ended || full_config.empty()) throw std::runtime_error("Missing mapped configuration metadata.");
@@ -688,7 +689,7 @@ GCodeDispatchPlan prepare_tool_mapped_gcode(std::istream &source, const GCodeDis
                     config_line = "; filament_nozzle_map = " + ConfigOptionInts(slots).serialize();
                 }
                 replacement += config_line + '\n';
-                if (replacement.size() > memory_limit) throw std::runtime_error("Configuration exceeds dispatch budget.");
+                if (replacement.size() > memory_limit) throw ToolMappingFailure(ToolMappingFailureReason::ResourceLimit, "Configuration exceeds dispatch budget.");
             }
             add_edit(body_offset, std::move(body), std::move(replacement));
             continue;
@@ -759,12 +760,12 @@ GCodeDispatchPlan prepare_tool_mapped_gcode(std::istream &source, const GCodeDis
         static const std::set<std::string_view> unchanged_commands{
             "G0", "G1", "G2", "G3", "G4", "G10", "G11", "G17", "G18", "G19", "G20", "G21",
             "G28", "G29", "G90", "G91", "G92", "M73", "M82", "M83", "M106", "M107", "M140",
-            "M141", "M190", "M191", "M201", "M203", "M204", "M205", "M400", "M486"};
+            "M141", "M190", "M191", "M201", "M203", "M204", "M205", "M400", "M486", "M979"};
         char operand = '\0';
         if (command == "M104" || command == "M109" || command == "M900") operand = 'T';
         else if (command == "M572") operand = 'D';
         else if (!unchanged_commands.count(command))
-            throw std::runtime_error("Unsupported native command in fast tool dispatch: " + std::string(command));
+            throw ToolMappingFailure(ToolMappingFailureReason::UnsupportedCommand, "Unsupported native command in fast tool dispatch: " + std::string(command));
         if (command_end == std::string_view::npos) continue;
         std::size_t pos = command_end;
         while (pos < code.size()) {
@@ -776,14 +777,14 @@ GCodeDispatchPlan prepare_tool_mapped_gcode(std::istream &source, const GCodeDis
                 add_edit(offset + first + pos + 1, std::string(token.substr(1)), mapped_id(token.substr(1), 0));
             else if ((token.front() == 'T' && command != "M204" && command != "M205") ||
                      (command == "G10" && token.front() == 'P'))
-                throw std::runtime_error("Unsupported native tool operand; regenerate the print job.");
+                throw ToolMappingFailure(ToolMappingFailureReason::UnsupportedCommand, "Unsupported native tool operand; regenerate the print job.");
             if (end == std::string_view::npos) break;
             pos = end;
         }
     }
-    if (seen.size() != data.templates.size()) throw std::runtime_error("A custom-script certificate is missing from the final G-code.");
+    if (seen.size() != data.templates.size()) throw ToolMappingFailure(ToolMappingFailureReason::FileIntegrity, "A custom-script certificate is missing from the final G-code.");
     if (plan.source_bytes != data.source_bytes || plan.source_fingerprint != data.source_fingerprint)
-        throw std::runtime_error("G-code changed after generation; regenerate the print job.");
+        throw ToolMappingFailure(ToolMappingFailureReason::FileIntegrity, "G-code changed after generation; regenerate the print job.");
     if (progress) progress(plan.source_bytes);
     return plan;
 }

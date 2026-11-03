@@ -4,6 +4,7 @@
 #include "ExtrusionEntity.hpp"
 #include "Exception.hpp"
 #include "Layer.hpp"
+#include "BrickCourseRamps.hpp"
 #include "BridgeDetector.hpp"
 #include "ClipperUtils.hpp"
 #include "Geometry.hpp"
@@ -265,32 +266,6 @@ void ramp_staggered_endpoint(ExtrusionPath &path, bool at_start,
         path.polyline.reverse();
 }
 
-void smooth_staggered_transitions(ExtrusionPaths &paths, coord_t z_offset,
-                                  bool closed)
-{
-    if (paths.size() < 2)
-        return;
-    const size_t transition_count = closed ? paths.size() : paths.size() - 1;
-    for (size_t idx = 0; idx < transition_count; ++idx) {
-        ExtrusionPath &before = paths[idx];
-        ExtrusionPath &after = paths[(idx + 1) % paths.size()];
-        const auto is_raised = [](const ExtrusionPath &path) {
-            return path.staggered_perimeter && std::any_of(
-                path.polyline.points.begin(), path.polyline.points.end(),
-                [](const Point3 &point) { return point.z() > 0; });
-        };
-        const bool before_raised = is_raised(before);
-        const bool after_raised = is_raised(after);
-        if (before_raised == after_raised ||
-            before.last_point3().to_point() != after.first_point3().to_point())
-            continue;
-        if (before_raised)
-            ramp_staggered_endpoint(before, false, z_offset);
-        else
-            ramp_staggered_endpoint(after, true, z_offset);
-    }
-}
-
 ExtrusionPaths stagger_supported_fragments(const ExtrusionPath &source,
                                            int inherited_inset_idx,
                                            coord_t z_offset,
@@ -527,7 +502,7 @@ void apply_staggered_perimeters(ExtrusionEntity &entity, int inherited_inset_idx
                     fragment, inset_idx, z_offset, inner_only,
                     lower_staggered_coverage, lower_coverage, current_coverage));
         }
-        smooth_staggered_transitions(paths, z_offset, false);
+        detail::smooth_staggered_transitions(paths, z_offset, false);
         multipath->paths = std::move(paths);
     } else if (auto *loop = dynamic_cast<ExtrusionLoop *>(&entity)) {
         // The same loop may contain independently classified overhang and
@@ -548,7 +523,7 @@ void apply_staggered_perimeters(ExtrusionEntity &entity, int inherited_inset_idx
         // continuous loop while preventing a seam prime at the raised height
         // followed by a descent through an already deposited brick bead.
         start_closed_course_at_lowest_path(paths);
-        smooth_staggered_transitions(paths, z_offset, true);
+        detail::smooth_staggered_transitions(paths, z_offset, true);
         loop->paths = std::move(paths);
     } else if (auto *collection = dynamic_cast<ExtrusionEntityCollection *>(&entity)) {
         for (ExtrusionEntity *child : collection->entities)
@@ -681,6 +656,108 @@ void apply_smooth_outer_wall_courses(ExtrusionEntityCollection &collection,
 }
 
 } // namespace
+
+void detail::smooth_staggered_transitions(ExtrusionPaths &paths, coord_t z_offset, bool closed)
+{
+    if (paths.size() < 2 || z_offset <= 0)
+        return;
+    const size_t count = paths.size();
+    std::vector<bool> raised(count), enter(count, false), leave(count, false), planned(count, false);
+    for (size_t i = 0; i < count; ++i)
+        raised[i] = paths[i].staggered_perimeter && std::any_of(
+            paths[i].polyline.points.begin(), paths[i].polyline.points.end(),
+            [](const Point3 &point) { return point.z() > 0; });
+    const auto connected = [&paths](size_t a, size_t b) {
+        return !paths[a].polyline.points.empty() && !paths[b].polyline.points.empty() &&
+            paths[a].last_point() == paths[b].first_point();
+    };
+    for (size_t i = 0; i < (closed ? count : count - 1); ++i) {
+        const size_t next = (i + 1) % count;
+        if (raised[i] != raised[next] && connected(i, next)) {
+            leave[i] = raised[i];
+            enter[next] = raised[next];
+        }
+    }
+    // Start a closed traversal in an unraised fragment so a connected raised
+    // run crossing the vector seam is planned once, with both ends together.
+    const auto ordinary = std::find(raised.begin(), raised.end(), false);
+    if (ordinary == raised.end())
+        return;
+    const size_t origin = closed ? size_t(ordinary - raised.begin()) : 0;
+    const auto index = [origin, count](size_t position) { return (origin + position) % count; };
+    for (size_t begin = 0; begin < count;) {
+        if (!raised[index(begin)]) { ++begin; continue; }
+        size_t end = begin + 1;
+        while (end < count && raised[index(end)] && connected(index(end - 1), index(end))) ++end;
+        const size_t first = index(begin), last = index(end - 1);
+        double length = 0.;
+        const coord_t top = paths[first].first_point3().z();
+        bool flat = top >= z_offset;
+        for (size_t i = begin; i < end; ++i) {
+            for (const Point3 &point : paths[index(i)].polyline.points) flat &= point.z() == top;
+            for (const Line3 &line : paths[index(i)].polyline.lines())
+                length += (line.b.to_point() - line.a.to_point()).cast<double>().norm();
+        }
+        // Match the existing local brick seam's 1:2 rise/run qualification.
+        // Width remains the preferred run, not a cap tied to one tiny edge.
+        const double minimum = 2. * double(z_offset);
+        const unsigned ends = unsigned(enter[first]) + unsigned(leave[last]);
+        if (flat && ends && length >= ends * minimum) {
+            double start_run = enter[first] ? std::max(minimum, double(scale_(std::max(.1f, paths[first].width)))) : 0.;
+            double end_run = leave[last] ? std::max(minimum, double(scale_(std::max(.1f, paths[last].width)))) : 0.;
+            const double extra = start_run + end_run - ends * minimum;
+            if (extra > 0. && start_run + end_run > length) {
+                const double fraction = (length - ends * minimum) / extra;
+                if (enter[first]) start_run = minimum + (start_run - minimum) * fraction;
+                if (leave[last]) end_run = minimum + (end_run - minimum) * fraction;
+            }
+            const auto height = [=](double along) {
+                double ratio = 1.;
+                if (start_run > 0.) ratio = std::min(ratio, along / start_run);
+                if (end_run > 0.) ratio = std::min(ratio, (length - along) / end_run);
+                return top - z_offset + coord_t(std::llround(z_offset * std::clamp(ratio, 0., 1.)));
+            };
+            std::array<double, 4> breaks{start_run * .5, start_run, length - end_run, length - end_run * .5};
+            std::sort(breaks.begin(), breaks.end());
+            double along = 0.;
+            for (size_t i = begin; i < end; ++i) {
+                ExtrusionPath &path = paths[index(i)];
+                Points3 sampled;
+                sampled.reserve(path.polyline.points.size() + breaks.size());
+                sampled.emplace_back(path.first_point(), height(along));
+                for (const Line3 &line : path.polyline.lines()) {
+                    const double segment = (line.b.to_point() - line.a.to_point()).cast<double>().norm();
+                    for (double split : breaks) {
+                        if (split <= along || split >= along + segment) continue;
+                        const double ratio = (split - along) / segment;
+                        const Point xy = line.a.to_point() + Point(
+                            coord_t(std::llround((line.b.x() - line.a.x()) * ratio)),
+                            coord_t(std::llround((line.b.y() - line.a.y()) * ratio)));
+                        const Point3 point(xy, height(split));
+                        if (sampled.back() != point) sampled.push_back(point);
+                    }
+                    along += segment;
+                    const Point3 point(line.b.to_point(), height(along));
+                    if (sampled.back() != point) sampled.push_back(point);
+                }
+                path.polyline.points = std::move(sampled);
+                path.polyline.fitting_result.clear();
+                path.staggered_transition = true;
+                planned[index(i)] = true;
+            }
+        }
+        begin = end;
+    }
+    // Intentionally retain the legacy geometry for whole runs too short to
+    // fit the slope bound. Locally flattening them would invalidate the next
+    // layer's independently inferred entry/exit schedule. Their emitted
+    // vertical material remains explicitly unresolved by analysis, not omitted.
+    for (size_t i = 0; i < (closed ? count : count - 1); ++i) {
+        const size_t next = (i + 1) % count;
+        if (leave[i] && !planned[i]) ramp_staggered_endpoint(paths[i], false, z_offset);
+        if (enter[next] && !planned[next]) ramp_staggered_endpoint(paths[next], true, z_offset);
+    }
+}
 
 Flow LayerRegion::flow(FlowRole role) const
 {

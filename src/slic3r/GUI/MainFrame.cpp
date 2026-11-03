@@ -2135,7 +2135,9 @@ const char* print_select_type_key(MainFrame::PrintSelectType type)
     case MainFrame::eExportSlicedFile:    return "export_sliced_file";
     case MainFrame::eExportAllSlicedFile: return "export_all_sliced_file";
     case MainFrame::eExportGcode:         return "export_gcode";
-    case MainFrame::eExportDepositionStl: return "export_deposition_stl";
+    case MainFrame::eExportDepositionStl: return "export_geometry";
+    case MainFrame::eExportDepositionStep: return "export_deposition_step";
+    case MainFrame::eExportDepositionObj: return "export_deposition_obj";
     case MainFrame::eSendGcode:           return "send_gcode";
     case MainFrame::eSendToPrinter:       return "send_to_printer";
     case MainFrame::eSendToPrinterAll:    return "send_to_printer_all";
@@ -2153,8 +2155,10 @@ wxString print_select_type_label(MainFrame::PrintSelectType type)
     case MainFrame::ePrintPlate:          return _L("Print plate");
     case MainFrame::eExportSlicedFile:    return _L("Export plate sliced file");
     case MainFrame::eExportAllSlicedFile: return _L("Export all sliced file");
-    case MainFrame::eExportGcode:         return _L("Export G-code file");
-    case MainFrame::eExportDepositionStl: return _L("Export printed extrusion as STL");
+    case MainFrame::eExportGcode:         return _L("Export G-code");
+    case MainFrame::eExportDepositionStl: return _L("Export geometry");
+    case MainFrame::eExportDepositionStep: return _L("Export printed extrusion as STEP");
+    case MainFrame::eExportDepositionObj: return _L("Export printed extrusion as OBJ");
     case MainFrame::eSendGcode:           return _L_CONTEXT("Print", "Verb");
     case MainFrame::eSendToPrinter:       return _L("Send");
     case MainFrame::eSendToPrinterAll:    return _L("Send all");
@@ -2240,7 +2244,8 @@ bool MainFrame::get_remembered_print_select(PrintSelectType& out) const
         return false;
     // Orca: only restore an action the current printer actually offers in the dropdown
     for (PrintSelectType type : available_print_actions()) {
-        if (saved == print_select_type_key(type)) {
+        if (saved == print_select_type_key(type) || (type == eExportDepositionStl &&
+            (saved == "export_deposition_stl" || saved == "export_deposition_step" || saved == "export_deposition_obj"))) {
             out = type;
             return true;
         }
@@ -2382,7 +2387,11 @@ wxBoxSizer* MainFrame::create_side_tools()
             else if (m_print_select == eExportGcode)
                 wxPostEvent(m_plater, SimpleEvent(EVT_GLTOOLBAR_EXPORT_GCODE));
             else if (m_print_select == eExportDepositionStl)
-                m_plater->export_deposition_stl();
+                m_plater->export_deposition_geometry();
+            else if (m_print_select == eExportDepositionStep)
+                m_plater->export_deposition_geometry();
+            else if (m_print_select == eExportDepositionObj)
+                m_plater->export_deposition_geometry();
             else if (m_print_select == eSendGcode)
                 wxPostEvent(m_plater, SimpleEvent(EVT_GLTOOLBAR_SEND_GCODE));
             else if (m_print_select == eUploadGcode)
@@ -2538,14 +2547,15 @@ bool MainFrame::get_enable_print_status()
         }
         enable = enable && !is_all_plates;
     }
-    else if (m_print_select == eExportGcode || m_print_select == eExportDepositionStl)
+    else if (m_print_select == eExportGcode || m_print_select == eExportDepositionStl ||
+             m_print_select == eExportDepositionStep || m_print_select == eExportDepositionObj)
     {
         if (!current_plate->is_slice_result_valid())
         {
             enable = false;
         }
         enable = enable && !is_all_plates;
-        if (m_print_select == eExportDepositionStl)
+        if (m_print_select != eExportGcode)
             enable = enable && m_plater->printer_technology() == ptFFF &&
                      !m_plater->is_background_process_slicing() && m_plater->get_ui_job_worker().is_idle();
     }
@@ -3112,9 +3122,9 @@ void MainFrame::init_menubar_as_editor()
             [this](wxCommandEvent&) { if (m_plater) m_plater->export_gcode(false); }, "menu_export_gcode", nullptr,
             [this]() {return can_export_gcode(); }, this);
 
-        append_menu_item(export_menu, wxID_ANY, _L("Export printed extrusion as STL") + dots,
-            _L("Reconstruct the current G-code as one nominal extrusion mesh, including infill and air gaps"),
-            [this](wxCommandEvent&) { if (m_plater) m_plater->export_deposition_stl(); }, "menu_export_toolpaths", nullptr,
+        append_menu_item(export_menu, wxID_ANY, _L("Export geometry") + dots,
+            _L("Export the current G-code's nominal extrusion geometry as STL, STEP or OBJ"),
+            [this](wxCommandEvent&) { if (m_plater) m_plater->export_deposition_geometry(); }, "menu_export_toolpaths", nullptr,
             [this]() { return can_export_gcode(); }, this);
 
         append_menu_item(export_menu, wxID_ANY, _L("Export toolpaths as OBJ") + dots, _L("Export toolpaths as OBJ"),

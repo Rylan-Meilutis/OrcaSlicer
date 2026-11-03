@@ -37,6 +37,9 @@ namespace Slic3r {
 
 class Print;
 struct GCodeDispatchData;
+class DepositionProvenance;
+class DepositionSections;
+namespace Thermoelastic { class NativeOwnershipSnapshot; }
 
 // For a filament whose density is not set, in g/cm³.
 inline constexpr float DEFAULT_FILAMENT_DENSITY = 1.245f;
@@ -267,6 +270,17 @@ inline constexpr float DEFAULT_FILAMENT_DENSITY = 1.245f;
             // Shared target snapshot, not measured heater temperatures. Copies
             // of moves made by timing/post-processing retain this association.
             unsigned int temperature_targets_id{0};
+            // Generation-local source. Provisional until deposition_provenance
+            // is published after the complete output transcript is verified.
+            std::uint32_t deposition_source_id{0};
+            // Verified emission-time nominal scarf design heights (mm), not E-derived.
+            std::optional<std::array<double, 2>> deposition_design_heights;
+            std::optional<float> deposition_design_width;
+            std::uint32_t deposition_command_section_id{0};
+            // Authenticated positive-E brick motion with no XY footprint.
+            // Keep its Travel type/timing; analysis must retain unresolved
+            // material instead of inventing a volumetric bead.
+            bool deposition_vertical_extrusion{false};
 
             float volumetric_rate() const { return feedrate * mm3_per_mm; }
             float actual_volumetric_rate() const { return actual_feedrate * mm3_per_mm; }
@@ -313,6 +327,22 @@ inline constexpr float DEFAULT_FILAMENT_DENSITY = 1.245f;
 
         std::string filename;
         std::shared_ptr<const GCodeDispatchData> dispatch_data;
+        std::shared_ptr<const DepositionProvenance> deposition_provenance;
+        std::shared_ptr<const DepositionSections> deposition_sections;
+        struct DepositionZSpan {
+            std::size_t move_index;
+            std::uint32_t source_id, command_id;
+            std::array<double, 2> z_mm;
+            std::array<float, 2> preview_z_mm;
+        };
+        static constexpr std::size_t maximum_deposition_z_spans = 8 * 1024 * 1024 / sizeof(DepositionZSpan);
+        // Sparse, ordered, generation-bound analysis coordinates for commands
+        // with an explicit lower surface. Rendering retains its float vertices.
+        std::vector<DepositionZSpan> deposition_z_spans;
+        std::uint64_t deposition_z_generation = 0;
+        const DepositionZSpan* deposition_z_for_move(std::size_t move_index) const noexcept;
+        std::string deposition_sections_failure;
+        std::shared_ptr<const Thermoelastic::NativeOwnershipSnapshot> native_ownership;
         unsigned int id;
         std::vector<MoveVertex> moves;
         // Maximum principal tensile stress at each move, in MPa. An empty
@@ -426,6 +456,12 @@ inline constexpr float DEFAULT_FILAMENT_DENSITY = 1.245f;
         {
             filename = std::forward<Other>(other).filename;
             dispatch_data = std::forward<Other>(other).dispatch_data;
+            deposition_provenance = std::forward<Other>(other).deposition_provenance;
+            deposition_sections = std::forward<Other>(other).deposition_sections;
+            deposition_z_spans = std::forward<Other>(other).deposition_z_spans;
+            deposition_z_generation = other.deposition_z_generation;
+            deposition_sections_failure = std::forward<Other>(other).deposition_sections_failure;
+            native_ownership = std::forward<Other>(other).native_ownership;
             id = std::forward<Other>(other).id;
             moves = std::forward<Other>(other).moves;
             thermal_stress_mpa = std::forward<Other>(other).thermal_stress_mpa;
@@ -1371,6 +1407,15 @@ inline constexpr float DEFAULT_FILAMENT_DENSITY = 1.245f;
         Print* m_print{ nullptr };
 
         GCodeProcessorResult m_result;
+        std::uint32_t m_deposition_source_id = 0;
+        std::uint32_t m_deposition_section_id = 0;
+        struct SectionChild {
+            std::size_t move;
+            std::uint32_t section;
+            std::array<double, 3> start, end;
+        };
+        std::vector<SectionChild> m_section_children;
+        bool m_section_children_valid = true;
         static unsigned int s_result_id;
 
     public:
@@ -1430,6 +1475,26 @@ inline constexpr float DEFAULT_FILAMENT_DENSITY = 1.245f;
             m_result.moves.emplace_back(GCodeProcessorResult::MoveVertex());
         }
         void process_buffer(const std::string& buffer);
+        // Only the live export stream supplies these IDs; imported comments
+        // never establish source identity. Called on the processing thread.
+        void set_deposition_source(std::uint32_t id) noexcept
+        {
+            m_result.deposition_provenance.reset();
+            m_result.native_ownership.reset();
+            m_deposition_source_id = id;
+        }
+        // The caller verifies the independent control transcript after joining
+        // generation. Null or incompatible registries discard all provisional IDs.
+        void finish_deposition_provenance(std::shared_ptr<const DepositionProvenance> verified_registry);
+        void set_deposition_section(std::uint32_t id) noexcept
+        {
+            m_result.deposition_sections.reset();
+            m_result.deposition_z_spans.clear();
+            m_result.deposition_z_generation = 0;
+            m_deposition_section_id = id;
+        }
+        // Call before finalize adds display-only vertices. Publication is all-or-nothing.
+        void finish_deposition_sections(std::shared_ptr<const DepositionSections> registry);
         void finalize(bool post_process);
 
         double get_time(PrintEstimatedStatistics::ETimeMode mode) const;

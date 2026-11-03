@@ -7,6 +7,7 @@
 #include "Circle.hpp"
 #include "Config.hpp"
 #include "GCode/GCodeProcessor.hpp"
+#include "GCode/DepositionSection.hpp"
 #include "Flow.hpp"
 #include "GCode/ThumbnailData.hpp"
 #include "GCode/ToolOrdering.hpp"
@@ -40,6 +41,11 @@
 #include "IMEXHelpers.hpp"
 #include "GCode.hpp"
 #include "GCode/ToolMapping.hpp"
+#include "GCode/DepositionProvenance.hpp"
+#include "ThermoelasticSourceOwnership.hpp"
+#include "ThermoelasticMesh.hpp"
+#include <charconv>
+#include <string_view>
 #include <boost/nowide/fstream.hpp>
 #include "NonplanarSurface.hpp"
 #include <cstdio>
@@ -2872,7 +2878,21 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
 
     m_processor.initialize(path_tmp);
     m_processor.set_print(print);
+    m_deposition_provenance.reset();
+    m_deposition_sections.reset();
+    m_deposition_sections_valid = true;
+    m_deposition_sections_failure.clear();
+    m_deposition_source_ids.clear();
+    m_deposition_expected_events.clear();
+    m_deposition_instance.reset();
+    m_deposition_assignment = DepositionSource::Assignment::Unknown;
+    if (m_deposition_provenance_enabled && !print->config().spiral_mode.value && print->config().time_lapse_gcode.value.empty())
+        m_deposition_provenance = std::make_shared<DepositionProvenance>();
     GCodeOutputStream file(boost::nowide::fopen(path_tmp.c_str(), "wb"), m_processor);
+    if (m_deposition_provenance)
+        file.enable_provenance(m_deposition_provenance->generation());
+    if (m_deposition_provenance && !print->config().belt_printer.value && !m_writer.has_axis_remap())
+        m_deposition_sections = std::make_shared<DepositionSections>(m_deposition_provenance->generation());
     if (! file.is_open()) {
         // TRN %1% is a file path.
         std::string err_msg = Slic3r::format(_(L("G-code export to %1% failed.\nCannot open the file for writing.")), path) + "\n";
@@ -2899,6 +2919,19 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
     try {
         this->_do_export(*print, file, thumbnail_cb);
         file.flush();
+        if (m_deposition_sections) {
+            m_deposition_sections->seal();
+            if (!file.finish_sections(*m_deposition_sections)) {
+                m_deposition_sections_failure = "Section control transcript mismatch; emitted commands=" + std::to_string(m_deposition_sections->size());
+                m_deposition_sections.reset();
+            } else if (!m_deposition_sections_valid)
+                m_deposition_sections.reset();
+        }
+        if (m_deposition_provenance) {
+            m_deposition_provenance->seal();
+            if (!file.finish_provenance(m_deposition_provenance, m_deposition_expected_events))
+                m_deposition_provenance.reset();
+        }
         if (file.is_error()) {
             file.close();
             boost::nowide::remove(path_tmp.c_str());
@@ -2995,7 +3028,30 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
     // single-nozzle prints, where the injector is gated off anyway (enable_pre_heating false).
     m_processor.result().nozzle_group_result = m_print->get_layered_nozzle_group_result();
 
+    if (m_deposition_provenance_enabled)
+        m_processor.finish_deposition_sections(m_deposition_sections);
+    if (!m_deposition_sections_failure.empty())
+        m_processor.result().deposition_sections_failure = m_deposition_sections_failure;
     m_processor.finalize(true);
+    if (m_deposition_provenance_enabled)
+        m_processor.finish_deposition_provenance(m_deposition_provenance);
+    if (m_processor.result().deposition_provenance && !print->config().belt_printer.value &&
+        print->get_imex_slice_offset().isZero()) {
+        // Capture while this export still owns the matching immutable Print.
+        // Writer/processor plate and nozzle offsets cancel in Cartesian preview
+        // space; native instance shifts are retained by the snapshot factory.
+        try {
+            m_processor.result().native_ownership = std::make_shared<const Thermoelastic::NativeOwnershipSnapshot>(
+                Thermoelastic::capture_native_ownership(*print, m_processor.result().deposition_provenance,
+                    Point(0, 0), 0., {}, [print] { print->throw_if_canceled(); }));
+        } catch (const CanceledException &) {
+            throw;
+        } catch (const Thermoelastic::ResourceLimit &error) {
+            BOOST_LOG_TRIVIAL(warning) << "Native deposition ownership unavailable: " << error.what();
+        } catch (const std::invalid_argument &error) {
+            BOOST_LOG_TRIVIAL(warning) << "Native deposition ownership unavailable: " << error.what();
+        }
+    }
     if (m_dispatch_data && m_dispatch_data->valid) {
         try {
             boost::nowide::ifstream generated(path_tmp, std::ios::binary);
@@ -4417,6 +4473,15 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
         file.write(m_writer.set_additional_fan(0));
     }
 
+    // Dedicated firmware protocol: never approximate cooldown with sliced time
+    // or overload M106 parameters accepted differently by older firmware.
+    if (print.config().support_rme_indx_dock_fan_cooldown.value) {
+        if (print.config().rme_indx_dock_fan_cooldown.value)
+            file.write("M979 S1 C" + std::to_string(std::clamp(print.config().rme_indx_dock_fan_cooldown_time.value, 30, 1800)) +
+                       " ; RME INDX firmware-managed dock-fan cooldown\n");
+        else
+            file.write("M979 S0 ; return dock fan to firmware manual mode\n");
+    }
     std::string machine_start_gcode = this->placeholder_parser_process("machine_start_gcode", print.config().machine_start_gcode.value, initial_extruder_id);
     if (print.config().gcode_flavor != gcfKlipper) {
         // Set bed temperature if the start G-code does not contain any bed temp control G-codes.
@@ -5212,7 +5277,9 @@ void GCode::process_layers(
             check_placeholder_parser_failed();
             print.throw_if_canceled();
             m_extrusion_quality_estimator.set_precomputed_layers(std::move(precomputed.overhang_layers));
-            return this->process_layer(print, layer.second, layer_tools, &layer == &layers_to_print.back(), &print_object_instances_ordering, tool_ordering.get_most_used_extruder(), size_t(-1));
+            auto result = this->process_layer(print, layer.second, layer_tools, &layer == &layers_to_print.back(), &print_object_instances_ordering, tool_ordering.get_most_used_extruder(), size_t(-1));
+            record_deposition_events(result.gcode);
+            return result;
         });
     if (m_spiral_vase) {
         float nozzle_diameter  = EXTRUDER_CONFIG(nozzle_diameter);
@@ -5309,7 +5376,9 @@ void GCode::process_layers(
             check_placeholder_parser_failed();
             print.throw_if_canceled();
             m_extrusion_quality_estimator.set_precomputed_layers(std::move(precomputed.overhang_layers));
-            return this->process_layer(print, { std::move(layer) }, tool_ordering.tools_for_layer(layer.print_z()), &layer == &layers_to_print.back(), nullptr, tool_ordering.get_most_used_extruder(), single_object_idx, prime_extruder);
+            auto result = this->process_layer(print, { std::move(layer) }, tool_ordering.tools_for_layer(layer.print_z()), &layer == &layers_to_print.back(), nullptr, tool_ordering.get_most_used_extruder(), single_object_idx, prime_extruder);
+            record_deposition_events(result.gcode);
+            return result;
         });
     if (m_spiral_vase) {
         float nozzle_diameter  = EXTRUDER_CONFIG(nozzle_diameter);
@@ -6142,6 +6211,11 @@ std::string GCode::generate_object_brim(const Print &print, const PrintObject &o
     }
 
     if (!first_layer)
+        return {};
+
+    if (print.config().brim_filament.value > 0 &&
+        (m_writer.filament() == nullptr || m_writer.filament()->id() !=
+            static_cast<unsigned int>(print.config().brim_filament.value - 1)))
         return {};
 
     auto emit_brim = [this](const ExtrusionEntityCollection& brim, const std::vector<ObjectInstanceID>& instances) {
@@ -7707,12 +7781,30 @@ LayerResult GCode::process_layer(
         }
 
         auto &filament_plan = filament_to_print_instances[extruder_id];
+        // A dedicated brim tool may have no model or support paths. Emit its
+        // instance brims here, after tool selection, rather than waiting for a
+        // model visit that will never occur. The brim map deduplicates groups.
+        if (first_layer && !print.config().belt_printer && print.config().brim_filament.value > 0 &&
+            extruder_id == static_cast<unsigned int>(print.config().brim_filament.value - 1)) {
+            const Vec2d saved_origin = m_origin;
+            for (const LayerToPrint &ltp : layers) {
+                const PrintObject *owner = ltp.object();
+                if (owner == nullptr) continue;
+                for (size_t instance = 0; instance < owner->instances().size(); ++instance) {
+                    if (single_object_instance_idx != size_t(-1) && instance != single_object_instance_idx) continue;
+                    gcode += generate_object_brim(print, *owner, instance, true, ltp.object_layer);
+                }
+            }
+            this->set_origin(saved_origin);
+        }
         std::vector<InstanceToPrint>     &instances_to_print = filament_plan.first;
         const std::vector<InstanceVisit> &instance_visits    = filament_plan.second;
 
         // We are almost ready to print. However, we must go through all the objects twice to print the overridden extrusions first (infill/perimeter wiping feature):
         std::vector<ObjectByExtruder::Island::Region> by_region_per_copy_cache;
         for (int print_wipe_extrusions = is_anything_overridden; print_wipe_extrusions>=0; --print_wipe_extrusions) {
+            m_deposition_assignment = print_wipe_extrusions ? DepositionSource::Assignment::WipingOverride :
+                DepositionSource::Assignment::NominalRole;
             if (is_anything_overridden && print_wipe_extrusions == 0)
                 gcode+="; PURGING FINISHED\n";
 
@@ -7720,6 +7812,9 @@ LayerResult GCode::process_layer(
                 InstanceToPrint &instance_to_print = instances_to_print[visit.instance_idx];
                 const auto& inst = instance_to_print.print_object.instances()[instance_to_print.instance_id];
                 const LayerToPrint &layer_to_print = layers[instance_to_print.layer_id];
+                m_deposition_instance = std::make_pair(
+                    std::uint64_t(instance_to_print.print_object.get_id()),
+                    std::uint64_t(instance_to_print.instance_id));
                 if (visit.first_visit && print_wipe_extrusions == (is_anything_overridden ? 1 : 0)) {
                     gcode += generate_object_skirt_group(print, instance_to_print.print_object, instance_to_print.instance_id, layer_tools, layer, extruder_id);
                     const PrintObject &vobj = instance_to_print.print_object;
@@ -8252,6 +8347,7 @@ LayerResult GCode::process_layer(
             }
         }
 
+        m_deposition_assignment = DepositionSource::Assignment::Unknown;
         // Mixed-color sublayer extrusion: if this extruder is a component of a mixed sublayer
         // group, extrude the mixed slot's geometry at the appropriate sub-Z with scaled flow.
         // Ported from BambuStudio and adapted to Orca's instance loop and its finer-grained
@@ -9263,6 +9359,9 @@ std::string GCode::extrude_loop(const ExtrusionLoop&        loop_ref,
                 primer.height = target_height;
                 for (Point3 &point : primer.polyline.points)
                     point.z() = target_z;
+                // This is a newly aligned seam primer, not the projected
+                // upper surface certified by the copied ContourZ path.
+                primer.contour_z_generated = false;
                 primer.z_contoured = target_z != 0;
                 primer.staggered_perimeter = false;
                 primer.nonplanar_surface = false;
@@ -9428,6 +9527,8 @@ std::string GCode::extrude_loop(const ExtrusionLoop&        loop_ref,
                 const auto seam_connector = [](const Point3 &from, const Point3 &to,
                                                const ExtrusionPath &before, const ExtrusionPath &after) {
                     ExtrusionPath connector(Polyline3(Points3{from, to}), before);
+                    // Endpoint interpolation is not a ContourZ projection.
+                    connector.contour_z_generated = false;
                     connector.set_extrusion_role(erPerimeter);
                     connector.z_contoured = before.z_contoured || after.z_contoured;
                     connector.staggered_perimeter = before.staggered_perimeter || after.staggered_perimeter;
@@ -9998,6 +10099,7 @@ std::string GCode::extrude_perimeters(const Print &print, const std::vector<Obje
             const bool should_print = arc_anchor_pass ? !is_infill_first :
                 (is_first_layer ? !is_infill_first : (m_config.is_infill_first == is_infill_first));
             if (!should_print) continue;
+            const std::size_t provenance_begin = gcode.size();
 
             if (!replace_unsupported_perimeters) {
                 const bool brick_mode = m_config.perimeter_layering.value == PerimeterLayeringMode::Brick;
@@ -10174,6 +10276,7 @@ std::string GCode::extrude_perimeters(const Print &print, const std::vector<Obje
             };
             for (const ExtrusionEntity *entity : region.perimeters)
                 extrude_anchor_perimeters(*entity);
+            wrap_deposition_region(gcode, provenance_begin, &region - &by_region.front());
             continue;
             }
             // Build the printed prefix once in emission order, scoped to this
@@ -10211,6 +10314,7 @@ std::string GCode::extrude_perimeters(const Print &print, const std::vector<Obje
                 if (wipe_support)
                     wipe_support->append(*ee);
             }
+            wrap_deposition_region(gcode, provenance_begin, &region - &by_region.front());
         }
     m_outer_seam_plans.clear();
     m_inner_seam_fallback_loops.clear();
@@ -10242,6 +10346,7 @@ std::string GCode::extrude_infill(const Print &print, const std::vector<ObjectBy
                     extrusions.emplace_back(ee);
             if (! extrusions.empty()) {
                 m_config.apply(print.get_print_region(&region - &by_region.front()).config());
+                const std::size_t provenance_begin = gcode.size();
                 // Different arc-overhang collections on the same layer share
                 // prior_arc_paths and may therefore depend on their generation
                 // order. Preserve that order just as we preserve paths inside
@@ -10265,6 +10370,7 @@ std::string GCode::extrude_infill(const Print &print, const std::vector<ObjectBy
                         gcode += this->extrude_entity_nonplanar_filtered(
                             *fill, extrusion_name, false);
                 }
+                wrap_deposition_region(gcode, provenance_begin, &region - &by_region.front());
             }
         }
     return gcode;
@@ -10278,6 +10384,8 @@ std::string GCode::extrude_nonplanar_surface(
     if (!feature_course) {
         for (const ObjectByExtruder::Island::Region &region : by_region) {
             m_config.apply(print.get_print_region(&region - &by_region.front()).config());
+            if (m_config.is_infill_first)
+                continue;
             for (const ExtrusionEntity *entity : region.perimeters)
                 gcode += this->extrude_entity_nonplanar_filtered(
                     *entity, "non-planar perimeter", true, region.perimeters,
@@ -10293,6 +10401,11 @@ std::string GCode::extrude_nonplanar_surface(
         }
         for (const ObjectByExtruder::Island::Region &region : by_region) {
             m_config.apply(print.get_print_region(&region - &by_region.front()).config());
+            if (m_config.is_infill_first)
+                for (const ExtrusionEntity *entity : region.perimeters)
+                    gcode += this->extrude_entity_nonplanar_filtered(
+                        *entity, "non-planar perimeter", true, region.perimeters,
+                        before_current_layer, false);
             for (const ExtrusionEntity *entity : region.infills)
                 if (entity->role() == erIroning)
                     gcode += this->extrude_entity_nonplanar_filtered(
@@ -10501,8 +10614,176 @@ bool GCode::GCodeOutputStream::is_error() const
     return ::ferror(this->f);
 }
 
+bool GCode::deposition_source_transformed() const
+{
+    return m_config.perimeter_layering.value != PerimeterLayeringMode::Standard ||
+        m_config.top_surface_z_mode.value != TopSurfaceZMode::Disabled ||
+        m_config.seam_slope_type.value != SeamScarfType::None || m_config.zaa_enabled.value ||
+        m_config.nonplanar_infill.value || m_config.infill_combination.value ||
+        m_config.thick_bridges.value || m_config.thick_internal_bridges.value ||
+        m_config.flush_into_objects.value || m_config.flush_into_infill.value;
+}
+
+void GCode::wrap_deposition_region(std::string& gcode, std::size_t begin, std::size_t region)
+{
+    if (!m_deposition_provenance || !m_deposition_instance || !m_layer ||
+        m_nonplanar_transition_planning || gcode.size() == begin || !m_writer.filament()) return;
+    if ((begin != 0 && gcode[begin - 1] != '\n') || gcode.back() != '\n')
+        throw std::runtime_error("Deposition provenance requires complete generated lines.");
+    const bool transformed = deposition_source_transformed();
+    const auto height = transformed ? DepositionSource::Height::Transformed : DepositionSource::Height::NativePlanar;
+    const auto filament = std::uint32_t(m_writer.filament()->id());
+    const DepositionSourceKey key{m_deposition_instance->first, m_deposition_instance->second,
+        std::uint64_t(m_layer->id()), std::uint64_t(region), filament, std::uint64_t(height),
+        std::uint64_t(m_deposition_assignment)};
+    auto found = m_deposition_source_ids.find(key);
+    if (found == m_deposition_source_ids.end()) {
+        const auto id = m_deposition_provenance->add({key[0], key[1], key[2], key[3], filament, height,
+                                                    m_deposition_assignment});
+        found = m_deposition_source_ids.emplace(key, id).first;
+    }
+    // Regions are assembled after per-copy wiping overrides and tool selection.
+    // Private markers are stripped at the output boundary, never written to disk.
+    gcode.insert(begin, m_deposition_provenance->begin(found->second));
+    gcode += m_deposition_provenance->clear();
+}
+
+void GCode::record_deposition_events(const std::string& gcode)
+{
+    if (!m_deposition_provenance) return;
+    const std::string prefix = ";_ORCA_INTERNAL_SOURCE:" + std::to_string(m_deposition_provenance->generation()) + ":";
+    std::size_t position = 0;
+    while (position < gcode.size()) {
+        const auto end = gcode.find('\n', position);
+        const auto length = (end == std::string::npos ? gcode.size() : end) - position;
+        const std::string_view line(gcode.data() + position, length);
+        if (line.substr(0, prefix.size()) == prefix) {
+            std::uint32_t id = 0;
+            const auto parsed = std::from_chars(line.data() + prefix.size(), line.data() + line.size(), id);
+            if (parsed.ec != std::errc{} || parsed.ptr != line.data() + line.size() ||
+                (id != 0 && !m_deposition_provenance->source(id)))
+                throw std::runtime_error("Invalid generated deposition provenance.");
+            if (m_deposition_expected_events.size() == DepositionProvenanceDecoder::maximum_events)
+                throw std::length_error("Deposition provenance event budget exceeded.");
+            m_deposition_expected_events.push_back(id);
+        }
+        if (end == std::string::npos) break;
+        position = end + 1;
+    }
+}
+
+void GCode::emit_deposition_section(std::string& gcode, const Vec3d& target, double extrusion,
+    const std::string& description, bool no_extrusion, double width, double start_height, double end_height, bool xy_only,
+    const std::optional<Vec2d>& arc_offset, bool arc_ccw,
+    const std::optional<std::array<double, 2>>& nominal_lower_z, DepositionCommandSection::Transform transform,
+    DepositionCommandSection::Purpose purpose)
+{
+    std::uint32_t id = 0;
+    const double emitted_extrusion = m_config.use_relative_e_distances.value ? GCodeFormatter::quantize_e(extrusion) :
+        GCodeFormatter::quantize_e(m_writer.filament()->E() + extrusion) - GCodeFormatter::quantize_e(m_writer.filament()->E());
+    if (m_deposition_sections && m_deposition_sections_valid && !no_extrusion && extrusion > 0. &&
+        emitted_extrusion > 0. && m_sub_layer_flow_ratio <= 0.) {
+        DepositionCommandSection section;
+        const Vec3d start = m_writer.get_position();
+        const auto offset = m_writer.get_xy_offset();
+        for (std::size_t axis = 0; axis < 3; ++axis) {
+            const double shift = axis < 2 ? offset[axis] : 0.;
+            // Match the parser input precision: Klipper reads precise decimal
+            // axes; other flavors widen the reader's float values to double.
+            // Divide the emitted decimal integer by its exact scale. The
+            // formatter's reciprocal multiplication can differ from parsing
+            // that decimal by one double ULP, breaking exact arc endpoints.
+            const double scale = GCodeFormatter::pow_10[GCodeFormatter::XYZF_EXPORT_DIGITS];
+            section.start[axis] = std::round((start[axis] - shift) * scale) / scale;
+            section.end[axis] = std::round((target[axis] - shift) * scale) / scale;
+            if (axis < 2 && m_config.gcode_flavor.value != gcfKlipper) {
+                section.start[axis] = float(section.start[axis]);
+                section.end[axis] = float(section.end[axis]);
+            }
+        }
+        section.width = width;
+        section.transform = transform;
+        section.purpose = purpose;
+        section.start_height = start_height;
+        section.end_height = end_height;
+        if (nominal_lower_z) {
+            section.nominal_lower_z = nominal_lower_z;
+            section.start_height = section.start[2] - (*nominal_lower_z)[0];
+            section.end_height = section.end[2] - (*nominal_lower_z)[1];
+        }
+        section.filament = m_writer.filament()->id();
+        if (arc_offset) {
+            section.arc_direction = arc_ccw ? 1 : -1;
+            for (std::size_t axis = 0; axis < 2; ++axis)
+                section.arc_center[axis] = section.start[axis] + float(GCodeFormatter::quantize_xyzf((*arc_offset)[axis]));
+        }
+        // Rounding can collapse a tiny scarf move to stationary positive E.
+        // Keep that command unchanged and spatially unresolved; do not invent
+        // a bead or invalidate valid geometry belonging to other commands.
+        try { if (section.start != section.end) id = m_deposition_sections->add(section); }
+        catch (const std::invalid_argument& error) {
+            m_deposition_sections_valid = false;
+            std::ostringstream detail;
+            detail.precision(17);
+            detail << error.what() << " after command " << m_deposition_sections->size()
+                   << " role=" << unsigned(m_last_processor_extrusion_role) << " filament=" << section.filament
+                   << " layer=" << (m_layer ? std::to_string(m_layer->id()) : "none")
+                   << " startZ=" << section.start[2] << " endZ=" << section.end[2]
+                   << " height=" << section.start_height << "," << section.end_height
+                   << " intendedZ=" << start.z() << "," << target.z();
+            if (section.nominal_lower_z)
+                detail << " lowerZ=" << (*section.nominal_lower_z)[0] << "," << (*section.nominal_lower_z)[1];
+            m_deposition_sections_failure = detail.str();
+        }
+        catch (const std::length_error& error) {
+            m_deposition_sections_valid = false;
+            m_deposition_sections_failure = std::string(error.what()) + " after command " + std::to_string(m_deposition_sections->size());
+        }
+    }
+    if (id) gcode += m_deposition_sections->marker(id);
+    if (arc_offset)
+        m_writer.extrude_arc_to_xy(gcode, target.head<2>(), *arc_offset, extrusion, arc_ccw, description, no_extrusion);
+    else if (xy_only)
+        m_writer.extrude_to_xy(gcode, target.head<2>(), extrusion, description, no_extrusion);
+    else
+        m_writer.extrude_to_xyz(gcode, target, extrusion, description, no_extrusion);
+    if (id) gcode += m_deposition_sections->marker(0);
+}
+
+void GCode::GCodeOutputStream::enable_provenance(std::uint64_t generation)
+{
+    m_provenance_capture = std::make_unique<DepositionProvenanceCapture>(generation);
+    m_section_capture = std::make_unique<DepositionSectionCapture>(generation);
+}
+
+bool GCode::GCodeOutputStream::finish_sections(const DepositionSections& registry)
+{
+    this->flush();
+    return m_section_capture && m_section_capture->finish(registry);
+}
+
+bool GCode::GCodeOutputStream::finish_provenance(std::shared_ptr<const DepositionProvenance> registry,
+                                               const std::vector<std::uint32_t>& expected)
+{
+    this->flush();
+    return m_provenance_capture && m_provenance_capture->finish(std::move(registry), expected);
+}
+
+void GCode::GCodeOutputStream::write_plain(const std::string& data)
+{
+    if (data.empty()) return;
+    if (m_provenance_capture) m_processor.set_deposition_source(m_provenance_capture->source_id());
+    if (m_section_capture) m_processor.set_deposition_section(m_section_capture->active());
+    fwrite(data.data(), 1, data.size(), f);
+    m_processor.process_buffer(data);
+}
+
 void GCode::GCodeOutputStream::flush()
 {
+    if (!m_pending_line.empty()) {
+        if (!m_provenance_capture->consume(m_pending_line) && !m_section_capture->consume(m_pending_line)) write_plain(m_pending_line);
+        m_pending_line.clear();
+    }
     ::fflush(this->f);
 }
 
@@ -10516,6 +10797,37 @@ void GCode::GCodeOutputStream::close()
 
 void GCode::GCodeOutputStream::write(const char *what)
 {
+    if (what != nullptr && m_provenance_capture) {
+        constexpr std::size_t maximum_line_bytes = 1024 * 1024;
+        std::string ordinary;
+        const char* cursor = what;
+        while (*cursor != '\0') {
+            const char* newline = std::strchr(cursor, '\n');
+            const std::size_t length = newline ? std::size_t(newline - cursor) + 1 : std::strlen(cursor);
+            if (length > maximum_line_bytes - m_pending_line.size())
+                throw std::length_error("Deposition provenance line budget exceeded.");
+            m_pending_line.append(cursor, length);
+            cursor += length;
+            if (newline == nullptr) break;
+            // Flush the preceding run with its OLD context before consuming a
+            // boundary. Ordinary lines remain batched for the existing parser.
+            if (m_pending_line.rfind(";_ORCA_INTERNAL_SOURCE", 0) == 0 ||
+                m_pending_line.rfind(";_ORCA_INTERNAL_SECTION", 0) == 0) {
+                write_plain(ordinary);
+                ordinary.clear();
+                if (!m_provenance_capture->consume(m_pending_line)) m_section_capture->consume(m_pending_line);
+            } else {
+                ordinary += m_pending_line;
+                if (ordinary.size() >= maximum_line_bytes) {
+                    write_plain(ordinary);
+                    ordinary.clear();
+                }
+            }
+            m_pending_line.clear();
+        }
+        write_plain(ordinary);
+        return;
+    }
     if (what != nullptr) {
         const char* gcode = what;
         // writes string to file
@@ -10662,13 +10974,21 @@ std::string GCode::_extrude(const ExtrusionPath &input_path, const std::string &
                             bool validate_nonplanar_clearance)
 {
     std::string gcode;
-    auto machine_points = [this](const ExtrusionPath &candidate, bool planar) {
+    const auto clearance_position = [this](const Vec3d &point) {
+        if (!m_nonplanar_transition_planning)
+            return point;
+        const auto serialized = m_writer.quantized_clearance_position(point);
+        if (!serialized)
+            throw SlicingError(_(L("Non-planar clearance requires finite Cartesian coordinates without axis remapping.")));
+        return *serialized;
+    };
+    auto machine_points = [this, &clearance_position](const ExtrusionPath &candidate, bool planar) {
         std::vector<Vec3d> points;
         points.reserve(candidate.polyline.points.size());
         for (const Point3 &point : candidate.polyline.points) {
             const Vec2d xy = this->point_to_gcode(point.to_point());
-            points.emplace_back(xy.x(), xy.y(), m_nominal_z +
-                (planar ? 0. : unscale_(point.z())));
+            points.emplace_back(clearance_position(Vec3d(xy.x(), xy.y(), m_nominal_z +
+                (planar ? 0. : unscale_(point.z())))));
         }
         return points;
     };
@@ -10955,8 +11275,11 @@ std::string GCode::_extrude(const ExtrusionPath &input_path, const std::string &
         if (m_last_pos_defined &&
             (input_path.nonplanar_surface ||
              m_nonplanar_clearance_active_this_layer)) {
-            const Vec2d target_xy = point_to_gcode(first_point);
-            const double target_z = z == DBL_MAX ? m_nominal_z : z;
+            const Vec2d nominal_xy = point_to_gcode(first_point);
+            const Vec3d target = clearance_position(Vec3d(nominal_xy.x(), nominal_xy.y(),
+                z == DBL_MAX ? m_nominal_z : z));
+            const Vec2d target_xy = target.head<2>();
+            const double target_z = target.z();
             // Arachne and clipping may divide one continuous variable-width
             // wall into adjacent ExtrusionPaths whose endpoints differ by a
             // few microns.  These are not independent travel moves: the
@@ -10967,7 +11290,7 @@ std::string GCode::_extrude(const ExtrusionPath &input_path, const std::string &
             // coincident XYZ continuation; larger XY gaps and Z steps still
             // receive the full collision check below.
             constexpr double nonplanar_join_tolerance = 0.05;
-            const Vec3d current_position = m_writer.get_position();
+            const Vec3d current_position = clearance_position(m_writer.get_position());
             const bool nearby_nonplanar_continuation =
                 input_path.nonplanar_surface &&
                 (current_position.head<2>() - target_xy).norm() <=
@@ -11724,6 +12047,44 @@ std::string GCode::_extrude(const ExtrusionPath &input_path, const std::string &
     // the planned layer height so it shows the additional material as a wider
     // line instead of retaining the unadjusted path width.
     float processor_width = path.width;
+    // Brims have command evidence but no invented model source. Other ordinary
+    // XY commands need a design envelope when their region is transformed.
+    // Neither branch certifies native material ownership.
+    const bool capture_brim_section = m_deposition_sections && path.role() == erBrim && !path.z_contoured &&
+        sloped == nullptr && !path.staggered_perimeter && !path.staggered_transition &&
+        !path.nonplanar_surface && !path.nonplanar_schedule_owned && !path.nonplanar_transition &&
+        !path.nonplanar_feature_transition && !path.nonplanar_infill && !path.nonplanar_interlocking_wall &&
+        !path.shrinkage_compensation && !path.smooth_outer_wall;
+    const auto planar_purpose = capture_brim_section ? DepositionCommandSection::Purpose::AuxiliaryBrim :
+        DepositionCommandSection::Purpose::Model;
+    const bool capture_planar_section = capture_brim_section || (m_deposition_sections && deposition_source_transformed() &&
+        (path.role() == erPerimeter || path.role() == erExternalPerimeter || path.role() == erOverhangPerimeter || path.role() == erInternalInfill ||
+         path.role() == erSolidInfill || path.role() == erTopSolidInfill || path.role() == erBottomSurface ||
+         path.role() == erBridgeInfill || path.role() == erInternalBridgeInfill || path.role() == erGapFill));
+    // Authenticate only native brick courses, not a brick preview role shared
+    // with draped/compensated geometry. The scheduled path height includes the
+    // entry/exit course adjustment; neither Z offset nor E measures thickness.
+    const bool capture_brick_section = m_deposition_sections &&
+        (path.staggered_perimeter || path.staggered_transition) &&
+        !path.nonplanar_surface && !path.nonplanar_transition && !path.nonplanar_feature_transition &&
+        !path.nonplanar_infill && !path.nonplanar_interlocking_wall && !path.shrinkage_compensation &&
+        sloped == nullptr;
+    // ContourZ changes the upper surface, not the original native base. This
+    // is geometric provenance, not a thickness reconstructed from endpoint E.
+    // Other users of z_contoured (including ironing) must not acquire it.
+    // Localized shrinkage only changes XY before ContourZ; its preview marker
+    // does not invalidate the subsequently projected top or native lower base.
+    std::optional<std::array<double, 2>> contour_lower_z;
+    if (m_deposition_sections && path.contour_z_generated && path.z_contoured && m_layer &&
+        (path.role() == erPerimeter || path.role() == erExternalPerimeter || path.role() == erTopSolidInfill) &&
+        path.height == float(m_layer->height) && m_nominal_z == m_layer->print_z + m_config.z_offset.value &&
+        sloped == nullptr && !path.staggered_perimeter && !path.staggered_transition && !path.smooth_outer_wall &&
+        !path.nonplanar_surface && !path.nonplanar_schedule_owned && !path.nonplanar_replacement_remainder &&
+        !path.nonplanar_transition && !path.nonplanar_feature_transition && !path.nonplanar_leveling_transition &&
+        !path.nonplanar_infill && !path.nonplanar_interlocking_wall) {
+        const double base = std::round((m_layer->bottom_z() + m_config.z_offset.value) * 1e6) / 1e6;
+        contour_lower_z = std::array<double, 2>{base, base};
+    }
     if (use_inner_walls_flow && path.height > EPSILON) {
         const double extra_area =
             path.mm3_per_mm * (inner_walls_flow - 1.);
@@ -12006,24 +12367,52 @@ std::string GCode::_extrude(const ExtrusionPath &input_path, const std::string &
                         if (z < 0.1) {
                             throw RuntimeError("GCode: very low z");
                         }
-                        m_writer.extrude_to_xyz(gcode, Vec3d(dest2d.x(), dest2d.y(), z), e,
-                                                flow_description.empty() ? description : flow_description);
+                        if (capture_brick_section)
+                            emit_deposition_section(gcode, Vec3d(dest2d.x(), dest2d.y(), z), e,
+                                flow_description.empty() ? description : flow_description, false,
+                                processor_width, path.height, path.height, false, {}, false, {},
+                                DepositionCommandSection::Transform::BrickCourse);
+                        else if (contour_lower_z)
+                            emit_deposition_section(gcode, Vec3d(dest2d.x(), dest2d.y(), z), e,
+                                flow_description.empty() ? description : flow_description, false,
+                                processor_width, path.height, path.height, false, {}, false, contour_lower_z);
+                        else
+                            m_writer.extrude_to_xyz(gcode, Vec3d(dest2d.x(), dest2d.y(), z), e,
+                                                    flow_description.empty() ? description : flow_description);
 
                     } else if (sloped == nullptr) {
                         // Normal extrusion
-                        m_writer.extrude_to_xy(gcode,
-                            this->point_to_gcode(line.b.to_point()),
-                            dE,
-                            flow_description.empty() ? description : flow_description, path.is_force_no_extrusion());
+                        const auto destination = this->point_to_gcode(line.b.to_point());
+                        if (capture_planar_section)
+                            emit_deposition_section(gcode, Vec3d(destination.x(), destination.y(), m_writer.get_position().z()), dE,
+                                flow_description.empty() ? description : flow_description, path.is_force_no_extrusion(),
+                                processor_width, path.height, path.height, true, {}, false, {},
+                                DepositionCommandSection::Transform::Ordinary, planar_purpose);
+                        else
+                            m_writer.extrude_to_xy(gcode, destination, dE,
+                                flow_description.empty() ? description : flow_description, path.is_force_no_extrusion());
                     } else {
                         // Sloped extrusion
-                        const auto [z_ratio, e_ratio] = sloped->interpolate(path_length / total_length);
+                        const auto slope_start = sloped->interpolate((path_length - line_length) / total_length);
+                        const auto slope_end = sloped->interpolate(path_length / total_length);
+                        const auto [z_ratio, e_ratio] = slope_end;
+                        std::optional<std::array<double, 2>> nominal_lower_z;
+                        if (slope_start.z_ratio == slope_start.e_ratio && slope_end.z_ratio == slope_end.e_ratio &&
+                            m_layer && path.height == float(m_layer->height) &&
+                            m_nominal_z == m_layer->print_z + m_config.z_offset.value) {
+                            // Canonicalize the independently known native base
+                            // to the analysis geometry's existing nanometre grid.
+                            const double base = std::round((m_layer->bottom_z() + m_config.z_offset.value) * 1e6) / 1e6;
+                            nominal_lower_z = std::array<double, 2>{base, base};
+                        }
                         Vec2d dest2d = this->point_to_gcode(line.b.to_point());
                         Vec3d dest3d(dest2d(0), dest2d(1), get_sloped_z(z_ratio));
-                        m_writer.extrude_to_xyz(gcode,
+                        emit_deposition_section(gcode,
                             dest3d,
                             dE * e_ratio,
-                            flow_description.empty() ? description : flow_description, path.is_force_no_extrusion());
+                            flow_description.empty() ? description : flow_description, path.is_force_no_extrusion(),
+                            processor_width, path.height * slope_start.e_ratio,
+                            path.height * e_ratio, false, {}, false, nominal_lower_z);
                     }
                     check_and_insert_timelapse(line.b.to_point()); // Inline farthest-point snapshot
                 }
@@ -12051,10 +12440,15 @@ std::string GCode::_extrude(const ExtrusionPath &input_path, const std::string &
                                     flow_description = description + Slic3r::format(" | Old Flow Value: %0.5f Length: %0.5f",oldE, line_length);
                                 }
                             }
-                            m_writer.extrude_to_xy(gcode,
-                                this->point_to_gcode(line.b),
-                                dE,
-                                flow_description.empty() ? description : flow_description, path.is_force_no_extrusion());
+                            const auto destination = this->point_to_gcode(line.b);
+                            if (capture_planar_section)
+                                emit_deposition_section(gcode, Vec3d(destination.x(), destination.y(), m_writer.get_position().z()), dE,
+                                    flow_description.empty() ? description : flow_description, path.is_force_no_extrusion(),
+                                    processor_width, path.height, path.height, true, {}, false, {},
+                                    DepositionCommandSection::Transform::Ordinary, planar_purpose);
+                            else
+                                m_writer.extrude_to_xy(gcode, destination, dE,
+                                    flow_description.empty() ? description : flow_description, path.is_force_no_extrusion());
                             check_and_insert_timelapse(line.b); // Inline farthest-point snapshot
                         }
                         break;
@@ -12075,7 +12469,14 @@ std::string GCode::_extrude(const ExtrusionPath &input_path, const std::string &
                                 flow_description = description + Slic3r::format(" | Old Flow Value: %0.5f Length: %0.5f",oldE, arc_length);
                             }
                         }
-                        m_writer.extrude_arc_to_xy(gcode,
+                        if (capture_planar_section) {
+                            const auto destination = this->point_to_gcode(arc.end_point);
+                            emit_deposition_section(gcode, Vec3d(destination.x(), destination.y(), m_writer.get_position().z()),
+                                dE, flow_description.empty() ? description : flow_description, path.is_force_no_extrusion(),
+                                processor_width, path.height, path.height, true, center_offset,
+                                arc.direction == ArcDirection::Arc_Dir_CCW, {},
+                                DepositionCommandSection::Transform::Ordinary, planar_purpose);
+                        } else m_writer.extrude_arc_to_xy(gcode,
                             this->point_to_gcode(arc.end_point),
                             center_offset,
                             dE,
@@ -12220,16 +12621,42 @@ std::string GCode::_extrude(const ExtrusionPath &input_path, const std::string &
                 if (z < 0.1) {
                     throw RuntimeError("GCode: very low z");
                 }
-                m_writer.extrude_to_xyz(gcode, Vec3d(dest2d.x(), dest2d.y(), z), e,
-                                        flow_description.empty() ? description : flow_description);
+                if (capture_brick_section)
+                    emit_deposition_section(gcode, Vec3d(dest2d.x(), dest2d.y(), z), e,
+                        flow_description.empty() ? description : flow_description, false,
+                        processor_width, path.height, path.height, false, {}, false, {},
+                        DepositionCommandSection::Transform::BrickCourse);
+                else if (contour_lower_z)
+                    emit_deposition_section(gcode, Vec3d(dest2d.x(), dest2d.y(), z), e,
+                        flow_description.empty() ? description : flow_description, false,
+                        processor_width, path.height, path.height, false, {}, false, contour_lower_z);
+                else
+                    m_writer.extrude_to_xyz(gcode, Vec3d(dest2d.x(), dest2d.y(), z), e,
+                                            flow_description.empty() ? description : flow_description);
             } else if (sloped == nullptr) {
                 // Normal extrusion
-                m_writer.extrude_to_xy(gcode, p.head<2>(), dE, flow_description.empty() ? description : flow_description);
+                if (capture_planar_section)
+                    emit_deposition_section(gcode, Vec3d(p.x(), p.y(), m_writer.get_position().z()), dE,
+                        flow_description.empty() ? description : flow_description, false, processor_width, path.height, path.height, true,
+                        {}, false, {}, DepositionCommandSection::Transform::Ordinary, planar_purpose);
+                else
+                    m_writer.extrude_to_xy(gcode, p.head<2>(), dE, flow_description.empty() ? description : flow_description);
             } else {
                 // Sloped extrusion
-                const auto [z_ratio, e_ratio] = sloped->interpolate(path_length / total_length);
+                const auto slope_start = sloped->interpolate((path_length - line_length) / total_length);
+                const auto slope_end = sloped->interpolate(path_length / total_length);
+                const auto [z_ratio, e_ratio] = slope_end;
+                std::optional<std::array<double, 2>> nominal_lower_z;
+                if (slope_start.z_ratio == slope_start.e_ratio && slope_end.z_ratio == slope_end.e_ratio &&
+                    m_layer && path.height == float(m_layer->height) &&
+                    m_nominal_z == m_layer->print_z + m_config.z_offset.value) {
+                    const double base = std::round((m_layer->bottom_z() + m_config.z_offset.value) * 1e6) / 1e6;
+                    nominal_lower_z = std::array<double, 2>{base, base};
+                }
                 Vec3d dest3d(p(0), p(1), get_sloped_z(z_ratio));
-                m_writer.extrude_to_xyz(gcode, dest3d, dE * e_ratio, flow_description.empty() ? description : flow_description);
+                emit_deposition_section(gcode, dest3d, dE * e_ratio, flow_description.empty() ? description : flow_description,
+                    false, processor_width, path.height * slope_start.e_ratio,
+                    path.height * e_ratio, false, {}, false, nominal_lower_z);
             }
 
             // Inline farthest-point snapshot on the segmented emission path. Inert unless the

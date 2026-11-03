@@ -1078,6 +1078,11 @@ public:
     std::vector<ObjectID> print_object_ids() const override;
 
     ApplyStatus         apply(const Model &model, DynamicPrintConfig config, bool extruder_applied = false) override;
+    enum class ApplyPurpose { Normal, PrivateCandidate };
+    // Private evaluations supply an explicit candidate config. Skip only the
+    // heuristic policy pass, not the persisted Auto flag used by brim/path
+    // generation. This purpose is per-call and is never saved in the project.
+    ApplyStatus         apply(const Model &model, DynamicPrintConfig config, bool extruder_applied, ApplyPurpose purpose);
 
     void                process(long long *time_cost_with_cache = nullptr, bool use_cache = false) override;
     // Exports G-code into a file name based on the path_template, returns the file path of the generated G-code file.

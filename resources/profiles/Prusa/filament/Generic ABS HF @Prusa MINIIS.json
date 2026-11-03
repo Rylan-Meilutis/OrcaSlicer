@@ -53,6 +53,7 @@
 		"3"
 	],
 	"compatible_printers": [
-		"Prusa MINIIS 0.4 nozzle"
+		"Prusa MINIIS 0.4 nozzle",
+		"Prusa MINI RME 0.4 nozzle"
 	]
 }

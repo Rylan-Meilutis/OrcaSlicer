@@ -27,6 +27,10 @@ Status completed_print(const std::string &file_json, const std::string &expected
                        const std::string &server_key, CompletedPrint &result);
 std::string file_sha1(const std::string &path, const std::function<void()> &checkpoint = {});
 std::string server_key(const std::string &host);
+// With no declared setup revision, learn only within an exact-file cohort.
+// G-code supplies configuration identity but cannot identify external firmware/macros.
+std::string compatibility_context(const std::string &server, const std::string &revision,
+                                  const std::string &gcode_hash);
 
 // At most 128 observations / 1 MiB. Credentials and printer URLs are never
 // persisted. Writes use a private sibling and atomic rename; no large files.

@@ -18,6 +18,7 @@
 #include "PrintConfig.hpp"
 #include "Config.hpp"
 #include "GCode/MachineKinematics.hpp"
+#include <optional>
 #include <memory>
 
 namespace Slic3r {
@@ -167,6 +168,9 @@ public:
     void set_axis_remap(int rx, int ry, int rz);
     void set_build_volume_max(const Vec3d &max);
     bool has_axis_remap() const;
+    // Actual serialized XYZ, expressed back in the untranslated logical frame.
+    // No inverse is assumed for belt/custom/remapped machine kinematics.
+    std::optional<Vec3d> quantized_clearance_position(const Vec3d &position) const;
 
     // Install the machine frame mapping.  Any axis remap / build volume already
     // configured is carried over, so install order does not matter.

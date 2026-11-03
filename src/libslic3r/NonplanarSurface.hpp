@@ -21,6 +21,12 @@ class LayerRegion;
 class SupportLayer;
 class ExtrusionPath;
 class ExtrusionEntity;
+class ExtrusionLoop;
+
+// Cyclically move a complete native wall seam to an existing highest vertex.
+// Preserve every directed XYZ segment and its flow metadata; reject open or
+// disconnected input without modification. This is not a clearance certificate.
+bool rotate_native_nonplanar_wall_seam(ExtrusionLoop &loop);
 
 // Absolute machine-space waypoints, including start and destination. Validate
 // departure, traverse and approach separately; a clear traverse alone is not
@@ -64,7 +70,19 @@ std::vector<ExtrusionEntity *> project_nonplanar_source_course(
     const ExPolygons &surface_projection, const std::vector<uint8_t> &facets,
     const ExPolygons &course_domain, coordf_t destination_owner_z,
     double maximum_drape_height,
-    const NonplanarCourseProjection *course = nullptr);
+    const NonplanarCourseProjection *course = nullptr,
+    bool *projection_complete = nullptr);
+
+// Generate the configured native solid pattern on this course's printable
+// interior, not by relabelling/thinning another course. Projection is atomic;
+// actual predecessor support and clearance still require separate validation.
+std::vector<ExtrusionEntity *> generate_nonplanar_solid_course(
+    LayerRegion &source_region, const sla::IndexedMesh &mesh,
+    const ExPolygons &surface_projection, const std::vector<uint8_t> &facets,
+    const ExPolygons &fill_domain, const NonplanarCourseProjection &course,
+    coordf_t destination_owner_z, double maximum_drape_height,
+    double layer_height, size_t course_index, bool top, bool &complete,
+    ExPolygons *required_deposition = nullptr);
 
 // Index of the first solid course required by layer count and physical shell
 // thickness. Zero uses the whole available stack; any additional required

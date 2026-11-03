@@ -28,6 +28,8 @@ public:
     size_t apply(PrintObject &object, const std::function<void()> &cancel, const Progress &progress = {},
                  std::vector<ContactResult> *z_contacts = nullptr) const;
 private:
+    size_t apply_impl(PrintObject &object, const std::function<void()> &cancel, const Progress &progress,
+                      std::vector<ContactResult> *z_contacts) const;
     size_t apply_xy(PrintObject &object, const std::function<void()> &cancel,
                    const std::vector<std::vector<ExPolygons>> &beams, const Progress &progress) const;
     std::vector<std::vector<ExPolygons>> m_slices; // layer, region

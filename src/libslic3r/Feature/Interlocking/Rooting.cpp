@@ -1,4 +1,5 @@
 #include "Rooting.hpp"
+#include "InterlockingGenerator.hpp"
 #include "libslic3r/BoundingBox.hpp"
 #include "libslic3r/ExPolygon.hpp"
 #include "libslic3r/Line.hpp"
@@ -27,6 +28,9 @@ namespace Slic3r {
 namespace {
 bool different_root_materials(const PrintObject &object, size_t a, size_t b)
 {
+    if (object.printing_region(a).config().manual_support.value ||
+        object.printing_region(b).config().manual_support.value)
+        return false;
     const auto first = object.printing_region(a).extruder(frExternalPerimeter);
     const auto second = object.printing_region(b).extruder(frExternalPerimeter);
     const auto &types = object.print()->config().filament_type;
@@ -128,6 +132,17 @@ double root_wall_clearance(const PrintObject &object, const PrintRegion &region,
 }
 
 size_t Rooting::apply(PrintObject &object, const std::function<void()> &cancel, const Progress &progress,
+                     std::vector<ContactResult> *z_contacts) const
+{
+    const size_t count = apply_impl(object, cancel, progress, z_contacts);
+    // Root skins and collars can sever an otherwise connected beam. Validate
+    // the combined result against the native body, not against beam additions.
+    if (!m_slices.empty())
+        InterlockingGenerator::restore_disconnected_material(&object, m_slices, cancel);
+    return count;
+}
+
+size_t Rooting::apply_impl(PrintObject &object, const std::function<void()> &cancel, const Progress &progress,
                      std::vector<ContactResult> *z_contacts) const
 {
     if (z_contacts) z_contacts->clear();
@@ -800,8 +815,25 @@ size_t Rooting::apply_xy(PrintObject &object, const std::function<void()> &cance
                                     return std::find(course.begin(), course.end(), false) != course.end();
                                 })) continue;
                                 for (size_t i = 0; i < additions.size(); ++i) {
-                                    layers[bottom + i]->get_region(host)->slices.set(diff_ex(from[i], additions[i]), stInternal);
-                                    layers[bottom + i]->get_region(donor)->slices.set(union_ex(to[i], additions[i]), stInternal);
+                                    // Clipping against independently rounded rotated
+                                    // material boundaries can leave a one-grid-unit
+                                    // slit at the attachment. Join only at the integer
+                                    // polygon grid (2 nm), before printable-core
+                                    // connectivity is checked. Retain the original
+                                    // donor outline; do not relax that connectivity test.
+                                    const auto merged = union_ex(to[i], additions[i]);
+                                    // Existing beam teeth already define their
+                                    // attachment and must not be rounded again.
+                                    ExPolygons repair;
+                                    if (beam_band.empty()) {
+                                        repair = intersection_ex(diff_ex(closing_ex(merged, 2.), merged),
+                                            intersection_ex(offset_ex(to[i], 2.), offset_ex(additions[i], 2.)));
+                                        repair = intersection_ex(repair, union_ex(from[i], to[i]));
+                                    }
+                                    const auto transferred = union_ex(additions[i], repair);
+                                    const auto joined = union_ex(to[i], transferred);
+                                    layers[bottom + i]->get_region(host)->slices.set(diff_ex(from[i], transferred), stInternal);
+                                    layers[bottom + i]->get_region(donor)->slices.set(joined, stInternal);
                                     // Reserve the attachment as well as the roots so
                                     // later trees cannot cut off an earlier network.
                                     occupied[bottom + i] = union_ex(occupied[bottom + i],

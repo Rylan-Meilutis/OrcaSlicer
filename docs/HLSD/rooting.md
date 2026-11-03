@@ -18,6 +18,17 @@ purge towers are explicitly excluded. Objects without eligible material pairs do
 not acquire rooting-only interface shells or root-failure warnings. Changing a
 material type or an object's purge-tower role invalidates rooting geometry.
 
+The `manual_support` region option marks manually modeled support without
+changing its mesh type, material or normal slicing behavior. It defaults to
+false and can be inherited from an object or overridden on a part. Both Z/XY
+rooting and beam interlocking skip every contact pair touching a marked region;
+other eligible pairs remain enabled. The option participates in region equality
+and configuration persistence, so marked and unmarked parts using the same
+filament cannot be merged into one region. Changing it invalidates slicing.
+The checkbox is under Objects → Multimaterial → Advanced for the selected
+object or part. It uses the normal setting edit/undo and project-save paths;
+the global process row is hidden to avoid marking unrelated objects globally.
+
 Failed Z contacts are aggregated into one warning per object listing affected
 parts. A single affected part retains its direct selection link; a multi-part
 summary links to the owning assembly. Successful contacts and excluded pairs
@@ -94,9 +105,27 @@ another root's beam attachment. Third-material regions are never reclaimed.
 Artificial beam interfaces therefore cannot recursively seed roots. Roots never
 seed other roots during the same slice either.
 
+Combined structural geometry is checked again after root growth. Components
+must intersect their own native material somewhere through adjacent layers;
+regions using the same filament are considered together. Disconnected additions
+are restored to the original material ownership, not deleted from the part.
+Before connectivity checks, unassigned native pockets are restored to their
+original owners and every region is restricted to the native overall footprint.
+This final check matters because root skins can sever a beam that was connected
+when the beam generator finished. Attachment cores use the wall generator's
+minimum-feature width, including overlap between courses, so a vanishing neck
+or interlayer contact cannot anchor a large addition. Rejected cores are expanded
+back within their original envelopes; valid outlines are not opened or smoothed.
+A second exact-connectivity pass restores detached boundary remnants. These
+geometric checks do not establish joint strength, and regression checks also
+examine the generated extrusion footprints.
+Thin-area expansion and gap closing at beam interfaces are clipped to the
+original pair's footprint so internal material transfers cannot fill native
+holes or exterior notches.
+
 Native upper geometry, including its top layers, is unchanged when beams are
 disabled. In combined mode the beam-only geometry above the root attachment
-is preserved instead. Buried branches may extend
+is preserved except for disconnected additions restored by the final check. Buried branches may extend
 beyond the contact patch only where a full protective top skin remains.
 Per-course clearance checks include host side walls, native material above and
 below the branch, and third-material regions. This preserves ledges, holes,

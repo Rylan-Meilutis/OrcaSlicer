@@ -1661,6 +1661,19 @@ void ViewerImpl::refresh_visibility()
     m_settings.update_colors = true;
 }
 
+void ViewerImpl::set_thermal_stress_samples(const std::vector<float>& samples_mpa)
+{
+    for (PathVertex& vertex : m_vertices) {
+        const float value = vertex.source_move_id < samples_mpa.size() ?
+            samples_mpa[vertex.source_move_id] : -1.0f;
+        vertex.thermal_stress_mpa = std::isfinite(value) && value >= 0.0f ? value : -1.0f;
+    }
+    // The range cache is keyed by visibility, not by scalar data. A new
+    // analysis can change every value without changing either visibility mask.
+    m_settings_used_for_ranges.reset();
+    m_settings.update_colors = true;
+}
+
 void ViewerImpl::set_view_visible_range(Interval::value_type min, Interval::value_type max)
 {
     // force update of the full range, to avoid clamping the visible range with full old values

@@ -1008,6 +1008,11 @@ void ToolOrdering::collect_extruders(const PrintObject &object, const std::vecto
         }
     }
 
+    if (!object.print()->config().belt_printer && object.print()->config().brim_filament.value > 0 &&
+        object.print()->has_brim() && !object.layers().empty())
+        this->tools_for_layer(object.layers().front()->print_z).extruders.push_back(
+            static_cast<unsigned int>(object.print()->config().brim_filament.value));
+
     // Belt brim apron bands own their layers outright: they print below the
     // object's first layer, so no object or support layer claims an extruder there
     // and process_layer() would bail out at "Nothing to extrude".  Claim the

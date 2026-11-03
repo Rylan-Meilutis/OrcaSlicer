@@ -5,6 +5,7 @@
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 #include "test_helpers.hpp"
 #include "libslic3r/Config.hpp"
+#include "libslic3r/BrimEarsPoint.hpp"
 #include "libslic3r/CoolingAssistant.hpp"
 #include "libslic3r/Model.hpp"
 #include "libslic3r/Print.hpp"
@@ -252,6 +253,52 @@ TEST_CASE("Automatic warp mitigation changes effective adhesion without changing
     CHECK(std::any_of(warnings.begin(), warnings.end(), [](const auto &warning) {
         return warning.opt_key == "automatic_warp_mitigation" && warning.is_warning;
     }));
+}
+
+TEST_CASE("Private mitigation candidates preserve explicit settings without repeating Auto policy", "[WarpMitigation][PrivateCandidate]")
+{
+    const auto brim = GENERATE(btPainted, btEar);
+    auto config = Test::multifilament_config(1, {
+        {"filament_type", "ASA"}, {"automatic_warp_mitigation", "1"},
+        {"brim_width", "1"}, {"brim_object_gap", "0.2"},
+        {"enable_overhang_speed", "0"}, {"slowdown_for_curled_perimeters", "0"}});
+    config.set_key_value("brim_type", new ConfigOptionEnum<BrimType>(brim));
+    Model model;
+    Print normal;
+    Test::init_print({make_cube(80., 70., 1.)}, normal, model, config);
+    const auto risk = assess_warp_risk(config, model);
+    REQUIRE(risk.elevated());
+    REQUIRE(risk.brim_mm() > 1.);
+    model.objects.front()->brim_points.emplace_back(0.f, 0.f, 0.f, 3.f);
+    const auto original_config = config;
+    const Model original_model(model);
+    Print candidate;
+    candidate.set_status_silent();
+    candidate.apply(model, config, false, Print::ApplyPurpose::PrivateCandidate);
+    REQUIRE(candidate.objects().size() == 1);
+    CHECK(candidate.config().automatic_warp_mitigation.value);
+    CHECK(candidate.objects().front()->config().brim_type.value == brim);
+    CHECK_THAT(candidate.objects().front()->config().brim_width.value, WithinAbs(1., 1e-9));
+    CHECK_THAT(candidate.objects().front()->config().brim_object_gap.value, WithinAbs(.2, 1e-9));
+    CHECK_FALSE(candidate.full_print_config().option<ConfigOptionBoolsNullable>("enable_overhang_speed")->get_at(0));
+    CHECK_FALSE(candidate.full_print_config().option<ConfigOptionBoolsNullable>("slowdown_for_curled_perimeters")->get_at(0));
+    CHECK(candidate.model().objects.front()->brim_points == original_model.objects.front()->brim_points);
+
+    // The purpose is per-call, not sticky state: the existing virtual entry
+    // point must still run the normal policy on this very same Print.
+    PrintBase &normal_entry = candidate;
+    normal_entry.apply(model, config);
+    CHECK(candidate.config().automatic_warp_mitigation.value);
+    CHECK_THAT(candidate.objects().front()->config().brim_width.value, WithinAbs(risk.brim_mm(), 1e-9));
+    CHECK(candidate.objects().front()->config().brim_type.value == (brim == btEar ? btEar : btOuterOnly));
+    CHECK(candidate.full_print_config().option<ConfigOptionBoolsNullable>("enable_overhang_speed")->get_at(0));
+    CHECK(candidate.full_print_config().option<ConfigOptionBoolsNullable>("slowdown_for_curled_perimeters")->get_at(0));
+    CHECK(config.diff(original_config).empty());
+    CHECK(model.objects.front()->config.get().diff(original_model.objects.front()->config.get()).empty());
+    CHECK(model.objects.front()->brim_points == original_model.objects.front()->brim_points);
+    CHECK(model.objects.front()->volumes.front()->mesh().its.vertices == original_model.objects.front()->volumes.front()->mesh().its.vertices);
+    CHECK(model.objects.front()->volumes.front()->mesh().its.indices == original_model.objects.front()->volumes.front()->mesh().its.indices);
+    CHECK_FALSE(candidate.is_step_done(psSlicingFinished));
 }
 
 TEST_CASE("Unused susceptible filament does not change PLA adhesion", "[WarpMitigation]")

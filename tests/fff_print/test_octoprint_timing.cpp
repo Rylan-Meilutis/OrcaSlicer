@@ -13,6 +13,22 @@
 
 using namespace Slic3r;
 
+TEST_CASE("Automatic timing identity isolates files when the firmware setup is unknown", "[OctoPrintTiming]")
+{
+    const std::string server(40, 'a'), first(40, 'b'), second(40, 'c');
+    const auto automatic = OctoPrintTiming::compatibility_context(server, "", first);
+    REQUIRE_FALSE(automatic.empty());
+    CHECK(automatic != OctoPrintTiming::compatibility_context(server, "", second));
+    CHECK(automatic != OctoPrintTiming::compatibility_context(second, "", first));
+    CHECK(OctoPrintTiming::compatibility_context(server, "setup-1", first) ==
+          OctoPrintTiming::compatibility_context(server, "setup-1", second));
+    CHECK(OctoPrintTiming::compatibility_context(server, "setup-1", first) !=
+          OctoPrintTiming::compatibility_context(server, "setup-2", first));
+    CHECK(OctoPrintTiming::compatibility_context("", "", first).empty());
+    CHECK(OctoPrintTiming::compatibility_context(server, "", "").empty());
+    CHECK(OctoPrintTiming::compatibility_context(server, std::string(257, 'x'), first).empty());
+}
+
 TEST_CASE("OctoPrint timing accepts only exact-file successful last attempts", "[OctoPrintTiming]")
 {
     const std::string hash(40, 'a'), server(40, 'b');

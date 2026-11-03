@@ -46,6 +46,7 @@ void validate(const Segment &s, double resolution)
         throw std::runtime_error(_u8L("G-code contains undefined bead dimensions or a bead narrower than its height."));
     if ((s.end - s.start).head<2>().squaredNorm() < 1e-12f)
         throw std::runtime_error(_u8L("Stationary extrusion has no reconstructable spatial bead path."));
+    if (resolution == 0.) return; // Separate-bead exports have no voxel sampling grid.
     if (resolution > .5 * std::min(double(s.width), double(s.height)) + 1e-7)
         throw std::runtime_error(_u8L("Choose a voxel size no larger than half the smallest extrusion width or layer height."));
     if (s.width / resolution > 100000000. || s.height / resolution > 100000000. ||
@@ -131,7 +132,7 @@ void triangle(std::ostream &out, const openvdb::Vec3s &a, const openvdb::Vec3s &
 }
 } // namespace
 
-Snapshot snapshot(const GCodeProcessorResult &gcode, const Options &o, const std::function<void()> &check)
+Snapshot snapshot(const GCodeProcessorResult &gcode, const Options &o, const std::function<void()> &check, bool validate_sampling)
 {
     validate(o);
     std::size_t count = 0;
@@ -149,7 +150,7 @@ Snapshot snapshot(const GCodeProcessorResult &gcode, const Options &o, const std
                 }
                 continue;
             }
-            validate(Segment{gcode.moves[i-1].position, m.position, m.width, m.height}, o.voxel_size_mm);
+            validate(Segment{gcode.moves[i-1].position, m.position, m.width, m.height}, validate_sampling ? o.voxel_size_mm : 0.);
             if (++count > o.max_segments || count > o.max_memory_bytes / (2 * sizeof(Segment)))
                 throw std::runtime_error(_u8L("Deposition snapshot exceeds the memory or segment budget."));
         } else if (m.type == EMoveType::Unretract && m.delta_extruder > 0.f)
@@ -164,7 +165,8 @@ Snapshot snapshot(const GCodeProcessorResult &gcode, const Options &o, const std
         const auto &m = gcode.moves[i];
         if (m.type == EMoveType::Extrude &&
             (m.position-gcode.moves[i-1].position).head<2>().squaredNorm()>=1e-12f)
-            result.segments.push_back({gcode.moves[i-1].position, m.position, m.width, m.height});
+            result.segments.push_back({gcode.moves[i-1].position, m.position, m.width, m.height,
+                                       m.gcode_id, m.extruder_id, m.cp_color_id});
     }
     if (check) check();
     return result;
@@ -249,6 +251,11 @@ void export_tile(const Snapshot &input, const std::vector<std::size_t> *selected
             if(tile) { z0=std::max(z0,tile->low[2]); z1=std::min(z1,tile->high[2]); }
             for (int b = b0; b <= b1; ++b) for (int z = z0; z <= z1; ++z) {
                 tick();
+                const openvdb::Coord p(along_x?a:b,along_x?b:a,z);
+                const float previous = accessor.getValue(p);
+                // Union is a minimum of clamped distances. A sample already
+                // at the lower clamp cannot change, even for a sloping bead.
+                if (previous <= float(-band)) continue;
                 const double x = (along_x?a:b)*h, y = (along_x?b:a)*h;
                 double u = std::clamp(((x-s.start.x())*dx+(y-s.start.y())*dy)/length2,0.,1.);
                 const double disc_radius=(double(s.width)-s.height)*.5;
@@ -295,9 +302,8 @@ void export_tile(const Snapshot &input, const std::vector<std::size_t> *selected
                 // curved surfaces and resolvable gaps are not expanded.
                 if (dz==0. && disc_radius>0. && side==0. && std::abs(distance)<=flat_z_uncertainty)
                     distance=-h*1e-7;
-                const openvdb::Coord p(along_x?a:b,along_x?b:a,z);
                 const float value = float(std::max(-band,distance));
-                if (value >= accessor.getValue(p)) continue;
+                if (value >= previous) continue;
                 if (!grid->tree().probeLeaf(p)) {
                     std::size_t growth = 2*(sizeof(Leaf)+Leaf::SIZE*sizeof(float)+128);
                     if (!grid->tree().probeNode<Lower>(p)) growth += 2*sizeof(Lower);

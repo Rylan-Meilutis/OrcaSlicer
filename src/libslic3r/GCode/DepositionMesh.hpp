@@ -26,6 +26,9 @@ struct Options {
 struct Segment {
     Eigen::Vector3f start, end;
     float width, height;
+    unsigned int gcode_id = 0;
+    unsigned int extruder_id = 0;
+    unsigned int color_id = 0;
 };
 struct Snapshot {
     std::vector<Segment> segments;
@@ -54,8 +57,10 @@ struct DegenerateTriangleError : std::runtime_error {
 
 // A small, owned snapshot, independent of preview visibility and result lifetime.
 // Arcs are already tessellated by GCodeProcessor. Includes every extrusion role.
+// Separate-bead writers disable voxel sampling validation, not dimension or
+// resource validation. export_stl always validates its own sampling resolution.
 Snapshot snapshot(const GCodeProcessorResult &, const Options & = {},
-                  const std::function<void()> &checkpoint = {});
+                  const std::function<void()> &checkpoint = {}, bool validate_sampling = true);
 
 // Nominal rounded-bead union, not CAD or measured printed geometry. Each bead is
 // segment + horizontal disc((width-height)/2) + sphere(height/2), shifted down

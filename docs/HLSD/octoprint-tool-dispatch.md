@@ -156,9 +156,13 @@ The preflight edit plan is capped at 32 MiB. A bounded streaming pass writes one
 private destination and verifies the source fingerprint again before the output
 can be published. Disk-space checks reserve system headroom and account for the
 additional spool-metadata rewrite. IMEX, SEMM, prime towers, nozzle preheating, logical nozzle-group
-templates, non-Marlin dialects, external processors and changed-tool sliced-3MF
-packaging use regeneration. Rejected preflight asks for Regenerate or Cancel on
-the main thread; it does not silently start a second slice. Different nozzle
+templates, non-Marlin dialects and external processors use regeneration.
+Changed-tool sliced-3MF packaging additionally preflights its material statistics
+and rejects opaque warning metadata that cannot safely be relabeled.
+Rejected preflight reports a fixed diagnostic category and asks for Regenerate
+or Cancel on the main thread; it does not silently start a second slice. Logs
+record only the category, never exception details that may contain private
+printer scripts. Unclassified failures retain a generic explanation. Different nozzle
 diameters receive a specific explanation before regeneration.
 
 Regeneration produces a separate temporary
@@ -172,9 +176,12 @@ slicing, G-code generation, spool metadata, packaging and copying. Script and
 plugin names are reported when those processors actually run.
 
 Physical-index spool metadata is embedded when spool-name embedding is enabled.
-Sliced 3MF packaging uses the mapped print and its G-code processor result,
-including used physical tool IDs and material metadata. It does not package
-the old logical preview file for changed mappings. Identity reuse packages the
+Regenerated sliced 3MF packaging uses the mapped print and its processor result.
+Certified fast reuse packages the separately remapped file, mapped model/config,
+and source logical material statistics projected into physical tool slots.
+Logical nozzle-group caches are replaced by the certified static physical nozzle
+identities. The source preview and its statistics are never mutated or cloned.
+It does not package the old logical preview file for changed mappings. Identity reuse packages the
 unchanged print and its existing processor result. Upload receives its own temporary copy so GUI
 cleanup cannot remove a queued job's input.
 

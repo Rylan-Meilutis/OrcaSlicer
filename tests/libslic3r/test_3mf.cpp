@@ -109,6 +109,65 @@ namespace Catch {
 
 using namespace Slic3r;
 
+TEST_CASE("Manual support object and part overrides survive a real project round trip", "[3mf][ManualSupport]")
+{
+    ScopedSlic3rTemporaryDir backup("manual_support_project");
+    Model model;
+    model.set_backup_path(backup.string());
+    auto *object = model.add_object("Assembly", "", make_cube(4., 4., 2.));
+    object->config.set("manual_support", true);
+    object->volumes.front()->name = "Inherited support";
+    auto cube = make_cube(4., 4., 2.);
+    cube.translate(4., 0., 0.);
+    auto *part = object->add_volume(cube);
+    part->name = "Normal part";
+    part->config.set("manual_support", false);
+    model.add_default_instances();
+    DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+    ScopedTemporaryFile file(".3mf");
+    StoreParams params;
+    params.path = file.string();
+    params.model = &model;
+    params.config = &config;
+    params.strategy = SaveStrategy::Zip64 | SaveStrategy::Silence;
+    REQUIRE(store_bbs_3mf(params));
+    CHECK(boost::filesystem::file_size(file.path()) < 1024 * 1024);
+    Model loaded;
+    ScopedTemporaryDir loaded_backup("manual_support_loaded");
+    loaded.set_backup_path(loaded_backup.string());
+    DynamicPrintConfig loaded_config;
+    ConfigSubstitutionContext substitutions{ForwardCompatibilitySubstitutionRule::Enable};
+    struct Resources {
+        PlateDataPtrs plates;
+        std::vector<Preset *> presets;
+        ~Resources() {
+            release_PlateData_list(plates);
+            for (Preset *preset : presets) delete preset;
+        }
+    } resources;
+    bool bbl = false, orca = false;
+    Semver version;
+    REQUIRE(load_bbs_3mf(params.path.c_str(), &loaded_config, &substitutions, &loaded,
+        &resources.plates, &resources.presets, &bbl, &orca, &version, nullptr,
+        LoadStrategy::LoadModel | LoadStrategy::LoadConfig));
+    REQUIRE(loaded.objects.size() == 1);
+    REQUIRE(loaded.objects.front()->config.has("manual_support"));
+    CHECK(loaded.objects.front()->config.get().opt_bool("manual_support"));
+    REQUIRE(loaded.objects.front()->volumes.size() == 2);
+    size_t explicit_parts = 0;
+    for (const auto *volume : loaded.objects.front()->volumes) {
+        if (volume->name == "Normal part") {
+            ++explicit_parts;
+            REQUIRE(volume->config.has("manual_support"));
+            CHECK_FALSE(volume->config.get().opt_bool("manual_support"));
+        } else {
+            CHECK(volume->name == "Inherited support");
+            CHECK_FALSE(volume->config.has("manual_support"));
+        }
+    }
+    CHECK(explicit_parts == 1);
+}
+
 TEST_CASE("Brim brush operations and project adhesion overrides survive saving", "[3mf][Brim]")
 {
     const bool legacy = GENERATE(false, true);

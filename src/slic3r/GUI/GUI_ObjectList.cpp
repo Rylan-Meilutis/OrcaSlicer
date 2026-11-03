@@ -94,6 +94,7 @@
 #include "libslic3r/Format/bbs_3mf.hpp"
 #include "libslic3r/Orient.hpp"
 #include "libslic3r/PrintConfig.hpp"
+#include "libslic3r/FilamentAssignment.hpp"
 
 #ifdef __WXMSW__
 #include "wx/uiaction.h"
@@ -1174,12 +1175,15 @@ void ObjectList::update_filament_in_config(const wxDataViewItem& item)
     take_snapshot(_u8L("Change Filament"));
 
     const int extruder = m_objects_model->GetExtruderNumber(item);
+    clear_uniform_feature_filament_overrides(*m_config);
     m_config->set_key_value("extruder", new ConfigOptionInt(extruder));
 
     // BBS
     if (item_type & itObject) {
         const int obj_idx = m_objects_model->GetIdByItem(item);
         for (ModelVolume* mv : (*m_objects)[obj_idx]->volumes) {
+            if (mv->is_model_part())
+                clear_uniform_feature_filament_overrides(mv->config);
             if (mv->config.has("extruder"))
                 mv->config.erase("extruder");
         }
@@ -6889,6 +6893,7 @@ void ObjectList::set_extruder_for_selected_items(const int extruder)
                 auto mv = (*m_objects)[obj_idx]->volumes[i];
                 if (mv->is_cut_connector()) {
                     ModelConfig &config = mv->config;
+                    clear_uniform_feature_filament_overrides(config);
                     if (config.has("extruder"))
                         config.set("extruder", new_extruder);
                     else
@@ -6897,6 +6902,7 @@ void ObjectList::set_extruder_for_selected_items(const int extruder)
             }
         } else {
             ModelConfig &config = get_item_config(item);
+            clear_uniform_feature_filament_overrides(config);
             if (config.has("extruder"))
                 config.set("extruder", new_extruder);
             else
@@ -6907,6 +6913,8 @@ void ObjectList::set_extruder_for_selected_items(const int extruder)
         if (type & itObject) {
             ObjectDataViewModelNode* node = (ObjectDataViewModelNode*)item.GetID();
             for (ModelVolume* mv : node->m_model_object->volumes) {
+                if (mv->is_model_part())
+                    clear_uniform_feature_filament_overrides(mv->config);
                 if (mv->type() == ModelVolumeType::MODEL_PART && mv->config.has("extruder"))
                     mv->config.erase("extruder");
             }

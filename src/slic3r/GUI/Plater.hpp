@@ -571,8 +571,9 @@ public:
 
     void send_to_printer(bool isall = false);
     void export_gcode(bool prefer_removable);
-    void export_deposition_stl();
+    void export_deposition_geometry();
     void update_learned_time_estimate(unsigned int result_id, const std::string &filename);
+    void update_learned_time_estimate();
     std::string learned_timing_context() const;
     void export_gcode_3mf(bool export_all = false);
     void send_gcode_finish(wxString name);

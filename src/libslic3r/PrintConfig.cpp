@@ -5889,6 +5889,13 @@ void PrintConfigDef::init_fff_params()
     def->mode     = comAdvanced;
     def->set_default_value(new ConfigOptionFloat(0.));
 
+    def = this->add("manual_support", coBool);
+    def->label = L("Manual support");
+    def->tooltip = L("Treat this object or part as manually modeled support. Disable rooting and beam interlocking at contacts touching it, while preserving its geometry, filament assignments and normal slicing settings.");
+    def->category = L("Multimaterial");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionBool(false));
+
     def           = this->add("interlocking_beam", coBool);
     def->label    = L("Use beam interlocking");
     def->tooltip  = L("Generate interlocking beam structure at the locations where different filaments touch. This improves the adhesion between filaments, especially models printed in different materials.");
@@ -7928,6 +7935,30 @@ void PrintConfigDef::init_fff_params()
     def->set_default_value(new ConfigOptionInt(1));
 
 
+    def = this->add("support_rme_indx_dock_fan_cooldown", coBool);
+    def->label = L("Firmware supports RME INDX dock-fan cooldown");
+    def->category = L("Accessory");
+    def->tooltip = L("Enable only after installing firmware implementing the M979 dock-fan cooldown protocol. This capability is not detected automatically. Older firmware does not provide this control.");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionBool(false));
+
+    def = this->add("rme_indx_dock_fan_cooldown", coBool);
+    def->label = L("RME INDX automatic dock-fan cooldown");
+    def->category = L("Accessory");
+    def->tooltip = L("Requires RME INDX firmware implementing the M979 dock-fan cooldown protocol. Enables firmware-managed cooling after each tool is parked, including the final tool change. Do not enable with firmware that does not support M979.");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionBool(false));
+
+    def = this->add("rme_indx_dock_fan_cooldown_time", coInt);
+    def->label = L("Dock-fan minimum cooldown time");
+    def->category = L("Accessory");
+    def->tooltip = L("Minimum cooling time after the most recent tool parking event. Firmware must keep cooling longer when its thermal safety checks require it. This does not add a pause to the print.");
+    def->sidetext = L("s");
+    def->min = 30;
+    def->max = 1800;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionInt(180));
+
     def = this->add("file_start_gcode", coString);
     def->label = L("File header G-code");
     def->tooltip = L("G-code written at the very top of the output file, before any other content. "
@@ -8389,6 +8420,15 @@ void PrintConfigDef::init_fff_params()
     def->min = 0;
     def->max = 5000;
     def->mode = comDevelop;
+    def->set_default_value(new ConfigOptionInt(0));
+
+    def = this->add("brim_filament", coInt);
+    def->gui_type = ConfigOptionDef::GUIType::i_enum_open;
+    def->label = L("Brim filament");
+    def->category = L("Others");
+    def->tooltip = L("Filament used for this project's flat-plate brims, including brims around supports. Default preserves automatic filament selection. Skirts, rafts and belt-printer brims are unchanged.");
+    def->min = 0;
+    def->mode = comSimple;
     def->set_default_value(new ConfigOptionInt(0));
 
     def = this->add("support_filament", coInt);
