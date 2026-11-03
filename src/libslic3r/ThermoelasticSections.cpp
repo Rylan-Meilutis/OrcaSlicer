@@ -430,7 +430,8 @@ SectionMechanicalResult solve_section_source(double bed_z_m,
                             if (request.material != slab.material || sample_z < slab_bottom || sample_z >= slab_top)
                                 continue;
                             charge(footprint.vertex_count());
-                            const Point xy(std::llround(request.position_m.x() * 1e9), std::llround(request.position_m.y() * 1e9));
+                            const Point xy(static_cast<coord_t>(std::llround(request.position_m.x() * 1e9)),
+                                           static_cast<coord_t>(std::llround(request.position_m.y() * 1e9)));
                             bool contained;
                             if (exact) {
                                 const auto membership=exact_closed_contains_point(footprint.exact(),xy,exact_budget(),[&] { charge(0); });
@@ -1146,7 +1147,8 @@ SectionMechanicalResult solve_section_source(double bed_z_m,
     for (std::size_t request_index = 0; request_index < samples.size(); ++request_index) {
         charge();
         const auto& request = samples[request_index];
-        const Point xy(std::llround(request.position_m.x() * 1e9), std::llround(request.position_m.y() * 1e9));
+        const Point xy(static_cast<coord_t>(std::llround(request.position_m.x() * 1e9)),
+                       static_cast<coord_t>(std::llround(request.position_m.y() * 1e9)));
         const coord_t z = std::llround(request.position_m.z() * 1e9);
         std::optional<std::size_t> component;
         for (const auto provisional : sample_components[request_index]) {

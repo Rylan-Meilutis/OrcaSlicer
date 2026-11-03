@@ -498,7 +498,7 @@ SectionOwnership NativeOwnershipSnapshot::section(std::shared_ptr<const Depositi
                 if (work==limits.max_work) throw ResourceLimit("Scarf ownership work budget exceeded.");
                 ++work;
             });
-            const auto native = [](double v) { return std::llround(v * 1e9); };
+            const auto native = [](double v) -> coord_t { return std::llround(v * 1e9); };
             double envelope_bottom=mask.bottom_m,envelope_top=mask.top_m;
             if (brick) {
                 // The command authenticates the emitted transform, not a
