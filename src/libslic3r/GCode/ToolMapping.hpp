@@ -126,8 +126,12 @@ bool can_reuse_identity_tool_mapping(const DynamicPrintConfig &source,
 // All unrecognised differences fail closed. A successful comparison establishes
 // configuration equivalence only; custom scripts and generated tool references
 // still need certified replay before a changed assignment can reuse motion.
+// Optional nonempty, unique zero-based material IDs must come from the source
+// slice. They permit a derived nozzle-group cache to differ only for unused
+// materials; no material settings or physical nozzle checks are skipped.
 bool equivalent_tool_mapping_config(const DynamicPrintConfig &source,
                                     const DynamicPrintConfig &target,
-                                    const std::vector<int> &tools);
+                                    const std::vector<int> &tools,
+                                    const std::vector<unsigned int> *used_materials = nullptr);
 
 } // namespace Slic3r

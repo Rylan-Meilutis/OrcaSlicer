@@ -429,8 +429,9 @@ void BackgroundSlicingProcess::process_fff()
                         }
                     };
                     try {
+                        const auto used_materials = m_fff_print->extruders(true);
                         if (!equivalent_tool_mapping_config(m_fff_print->full_print_config(),
-                                m_dispatch_print->full_print_config(), m_dispatch_tools))
+                                m_dispatch_print->full_print_config(), m_dispatch_tools, &used_materials))
                             throw ToolMappingFailure(ToolMappingFailureReason::Configuration, "Mapped settings require regeneration.");
                         if (!m_gcode_result->dispatch_data)
                             throw ToolMappingFailure(ToolMappingFailureReason::MissingCapture, "Missing dispatch capture.");

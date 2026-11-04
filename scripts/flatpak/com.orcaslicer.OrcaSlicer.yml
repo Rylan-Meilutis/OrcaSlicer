@@ -148,6 +148,13 @@ modules:
       # be in place before the OrcaSlicer module configures, which this module
       # always precedes.
       - install -Dm755 uv/uv /app/share/OrcaSlicer/tools/uv/uv
+      # CI keeps the application build directory for its test artifact, but
+      # dependency sources and objects are no longer needed after installation.
+      # Keep /app intact; otherwise these intermediates exhaust runner storage
+      # while the application and its test binaries are being installed.
+      - du -sh /run/build/orca_deps/deps/build_flatpak
+      - rm -rf /run/build/orca_deps/deps/build_flatpak
+      - df -h / /app
 
     cleanup:
       - /include

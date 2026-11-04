@@ -870,7 +870,7 @@ bool prepare_tool_dispatch(wxWindow *parent, const Print &source, const DynamicP
         // writing anything; rejected replay asks again before regeneration.
         const bool reuse_gcode = can_reuse_identity_tool_mapping(
             source.full_print_config(), mapped->full_print_config(), tools) ||
-            equivalent_tool_mapping_config(source.full_print_config(), mapped->full_print_config(), tools);
+            equivalent_tool_mapping_config(source.full_print_config(), mapped->full_print_config(), tools, &used_materials);
         bool nozzle_changed = false;
         const auto &source_nozzles = source.config().nozzle_diameter;
         const auto &target_nozzles = mapped->config().nozzle_diameter;

@@ -215,10 +215,19 @@ TEST_CASE("An imported project retains applied settings across physical tool dis
     });
     bool is_bbl = false;
     Semver version;
+    int selected_plate_number = 0;
+    if (const char *selected_plate = std::getenv("ORCA_TOOL_MAPPING_PLATE")) {
+        std::size_t consumed = 0;
+        selected_plate_number = std::stoi(selected_plate, &consumed);
+        REQUIRE(consumed == std::string_view(selected_plate).size());
+        REQUIRE(selected_plate_number > 0);
+    }
     auto model = Model::read_from_file(path, &imported, &substitutions,
         LoadStrategy::LoadModel | LoadStrategy::LoadConfig | LoadStrategy::AddDefaultInstances,
-        &plates, &presets, &is_bbl, &version);
+        &plates, &presets, &is_bbl, &version, nullptr, nullptr, nullptr, selected_plate_number);
     REQUIRE_FALSE(model.objects.empty());
+    const std::size_t plate_index = selected_plate_number > 0 ? std::size_t(selected_plate_number - 1) : 0;
+    if (selected_plate_number > 0) REQUIRE(plate_index < plates.size());
     if (const char *reassign = std::getenv("ORCA_TOOL_MAPPING_REASSIGN"); reassign && std::string_view(reassign) == "1") {
         // Exercise explicit whole-part reassignment without modifying the user's
         // saved project. Existing mixed feature assignments remain untouched.
@@ -253,7 +262,7 @@ TEST_CASE("An imported project retains applied settings across physical tool dis
     }
     REQUIRE(bundle.filament_presets.size() == tools.size());
     DynamicPrintConfig plate;
-    if (!plates.empty()) plate = plates.front()->config;
+    if (!plates.empty()) plate = plates[plate_index]->config;
     auto source_config = bundle.full_config(false);
     source_config.apply(plate);
     Print source;
@@ -378,13 +387,18 @@ TEST_CASE("An imported project retains applied settings across physical tool dis
                 preview_colors_match_filaments &= move.cp_color_id == move.extruder_id;
             }
         std::set<unsigned int> expected_filaments;
-        for (unsigned int material = 0; material < tools.size(); ++material)
-            expected_filaments.insert(material);
+        if (selected_plate_number > 0) {
+            const auto used = source.extruders();
+            expected_filaments.insert(used.begin(), used.end());
+        } else
+            for (unsigned int material = 0; material < tools.size(); ++material)
+                expected_filaments.insert(material);
         CHECK(preview_filaments == expected_filaments);
         CHECK(preview_colors_match_filaments);
         REQUIRE(generated.dispatch_data);
         REQUIRE(generated.dispatch_data->sealed);
-        REQUIRE(equivalent_tool_mapping_config(source.full_print_config(), mapped.full_print_config(), tools));
+        const auto used_materials = source.extruders(true);
+        REQUIRE(equivalent_tool_mapping_config(source.full_print_config(), mapped.full_print_config(), tools, &used_materials));
         const auto timestamp = source.step_state_with_timestamp(psSlicingFinished).timestamp;
         std::string full_config;
         GCode::append_full_config(mapped, full_config);

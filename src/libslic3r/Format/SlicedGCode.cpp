@@ -76,7 +76,8 @@ bool store_sliced_gcode_3mf(const std::string &path, const Print &print,
 void validate_tool_mapped_sliced_gcode_3mf(const Print &source_print, const Print &mapped_print,
     const GCodeProcessorResult &source_result, const std::vector<int> &tools)
 {
-    if (!equivalent_tool_mapping_config(source_print.full_print_config(), mapped_print.full_print_config(), tools))
+    const auto used_materials = source_print.extruders(true);
+    if (!equivalent_tool_mapping_config(source_print.full_print_config(), mapped_print.full_print_config(), tools, &used_materials))
         throw std::invalid_argument("Sliced package settings require normal regeneration.");
     if (!source_result.warnings.empty())
         throw std::invalid_argument("Sliced package warning metadata requires normal regeneration.");

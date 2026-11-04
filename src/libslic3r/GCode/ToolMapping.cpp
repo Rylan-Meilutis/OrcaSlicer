@@ -309,17 +309,23 @@ std::string replay_tool_mapped_template(const GCodeTemplateSnapshot &snapshot,
 }
 
 bool equivalent_tool_mapping_config(const DynamicPrintConfig &source, const DynamicPrintConfig &target,
-                                    const std::vector<int> &tools)
+                                    const std::vector<int> &tools, const std::vector<unsigned int> *used_materials)
 {
     if (tools.empty()) return false;
     std::set<int> assigned;
     for (int tool : tools)
         if (tool < 0 || tool >= 256 || !assigned.insert(tool).second) return false;
+    std::set<unsigned int> used;
+    if (used_materials) {
+        if (used_materials->empty()) return false;
+        for (unsigned int material : *used_materials)
+            if (material >= tools.size() || !used.insert(material).second) return false;
+    }
 
     // This path handles one independent physical nozzle per logical material.
     // Layer-dependent nozzle maps and virtual mixtures cannot be represented
     // by substituting a single physical tool number.
-    const auto valid_map = [](const DynamicPrintConfig &config, std::size_t required, bool identity) {
+    const auto valid_map = [&](const DynamicPrintConfig &config, std::size_t required, bool identity) {
         if (const auto *dynamic = config.option<ConfigOptionBool>("enable_filament_dynamic_map"); dynamic && dynamic->value)
             return false;
         if (const auto *map = config.option<ConfigOptionInts>("filament_map")) {
@@ -337,8 +343,16 @@ bool equivalent_tool_mapping_config(const DynamicPrintConfig &source, const Dyna
                 // The static single-nozzle-per-extruder engine writes this
                 // derived cache after slicing. It is not a different nozzle
                 // assignment from the all-zero pre-slice placeholder.
-                for (std::size_t i = 0; i < nozzles->size(); ++i)
-                    if (nozzles->values[i] != extruders->values[i] - 1) return false;
+                for (std::size_t i = 0; i < nozzles->size(); ++i) {
+                    if (nozzles->values[i] == extruders->values[i] - 1) continue;
+                    // Grouping may assign an unused material a different
+                    // group ID without changing its configured extruder. Only
+                    // authoritative slice usage can disambiguate that cache.
+                    const auto *diameters = config.option<ConfigOptionFloats>("nozzle_diameter");
+                    if (identity || !used_materials || i >= tools.size() || used.count(static_cast<unsigned int>(i)) ||
+                        !diameters || nozzles->values[i] < 0 ||
+                        std::size_t(nozzles->values[i]) >= diameters->size()) return false;
+                }
             }
         }
         // Multiple nozzle-volume variants per material need a column map,

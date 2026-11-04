@@ -137,6 +137,32 @@ TEST_CASE("Custom tool templates replay expressions without rewriting literal co
     CHECK_THROWS_AS(replay_tool_mapped_template(snapshot, target, {2, 0}), std::runtime_error);
 }
 
+TEST_CASE("Dispatch ignores unused derived nozzle groups only with explicit slice usage", "[ToolMapping]")
+{
+    DynamicPrintConfig source;
+    source.set_key_value("filament_map", new ConfigOptionInts{1, 1});
+    source.set_key_value("filament_nozzle_map", new ConfigOptionInts{0, 1});
+    source.set_key_value("nozzle_diameter", new ConfigOptionFloats(std::vector<double>(8, 0.4)));
+    auto target = source;
+    target.set_key_value("filament_map", new ConfigOptionInts{1, 2, 3, 4, 5, 6, 7, 8});
+    target.set_key_value("filament_nozzle_map", new ConfigOptionInts(std::vector<int>(8, 0)));
+    const std::vector<int> tools{4, 0};
+    const std::vector<unsigned int> used{0}, both{0, 1}, empty, invalid{2}, repeated{0, 0};
+    CHECK_FALSE(equivalent_tool_mapping_config(source, target, tools));
+    CHECK(equivalent_tool_mapping_config(source, target, tools, &used));
+    CHECK_FALSE(equivalent_tool_mapping_config(source, target, tools, &both));
+    CHECK_FALSE(equivalent_tool_mapping_config(source, target, tools, &empty));
+    CHECK_FALSE(equivalent_tool_mapping_config(source, target, tools, &invalid));
+    CHECK_FALSE(equivalent_tool_mapping_config(source, target, tools, &repeated));
+    source.set_key_value("filament_nozzle_map", new ConfigOptionInts{1, 0});
+    CHECK_FALSE(equivalent_tool_mapping_config(source, target, tools, &used));
+    source.set_key_value("filament_nozzle_map", new ConfigOptionInts{0, 8});
+    CHECK_FALSE(equivalent_tool_mapping_config(source, target, tools, &used));
+    source.set_key_value("filament_nozzle_map", new ConfigOptionInts{0, 1});
+    target.option<ConfigOptionFloats>("nozzle_diameter")->values[4] = 0.6;
+    CHECK_FALSE(equivalent_tool_mapping_config(source, target, tools, &used));
+}
+
 TEST_CASE("Dispatch accepts only unresolved or static physical nozzle maps", "[ToolMapping]")
 {
     DynamicPrintConfig source;
