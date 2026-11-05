@@ -1,0 +1,12 @@
+{
+	"type": "machine_model",
+	"name": "Prusa CORE One INDX RME",
+	"bed_model": "coreone_indx_rme.stl",
+	"bed_texture": "coreone_indx_rme.svg",
+	"default_materials": "Generic PLA @Prusa CORE One INDX;Generic PETG @Prusa CORE One INDX;Generic ABS @Prusa CORE One INDX;Generic ASA @Prusa CORE One HF 0.4",
+	"family": "Prusa",
+	"hotend_model": "",
+	"machine_tech": "FFF",
+	"model_id": "Prusa_CORE_One_INDX_RME",
+	"nozzle_diameter": "0.4"
+}

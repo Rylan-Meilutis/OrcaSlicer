@@ -1,15 +1,127 @@
 #include <catch2/catch_all.hpp>
+#include <catch2/catch_message.hpp>
+#include <catch2/generators/catch_generators.hpp>
+#include <cstddef>
+#include <iterator>
+#include "libslic3r/Config.hpp"
+#include <map>
+#include <stdexcept>
+#include <utility>
 
 #include <algorithm>
+#include "libslic3r/CustomGCode.hpp"
 #include <sstream>
 #include <string>
 
+#include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers.hpp>
+#include <catch2/matchers/catch_matchers_floating_point.hpp>
 #include "libslic3r/calib.hpp"
+#include "libslic3r/SeamCalibration.hpp"
+#include "libslic3r/TemperatureTowerPresets.hpp"
 #include "libslic3r/Model.hpp"
 #include "libslic3r/TriangleMesh.hpp"
 #include "libslic3r/PrintConfig.hpp"
+#include "libslic3r/Point.hpp"
 
 using namespace Slic3r;
+
+TEST_CASE("Seam calibration creates closed repeatable coupons and isolated setting ranges", "[Calib][SeamCalibration]")
+{
+    const auto kind = GENERATE(SeamCalibrationKind::Length, SeamCalibrationKind::StartHeight,
+        SeamCalibrationKind::Flow, SeamCalibrationKind::Speed, SeamCalibrationKind::InnerEntry);
+    SeamCalibrationParams params;
+    params.kind = kind;
+    params.count = 2;
+    if (kind == SeamCalibrationKind::Flow) { params.start = 0.8; params.step = 0.1; }
+    const auto preset = DynamicPrintConfig::full_print_config();
+    Model model;
+    make_seam_calibration(model, preset, params);
+    const bool inner = kind == SeamCalibrationKind::InnerEntry;
+    REQUIRE(model.objects.size() == (inner ? 8 : 12));
+    for (size_t i = 0; i < model.objects.size(); ++i) {
+        const auto &object = *model.objects[i];
+        const auto &mesh = object.volumes.front()->mesh();
+        CHECK(its_volume(mesh.its) > 0.);
+        CHECK_THAT(mesh.bounding_box().size().z(), Catch::Matchers::WithinAbs(inner ? 8. : 24., 1e-5));
+        // Every mesh edge must be shared by exactly two triangles, with opposite winding.
+        std::map<std::pair<int,int>, std::pair<int,int>> edges;
+        for (const auto &triangle : mesh.its.indices)
+            for (int e = 0; e < 3; ++e) {
+                const int a = triangle[e], b = triangle[(e + 1) % 3];
+                auto &edge = edges[std::minmax(a,b)];
+                ++edge.first; edge.second += a < b ? 1 : -1;
+            }
+        for (const auto &[key, edge] : edges) {
+            CHECK(edge.first == 2);
+            CHECK(edge.second == 0);
+        }
+        CHECK_FALSE(object.config.get().opt_bool("arc_overhang_enabled"));
+        CHECK(object.config.get().opt_bool("seam_start_on_inner_wall") == (inner && i >= 4));
+        CHECK(object.layer_config_ranges.size() == (inner ? 0 : 3));
+        if (!inner) {
+            CHECK(object.layer_config_ranges.begin()->second.opt_serialize("seam_slope_type") == "none");
+            for (auto range = std::next(object.layer_config_ranges.begin()); range != object.layer_config_ranges.end(); ++range)
+                CHECK(range->second.size() == 2); // swept value plus required layer height
+        }
+    }
+    CHECK(preset == DynamicPrintConfig::full_print_config());
+}
+
+TEST_CASE("Seam calibration rejects unsafe or unbounded sweep values", "[Calib][SeamCalibration]")
+{
+    SeamCalibrationParams params;
+    params.count = 100;
+    CHECK_THROWS_AS(seam_calibration_values(params), std::invalid_argument);
+    params.count = 4;
+    params.start = 39.;
+    CHECK_THROWS_AS(seam_calibration_values(params), std::invalid_argument);
+    params.kind = SeamCalibrationKind::StartHeight;
+    params.start = 100.;
+    CHECK_THROWS_AS(seam_calibration_values(params), std::invalid_argument);
+}
+
+TEST_CASE("Temperature tower presets have unique materials and valid descending steps", "[Calib]")
+{
+    for (size_t i = 0; i < temperature_tower_presets.size(); ++i) {
+        const auto &preset = temperature_tower_presets[i];
+        INFO(preset.material);
+        CHECK(preset.start <= 500);
+        CHECK(preset.end >= 155);
+        CHECK(preset.start > preset.end);
+        CHECK(preset.start % 5 == 0);
+        CHECK(preset.end % 5 == 0);
+        for (size_t j = 0; j < i; ++j)
+            CHECK(std::string(preset.material) != temperature_tower_presets[j].material);
+    }
+    CHECK(std::string(temperature_tower_presets[5].material) == "PA-CF");
+    CHECK(temperature_tower_presets[5].start == 320);
+    CHECK(std::string(temperature_tower_presets[6].material) == "PET-CF");
+    CHECK(temperature_tower_presets[6].start == 320);
+}
+
+TEST_CASE("Calibration disables inherited and local arc overhangs without changing the preset", "[Calib][Regression]")
+{
+    DynamicPrintConfig preset;
+    preset.set_key_value("arc_overhang_enabled", new ConfigOptionBool(true));
+    Model model;
+    for (int i = 0; i < 2; ++i) {
+        ModelObject *object = model.add_object("cube", "", make_cube(20, 20, 20));
+        object->config.set_key_value("wall_loops", new ConfigOptionInt(3));
+        object->volumes.front()->config.set_key_value("arc_overhang_enabled", new ConfigOptionBool(true));
+        object->layer_config_ranges[{1., 2.}].set_key_value("arc_overhang_enabled", new ConfigOptionBool(true));
+    }
+    disable_arc_overhangs_for_calibration(model);
+    for (const ModelObject *object : model.objects) {
+        DynamicPrintConfig resolved = preset;
+        resolved.apply(object->config.get());
+        CHECK_FALSE(resolved.opt_bool("arc_overhang_enabled"));
+        CHECK_FALSE(object->volumes.front()->config.get().opt_bool("arc_overhang_enabled"));
+        CHECK_FALSE(object->layer_config_ranges.begin()->second.get().opt_bool("arc_overhang_enabled"));
+        CHECK(object->config.opt_int("wall_loops") == 3);
+    }
+    CHECK(preset.opt_bool("arc_overhang_enabled"));
+}
 
 namespace {
 

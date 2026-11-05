@@ -62,6 +62,7 @@
 	"resolution": "0.008",
 	"elefant_foot_compensation": "0.2",
 	"compatible_printers": [
-		"Prusa XL 5T 0.4 nozzle"
+		"Prusa XL 5T 0.4 nozzle",
+		"Prusa XL 5T RME 0.4 nozzle"
 	]
 }

@@ -1,7 +1,10 @@
 #ifndef BRIMEARSPOINT_HPP
 #define BRIMEARSPOINT_HPP
 
+#include <cstdlib>
+#include "libslic3r.h"
 #include <libslic3r/Point.hpp>
+#include <vector>
 
 
 namespace Slic3r {
@@ -18,6 +21,11 @@ struct BrimPoint
 {
     Vec3f pos;
     float head_front_radius;
+    // Zero is the legacy mouse ear. Brush operations are applied in order.
+    enum class Shape : unsigned char { Ear, Circle, Square, EraseCircle, EraseSquare };
+    Shape shape = Shape::Ear;
+    bool erases() const { return shape == Shape::EraseCircle || shape == Shape::EraseSquare; }
+    bool square() const { return shape == Shape::Square || shape == Shape::EraseSquare; }
 
     BrimPoint()
         : pos(Vec3f::Zero()), head_front_radius(0.f)
@@ -50,13 +58,13 @@ struct BrimPoint
     bool operator==(const BrimPoint &sp) const
     {
         float rdiff = std::abs(head_front_radius - sp.head_front_radius);
-        return (pos == sp.pos) && rdiff < float(EPSILON);
+        return (pos == sp.pos) && rdiff < float(EPSILON) && shape == sp.shape;
     }
 
     bool operator!=(const BrimPoint &sp) const { return !(sp == (*this)); }
     template<class Archive> void serialize(Archive &ar)
     {
-        ar(pos, head_front_radius);
+        ar(pos, head_front_radius, shape);
     }
 };
 

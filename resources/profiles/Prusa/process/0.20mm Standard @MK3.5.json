@@ -6,7 +6,8 @@
 	"setting_id": "6tMTNrOMs79q12lV",
 	"instantiation": "true",
 	"compatible_printers": [
-		"Prusa MK3.5 0.4 nozzle"
+		"Prusa MK3.5 0.4 nozzle",
+		"Prusa MK3.5 RME 0.4 nozzle"
 	],
 	"line_width": "0.45",
 	"inner_wall_line_width": "0.45",

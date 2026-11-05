@@ -6,7 +6,8 @@
 	"setting_id": "8Sg9zpg5mIR9bcnU",
 	"instantiation": "true",
 	"compatible_printers": [
-		"Prusa MINIIS 0.4 nozzle"
+		"Prusa MINIIS 0.4 nozzle",
+		"Prusa MINI RME 0.4 nozzle"
 	],
 	"line_width": "0.45",
 	"inner_wall_line_width": "0.45",

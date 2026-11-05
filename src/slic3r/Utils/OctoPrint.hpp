@@ -1,13 +1,19 @@
 #ifndef slic3r_OctoPrint_hpp_
 #define slic3r_OctoPrint_hpp_
 
+#include <boost/optional/optional.hpp>
 #include <string>
+#include <vector>
 #include <wx/string.h>
 #include <boost/optional.hpp>
 #include <boost/asio/ip/address.hpp>
 
 #include "PrintHost.hpp"
 #include "libslic3r/PrintConfig.hpp"
+#include "libslic3r/GCode/SpoolManagerMetadata.hpp"
+#include "libslic3r/GCode/OctoPrintTiming.hpp"
+#include <functional>
+#include "libslic3r/enum_bitmask.hpp"
 
 
 namespace Slic3r {
@@ -33,6 +39,22 @@ public:
     std::string get_host() const override { return m_host; }
     const std::string& get_apikey() const { return m_apikey; }
     const std::string& get_cafile() const { return m_cafile; }
+    // Explicit opt-in only. Reads metadata; never issues printer commands.
+    OctoPrintTiming::Status get_completed_print(const std::string &expected_sha1,
+        OctoPrintTiming::CompletedPrint &result, bool opted_in,
+        const std::function<bool()> &cancelled = {}) const;
+    OctoPrintTiming::RefreshResult refresh_learned_timing(const std::string &local_filename,
+        const std::string &store_path, const std::string &setup_revision, bool opted_in,
+        const std::function<bool()> &cancelled = {}) const;
+    // Successful live reads are persisted. Cached fallback is opt-in; on a
+    // cached success, error contains a warning which the caller must display.
+    bool get_selected_filament_spools(std::vector<SpoolManagerMetadata::Filament> &slots, wxString &error,
+                                     bool allow_cached = false) const;
+    bool get_filament_spools(std::vector<SpoolManagerMetadata::Filament> &slots,
+                             std::vector<SpoolManagerMetadata::Filament> &inventory,
+                             wxString &error, bool require_assignments = false) const;
+    bool get_spool_manager_selected_spools(std::vector<SpoolManagerMetadata::Filament> &slots, wxString &error) const
+    { return get_selected_filament_spools(slots, error); }
 
 protected:
 #ifdef WIN32
@@ -45,6 +67,7 @@ protected:
     std::string m_apikey;
     std::string m_cafile;
     bool        m_ssl_revoke_best_effort;
+    std::string m_filament_plugin_endpoint;
 
     virtual void set_auth(Http &http) const;
     std::string make_url(const std::string &path) const;

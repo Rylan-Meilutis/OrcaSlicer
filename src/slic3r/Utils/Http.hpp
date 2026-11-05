@@ -1,8 +1,10 @@
 #ifndef __Http_hpp__
 #define __Http_hpp__
 
+#include <cstddef>
 #include <map>
 #include <memory>
+#include <ostream>
 #include <string>
 #include <functional>
 #include <boost/filesystem/path.hpp>
@@ -80,6 +82,7 @@ public:
 	// These are the primary constructors that create a HTTP object
 	// for a GET and a POST request respectively.
 	static Http get(std::string url);
+	static Http head(std::string url);
 	static Http post(std::string url);
 	static Http put(std::string url);
 	static Http del(std::string url);
