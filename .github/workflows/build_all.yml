@@ -369,8 +369,11 @@ jobs:
     # directory's own config file, which the sandbox reads too.
     - name: Enable compiler cache
       run: |
+        # no-debuginfo/strip act after compilation. Override the SDK's -g for
+        # Release objects too, or the retained app + test trees exhaust x64 CI.
         printf '        %s\n' \
           'CMAKE_C_COMPILER_LAUNCHER: ccache' \
+          'ORCA_FLATPAK_DEBUG_FLAGS: -g0' \
           'CMAKE_CXX_COMPILER_LAUNCHER: ccache' > "$RUNNER_TEMP/ccache-env.yml"
         sed -i "/^        git_commit_hash: /r $RUNNER_TEMP/ccache-env.yml" \
           scripts/flatpak/com.orcaslicer.OrcaSlicer.yml
