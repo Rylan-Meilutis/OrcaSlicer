@@ -8465,16 +8465,18 @@ TEST_CASE("A multi-toolhead project saved without filament self indices loads ev
 TEST_CASE("A project with fewer filaments than tools fills every filament slot", "[Preset][Bundle][Regression]")
 {
     const size_t tool_count = 4;
+    PresetBundle bundle;
     DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+    configure_fixed_palette_printer(bundle, config);
     config.opt<ConfigOptionStrings>("filament_colour")->values = { "#FF0000", "#00FF00" };
     config.opt<ConfigOptionFloats>("nozzle_diameter")->values = std::vector<double>(tool_count, 0.4);
     config.option<ConfigOptionBool>("single_extruder_multi_material")->value = false;
     Preset::normalize(config);
 
-    PresetBundle bundle;
     bundle.load_config_model("test.3mf", std::move(config));
 
     const auto &colors = bundle.project_config.opt<ConfigOptionStrings>("filament_colour")->values;
+    REQUIRE_FALSE(bundle.uses_logical_filament_slots());
     REQUIRE(bundle.filament_presets.size() == tool_count);
     REQUIRE(colors.size() == tool_count);
     CHECK(colors[0] == "#FF0000");
@@ -8520,6 +8522,36 @@ TEST_CASE("A project with fewer filaments than tools fills every filament slot",
         CHECK(colors[2] == kept_color);
         CHECK(colors[3] == kept_color);
     }
+}
+
+TEST_CASE("A logical-palette project preserves fewer filaments than physical tools", "[Preset][Bundle][Regression][ToolMapping]")
+{
+    const auto host = GENERATE(htOctoPrint, htPrusaLink);
+    const std::vector<std::string> colors = { "#FF0000", "#00FF00" };
+    const std::vector<int> tools = { 4, 2 };
+    DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+    config.opt<ConfigOptionStrings>("filament_colour")->values = colors;
+    config.set_key_value("filament_colour_type", new ConfigOptionStrings{ "1", "1" });
+    config.set_key_value("filament_multi_colour", new ConfigOptionStrings(colors));
+    config.set_key_value("filament_map", new ConfigOptionInts(tools));
+    config.opt<ConfigOptionFloats>("nozzle_diameter")->values = std::vector<double>(4, 0.4);
+    config.option<ConfigOptionBool>("single_extruder_multi_material")->value = false;
+    config.set_key_value("host_type", new ConfigOptionEnum<PrintHostType>(host));
+    Preset::normalize(config);
+
+    PresetBundle bundle;
+    bundle.load_config_model("test.3mf", std::move(config));
+
+    REQUIRE(bundle.uses_logical_filament_slots());
+    REQUIRE(bundle.filament_presets.size() == colors.size());
+    CHECK(bundle.get_printer_extruder_count() == 4);
+    CHECK(bundle.project_config.opt<ConfigOptionStrings>("filament_colour")->values == colors);
+    CHECK(bundle.project_config.opt<ConfigOptionStrings>("filament_colour_type")->values.size() == colors.size());
+    CHECK(bundle.project_config.opt<ConfigOptionStrings>("filament_multi_colour")->values.size() == colors.size());
+    CHECK(bundle.project_config.opt<ConfigOptionInts>("filament_map")->values == tools);
+    const size_t head_count = bundle.project_config.opt<ConfigOptionFloats>("flush_multiplier")->values.size();
+    CHECK(head_count == 4);
+    CHECK(bundle.project_config.opt<ConfigOptionFloats>("flush_volumes_matrix")->values.size() == colors.size() * colors.size() * head_count);
 }
 
 TEST_CASE("A system preset resolves by name from the bundled profiles", "[Preset][Bundle]")
