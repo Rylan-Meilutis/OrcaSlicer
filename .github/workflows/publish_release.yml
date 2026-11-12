@@ -2,7 +2,7 @@ name: Publish release artifacts
 
 # Pulls the platform binaries produced by a successful push or manually dispatched
 # "Build all" run and uploads them to the matching release. It may also be
-# dispatched manually to retry or publish a deliberately partial build.
+# dispatched manually to retry uploading a successful matching build.
 # It also writes an ordered download table into the draft's release notes.
 #
 # Trigger: Actions tab -> "Publish release artifacts" -> Run workflow.
@@ -113,28 +113,27 @@ jobs:
 
       - name: Verify source build run
         if: env.TAG != ''
-        run: |
-          info=$(gh run view "$RUN_ID" --repo "$GITHUB_REPOSITORY" --json workflowName,conclusion,headBranch)
-          name=$(echo "$info" | jq -r '.workflowName')
-          conclusion=$(echo "$info" | jq -r '.conclusion')
-          branch=$(echo "$info" | jq -r '.headBranch')
-          echo "Source run #$RUN_ID: '$name' on '$branch' (conclusion: $conclusion)"
-          if [ "$conclusion" != "success" ]; then
-            echo "::warning::Source run did not conclude 'success' ($conclusion). Some assets may be missing."
-          fi
-
-      - name: Wait for and verify stable release build
-        if: env.TAG != '' && github.event_name == 'workflow_dispatch' && inputs.publish_stable
+        env:
+          WAIT_FOR_BUILD: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_stable }}
         run: |
           set -euo pipefail
-          info=$(gh run view "$RUN_ID" --repo "$GITHUB_REPOSITORY" --json workflowName,status,conclusion,headSha)
-          test "$(jq -r '.workflowName' <<< "$info")" = 'Build all'
-          while [ "$(jq -r '.status' <<< "$info")" != 'completed' ]; do
+          while true; do
+            info=$(gh run view "$RUN_ID" --repo "$GITHUB_REPOSITORY" --json workflowName,event,status,conclusion,headSha)
+            if ! jq -e '.workflowName == "Build all" and (.event == "push" or .event == "workflow_dispatch")' <<< "$info" >/dev/null; then
+              echo "::error::Select a Build all push or manual run, not a pull-request or unrelated workflow."
+              exit 1
+            fi
+            if [ "$(jq -r '.status' <<< "$info")" = 'completed' ]; then
+              break
+            fi
+            if [ "$WAIT_FOR_BUILD" != 'true' ]; then
+              echo "::error::The source build has not finished. Retry after Build all succeeds."
+              exit 1
+            fi
             sleep 30
-            info=$(gh run view "$RUN_ID" --repo "$GITHUB_REPOSITORY" --json workflowName,status,conclusion,headSha)
           done
           if [ "$(jq -r '.conclusion' <<< "$info")" != 'success' ]; then
-            echo "::error::Release build did not pass. Leaving the release unpublished."
+            echo "::error::Release build did not pass. No artifacts will be attached."
             exit 1
           fi
           ref=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG")
@@ -142,7 +141,15 @@ jobs:
           if [ "$(jq -r '.object.type' <<< "$ref")" = 'tag' ]; then
             sha=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$sha" --jq '.object.sha')
           fi
-          test "$sha" = "$(jq -r '.headSha' <<< "$info")"
+          if [ "$sha" != "$(jq -r '.headSha' <<< "$info")" ]; then
+            echo "::error::Release tag $TAG does not match source run #$RUN_ID. Select the matching tag and build."
+            exit 1
+          fi
+
+      - name: Verify stable release draft
+        if: env.TAG != '' && github.event_name == 'workflow_dispatch' && inputs.publish_stable
+        run: |
+          set -euo pipefail
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease |
             jq -e '.isDraft and (.isPrerelease | not)'
 
