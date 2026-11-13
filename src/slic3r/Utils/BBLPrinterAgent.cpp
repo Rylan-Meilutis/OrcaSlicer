@@ -25,6 +25,11 @@
 #include <openssl/err.h>
 #include <openssl/pem.h>
 #include <openssl/pemerr.h>
+#if __has_include(<openssl/types.h>)
+#include <openssl/types.h>
+#else
+#include <openssl/ossl_typ.h>
+#endif
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
 #include <cmath>

@@ -151,8 +151,7 @@ namespace Slic3r
 
     DeviceManager::~DeviceManager()
     {
-        if (m_refresher)
-            delete m_refresher;
+        delete m_refresher;
 
         for (auto it = localMachineList.begin(); it != localMachineList.end(); it++)
         {

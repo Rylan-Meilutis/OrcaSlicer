@@ -2719,9 +2719,7 @@ StatusPanel::~StatusPanel()
     if (sdcard_hint_dlg != nullptr)
         delete sdcard_hint_dlg;
 
-    if (m_score_data != nullptr) {
-        delete m_score_data;
-    }
+    delete m_score_data;
 }
 
 void StatusPanel::init_scaled_buttons()
