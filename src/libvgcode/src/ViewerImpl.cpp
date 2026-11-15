@@ -1625,6 +1625,12 @@ void ViewerImpl::set_tone(float exposure, float saturation)
 
 void ViewerImpl::set_view_type(EViewType type)
 {
+    if (type != m_settings.view_type && m_settings.hidden_filaments.any()) {
+        // Filament eye controls are only available in the filament legend.
+        // Do not leave other views filtered with no way to restore the paths.
+        m_settings.hidden_filaments.reset();
+        m_settings.update_enabled_entities = true;
+    }
     m_settings.view_type = type;
     m_settings.update_colors = true;
 }

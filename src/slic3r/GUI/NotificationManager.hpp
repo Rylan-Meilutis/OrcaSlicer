@@ -369,6 +369,8 @@ public:
 	void device_ejected();
 	// renders notifications in queue and deletes expired ones
     void render_notifications(GLCanvas3D &canvas, float overlay_width, float bottom_margin, float right_margin);
+    // Measure inside an ImGui frame, before laying out other preview overlays.
+    float visible_notifications_height();
 	// finds and closes all notifications of given type
 	void close_notification_of_type(const NotificationType type);
 	// True while a notification of this type is on screen (not closed or finished).
@@ -510,6 +512,7 @@ private:
 		float                  get_bottom() const { return m_bottom_y; }
 		//returns top in actual frame
 		float                  get_current_top() const { return m_top_y; }
+        float                  layout_height();
 		const NotificationType get_type() const { return m_data.type; }
 		const NotificationData& get_data() const { return m_data; }
         std::string             get_text1() const { return m_text1; }

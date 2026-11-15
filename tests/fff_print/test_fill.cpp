@@ -15,6 +15,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
+#include <initializer_list>
 #include <limits>
 #include <cstddef>
 #include <cstdint>
@@ -4526,6 +4527,61 @@ TEST_CASE("A middle support applies the arc threshold to each unsupported bridge
         {"enable_support", "0"}
     });
 
+    CHECK_FALSE(print_has_arc_overhang(print));
+}
+
+TEST_CASE("Narrow rotated bridge gaps stay below the arc distance threshold", "[Fill][ArcOverhang][Regression]")
+{
+    const double angle = GENERATE(0., PI / 4.);
+    TriangleMesh model = make_cube(5., 30., 1.);
+    TriangleMesh right = make_cube(5., 30., 1.);
+    right.translate(6., 0., 0.);
+    model.merge(right);
+    TriangleMesh roof = make_cube(11., 30., 0.4);
+    roof.translate(0., 0., 1.);
+    model.merge(roof);
+    model.rotate_z(angle);
+    Print print;
+    Test::init_and_process_print({model}, print, {
+        {"layer_height", "0.2"}, {"wall_loops", "1"},
+        {"arc_overhang_enabled", "1"}, {"arc_overhang_bridges", "1"},
+        {"arc_overhang_overhangs", "1"}, {"arc_overhang_bridge_distance", "15"},
+        {"arc_overhang_min_overhang_distance", "1"}, {"enable_support", "0"},
+        {"automatic_warp_mitigation", "0"}
+    });
+    CAPTURE(angle);
+    CHECK_FALSE(print_has_arc_overhang(print));
+}
+
+TEST_CASE("A narrow moat around supported material stays on ordinary bridging",
+          "[Fill][ArcOverhang][Regression]")
+{
+    // The unsupported ring is 1 mm wide but its connected bounds span 36 mm.
+    // Support exists on both sides everywhere, including around the corners.
+    constexpr double height = 0.4;
+    TriangleMesh model = make_cube(40., 2., height);
+    TriangleMesh top = make_cube(40., 2., height);
+    top.translate(0., 38., 0.);
+    model.merge(top);
+    for (double x : {0., 38.}) {
+        TriangleMesh side = make_cube(2., 36., height);
+        side.translate(x, 2., 0.);
+        model.merge(side);
+    }
+    TriangleMesh center = make_cube(34., 34., height);
+    center.translate(3., 3., 0.);
+    model.merge(center);
+    TriangleMesh roof = make_cube(40., 40., height);
+    roof.translate(0., 0., height);
+    model.merge(roof);
+    Print print;
+    Test::init_and_process_print({model}, print, {
+        {"layer_height", "0.2"}, {"initial_layer_print_height", "0.2"}, {"wall_loops", "1"},
+        {"arc_overhang_enabled", "1"}, {"arc_overhang_bridges", "1"},
+        {"arc_overhang_overhangs", "1"}, {"arc_overhang_bridge_distance", "15"},
+        {"arc_overhang_min_overhang_distance", "1"}, {"enable_support", "0"},
+        {"automatic_warp_mitigation", "0"}
+    });
     CHECK_FALSE(print_has_arc_overhang(print));
 }
 

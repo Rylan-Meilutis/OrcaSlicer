@@ -4593,14 +4593,9 @@ Sidebar::Sidebar(Plater *parent)
                 if (dialog.ShowModal() != wxID_OK || !alive || wxGetApp().is_closing()) return;
                 // A nested modal loop must not redirect edits to another plate.
                 if (plates.get_curr_plate() != plate) return;
-                auto changed = initial.diff(dialog.edited);
-                if (initial.opt_bool("automatic_warp_mitigation") && !dialog.edited.opt_bool("automatic_warp_mitigation")) {
-                    // Turning Auto off keeps the brim shown in the dialog;
-                    // otherwise unchanged fields would fall back to the preset.
-                    for (const char *key : {"brim_type", "brim_width", "brim_object_gap"})
-                        if (std::find(changed.begin(), changed.end(), key) == changed.end())
-                            changed.emplace_back(key);
-                }
+                // Persist only edits, not the generated settings displayed by Auto.
+                // Disabling Auto must reveal the existing manual configuration again.
+                const auto changed = initial.diff(dialog.edited);
                 if (changed.empty()) return;
                 p->plater->take_snapshot(_u8L("Adjust active-plate auto mitigations"));
                 plate->config()->apply_only(dialog.edited, changed);

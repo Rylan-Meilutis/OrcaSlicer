@@ -1929,6 +1929,51 @@ TEST_CASE("Inner/Outer/Inner prints both outer walls of a pinched wall before th
     }
 }
 
+TEST_CASE("Inner outer inner visits neighboring comb walls without crossing the comb repeatedly",
+          "[Perimeters][Travel][Regression]")
+{
+    constexpr int teeth = 24;
+    constexpr double pitch = 4.;
+    constexpr double tooth_width = 1.8;
+    constexpr double span = (teeth - 1) * pitch;
+    TriangleMesh comb = make_cube(span + tooth_width, 0.8, 0.6);
+    for (int i = 0; i < teeth; ++i) {
+        TriangleMesh tooth = make_cube(tooth_width, 8., 0.6);
+        tooth.translate(float(i * pitch), 0., 0.);
+        comb.merge(tooth);
+    }
+    Print print;
+    init_and_process_print({comb}, print, {
+        {"wall_generator", "arachne"}, {"wall_sequence", "inner-outer-inner wall"},
+        {"wall_loops", 3}, {"layer_height", 0.2}, {"initial_layer_print_height", 0.2},
+        {"outer_wall_line_width", 0.42}, {"inner_wall_line_width", 0.45},
+        {"top_shell_layers", 0}, {"bottom_shell_layers", 0}, {"sparse_infill_density", "0%"},
+        {"only_one_wall_top", false}, {"only_one_wall_first_layer", false},
+        {"automatic_warp_mitigation", false}, {"perimeter_layering", "standard"}
+    });
+    REQUIRE(print.objects().front()->layers().size() >= 2);
+    std::vector<double> centers;
+    for (const LayerRegion *region : print.objects().front()->get_layer(1)->regions()) {
+        const auto perimeters = region->perimeters.flatten();
+        for (const ExtrusionEntity *entity : perimeters.entities) {
+            if (entity->inset_idx != 1)
+                continue;
+            BoundingBox bounds;
+            for (const Polyline &line : entity->as_polylines())
+                bounds.merge(line.points);
+            centers.push_back(unscale_(bounds.center().x()));
+        }
+    }
+    REQUIRE(centers.size() >= teeth);
+    double travel_x = 0.;
+    for (size_t i = 1; i < centers.size(); ++i)
+        travel_x += std::abs(centers[i] - centers[i - 1]);
+    // A sweep across the teeth plus one return accommodates the deliberate
+    // longest-wall relocation without accepting repeated cross-comb jumps.
+    CAPTURE(centers, travel_x);
+    CHECK(travel_x <= 2. * span);
+}
+
 namespace {
 
 // A 24x24x2mm slab with a round hole of 3mm radius, and a 2mm wide collar around the hole rising to 4mm. On the slab's

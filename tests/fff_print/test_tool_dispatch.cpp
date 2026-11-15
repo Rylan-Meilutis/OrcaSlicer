@@ -21,6 +21,7 @@
 #include "libslic3r/Model.hpp"
 #include "libslic3r/Print.hpp"
 #include "libslic3r/PrintConfig.hpp"
+#include "libslic3r/PlaceholderParser.hpp"
 #include "libslic3r/Preset.hpp"
 #include "libslic3r/PresetBundle.hpp"
 #include "libslic3r/Semver.hpp"
@@ -34,6 +35,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <ios>
+#include <memory>
 #include <sstream>
 #include <set>
 #include <stdexcept>
@@ -71,6 +73,50 @@ TEST_CASE("Reassigning an imported uniform part changes its sliced filament", "[
     CHECK(region.internal_solid_filament_id.value == 2);
     CHECK(region.top_surface_filament_id.value == 2);
     CHECK(region.bottom_surface_filament_id.value == 2);
+}
+
+TEST_CASE("Changing material usage retains effective retraction in printer scripts", "[ToolMapping][GCode]")
+{
+    auto config = Test::multifilament_config(2, {
+        {"nozzle_diameter", "0.4,0.4"},
+        {"single_extruder_multi_material", "0"},
+        {"filament_map", "1,2"},
+        {"enable_prime_tower", "1"},
+        {"retraction_length", "1,1"},
+        {"filament_retraction_length", "0.7,0.7"},
+        {"gcode_comments", "1"},
+        {"automatic_warp_mitigation", "0"}
+    });
+    Test::size_flush_to_nozzles(config);
+    Model model;
+    Print print;
+    Test::init_print({Test::cube(2.), Test::cube(2.)}, print, model, config);
+    CHECK_FALSE(print.config().enable_prime_tower.value);
+    CHECK(print.placeholder_parser().process("{retraction_length[0]}", 0) == "0.7");
+
+    // Only the model changes: the second normalization pass discovers the
+    // newly used filament and re-enables the requested tower.
+    model.objects[1]->config.set("extruder", 2);
+    print.apply(model, config);
+    CHECK(print.config().enable_prime_tower.value);
+    CHECK(print.placeholder_parser().process("{retraction_length[0]}", 0) == "0.7");
+
+    // An unrelated settings edit resets the parser, but does not appear in
+    // the retraction-override delta because the effective value is unchanged.
+    config.set_deserialize_strict("layer_height", "0.25");
+    print.apply(model, config);
+    CHECK(print.placeholder_parser().process("{retraction_length[0]}", 0) == "0.7");
+
+    auto parser = print.placeholder_parser();
+    parser.set("initial_tool", 0);
+    DynamicConfig outputs;
+    outputs.set_key_value("e_retracted", new ConfigOptionFloats{0., 0.});
+    PlaceholderParser::ContextData context;
+    context.global_config = std::make_unique<DynamicConfig>();
+    const std::string script = "T{initial_tool}\n{e_retracted[initial_tool] = retraction_length[initial_tool]}";
+    auto snapshot = GCodeTemplateSnapshot::capture("machine_start_gcode", script, 0, parser, nullptr, outputs, context);
+    snapshot.finish(parser.process(script, 0, nullptr, &outputs, &context), outputs, context);
+    CHECK(replay_tool_mapped_template(snapshot, print.full_print_config(), {1, 0}) == "T1\n");
 }
 
 TEST_CASE("A sliced independent-tool job retains its motions during physical tool dispatch", "[ToolMapping][GCode]")
@@ -264,6 +310,9 @@ TEST_CASE("An imported project retains applied settings across physical tool dis
     DynamicPrintConfig plate;
     if (!plates.empty()) plate = plates[plate_index]->config;
     auto source_config = bundle.full_config(false);
+    if (!plates.empty() && !plates[plate_index]->filament_maps.empty())
+        source_config = bundle.full_config(false, plates[plate_index]->filament_maps,
+            bundle.get_default_nozzle_volume_types_for_filaments(plates[plate_index]->filament_maps));
     source_config.apply(plate);
     Print source;
     source.set_status_silent();

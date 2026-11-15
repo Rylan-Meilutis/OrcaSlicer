@@ -938,7 +938,11 @@ static ExtrusionEntityCollection makeBrimInfillImpl(const ExPolygons& singleBrim
         params.wall_transition_length = 0.1f * flow.width();
         params.wall_transition_angle = 90.f;
         params.wall_transition_filter_deviation = 0.01f * flow.width();
-        params.wall_distribution_count = 1;
+        // Share the fractional-course remainder across neighboring beads.
+        // Concentrating it in the center course creates a sudden flow/width
+        // jump along the meeting front. Arachne moves the neighboring paths
+        // with their widths, preserving coverage and total deposited volume.
+        params.wall_distribution_count = 4;
         const size_t count = size_t(get_extents(interior).size().maxCoeff() / step) + 1;
         Arachne::WallToolPaths paths(interior, step, step, count, 0, flow.height(), params);
         Point last_pos(0, 0);

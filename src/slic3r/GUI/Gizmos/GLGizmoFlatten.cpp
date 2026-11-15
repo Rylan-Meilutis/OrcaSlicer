@@ -48,7 +48,7 @@ bool GLGizmoFlatten::on_mouse(const wxMouseEvent &mouse_event)
             if (selection.is_single_full_instance()) {
                 // Rotate the object so the normal points downward:
                 selection.flattening_rotate(m_planes[m_hover_id].normal);
-                m_parent.do_rotate(L("Gizmo-Place on Face"));
+                m_parent.do_rotate(L("Gizmo-Place on Face"), true);
                 wxGetApp().obj_manipul()->set_dirty();
             }
             return true;

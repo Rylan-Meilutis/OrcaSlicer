@@ -1703,15 +1703,16 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
 		m_placeholder_parser.set("print_preset",              new_full_config.option("print_settings_id")->clone());
 		m_placeholder_parser.set("filament_preset",           new_full_config.option("filament_settings_id")->clone());
 		m_placeholder_parser.set("printer_preset",            new_full_config.option("printer_settings_id")->clone());
-		// We want the filament overrides to be applied over their respective extruder parameters by the PlaceholderParser.
-		// see "Placeholders do not respect filament overrides." GH issue #3649
-		m_placeholder_parser.apply_config(filament_overrides);
 	    // It is also safe to change m_config now after this->invalidate_state_by_config_options() call.
 	    m_config.apply_only(new_full_config, print_diff, true);
 	    //FIXME use move semantics once ConfigBase supports it.
         // Some filament_overrides may contain values different from new_full_config, but equal to m_config.
         // As long as these config options don't reallocate memory when copying, we are safe overriding a value, which is in use by a worker thread.
 	    m_config.apply(filament_overrides);
+        // The override delta omits effective values that have not changed.
+        // A reset parser needs all of them, including after unrelated edits.
+        for (const auto &key : print_config_def.extruder_retract_keys())
+            m_placeholder_parser.set(key, m_config.option(key)->clone());
 	    // Handle changes to object config defaults
 	    m_default_object_config.apply_only(new_full_config, object_diff, true);
 	    // Handle changes to regions config defaults
@@ -2282,20 +2283,9 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
 
         update_apply_status(this->invalidate_step(psGCodeExport));
 
-        if (full_config_diff.empty()) {
-            //BBS: previous empty
-            BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(" %1%: full_config_diff previous empty, need to apply now.")%__LINE__;
-
-            m_placeholder_parser.clear_config();
-            // clear_config() wiped the constructor-set "version"; restore it for custom G-code.
-            m_placeholder_parser.set("version", std::string(SoftFever_VERSION));
-            // Set the profile aliases for the PrintBase::output_filename()
-            m_placeholder_parser.set("print_preset",              new_full_config.option("print_settings_id")->clone());
-            m_placeholder_parser.set("filament_preset",           new_full_config.option("filament_settings_id")->clone());
-            m_placeholder_parser.set("printer_preset",            new_full_config.option("printer_settings_id")->clone());
-
-            //m_placeholder_parser.apply_config(filament_overrides);
-        }
+        // These normalized settings resolve through m_full_print_config. Keep
+        // the parser's effective filament overrides: with unchanged presets,
+        // filament_overrides contains only deltas and cannot restore a reset.
         // It is also safe to change m_config now after this->invalidate_state_by_config_options() call.
         m_config.apply_only(new_full_config, new_changed_keys, true);
         // Handle changes to object config defaults

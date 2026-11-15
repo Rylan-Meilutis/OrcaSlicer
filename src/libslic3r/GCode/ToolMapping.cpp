@@ -160,7 +160,7 @@ DynamicConfig relocate_template_config(const DynamicConfig &source, const Dynami
     }
     for (const char *key : {"is_extruder_used", "e_position", "e_retracted", "e_restart_extra",
                             "extruded_volume", "extruded_weight", "tool_init",
-                            "first_layer_temperature", "temperature", "first_layer_bed_temperature",
+                            "first_layer_temperature", "temperature", "first_layer_bed_temperature", "bed_temperature_initial_layer",
                             "bed_temperature", "flush_volumetric_speeds", "flush_temperatures", "retract_length"}) {
         const auto *values = dynamic_cast<const ConfigOptionVectorBase *>(source.option(key));
         if (!values || values->empty()) continue;

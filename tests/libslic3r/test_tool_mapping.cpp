@@ -368,6 +368,28 @@ TEST_CASE("Tool replay retains effective material retraction overrides", "[ToolM
     CHECK_THROWS_AS(replay_tool_mapped_template(snapshot, target, {2}), std::runtime_error);
 }
 
+TEST_CASE("Tool replay relocates both first-layer bed temperature aliases", "[ToolMapping]")
+{
+    PlaceholderParser parser;
+    parser.set("initial_tool", 2);
+    parser.set("first_layer_bed_temperature", new ConfigOptionInts{115, 110, 50});
+    parser.set("bed_temperature_initial_layer", new ConfigOptionInts{115, 110, 50});
+    const std::string text = "T{initial_tool}\n"
+        "M140 S{first_layer_bed_temperature[initial_tool]}\n"
+        "M190 R{bed_temperature_initial_layer[initial_tool]}\n"
+        "{if bed_temperature_initial_layer[initial_tool] <= 60}G4 P20\n{endif}";
+    DynamicConfig outputs;
+    PlaceholderParser::ContextData context;
+    context.global_config = std::make_unique<DynamicConfig>();
+    auto snapshot = GCodeTemplateSnapshot::capture("machine_start_gcode", text, 2, parser, nullptr, outputs, context);
+    snapshot.finish(parser.process(text, 2, nullptr, &outputs, &context), outputs, context);
+    const auto mapped = replay_tool_mapped_template(snapshot, DynamicPrintConfig{}, {1, 2, 4});
+    CHECK(mapped.find("T4\n") != std::string::npos);
+    CHECK(mapped.find("M140 S50\n") != std::string::npos);
+    CHECK(mapped.find("M190 R50\n") != std::string::npos);
+    CHECK(mapped.find("G4 P20\n") != std::string::npos);
+}
+
 TEST_CASE("Tool replay retains implicit machine modes without changing explicit mode indices", "[ToolMapping]")
 {
     PlaceholderParser parser;

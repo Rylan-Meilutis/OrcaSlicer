@@ -244,11 +244,20 @@ TEST_CASE("Automatic warp mitigation changes effective adhesion without changing
         return warning.opt_key == "automatic_warp_mitigation" && !warning.is_warning;
     }));
 
-    config.set_key_value("automatic_warp_mitigation", new ConfigOptionBool(false));
+    // The plate dialog displays derived values, but commits only the user's edits.
+    // Unchecking Auto must not bake the displayed automatic brim into the project.
+    auto displayed = config;
+    apply_warp_mitigations(displayed, assess_warp_risk(config, model));
+    auto edited = displayed;
+    edited.set_key_value("automatic_warp_mitigation", new ConfigOptionBool(false));
+    config.apply_only(edited, displayed.diff(edited));
     print.apply(model, config);
     CHECK(print.config().reduce_fan_stop_start_freq.get_at(0));
     CHECK(print.objects().front()->config().brim_type.value == btPainted);
     CHECK_THAT(print.objects().front()->config().brim_width.value, WithinAbs(0., 1e-6));
+    CHECK_THAT(print.objects().front()->config().brim_object_gap.value, WithinAbs(0.2, 1e-6));
+    print.process();
+    CHECK_FALSE(print.has_brim());
     std::vector<StringObjectException> warnings;
     print.validate(&warnings);
     CHECK(std::any_of(warnings.begin(), warnings.end(), [](const auto &warning) {

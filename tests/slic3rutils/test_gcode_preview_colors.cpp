@@ -10,18 +10,55 @@
 #endif
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/catch_message.hpp>
 #include <catch2/matchers/catch_matchers.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 
 #include "libslic3r/Color.hpp"
 #include "libvgcode/include/Types.hpp"
+#include "libvgcode/include/Viewer.hpp"
 #include "slic3r/GUI/3DScene.hpp"
 #include "slic3r/GUI/LibVGCode/LibVGCodeWrapper.hpp"
 
 using Catch::Matchers::WithinAbs;
+
+TEST_CASE("Leaving filament preview restores hidden filaments in every other view", "[GCodePreviewColors][Regression]")
+{
+    for (uint8_t i = 0; i < uint8_t(libvgcode::EViewType::COUNT); ++i) {
+        const auto mode = static_cast<libvgcode::EViewType>(i);
+        if (mode == libvgcode::EViewType::ColorPrint)
+            continue;
+        CAPTURE(i);
+        libvgcode::Viewer viewer;
+        viewer.set_view_type(libvgcode::EViewType::ColorPrint);
+        viewer.toggle_filament_visibility(1);
+        viewer.toggle_filament_visibility(4);
+        REQUIRE_FALSE(viewer.is_filament_visible(1));
+        REQUIRE_FALSE(viewer.is_filament_visible(4));
+        const auto range = viewer.get_view_visible_range();
+        viewer.set_view_type(mode);
+        CHECK(viewer.is_filament_visible(1));
+        CHECK(viewer.is_filament_visible(4));
+        CHECK(viewer.get_view_visible_range() == range);
+        viewer.set_view_type(libvgcode::EViewType::ColorPrint);
+        CHECK(viewer.is_filament_visible(1));
+        CHECK(viewer.is_filament_visible(4));
+    }
+}
+
+TEST_CASE("Reselecting filament preview preserves its visibility choices", "[GCodePreviewColors][Regression]")
+{
+    libvgcode::Viewer viewer;
+    viewer.set_view_type(libvgcode::EViewType::ColorPrint);
+    viewer.toggle_filament_visibility(1);
+    viewer.set_view_type(libvgcode::EViewType::ColorPrint);
+    CHECK_FALSE(viewer.is_filament_visible(1));
+    CHECK(viewer.is_filament_visible(0));
+}
 
 TEST_CASE("Filament colors keep their opacity for the G-code preview", "[GCodePreviewColors]")
 {

@@ -256,6 +256,60 @@ TEST_CASE("Brim fills the channel left where opposing offset loops meet", "[Skir
     CHECK(unscale<double>(bounds.max.y()) <= width + 0.05);
 }
 
+TEST_CASE("Brim distributes the center remainder without concentrating flow in one course", "[SkirtBrim][BrimCoverage][Regression]")
+{
+    const double overlap = GENERATE(0., 0.8, 5., 25.);
+    const double courses = GENERATE(10.5, 11.4, 24.4);
+    const bool ring = GENERATE(false, true);
+    Print print;
+    Model model;
+    init_print({cube(20)}, print, model, {
+        {"initial_layer_line_width", 0.45}, {"initial_layer_print_height", 0.2},
+        {"brim_line_overlap", overlap}, {"nozzle_diameter", "0.4"}
+    });
+    const Flow flow = print.brim_flow();
+    const double width = courses * flow.spacing();
+    const Polygon outline({Point::new_scale(0, 0), Point::new_scale(40, 0),
+                           Point::new_scale(40, ring ? 40. : width), Point::new_scale(0, ring ? 40. : width)});
+    ExPolygon area(outline);
+    if (ring)
+        area.holes.emplace_back(Points{Point::new_scale(width, width), Point::new_scale(width, 40. - width),
+                                      Point::new_scale(40. - width, 40. - width), Point::new_scale(40. - width, width)});
+    const auto brim = makeBrimInfillFromPlateCoordinates({area}, print, {});
+    double deposited_section = 0.;
+    double maximum_flow = 0.;
+    size_t crossings = 0;
+    for_each_extrusion_path(brim, [&](const ExtrusionPath &path) {
+        for (size_t i = 1; i < path.polyline.points.size(); ++i) {
+            const auto &a = path.polyline.points[i - 1];
+            const auto &b = path.polyline.points[i];
+            if ((a.x() <= scale_(20.) && b.x() > scale_(20.)) ||
+                (b.x() <= scale_(20.) && a.x() > scale_(20.))) {
+                deposited_section += path.mm3_per_mm;
+                maximum_flow = std::max(maximum_flow, path.mm3_per_mm);
+                ++crossings;
+            }
+        }
+    });
+    REQUIRE(crossings > 2);
+    CAPTURE(overlap, courses, ring, maximum_flow, flow.mm3_per_mm());
+    CHECK(maximum_flow <= 1.2 * flow.mm3_per_mm());
+    // Keep the requested fusion allowance, but do not add extra volume at
+    // the meeting front. Each neighboring pair shares one overlap allowance.
+    const double step = unscale_(coord_t((1. - overlap / 100.) * flow.scaled_spacing()));
+    const size_t bands = ring ? 2 : 1;
+    const double expected_section = flow.height() * (bands * width + (crossings - bands) * (flow.spacing() - step));
+    // Export averages small width changes into constant-flow path segments;
+    // allow that quantization, but not a material increase at the center.
+    CHECK_THAT(deposited_section, Catch::Matchers::WithinRel(expected_section, 0.0025));
+    const auto covered = union_(brim.polygons_covered_by_width());
+    for (double y = 0.05; y < width - 0.05; y += 0.025) {
+        CHECK(contains(covered, Point::new_scale(20., y), false));
+        if (ring)
+            CHECK(contains(covered, Point::new_scale(20., 40. - y), false));
+    }
+}
+
 TEST_CASE("Adaptive brim courses cover a tapered channel", "[SkirtBrim][BrimCoverage]")
 {
     Print print;

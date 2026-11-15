@@ -89,6 +89,26 @@ TEST_CASE("A tilted box is laid on its largest face and dropped onto the bed", "
     check_on_bed(box);
 }
 
+TEST_CASE("Explicit face placement seats a multipart object without enabling automatic dropping", "[LayOnFace]")
+{
+    const double start_z = GENERATE(-40., 50.);
+    Model model;
+    ModelObject &object = add_box_object(model, { 40, 20, 10 });
+    add_box(object, { 10, 10, 5 }, { 10, 5, 10 });
+    object.auto_drop = false;
+    object.instances.front()->set_offset({ 100, 120, start_z });
+    object.add_instance()->set_offset({ 200, 120, 80 });
+    const Transform3d other_instance = object.instances.back()->get_matrix();
+    const Transform3d part_transform = object.volumes.back()->get_matrix();
+
+    lay_on_face(object, 0, { 1, 0, 0 });
+
+    check_on_bed(object);
+    CHECK_FALSE(object.auto_drop);
+    CHECK(object.instances.back()->get_matrix().isApprox(other_instance));
+    CHECK(object.volumes.back()->get_matrix().isApprox(part_transform));
+}
+
 TEST_CASE("A box lying on one of its equally large faces is not flipped", "[LayOnFace]")
 {
     // A half turn about X puts the other large face down, so the two cases expect different faces

@@ -371,11 +371,7 @@ void NotificationManager::PopNotification::render(GLCanvas3D& canvas, float init
         render_close_button(imgui, win_size.x, win_size.y, win_pos.x, win_pos.y); // ORCA draw it after minimize button since its position related to minimize button
 	}
 
-	const bool gcode_window_visible = canvas.get_canvas_type() == GLCanvas3D::ECanvasType::CanvasPreview && wxGetApp().show_gcode_window();
-	if (!gcode_window_visible)
-	{
-		ImGui::BringWindowToDisplayFront(ImGui::GetCurrentWindow());
-	}
+	ImGui::BringWindowToDisplayFront(ImGui::GetCurrentWindow());
 	
 	imgui.end();
 
@@ -651,6 +647,19 @@ void NotificationManager::PopNotification::set_next_window_size(ImGuiWrapper& im
 		std::max(m_lines_count, (size_t)2) * m_line_height :
 		2 * m_line_height;
 	m_window_height += 1 * m_line_height; // top and bottom
+}
+
+float NotificationManager::PopNotification::layout_height()
+{
+    if (m_state == EState::Hidden || is_finished())
+        return 0.f;
+    if (m_state == EState::Unknown || m_line_height != ImGui::CalcTextSize("A").y)
+        init();
+    // A progress notification can become hidden during initialization.
+    if (m_state == EState::Hidden || is_finished())
+        return 0.f;
+    set_next_window_size(*wxGetApp().imgui());
+    return m_window_height;
 }
 
 void NotificationManager::PopNotification::bbl_render_block_notif_text(ImGuiWrapper& imgui, const float win_size_x, const float win_size_y, const float win_pos_x, const float win_pos_y)
@@ -3192,6 +3201,17 @@ void NotificationManager::stop_delayed_notifications_of_type(const NotificationT
 			++it;
 		}
 	}
+}
+
+float NotificationManager::visible_notifications_height()
+{
+    float height = 0.f;
+    for (const auto &notification : m_pop_notifications) {
+        const float notification_height = notification->layout_height();
+        if (notification_height > 0.f)
+            height += notification_height + GAP_WIDTH;
+    }
+    return height;
 }
 
 void NotificationManager::render_notifications(GLCanvas3D &canvas, float overlay_width, float bottom_margin, float right_margin)

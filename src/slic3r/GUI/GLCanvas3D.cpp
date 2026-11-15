@@ -6474,7 +6474,7 @@ void GLCanvas3D::do_move(const std::string& snapshot_type, bool force_volume_mov
     m_dirty = true;
 }
 
-void GLCanvas3D::do_rotate(const std::string& snapshot_type)
+void GLCanvas3D::do_rotate(const std::string& snapshot_type, bool place_on_face)
 {
     if (m_model == nullptr)
         return;
@@ -6487,7 +6487,7 @@ void GLCanvas3D::do_rotate(const std::string& snapshot_type)
     for (int i = 0; i < static_cast<int>(m_model->objects.size()); ++i) {
         const ModelObject* obj = m_model->objects[i];
         for (int j = 0; j < static_cast<int>(obj->instances.size()); ++j) {
-            if (snapshot_type == L("Gizmo-Place on Face") && m_selection.get_object_idx() == i) {
+            if (place_on_face && m_selection.get_object_idx() == i) {
                 // This means we are flattening this object. In that case pretend
                 // that it is not sinking (even if it is), so it is placed on bed
                 // later on (whatever is sinking will be left sinking).
@@ -6550,7 +6550,9 @@ void GLCanvas3D::do_rotate(const std::string& snapshot_type)
             // BBS: don't call translate if the z is zero
             const double shift_z = mo->get_instance_min_z(i.second);
             // leave sinking instances as sinking
-            if (mo->auto_drop && (min_zs.find({i.first, i.second})->second >= SINKING_Z_THRESHOLD || shift_z > SINKING_Z_THRESHOLD) && (shift_z != 0.0f)) {
+            // Explicit face placement must reach the bed even when automatic dropping is disabled.
+            const bool force_on_bed = place_on_face && m_selection.get_object_idx() == i.first;
+            if ((mo->auto_drop || force_on_bed) && (min_zs.find({i.first, i.second})->second >= SINKING_Z_THRESHOLD || shift_z > SINKING_Z_THRESHOLD) && (shift_z != 0.0f)) {
                 const Vec3d shift(0.0, 0.0, -shift_z);
                 m_selection.translate(i.first, i.second, shift);
                 mo->translate_instance(i.second, shift);

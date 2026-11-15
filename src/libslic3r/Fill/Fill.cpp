@@ -928,24 +928,6 @@ void split_solid_surface(size_t layer_id, const SurfaceFill &fill, ExPolygons &n
 #endif
 }
 
-static double projected_bbox_span(const BoundingBox &bbox, const Vec2d &axis)
-{
-    const std::array<Point, 4> corners{
-        bbox.min,
-        bbox.max,
-        Point(bbox.min.x(), bbox.max.y()),
-        Point(bbox.max.x(), bbox.min.y())
-    };
-    double min_projection = std::numeric_limits<double>::max();
-    double max_projection = std::numeric_limits<double>::lowest();
-    for (const Point &corner : corners) {
-        const double projection = corner.cast<double>().dot(axis);
-        min_projection = std::min(min_projection, projection);
-        max_projection = std::max(max_projection, projection);
-    }
-    return max_projection - min_projection;
-}
-
 // Cosmetic-only relief: keep the load-bearing shell and all walls intact.
 // This is not thermal isolation: the sections remain bonded to the layer below.
 static void apply_cosmetic_top_relief(const Layer &layer, SurfaceFill &fill)
@@ -1282,8 +1264,11 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
                     const BoundingBox surface_bbox = get_extents(surface.expolygon);
                     const Vec2d bridge_axis(std::cos(params.bridge_angle), std::sin(params.bridge_angle));
                     const Vec2d overhang_axis(-bridge_axis.y(), bridge_axis.x());
-                    double bridge_span = projected_bbox_span(surface_bbox, bridge_axis);
-                    double overhang_span = projected_bbox_span(surface_bbox, overhang_axis);
+                    // Rotate the geometry before bounding it. Projecting its
+                    // axis-aligned box makes a long, narrow diagonal gap look wide.
+                    const BoundingBox span_bbox = get_extents_rotated(surface.expolygon, -params.bridge_angle);
+                    double bridge_span = double(span_bbox.size().x());
+                    double overhang_span = double(span_bbox.size().y());
                     bool has_unsupported_area = true;
                     bool one_sided_overhang = false;
                     Vec2d support_center = Vec2d::Zero();
@@ -1347,9 +1332,9 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
                         bridge_span = 0.;
                         overhang_span = 0.;
                         for (const ExPolygon &part : unsupported) {
-                            const BoundingBox part_bbox = get_extents(part);
-                            bridge_span = std::max(bridge_span, projected_bbox_span(part_bbox, bridge_axis));
-                            overhang_span = std::max(overhang_span, projected_bbox_span(part_bbox, overhang_axis));
+                            const BoundingBox part_bbox = get_extents_rotated(part, -params.bridge_angle);
+                            bridge_span = std::max(bridge_span, double(part_bbox.size().x()));
+                            overhang_span = std::max(overhang_span, double(part_bbox.size().y()));
                         }
                     }
 
@@ -1363,6 +1348,17 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
                         use_arc_overhang = region_config.arc_overhang_bridges && has_unsupported_area &&
                             (minimum_span <= 0. || unscale_(bridge_span) > minimum_span);
                     }
+
+                    // A connected narrow channel can wrap around a large supported
+                    // island. Its overall extent is not the unsupported gap: every
+                    // point may still be close to an anchor. Require clearance from
+                    // support as well as span (half the span for a two-sided bridge).
+                    const double support_distance = one_sided_overhang ?
+                        region_config.arc_overhang_min_overhang_distance.value :
+                        0.5 * region_config.arc_overhang_bridge_distance.value;
+                    if (use_arc_overhang && support_distance > 0. && !nearby_support.empty())
+                        use_arc_overhang = !diff_ex(surface.expolygon,
+                            offset_ex(nearby_support, scale_(support_distance))).empty();
 
                     if (use_arc_overhang) {
                         params.arc_one_sided_overhang = one_sided_overhang;
@@ -1537,13 +1533,16 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
         ExPolygons regular_parts = support_contact;
         ExPolygons arc_parts;
 
-        const Vec2d span_axis(std::cos(fill.params.bridge_angle), std::sin(fill.params.bridge_angle));
         const double minimum_span = fill.params.arc_one_sided_overhang ?
             region_config.arc_overhang_min_overhang_distance.value :
             region_config.arc_overhang_bridge_distance.value;
+        const double support_distance = minimum_span * (fill.params.arc_one_sided_overhang ? 1. : 0.5);
+        const ExPolygons nearby_anchors = minimum_span > 0. ? offset_ex(supported, scale_(support_distance)) : ExPolygons{};
         for (ExPolygon &candidate : candidates) {
-            const double span = unscale_(projected_bbox_span(get_extents(candidate), span_axis));
-            if (minimum_span <= 0. || span > minimum_span)
+            const double span = unscale_(get_extents_rotated(candidate, -fill.params.bridge_angle).size().x());
+            const bool reaches_support_distance = minimum_span <= 0. || supported.empty() ||
+                !diff_ex(candidate, nearby_anchors).empty();
+            if (reaches_support_distance && (minimum_span <= 0. || span > minimum_span))
                 arc_parts.emplace_back(std::move(candidate));
             else
                 regular_parts.emplace_back(std::move(candidate));

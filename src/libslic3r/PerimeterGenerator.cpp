@@ -1320,10 +1320,12 @@ std::tuple<std::vector<ExtrusionPaths>, Polygons> generate_extra_perimeters_over
             const Vec2d axis = one_sided ? depth_axis : bridge_axis;
             const ExPolygons unsupported = diff_ex(overhang, offset(contact, 0.5 * overhang_flow.scaled_width()));
             for (const auto &part : unsupported) {
-                const BoundingBox bb = get_extents(part);
-                span = std::max(span, std::abs(axis.x()) * double(bb.size().x()) + std::abs(axis.y()) * double(bb.size().y()));
+                const BoundingBox bb = get_extents_rotated(part, -std::atan2(axis.y(), axis.x()));
+                span = std::max(span, double(bb.size().x()));
             }
-            if (enabled && !unsupported.empty() && (threshold <= 0. || unscale_(span) > threshold)) {
+            const bool reaches_support_distance = threshold <= 0. || contact.empty() ||
+                !diff_ex(unsupported, offset(contact, scale_(threshold * (one_sided ? 1. : 0.5)))).empty();
+            if (enabled && !unsupported.empty() && reaches_support_distance && (threshold <= 0. || unscale_(span) > threshold)) {
                 append(inset_overhang_area_left_unfilled, overhang_to_cover);
                 continue;
             }
@@ -2710,7 +2712,11 @@ std::vector<int> findAllTouchingPerimeters(const std::vector<PerimeterGeneratorA
             }
         }
     }
-    return std::vector<int>(touchingIndices.begin(), touchingIndices.end());
+    // Keep the proximity order computed before grouping by inset. Hash-table
+    // iteration scrambles independent wall fragments into long cross-island jumps.
+    std::vector<int> ordered_indices(touchingIndices.begin(), touchingIndices.end());
+    std::sort(ordered_indices.begin(), ordered_indices.end());
+    return ordered_indices;
 }
 
 /**

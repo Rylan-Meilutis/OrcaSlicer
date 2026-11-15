@@ -18,6 +18,7 @@
 #include "GUI_App.hpp"
 #include "Shortcuts.hpp"
 #include "Plater.hpp"
+#include "NotificationManager.hpp"
 #include "Camera.hpp"
 #include "I18N.hpp"
 #include "format.hpp"
@@ -48,6 +49,7 @@
 #include "libvgcode/include/Viewer.hpp"
 #include "libvgcode/include/PathVertex.hpp"
 #include <cstddef>
+#include <cmath>
 #include <cstring>
 #include "slic3r/GUI/LibVGCode/LibVGCodeWrapper.hpp"
 #include <cassert>
@@ -1326,12 +1328,15 @@ void GCodeViewer::SequentialView::GCodeWindow::render(float top, float bottom, f
         return;
 
     // window height
-    const float wnd_height = bottom - top;
+    const float wnd_height = bottom - top - 6.f * m_scale;
 
     // number of visible lines
     const float text_height = ImGui::CalcTextSize("0").y;
     const ImGuiStyle& style = ImGui::GetStyle();
-    const uint64_t lines_count = static_cast<uint64_t>((wnd_height - 2.0f * style.WindowPadding.y + style.ItemSpacing.y) / (text_height + style.ItemSpacing.y));
+    if (wnd_height < text_height + 2.f * style.WindowPadding.y)
+        return;
+    const uint64_t lines_count = std::min<uint64_t>(m_lines_ends.size(),
+        static_cast<uint64_t>((wnd_height - 2.0f * style.WindowPadding.y + style.ItemSpacing.y) / (text_height + style.ItemSpacing.y)));
 
     if (lines_count == 0)
         return;
@@ -3243,15 +3248,22 @@ void GCodeViewer::render_overlay(int canvas_width, int canvas_height, int right_
     if (m_viewer.get_extrusion_roles().empty())
         return;
 
+    // Notifications share the right-hand column. Reserve their measured height
+    // before laying out the scrollable legend and G-code, not by changing their
+    // draw order (which merely makes one overlay obscure the other).
+    const float notification_height = wxGetApp().plater()->get_notification_manager()->visible_notifications_height();
+    const int overlay_height = std::max(0, canvas_height - static_cast<int>(std::ceil(notification_height)));
+    const int legend_available_height = notification_height > 0.f ?
+        std::max(0, sequential_view_height(overlay_height) - 40) : canvas_height;
     float legend_height = 0.0f;
-    render_legend(legend_height, canvas_width, canvas_height, right_margin);
+    render_legend(legend_height, canvas_width, legend_available_height, right_margin);
 
     if (m_user_mode != wxGetApp().get_mode()) {
         update_by_mode(wxGetApp().get_mode());
         m_user_mode = wxGetApp().get_mode();
     }
 
-    m_sequential_view.render_overlay(!m_no_render_path, legend_height, &m_viewer, m_viewer.get_current_vertex().gcode_id, canvas_width, sequential_view_height(canvas_height), right_margin * m_scale, m_viewer.get_view_type());
+    m_sequential_view.render_overlay(!m_no_render_path, legend_height, &m_viewer, m_viewer.get_current_vertex().gcode_id, canvas_width, sequential_view_height(overlay_height), right_margin * m_scale, m_viewer.get_view_type());
 
 #if VGCODE_ENABLE_COG_AND_TOOL_MARKERS
     if (is_legend_shown()) {
@@ -5141,10 +5153,8 @@ void GCodeViewer::render_legend_color_arr_recommen(float window_padding)
 
 void GCodeViewer::render_legend(float &legend_height, int canvas_width, int canvas_height, int right_margin)
 {
-    if (!is_legend_shown())
+    if (!is_legend_shown() || canvas_height <= 0)
         return;
-
-    const Size cnv_size = wxGetApp().plater()->get_current_canvas3D()->get_canvas_size();
 
     ImGuiWrapper& imgui = *wxGetApp().imgui();
 
@@ -5161,7 +5171,7 @@ void GCodeViewer::render_legend(float &legend_height, int canvas_width, int canv
     //ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(1.f, 1.f, 1.f, 1.0f));
     ImGui::PushStyleColor(ImGuiCol_Border, {1, 0, 0, 0});
     ImGui::SetNextWindowBgAlpha(0.8f);
-    const float max_height = 0.75f * static_cast<float>(cnv_size.get_height());
+    const float max_height = 0.75f * static_cast<float>(canvas_height);
     const float child_height = 0.3333f * max_height;
     ImGui::SetNextWindowSizeConstraints({ 0.0f, 0.0f }, { -1.0f, max_height });
     imgui.begin(std::string("Legend"), ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoMove);
