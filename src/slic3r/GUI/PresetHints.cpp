@@ -1,16 +1,25 @@
 #include <cassert>
+#include <algorithm>
+#include <cmath>
 
 #include "libslic3r/Flow.hpp"
+#include "libslic3r/GCode/ArcCooling.hpp"
+#include "libslic3r/GCode/FeatureTemperature.hpp"
 #include "libslic3r/Slicing.hpp"
+#include "libslic3r/Preset.hpp"
 #include "libslic3r/libslic3r.h"
 
 #include "PresetHints.hpp"
+#include "I18N.hpp"
+#include "format.hpp"
 
+#include <string>
+#include "libslic3r/Config.hpp"
 #include <wx/intl.h> 
 
-#include "GUI.hpp"
-#include "format.hpp"
-#include "I18N.hpp"
+namespace Slic3r { class Preset; }
+namespace Slic3r { class PresetBundle; }
+
 
 namespace Slic3r {
 
@@ -64,6 +73,48 @@ std::string PresetHints::cooling_description(const Preset &preset)
     } else
        out += cooling ? _u8L("During the other layers, fan will be turned off.") : _u8L("Fan will be turned off.");
     */
+    if (preset.config.opt_bool("filament_arc_auto_cooling", 0)) {
+        const auto estimate = estimate_arc_cooling(preset.config.opt_string("filament_type", 0),
+            preset.config.opt_float("filament_density", 0),
+            preset.config.opt_int("nozzle_temperature", 0),
+            preset.config.opt_int("chamber_temperature", 0),
+            preset.config.opt_float("arc_overhang_cooling", 0), 0.45);
+        if (estimate) {
+            const double time_override = preset.config.opt_float("filament_arc_min_path_time", 0);
+            const double speed_override = preset.config.opt_float("filament_arc_cover_speed", 0);
+            const double minimum_speed = std::max(0.1, preset.config.opt_float("slow_down_min_speed", 0));
+            out = GUI::format(_L("Auto — estimated for a 0.45 mm round strand: cooling target %1% s, covering speed limit %2% mm/s. "
+                                "Automatic slowdown allows shorter arcs below the filament minimum print speed, but at most doubles each arc's planned time. The cooling target may not be reached. "
+                                "Positive advanced values override these estimates. Validate with a test print."),
+                              std::round(estimate->path_time * 10.) / 10.,
+                              std::round(std::max(minimum_speed, estimate->cover_speed) * 10.) / 10.);
+            if (time_override > 0. || speed_override > 0.)
+                out += "\n" + _u8L("Manual arc cooling overrides are active.");
+            const auto material = arc_thermal_material(preset.config.opt_string("filament_type", 0),
+                preset.config.opt_int("nozzle_temperature", 0));
+            if (material && material->crystallization_heat > 0.)
+                out += "\n" + _u8L("Includes a conservative crystallization-heat allowance, not a prediction of crystallization rate or shrinkage. Measured XY/Z shrinkage compensation remains unchanged.");
+            if (material && material->matrix_proxy)
+                out += "\n" + _u8L("PPS-CF uses a PPS matrix thermal proxy with your profile density. Fiber content and orientation are unknown; calibrate the manual cooling overrides for your spool.");
+        } else
+            out = _u8L("Auto estimate unavailable for this material or cooling conditions. Using process settings and any manual overrides.");
+    }
+    if (preset.config.opt_bool("filament_fast_temperature_changes", 0)) {
+        const auto &config = preset.config;
+        const int normal = config.opt_int("nozzle_temperature", 0);
+        const auto target = [&](const char *key, bool gentle) {
+            return feature_temperature(true, config.opt_bool("filament_auto_feature_temperature", 0),
+                config.opt_string("filament_type", 0), normal, config.opt_int(key, 0),
+                config.opt_int("nozzle_temperature_range_low", 0),
+                config.opt_int("nozzle_temperature_range_high", 0), gentle);
+        };
+        if (!out.empty()) out += "\n\n";
+        out += GUI::format(_L("Feature temperature targets: arcs %1% °C, bridges %2% °C, steep overhangs %3% °C, same-material interface %4% °C. Normal: %5% °C. Targets are not guaranteed actual temperatures; validate on a fast-response hotend."),
+            target("filament_arc_temperature", false), target("filament_bridge_temperature", false),
+            target("filament_overhang_temperature", true),
+            config.opt_bool("filament_reduce_support_interface_temperature", 0) ?
+                target("filament_support_interface_temperature", true) : normal, normal);
+    }
     return out;
 }
 

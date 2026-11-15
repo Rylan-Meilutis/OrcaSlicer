@@ -2,6 +2,7 @@
 #define slic3r_GLGizmoFdmSupports_hpp_
 
 #include "GLGizmoPainterBase.hpp"
+#include "libslic3r/TriangleSelector.hpp"
 //BBS
 #include "libslic3r/Print.hpp"
 #include "libslic3r/ObjectID.hpp"
@@ -9,6 +10,15 @@
 #include "slic3r/GUI/I18N.hpp"
 
 #include <boost/thread.hpp>
+#include <atomic>
+#include "slic3r/GUI/Gizmos/GLGizmoBase.hpp"
+#include <string>
+#include <wx/string.h>
+#include <cstddef>
+#include <vector>
+#include <mutex>
+#include <map>
+#include <utility>
 
 namespace Slic3r::GUI {
 
@@ -26,8 +36,7 @@ public:
         state_ready
     };
 
-    //BBS
-    bool on_key_down_select_tool_type(int keyCode);
+    bool on_tool_shortcut(Shortcut shortcut) override;
 
 protected:
     void on_render_input_window(float x, float y, float bottom_limit) override;
@@ -58,6 +67,8 @@ private:
     PainterGizmoType get_painter_type() const override;
 
     void select_facets_by_angle(float threshold, bool block);
+    void auto_generate();
+    void apply_auto_paint_result();
     // BBS
     int get_selection_support_threshold_angle();
 
@@ -77,7 +88,12 @@ private:
     GLVolume *m_support_volume = NULL;
     mutable bool m_volume_ready = false;
     bool m_is_tree_support = false;
-    bool m_cancel = false;
+    std::atomic_bool m_cancel{false};
+    std::atomic_bool m_auto_paint_running{false};
+    std::atomic_bool m_auto_paint_ready{false};
+    std::atomic_bool m_auto_paint_failed{false};
+    std::vector<TriangleSelector::TriangleSplittingData> m_auto_paint_result;
+    ObjectID m_auto_paint_object_id;
     size_t m_object_id;
     std::vector<ObjectBase::Timestamp> m_volume_timestamps;
     PrintInstance m_print_instance;
@@ -86,7 +102,6 @@ private:
     boost::thread   m_thread;
     // Mutex and condition variable to synchronize m_thread with the UI thread.
     std::mutex      m_mutex;
-    int m_generate_count;
 
     // This map holds all translated description texts, so they can be easily referenced during layout calculations
     // etc. When language changes, GUI is recreated and this class constructed again, so the change takes effect.

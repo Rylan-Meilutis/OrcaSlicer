@@ -2,10 +2,27 @@
 #define slic3r_GLGizmoBrimEars_hpp_
 
 #include "GLGizmoBase.hpp"
+#include "slic3r/GUI/GLModel.hpp"
 #include "slic3r/GUI/GLSelectionRectangle.hpp"
 #include "slic3r/GUI/I18N.hpp"
 #include "libslic3r/BrimEarsPoint.hpp"
 #include "libslic3r/ObjectID.hpp"
+#include "slic3r/GUI/SceneRaycaster.hpp"
+#include "libslic3r/Point.hpp"
+#include <utility>
+#include <string>
+#include <wx/event.h>
+#include <vector>
+#include <map>
+#include "slic3r/GUI/3DScene.hpp"
+#include <memory>
+#include <optional>
+#include "slic3r/GUI/MeshUtils.hpp"
+#include <wx/string.h>
+#include "libslic3r/ExPolygon.hpp"
+#include "libslic3r/Polygon.hpp"
+#include <cereal/archives/binary.hpp>
+#include "libslic3r/Geometry.hpp"
 
 
 namespace Slic3r {
@@ -85,11 +102,11 @@ public:
     void update_model_object();
     //ClippingPlane get_sla_clipping_plane() const;
 
-    bool is_selection_rectangle_dragging() const { return m_selection_rectangle.is_dragging(); }
+    bool is_selection_rectangle_dragging() const override { return m_selection_rectangle.is_dragging(); }
 
     bool wants_enter_leave_snapshots() const override { return true; }
-    std::string get_gizmo_entering_text() const override { return _u8L("Entering Brim Ears"); }
-    std::string get_gizmo_leaving_text() const override { return _u8L("Leaving Brim Ears"); }
+    std::string get_gizmo_entering_text() const override { return _u8L("Entering Brim Painting"); }
+    std::string get_gizmo_leaving_text() const override { return _u8L("Leaving Brim Painting"); }
 
 private:
     bool on_init() override;
@@ -98,12 +115,12 @@ private:
 
     void render_points(const Selection& selection);
 
-    float m_new_point_head_diameter;        // Size of a new point.
+    float m_new_point_head_radius;          // Radius of a new point.
     float m_max_angle = 125.f;
     float m_detection_radius = 1.f;
     double m_detection_radius_max = .0f;
     CacheEntry m_point_before_drag;         // undo/redo - so we know what state was edited
-    float m_old_point_head_diameter = 0.;   // the same
+    float m_old_point_head_radius = 0.;     // the same
     mutable std::vector<CacheEntry> m_editing_cache; // a support point and whether it is currently selectedchanges or undo/redo
     std::map<int, CacheEntry> m_single_brim;
     ObjectID m_old_mo_id;
@@ -113,8 +130,18 @@ private:
     std::optional<CacheEntry> render_hover_point;
 
     bool m_link_text_hover = false;
+    bool m_paint_brim_mode = false;
+    bool m_painting_stroke = false;
+    bool m_has_painted_position = false;
+    Vec3f m_last_painted_position = Vec3f::Zero();
     
     PickingModel m_cylinder;
+    GLModel m_brush_preview;
+    bool m_brush_preview_dirty = true;
+    bool m_square_brush = false;
+    bool m_erase_brush = false;
+    ExPolygons brim_exclusion() const;
+    bool valid_brush_position(const Vec3f &position);
 
     // This map holds all translated description texts, so they can be easily referenced during layout calculations
     // etc. When language changes, GUI is recreated and this class constructed again, so the change takes effect.
@@ -167,6 +194,8 @@ protected:
 
     std::string on_get_name() const override;
     bool on_is_activable() const override;
+    // The preview ear is drawn only while the cursor is on the model.
+    bool render_follows_cursor() const override { return render_hover_point.has_value(); }
     //bool on_is_selectable() const override;
     virtual CommonGizmosDataID on_get_requirements() const override;
     void on_load(cereal::BinaryInputArchive& ar) override;
@@ -177,9 +206,11 @@ protected:
     //void update_single_mesh_pick(GLVolume* v);
     void reset_all_pick();
     bool add_point_to_cache(Vec3f pos, float head_radius, bool selected, Vec3f normal);
+    bool paint_point_at(const Vec2d &mouse_position);
     float get_brim_default_radius() const;
     ExPolygon make_polygon(BrimPoint point, const Geometry::Transformation &trsf);
     void find_single();
+    bool unproject_on_bed(const Vec2d &mouse_position, Vec3f &object_position) const;
 };
 
 wxDECLARE_EVENT(wxEVT_THREAD_DONE, wxCommandEvent);

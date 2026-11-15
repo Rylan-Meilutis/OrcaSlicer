@@ -2,8 +2,17 @@
 #define ARRANGE_HPP
 
 #include "ExPolygon.hpp"
+#include "Point.hpp"
+#include "Polygon.hpp"
 #include "PrintConfig.hpp"
 #include "Print.hpp"
+#include <cmath>
+#include "libslic3r.h"
+#include <vector>
+#include <string>
+#include <functional>
+#include <iostream>
+#include <ostream>
 
 #define BED_SHRINK_SEQ_PRINT 5
 
@@ -72,6 +81,17 @@ struct ArrangePolygon {
     int       itemid{ 0 };         // item id in the vector, used for accessing all possible params like extrude_id
     int       is_applied{ 0 };     // transform has been applied
     double    height{ 0 };         // item height
+    double    z_min{ 0 };          // lowest occupied Z coordinate
+    double    z_max{ 0 };          // highest occupied Z coordinate
+    bool      has_z_range{ false }; // whether z_min / z_max are authoritative
+    bool      is_bed_exclusion{ false }; // conditional bed-exclusion obstacle
+    // Physical nozzle ids used only for per-nozzle exclusion checks. These are
+    // deliberately separate from extrude_ids, which contains logical filament
+    // ids used by Orca's normal material-aware arrangement. Empty is treated
+    // conservatively as unresolved and therefore applicable to every nozzle.
+    std::vector<int> bed_exclusion_extruder_ids{};
+    // Zero-based nozzle owning an exclusion obstacle; -1 means shared.
+    int       bed_exclusion_extruder_id{ -1 };
     double    brim_width{ 0 };     // brim width
     std::string name;
 
@@ -133,10 +153,18 @@ struct ArrangeParams {
     float clearance_height_to_rod = 0;
     float clearance_height_to_lid = 0;
     float clearance_radius = 0;
+    Vec2d gantry_clearance = Vec2d::Zero(); // Machine-space X/Y gap; zero uses legacy radius.
     float object_skirt_offset = 0;
     float nozzle_height = 0;
     float printable_height = 256.0;
     Vec2d align_center{ 0.5,0.5 };
+    // Belt printer: items print in the order they lie along the belt axis, from
+    // its low end unless belt_reversed, and a part's top prints
+    // belt_tilt_slope * height further along it than its base.
+    bool  is_belt         = false;
+    int   belt_axis       = 1;   // 0 = X, 1 = Y
+    bool  belt_reversed   = false;
+    float belt_tilt_slope = 1.f; // cot(belt tilt angle), 0 when the belt is not tilted
 
     ArrangePolygons excluded_regions;   // regions cant't be used
     ArrangePolygons nonprefered_regions; // regions can be used but not prefered
@@ -171,6 +199,8 @@ struct ArrangeParams {
         ret += "\"clearance_height_to_rod\":" + std::to_string(clearance_height_to_rod) + ",";
         ret += "\"clearance_height_to_lid\":" + std::to_string(clearance_height_to_lid) + ",";
         ret += "\"clearance_radius\":" + std::to_string(clearance_radius) + ",";
+        ret += "\"gantry_clearance_x\":" + std::to_string(gantry_clearance.x()) + ",";
+        ret += "\"gantry_clearance_y\":" + std::to_string(gantry_clearance.y()) + ",";
         ret += "\"printable_height\":" + std::to_string(printable_height) + ",";
         return ret;
     }
@@ -184,6 +214,9 @@ void update_selected_items_inflation(ArrangePolygons& selected, const DynamicPri
 void update_unselected_items_inflation(ArrangePolygons& unselected, const DynamicPrintConfig* print_cfg, const ArrangeParams& params);
 
 void update_selected_items_axis_align(ArrangePolygons& selected, const DynamicPrintConfig* print_cfg, const ArrangeParams& params);
+
+bool has_bed_exclusion_regions(const ArrangePolygons& polygons);
+bool bed_exclusion_applies(const ArrangePolygon& item, const ArrangePolygon& fixed_item);
 
 Points get_shrink_bedpts(const DynamicPrintConfig* print_cfg, const ArrangeParams& params);
 

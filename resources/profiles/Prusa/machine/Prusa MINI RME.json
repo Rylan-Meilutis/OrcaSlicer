@@ -1,0 +1,12 @@
+{
+	"type": "machine_model",
+	"name": "Prusa MINI RME",
+	"model_id": "MINI_RME",
+	"nozzle_diameter": "0.4",
+	"machine_tech": "FFF",
+	"family": "Prusa",
+	"bed_model": "miniis_bed.stl",
+	"bed_texture": "miniis.svg",
+	"hotend_model": "",
+	"default_materials": "Generic PLA-CF @Prusa MINIIS;Generic PC @Prusa MINIIS;Generic PVA @Prusa MINIIS;Generic PA @Prusa MINIIS;Generic PA-CF @Prusa MINIIS;Generic ABS @Prusa MINIIS;Generic PLA @Prusa MINIIS;Generic PETG @Prusa MINIIS;Generic TPU @Prusa MINIIS;Generic ASA @Prusa MINIIS"
+}

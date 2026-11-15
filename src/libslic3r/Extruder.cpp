@@ -1,9 +1,19 @@
 #include "Extruder.hpp"
+#include "Exception.hpp"
+#include "GCodeWriter.hpp"
 #include "PrintConfig.hpp"
+#include <vector>
+#include "libslic3r.h"
+#include <cassert>
+#include <algorithm>
+#include <cmath>
+#include "Config.hpp"
+#include "I18N.hpp"
 
 namespace Slic3r {
 
 std::vector<double> Extruder::m_share_E = std::vector<double>(MAXIMUM_EXTRUDER_NUMBER, 0);
+std::vector<double> Extruder::m_share_emitted_E = std::vector<double>(MAXIMUM_EXTRUDER_NUMBER, 0);
 std::vector<double> Extruder::m_share_retracted = std::vector<double>(MAXIMUM_EXTRUDER_NUMBER, 0);
 
 Extruder::Extruder(unsigned int id, GCodeConfig *config, bool share_extruder) :
@@ -56,6 +66,36 @@ double Extruder::extrude(double dE)
             m_retracted -= dE;
     }
     return dE;
+}
+
+double Extruder::preview_extrusion_delta(double dE, bool high_precision) const
+{
+    if (m_config->use_relative_e_distances.value)
+        return GCodeFormatter::quantize_e(dE + (high_precision ? m_E_rounding_carry : 0.), high_precision);
+    return GCodeFormatter::quantize_e(this->E() + dE, high_precision) -
+           (m_share_extruder ? m_share_emitted_E[extruder_id()] : m_emitted_E);
+}
+
+double Extruder::E_to_emit(bool high_precision, double extra)
+{
+    const double e = this->E() + extra;
+    if (!m_config->use_relative_e_distances.value) {
+        const double serialized = GCodeFormatter::quantize_e(e, high_precision);
+        if (m_share_extruder) m_share_emitted_E[extruder_id()] = serialized;
+        else m_emitted_E = serialized;
+        return e;
+    }
+    if (! high_precision)
+        return e;
+    // Rounding each relative move on its own biases the flow when short moves of about the same length all round
+    // the same way. Carrying the rounding error into the next move keeps the written E within half of the last
+    // decimal of the extruded length, as with absolute E distances. Moves written with the standard precision
+    // (supports) are rounded on their own, as without high precision G-code, and keep the carry for the next move
+    // written with high precision.
+    const double carried = e + m_E_rounding_carry;
+    const double emitted = GCodeFormatter::quantize_e(carried, true);
+    m_E_rounding_carry   = carried - emitted;
+    return emitted;
 }
 
 /* This method makes sure the extruder is retracted by the specified amount
@@ -117,9 +157,9 @@ double Extruder::unretract()
 void Extruder::set_retracted(double retracted, double restart_extra)
 {
     if (retracted < - EPSILON)
-        throw Slic3r::RuntimeError("Custom G-code reports negative z_retracted.");
+        throw Slic3r::RuntimeError(_u8L("Custom G-code reports negative z_retracted."));
     if (restart_extra < - EPSILON)
-        throw Slic3r::RuntimeError("Custom G-code reports negative z_restart_extra.");
+        throw Slic3r::RuntimeError(_u8L("Custom G-code reports negative z_restart_extra."));
 
     if (retracted > EPSILON) {
         m_retracted     = retracted;
@@ -220,12 +260,12 @@ double Extruder::retract_restart_extra() const
 
 double Extruder::retract_length_toolchange() const
 {
-    return m_config->retract_length_toolchange.get_at(extruder_id());
+    return m_config->retract_length_toolchange.get_at(m_config_index);
 }
 
 double Extruder::retract_restart_extra_toolchange() const
 {
-    return m_config->retract_restart_extra_toolchange.get_at(extruder_id());
+    return m_config->retract_restart_extra_toolchange.get_at(m_config_index);
 }
 
 double Extruder::travel_slope() const
