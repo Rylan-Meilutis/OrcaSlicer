@@ -84,6 +84,38 @@ class ReleaseBuildGateTest(unittest.TestCase):
     def test_stable_waits_but_rejects_failure(self):
         self.check_gate(wait=True, pending=True, conclusion="failure")
 
+    def test_untagged_draft_does_not_block_matching_release(self):
+        source = WORKFLOW.read_text()
+        step = source.split("      - name: Resolve matching release\n", 1)[1]
+        step = step.split("\n      - name:", 1)[0]
+        script = step.split("        run: |\n", 1)[1]
+        script = "\n".join(line[10:] for line in script.splitlines())
+        mocks = r'''
+          gh() {
+            case "$*" in
+              *--paginate*) printf 'old-draft\nv2\n' ;;
+              *matching-refs/tags/old-draft*) printf '[]' ;;
+              *matching-refs/tags/v2*) printf '%s' '[
+                {"ref":"refs/tags/v2","object":{"type":"commit","sha":"abc"}},
+                {"ref":"refs/tags/v20","object":{"type":"commit","sha":"abc"}}
+              ]' ;;
+              *) echo 'Unexpected gh request' >&2; return 1 ;;
+            esac
+          }
+        '''
+        # The publisher uses mapfile, which requires Bash 4+ (CI uses Bash 5).
+        version = subprocess.check_output(["bash", "-c", "echo ${BASH_VERSINFO[0]}"], text=True)
+        if int(version.strip()) < 4:
+            self.skipTest("draft resolver requires Bash 4+")
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "env"
+            env = dict(os.environ, GITHUB_REPOSITORY="owner/repo", HEAD_SHA="abc",
+                       GITHUB_ENV=str(output))
+            result = subprocess.run(["bash", "-c", mocks + script], env=env,
+                                    capture_output=True, text=True, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(output.read_text(), "TAG=v2\n")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -77,7 +77,14 @@ jobs:
           fi
           matches=()
           for tag in "${tags[@]}"; do
-            ref=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag")
+            # Creating a draft does not create its Git tag. An unrelated,
+            # untagged draft must not block uploads for a tagged release.
+            refs=$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$tag")
+            ref=$(jq -c --arg ref "refs/tags/$tag" '.[] | select(.ref == $ref)' <<< "$refs")
+            if [ -z "$ref" ]; then
+              echo "::notice::Skipping draft $tag without a Git tag."
+              continue
+            fi
             sha=$(jq -r '.object.sha' <<< "$ref")
             if [ "$(jq -r '.object.type' <<< "$ref")" = 'tag' ]; then
               sha=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$sha" --jq '.object.sha')
