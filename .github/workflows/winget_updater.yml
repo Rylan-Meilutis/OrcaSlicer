@@ -4,6 +4,9 @@ on:
     types: [ released ]
 jobs:
   publish:
+    # Fork releases are GitHub-only. Never submit RME builds as the upstream
+    # SoftFever.OrcaSlicer package or require its external publishing token.
+    if: github.repository == 'OrcaSlicer/OrcaSlicer'
     runs-on: windows-latest
     steps:
       - uses: vedantmgoyal9/winget-releaser@main

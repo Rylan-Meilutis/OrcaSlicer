@@ -12,6 +12,14 @@ import unittest
 WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/publish_release.yml"
 
 
+class ReleaseDestinationTest(unittest.TestCase):
+    def test_winget_is_restricted_to_upstream(self):
+        source = WORKFLOW.with_name("winget_updater.yml").read_text()
+        job = source.split("  publish:\n", 1)[1]
+        self.assertIn("\n    if: github.repository == 'OrcaSlicer/OrcaSlicer'\n", job)
+        self.assertLess(job.index("    if:"), job.index("    steps:"))
+
+
 @unittest.skipUnless(shutil.which("bash") and shutil.which("jq"), "bash and jq required")
 class ReleaseBuildGateTest(unittest.TestCase):
     def check_gate(self, *, accepted=False, annotated=False, tag_sha="abc",
