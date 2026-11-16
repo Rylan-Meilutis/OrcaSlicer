@@ -1,0 +1,27 @@
+diff --git a/src/ModelingData/TKBRep/BRepGraph/BRepGraph_LayerTopoSupplement.cxx b/src/ModelingData/TKBRep/BRepGraph/BRepGraph_LayerTopoSupplement.cxx
+--- a/src/ModelingData/TKBRep/BRepGraph/BRepGraph_LayerTopoSupplement.cxx
++++ b/src/ModelingData/TKBRep/BRepGraph/BRepGraph_LayerTopoSupplement.cxx
+@@ -27,6 +27,12 @@ namespace
+ {
+ const TCollection_AsciiString THE_SUPPLEMENT_LAYER_NAME("LayerTopoSupplement");
+ 
++// MSVC 14.52 ARM64 crashes in its optimizer on this switch (C1001).
++// Keep the workaround local to this predicate; all other OCCT code stays optimized.
++#if defined(_MSC_VER) && defined(_M_ARM64) && !defined(__clang__)
++#pragma optimize("", off)
++#endif
++
+ bool isSupportedOwnerKind(const BRepGraph_NodeId::Kind theKind)
+ {
+   switch (theKind)
+@@ -50,6 +56,10 @@ bool isSupportedOwnerKind(const BRepGraph_NodeId::Kind theKind)
+   return false;
+ }
+ 
++#if defined(_MSC_VER) && defined(_M_ARM64) && !defined(__clang__)
++#pragma optimize("", on)
++#endif
++
+ bool isAttachmentKindCompatible(const BRepGraph_NodeId::Kind                        theOwnerKind,
+                                 const BRepGraph_LayerTopoSupplement::AttachmentKind theKind)
+ {
