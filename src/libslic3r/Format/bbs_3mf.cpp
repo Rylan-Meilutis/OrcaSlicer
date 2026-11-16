@@ -1,4 +1,5 @@
 #include "../libslic3r.h"
+#include "SupportPaint.hpp"
 #include "../Exception.hpp"
 #include "../IMEXHelpers.hpp"
 #include "../Model.hpp"
@@ -354,6 +355,7 @@ static constexpr const char* AUTO_DROP_ATTR = "auto_drop";
 static constexpr const char* IMPORTED_PARTS_HIDDEN_KEY = "orca:imported_parts_hidden";
 static constexpr const char* INSTANCESCOUNT_ATTR = "instances_count";
 static constexpr const char* CUSTOM_SUPPORTS_ATTR = "paint_supports";
+static constexpr const char* TYPED_SUPPORTS_ATTR = "paint_supports_typed";
 static constexpr const char* CUSTOM_FUZZY_SKIN_ATTR  = "paint_fuzzy_skin";
 static constexpr const char* CUSTOM_SEAM_ATTR = "paint_seam";
 static constexpr const char* MMU_SEGMENTATION_ATTR = "paint_color";
@@ -545,6 +547,12 @@ std::string bbs_get_attribute_value_string(const char** attributes, unsigned int
 {
     const char* text = bbs_get_attribute_value_charptr(attributes, attributes_size, attribute_key);
     return (text != nullptr) ? text : "";
+}
+
+static std::string bbs_support_paint(const char **attributes, unsigned int count)
+{
+    return Slic3r::select_support_paint(bbs_get_attribute_value_string(attributes, count, CUSTOM_SUPPORTS_ATTR),
+                               bbs_get_attribute_value_string(attributes, count, TYPED_SUPPORTS_ATTR));
 }
 
 float bbs_get_attribute_value_float(const char** attributes, unsigned int attributes_size, const char* attribute_key)
@@ -4065,7 +4073,7 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                 bbs_get_attribute_value_int(attributes, num_attributes, V2_ATTR),
                 bbs_get_attribute_value_int(attributes, num_attributes, V3_ATTR));
 
-            m_curr_object->geometry.custom_supports.push_back(bbs_get_attribute_value_string(attributes, num_attributes, CUSTOM_SUPPORTS_ATTR));
+            m_curr_object->geometry.custom_supports.push_back(bbs_support_paint(attributes, num_attributes));
             m_curr_object->geometry.custom_seam.push_back(bbs_get_attribute_value_string(attributes, num_attributes, CUSTOM_SEAM_ATTR));
             m_curr_object->geometry.mmu_segmentation.push_back(bbs_get_attribute_value_string(attributes, num_attributes, MMU_SEGMENTATION_ATTR));
             m_curr_object->geometry.fuzzy_skin.push_back(bbs_get_attribute_value_string(attributes, num_attributes, CUSTOM_FUZZY_SKIN_ATTR));
@@ -4694,7 +4702,8 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                 std::istringstream(value) >> std::boolalpha >> spiral_mode;
                 m_curr_plater->config.set_key_value("spiral_mode", new ConfigOptionBool(spiral_mode));
             }
-            else if (key == "automatic_warp_mitigation" || key == "brim_type" || key == "brim_width" || key == "brim_object_gap" || key == "raft_layers" ||
+            else if (key == "enable_support" || key == "support_type" || key == "support_style" ||
+                     key == "automatic_warp_mitigation" || key == "brim_type" || key == "brim_width" || key == "brim_object_gap" || key == "raft_layers" ||
                      key == "brim_flow_ratio" || key == "raft_contact_distance" || key == "raft_expansion" ||
                      key == "raft_first_layer_expansion" || key == "raft_first_layer_density") {
                 m_curr_plater->config.set_deserialize_strict(key, value);
@@ -5978,7 +5987,7 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                 bbs_get_attribute_value_int(attributes, num_attributes, V2_ATTR),
                 bbs_get_attribute_value_int(attributes, num_attributes, V3_ATTR));
 
-            current_object->geometry.custom_supports.push_back(bbs_get_attribute_value_string(attributes, num_attributes, CUSTOM_SUPPORTS_ATTR));
+            current_object->geometry.custom_supports.push_back(bbs_support_paint(attributes, num_attributes));
             current_object->geometry.custom_seam.push_back(bbs_get_attribute_value_string(attributes, num_attributes, CUSTOM_SEAM_ATTR));
             current_object->geometry.mmu_segmentation.push_back(bbs_get_attribute_value_string(attributes, num_attributes, MMU_SEGMENTATION_ATTR));
             current_object->geometry.fuzzy_skin.push_back(bbs_get_attribute_value_string(attributes, num_attributes, CUSTOM_FUZZY_SKIN_ATTR));
@@ -7829,6 +7838,15 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
 
                 std::string custom_supports_data_string = volume->supported_facets.get_triangle_as_string(i);
                 if (! custom_supports_data_string.empty()) {
+                    std::string legacy;
+                    if (legacy_support_paint(custom_supports_data_string, legacy) && legacy != custom_supports_data_string) {
+                        output_buffer += " ";
+                        output_buffer += TYPED_SUPPORTS_ATTR;
+                        output_buffer += "=\"1:";
+                        output_buffer += custom_supports_data_string;
+                        output_buffer += "\"";
+                        custom_supports_data_string = std::move(legacy);
+                    }
                     output_buffer += " ";
                     output_buffer += CUSTOM_SUPPORTS_ATTR;
                     output_buffer += "=\"";
@@ -8598,7 +8616,8 @@ bool _BBS_3MF_Exporter::_add_model_config_file_to_archive(mz_zip_archive& archiv
                 }
 
                 //filament map related
-                for (const char *key : {"automatic_warp_mitigation", "brim_type", "brim_width", "brim_object_gap", "raft_layers", "brim_flow_ratio",
+                for (const char *key : {"enable_support", "support_type", "support_style",
+                                       "automatic_warp_mitigation", "brim_type", "brim_width", "brim_object_gap", "raft_layers", "brim_flow_ratio",
                                        "raft_contact_distance", "raft_expansion", "raft_first_layer_expansion", "raft_first_layer_density"})
                     if (const auto *option = plate_data->config.option(key))
                         stream << "    <" << METADATA_TAG << " " << KEY_ATTR << "=\"" << key << "\" " << VALUE_ATTR << "=\"" << option->serialize() << "\"/>\n";

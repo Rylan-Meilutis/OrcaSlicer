@@ -6329,13 +6329,6 @@ void GCodeViewer::render_legend(float &legend_height, int canvas_width, int canv
         ImGui::SameLine();
         imgui.text(format_compact_count(m_print_statistics.total_filament_changes));
 
-        //display tool change times
-        ImGui::Dummy({window_padding, window_padding});
-        ImGui::SameLine();
-        imgui.text(_u8L("Tool changes") + ":");
-        ImGui::SameLine();
-        imgui.text(format_compact_count(m_print_statistics.total_extruder_changes));
-
         //BBS display cost
         ImGui::Dummy({ window_padding, window_padding });
         ImGui::SameLine();
@@ -6761,6 +6754,7 @@ void GCodeViewer::render_legend(float &legend_height, int canvas_width, int canv
     std::string prepare_str = _u8L("Prepare time");
     std::string print_str = _u8L("Model printing time");
     std::string total_str = _u8L("Total time");
+    const std::string tool_changes_str = _u8L("Tool changes");
     const auto &normal_estimate = m_print_statistics.modes[static_cast<size_t>(PrintEstimatedStatistics::ETimeMode::Normal)];
     const auto &stealth_estimate = m_print_statistics.modes[static_cast<size_t>(PrintEstimatedStatistics::ETimeMode::Stealth)];
     const bool show_both_estimates = normal_estimate.time > 0.0f && stealth_estimate.time > 0.0f;
@@ -6779,6 +6773,8 @@ void GCodeViewer::render_legend(float &legend_height, int canvas_width, int canv
             max_len += std::max(ImGui::CalcTextSize(print_str.c_str()).x,
                 (std::max(ImGui::CalcTextSize(prepare_str.c_str()).x, ImGui::CalcTextSize(total_str.c_str()).x)));
     }
+    max_len = std::max(max_len, window_padding + 2 * ImGui::GetStyle().ItemSpacing.x +
+        ImGui::CalcTextSize(tool_changes_str.c_str()).x);
     if (show_both_estimates)
         max_len = std::max(max_len, window_padding + 2 * ImGui::GetStyle().ItemSpacing.x +
             std::max(ImGui::CalcTextSize(normal_total_str.c_str()).x,
@@ -6814,6 +6810,13 @@ void GCodeViewer::render_legend(float &legend_height, int canvas_width, int canv
         ::sprintf(buf, "%.2f", ps.total_cost);
         imgui.text(buf);
     }
+    // Keep the exact job-wide count visible in every preview coloring mode.
+    ImGui::Dummy({ window_padding, window_padding });
+    ImGui::SameLine();
+    imgui.text(tool_changes_str + ":");
+    ImGui::SameLine(max_len);
+    imgui.text(std::to_string(m_print_statistics.total_extruder_changes));
+
     //BBS: start gcode is mostly same with prepeare time
     if (time_mode.prepare_time != 0.0f) {
         ImGui::Dummy({ window_padding, window_padding });

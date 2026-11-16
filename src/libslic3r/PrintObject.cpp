@@ -24,9 +24,11 @@
 #include "PrintConfig.hpp"
 #include "SLA/IndexedMesh.hpp"
 #include "Support/SupportMaterial.hpp"
+#include "Support/SupportParameters.hpp"
 #include "Support/SupportCommon.hpp"
 #include "Support/SupportSpotsGenerator.hpp"
 #include "Support/TreeSupport.hpp"
+#include "Support/TypedSupportPaint.hpp"
 #include "Surface.hpp"
 #include "Slicing.hpp"
 #include "Tesselate.hpp"
@@ -5677,10 +5679,17 @@ void PrintObject::combine_infill()
 
 void PrintObject::_generate_support_material()
 {
-    if (is_tree(m_config.support_type.value)) {
+    if (m_config.enable_support.value && has_normal_support_paint(*model_object()) &&
+        is_tree(m_config.support_type.value) && SupportParameters(*this).support_style == smsTreeOrganic)
+        throw SlicingError(_u8L("Painted normal support regions cannot be combined with Organic tree supports. Choose another default support style, or change those painted regions to Tree."));
+    if (is_tree(m_config.support_type.value) ||
+        (m_config.enable_support.value && has_typed_support_paint(*model_object()))) {
         TreeSupport tree_support(*this, m_slicing_params);
         tree_support.throw_on_cancel = [this]() { this->throw_if_canceled(); };
         tree_support.generate();
+        if (tree_support.typed_paint_without_contact_area)
+            active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL,
+                _u8L("Painted normal and tree support regions have no downward-facing contact area. Paint a downward-facing surface, or use Enforce for vertical-face point support."));
     }
     else {
         // The normal generator anchors its layer grid at the slicing frame origin

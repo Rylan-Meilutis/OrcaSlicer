@@ -21,6 +21,8 @@
 #include "libslic3r/PrintConfig.hpp"
 #include "libslic3r/Geometry.hpp"
 #include "libslic3r/TriangleSelector.hpp"
+#include "libslic3r/Model.hpp"
+#include "TypedSupportPaint.hpp"
 #include "libslic3r/ExtrusionEntity.hpp"
 #include "libslic3r/Flow.hpp"
 #include "libslic3r/Polyline.hpp"
@@ -88,6 +90,36 @@
 #endif
 namespace Slic3r
 {
+bool has_typed_support_paint(const ModelObject &object)
+{
+    for (const ModelVolume *volume : object.volumes)
+        if (volume->is_model_part() &&
+            (volume->supported_facets.has_facets(*volume, EnforcerBlockerType::NORMAL_SUPPORT) ||
+             volume->supported_facets.has_facets(*volume, EnforcerBlockerType::TREE_SUPPORT)))
+            return true;
+    return false;
+}
+
+bool has_normal_support_paint(const ModelObject &object)
+{
+    for (const ModelVolume *volume : object.volumes)
+        if (volume->is_model_part() &&
+            volume->supported_facets.has_facets(*volume, EnforcerBlockerType::NORMAL_SUPPORT))
+            return true;
+    return false;
+}
+
+PaintedSupportContacts partition_painted_support_contacts(const ExPolygons &demand,
+    const Polygons &normal, const Polygons &tree, const Polygons &blockers)
+{
+    PaintedSupportContacts result;
+    const ExPolygons available = diff_ex(union_ex(demand), union_(blockers));
+    result.normal = intersection_ex(available, union_(normal));
+    result.tree = diff_ex(intersection_ex(available, union_(tree)), result.normal);
+    result.automatic = diff_ex(diff_ex(available, result.normal), result.tree);
+    return result;
+}
+
 #define unscale_(val) ((val) * SCALING_FACTOR)
 
 inline double dot_with_unscale(const Point a, const Point b)
@@ -674,6 +706,12 @@ TreeSupport::TreeSupport(PrintObject& object, const SlicingParameters &slicing_p
     m_print_config = &m_object->print()->config();
     m_raft_layers = slicing_params.base_raft_layers + slicing_params.interface_raft_layers;
     support_type = m_object_config->support_type;
+    has_typed_paint = has_typed_support_paint(*object.model_object());
+    // The shared planner can carry normal columns and tree branches together.
+    // Keep the configured detection mode and default contact type; this is an
+    // internal planner choice, never an object or preset setting rewrite.
+    if (has_typed_paint && !is_tree(support_type))
+        m_support_params.support_style = smsTreeHybrid;
 
     SupportMaterialPattern support_pattern  = m_object_config->support_base_pattern;
     if (m_support_params.support_style == smsTreeHybrid && support_pattern == smpDefault)
@@ -687,6 +725,8 @@ TreeSupport::TreeSupport(PrintObject& object, const SlicingParameters &slicing_p
     base_radius                              = std::max(MIN_BRANCH_RADIUS, m_object_config->tree_support_branch_diameter.value / 2);
     // by default tree support needs no infill, unless it's tree hybrid which contains normal nodes.
     with_infill                              = support_pattern != smpNone && support_pattern != smpDefault;
+    if (has_typed_paint && has_normal_support_paint(*object.model_object()) && support_pattern == smpDefault)
+        with_infill = true;
     m_machine_border.contour = get_bed_shape_with_excluded_area(*m_print_config);
     Vec3d plate_offset       = m_object->print()->get_plate_origin();
     // align with the centered object in current plate (may not be the 1st plate, so need to add the plate offset)
@@ -730,7 +770,8 @@ bool TreeSupport::belt_polygon_landed(const ExPolygon &poly, double print_z) con
 #define SUPPORT_SURFACES_OFFSET_PARAMETERS jtSquare, 0.
 void TreeSupport::detect_overhangs(bool check_support_necessity/* = false*/)
 {
-    bool tree_support_enable = m_object_config->enable_support.value && is_tree(m_object_config->support_type.value);
+    bool tree_support_enable = m_object_config->enable_support.value &&
+        (is_tree(m_object_config->support_type.value) || has_typed_paint);
     if (!tree_support_enable && !check_support_necessity) {
         BOOST_LOG_TRIVIAL(info) << "Tree support is disabled.";
         return;
@@ -739,6 +780,8 @@ void TreeSupport::detect_overhangs(bool check_support_necessity/* = false*/)
     // Clear and create Tree Support Layers
     m_object->clear_support_layers();
     m_object->clear_tree_support_preview_cache();
+    painted_support_styles.clear();
+    typed_paint_without_contact_area = false;
 
     const PrintObjectConfig& config = m_object->config();
     SupportType stype = support_type;
@@ -865,7 +908,7 @@ void TreeSupport::detect_overhangs(bool check_support_necessity/* = false*/)
         return cluster;
     };
 
-    if (!is_tree(stype)) return;
+    if (!is_tree(stype) && !has_typed_paint) return;
 
     max_cantilever_dist = 0;
     m_highest_overhang_layer = 0;
@@ -1168,6 +1211,22 @@ void TreeSupport::detect_overhangs(bool check_support_necessity/* = false*/)
     m_vertical_enforcer_points.clear();
     m_object->project_and_append_custom_facets(false, EnforcerBlockerType::ENFORCER, enforcers, &m_vertical_enforcer_points);
     m_object->project_and_append_custom_facets(false, EnforcerBlockerType::BLOCKER, blockers);
+    const bool typed_paint = has_typed_support_paint(*m_object->model_object());
+    std::vector<Polygons> normal_paint, tree_paint;
+    if (typed_paint) {
+        m_object->project_and_append_custom_facets(false, EnforcerBlockerType::NORMAL_SUPPORT, normal_paint);
+        m_object->project_and_append_custom_facets(false, EnforcerBlockerType::TREE_SUPPORT, tree_paint);
+        enforcers.resize(m_object->layer_count());
+        normal_paint.resize(m_object->layer_count());
+        tree_paint.resize(m_object->layer_count());
+        bool has_typed_area = false;
+        for (std::size_t i = 0; i < enforcers.size(); ++i) {
+            append(enforcers[i], normal_paint[i]);
+            append(enforcers[i], tree_paint[i]);
+            has_typed_area |= !union_ex(normal_paint[i]).empty() || !union_ex(tree_paint[i]).empty();
+        }
+        typed_paint_without_contact_area = !has_typed_area;
+    }
 
     if (is_auto(stype) && config_remove_small_overhangs) {
         // remove small overhangs
@@ -1264,6 +1323,7 @@ void TreeSupport::detect_overhangs(bool check_support_necessity/* = false*/)
         }
 
 		int nDetected = layer->loverhangs.size();
+        const ExPolygons default_contacts = typed_paint ? layer->loverhangs : ExPolygons{};
         // enforcers now follow same logic as normal support. See STUDIO-3692
         if (layer_nr < enforcers.size() && lower_layer) {
             ExPolygons enforced_overhangs   = intersection_ex(diff_ex(layer->lslices_extrudable, lower_layer->lslices_extrudable), enforcers[layer_nr]);
@@ -1278,10 +1338,49 @@ void TreeSupport::detect_overhangs(bool check_support_necessity/* = false*/)
         // add sharp tail overhangs
         append(layer->loverhangs, sharp_tail_overhangs);
 
-        // fill overhang_types
-        for (size_t i = 0; i < layer->loverhangs.size(); i++)
-            overhang_types.emplace(&layer->loverhangs[i], i < nDetected ? OverhangType::Detected :
-                i < nEnforced ? OverhangType::Enforced : OverhangType::SharpTail);
+        // Explicit styles partition complete contact polygons, never just their
+        // centroids. Keep the ordinary path untouched when no typed paint exists.
+        if (typed_paint) {
+            const Polygons blocked = layer_nr < blockers.size() ?
+                to_polygons(offset_ex(union_(blockers[layer_nr]), scale_(radius_sample_resolution))) : Polygons{};
+            // Carry the type onto newly added enforcement margins, but do not
+            // take neighboring automatically detected contacts away from their
+            // configured default merely because they are close to the brush.
+            const Polygons default_mask = to_polygons(union_ex(default_contacts, sharp_tail_overhangs));
+            auto typed_mask = [&](const Polygons &paint) {
+                Polygons mask = paint;
+                append(mask, diff(offset(union_(paint), enforcer_overhang_offset), default_mask));
+                return mask;
+            };
+            auto partition = partition_painted_support_contacts(layer->loverhangs,
+                typed_mask(normal_paint[layer_nr]), typed_mask(tree_paint[layer_nr]), blocked);
+            ExPolygons contacts;
+            std::vector<OverhangType> kinds;
+            std::vector<PaintedSupportStyle> styles;
+            for (std::size_t i = 0; i < layer->loverhangs.size(); ++i) {
+                auto pieces = intersection_ex(ExPolygons{layer->loverhangs[i]}, partition.automatic);
+                kinds.insert(kinds.end(), pieces.size(), i < std::size_t(nDetected) ? Detected :
+                    i < std::size_t(nEnforced) ? Enforced : SharpTail);
+                styles.insert(styles.end(), pieces.size(), PaintedSupportStyle::Default);
+                append(contacts, std::move(pieces));
+            }
+            const auto add_typed = [&](ExPolygons &polygons, PaintedSupportStyle style) {
+                kinds.insert(kinds.end(), polygons.size(), Enforced);
+                styles.insert(styles.end(), polygons.size(), style);
+                append(contacts, std::move(polygons));
+            };
+            add_typed(partition.normal, PaintedSupportStyle::Normal);
+            add_typed(partition.tree, PaintedSupportStyle::Tree);
+            layer->loverhangs = std::move(contacts);
+            for (std::size_t i = 0; i < layer->loverhangs.size(); ++i) {
+                overhang_types.emplace(&layer->loverhangs[i], kinds[i]);
+                painted_support_styles.emplace(&layer->loverhangs[i], styles[i]);
+            }
+        } else {
+            for (size_t i = 0; i < layer->loverhangs.size(); i++)
+                overhang_types.emplace(&layer->loverhangs[i], i < nDetected ? OverhangType::Detected :
+                    i < nEnforced ? OverhangType::Enforced : OverhangType::SharpTail);
+        }
 
         if (!layer->loverhangs.empty()) {
             layers_with_overhangs++;
@@ -1893,7 +1992,7 @@ void TreeSupport::move_bounds_to_contact_nodes(std::vector<TreeSupport3D::Suppor
 
 void TreeSupport::generate()
 {
-    if (!is_tree(m_object_config->support_type.value)) return;
+    if (!is_tree(m_object_config->support_type.value) && !has_typed_paint) return;
 
     if (m_support_params.support_style == smsTreeOrganic) {
         generate_tree_support_3D(*m_object, this, this->throw_on_cancel);
@@ -3806,10 +3905,20 @@ void TreeSupport::generate_contact_points()
                 };
 
             for (const auto& overhang_part : layer->loverhangs)  {
-                const auto& overhang_type = this->overhang_types[&overhang_part];
+                const auto& overhang_type = this->overhang_types.at(&overhang_part);
                 is_sharp_tail = overhang_type == OverhangType::SharpTail;
                 ExPolygons overhangs_regular;
-                if (m_support_params.support_style == smsTreeHybrid && overhang_part.area() > m_support_params.thresh_big_overhang && !is_sharp_tail) {
+                const auto painted = painted_support_styles.find(&overhang_part);
+                const PaintedSupportStyle painted_style = painted == painted_support_styles.end() ?
+                    PaintedSupportStyle::Default : painted->second;
+                if (painted_style == PaintedSupportStyle::Normal ||
+                    (painted_style == PaintedSupportStyle::Default && !is_tree(support_type))) {
+                    const BoundingBox bounds = get_extents(overhang_part);
+                    if (SupportNode *node = insert_point(bounds.center(), overhang_part,
+                            unscale_(bounds.radius()), true, true))
+                        node->type = ePolygon;
+                } else if (painted_style != PaintedSupportStyle::Tree &&
+                           m_support_params.support_style == smsTreeHybrid && overhang_part.area() > m_support_params.thresh_big_overhang && !is_sharp_tail) {
                     overhangs_regular           = offset_ex(intersection_ex({overhang_part}, m_ts_data->m_layer_outlines_below[layer_nr - 1]), radius_scaled);
                     ExPolygons overhangs_normal = diff_ex({overhang_part}, overhangs_regular);
                     if (area(overhangs_normal) > m_support_params.thresh_big_overhang) {

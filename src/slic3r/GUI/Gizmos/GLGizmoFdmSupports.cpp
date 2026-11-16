@@ -16,6 +16,7 @@
 #include "slic3r/GUI/Shortcuts.hpp"
 #include "slic3r/GUI/ImGuiWrapper.hpp"
 #include "slic3r/GUI/Plater.hpp"
+#include "slic3r/GUI/PartPlate.hpp"
 #include "slic3r/GUI/GUI_ObjectList.hpp"
 #include "slic3r/GUI/format.hpp"
 #include "slic3r/GUI/GUI.hpp"
@@ -322,10 +323,12 @@ void GLGizmoFdmSupports::on_render_input_window(float x, float y, float bottom_l
     }
     m_support_threshold_angle = int(std::lround(m_highlight_by_angle_threshold_deg));
 
-    const float approx_height = m_imgui->scaled(23.f);
-    y = std::min(y, bottom_limit - approx_height);
+    const float approx_height = m_imgui->scaled(31.f);
+    y = std::max(0.f, std::min(y, bottom_limit - approx_height));
 
     GizmoImguiSetNextWIndowPos(x, y, ImGuiCond_Always, 0.0f, 0.0f);
+    ImGui::SetNextWindowSizeConstraints(ImVec2(0.f, 0.f),
+        ImVec2(std::numeric_limits<float>::max(), std::max(1.f, bottom_limit - y)));
 
     //BBS
     ImGuiWrapper::push_toolbar_style(m_parent.get_scale());
@@ -409,6 +412,58 @@ void GLGizmoFdmSupports::on_render_input_window(float x, float y, float bottom_l
 
     if (m_current_tool != old_tool)
         this->tool_changed(old_tool, m_current_tool);
+
+    ImGui::Separator();
+    ImGui::AlignTextToFramePadding();
+    m_imgui->text(_L("Paint support type"));
+    ImGui::SameLine();
+    const ImFontAtlasCustomRect *info_rect = m_imgui->GetTextureCustomRect(ImGui::InfoMarker);
+    const ImFontAtlas *atlas = ImGui::GetIO().Fonts;
+    const ImVec2 info_uv0(float(info_rect->X) / atlas->TexWidth, float(info_rect->Y) / atlas->TexHeight);
+    const ImVec2 info_uv1(float(info_rect->X + info_rect->Width) / atlas->TexWidth,
+                         float(info_rect->Y + info_rect->Height) / atlas->TexHeight);
+    if (m_imgui->image_button(atlas->TexID, ImVec2(ImGui::GetFontSize(), ImGui::GetFontSize()), info_uv0, info_uv1)) {
+        // Open outside the canvas render pass; do not retain the gizmo in the callback.
+        wxGetApp().CallAfter([] {
+            if (wxGetApp().is_closing())
+                return;
+            const wxString message =
+                _L("The default choice enforces supports using the effective object, project or profile settings, including vertical-face point supports. The other choice overrides the support type on painted downward-facing contact regions.") +
+                "\n\n" + _L("Painted types apply only to the marked contact regions. Unpainted regions use the configured support type. Tree branches may extend outside the painted area to reach a stable base.") +
+                "\n\n" + _L("Normal columns cannot currently be combined with Organic tree supports. Choose a different support style to mix normal columns and tree branches.") +
+                "\n\n" + _L("Left-click paints the selected type. Right-click blocks supports; Shift+left-click erases.");
+            MessageDialog dialog(nullptr, message, _L("Paint support type"), wxOK | wxICON_INFORMATION);
+            dialog.ShowModal();
+        });
+    }
+    if (ImGui::IsItemHovered())
+        m_imgui->tooltip(_L("Information"), max_tooltip_width);
+    const bool typed_available = typed_support_paint_available();
+    const DynamicPrintConfig support_config = selected_support_config();
+    const auto support_type = support_config.option<ConfigOptionEnum<SupportType>>("support_type")->value;
+    const auto support_style = support_config.option<ConfigOptionEnum<SupportMaterialStyle>>("support_style")->value;
+    const bool tree_default = is_tree(support_type);
+    const auto other_type = tree_default ? EnforcerBlockerType::NORMAL_SUPPORT : EnforcerBlockerType::TREE_SUPPORT;
+    const bool organic = tree_default && support_style != smsTreeSlim &&
+        support_style != smsTreeStrong && support_style != smsTreeHybrid;
+    if (!typed_available || (m_support_paint_type != EnforcerBlockerType::ENFORCER && m_support_paint_type != other_type) ||
+        (organic && m_support_paint_type == EnforcerBlockerType::NORMAL_SUPPORT))
+        m_support_paint_type = EnforcerBlockerType::ENFORCER;
+    m_imgui->disabled_begin(m_auto_paint_running);
+    if (m_imgui->radio_button(tree_default ? _L("Tree (default)") : _L("Normal (default)"),
+                              m_support_paint_type == EnforcerBlockerType::ENFORCER))
+        m_support_paint_type = EnforcerBlockerType::ENFORCER;
+    m_imgui->disabled_end();
+    m_imgui->disabled_begin(!typed_available || organic || m_auto_paint_running);
+    if (m_imgui->radio_button(tree_default ? _L("Normal") : _L("Tree"), m_support_paint_type == other_type))
+        m_support_paint_type = other_type;
+    m_imgui->disabled_end();
+    if (!typed_available) {
+        m_imgui->disabled_begin(m_auto_paint_running);
+        if (m_imgui->button(_L("Enable supports for this object")))
+            enable_support_for_object();
+        m_imgui->disabled_end();
+    }
 
     ImGui::Dummy(ImVec2(0.0f, ImGui::GetFontSize() * 0.1));
 
@@ -664,7 +719,7 @@ void GLGizmoFdmSupports::select_facets_by_angle(float threshold_deg, bool block)
         const indexed_triangle_set &its = mv->mesh().its;
         for (const stl_triangle_vertex_indices &face : its.indices) {
             if (its_face_normal(its, face).dot(down) >= dot_limit - 1e-6f) {
-                m_triangle_selectors[mesh_id]->set_facet(idx, block ? EnforcerBlockerType::BLOCKER : EnforcerBlockerType::ENFORCER);
+                m_triangle_selectors[mesh_id]->set_facet(idx, block ? EnforcerBlockerType::BLOCKER : get_left_button_state_type());
                 m_triangle_selectors.back()->request_update_render_data();
             }
             ++ idx;
@@ -742,7 +797,8 @@ void GLGizmoFdmSupports::auto_generate()
     m_auto_paint_failed = false;
     m_auto_paint_running = true;
     m_auto_paint_object_id = mo->id();
-    m_thread = create_thread([this, volumes = std::move(volumes), meshes = std::move(meshes), threshold_rad,
+    const EnforcerBlockerType paint_type = get_left_button_state_type();
+    m_thread = create_thread([this, volumes = std::move(volumes), meshes = std::move(meshes), threshold_rad, paint_type,
                               spot_radius, spot_spacing, supported_gap]() mutable {
         try {
             std::vector<TriangleSelector::TriangleSplittingData> result;
@@ -753,7 +809,7 @@ void GLGizmoFdmSupports::auto_generate()
 
                 TriangleMesh local_triangle_mesh(volume.triangles);
                 TriangleSelector selector(local_triangle_mesh);
-                selector.deserialize(volume.existing_paint, false);
+                selector.deserialize(volume.existing_paint, false, EnforcerBlockerType::TREE_SUPPORT);
                 Transform3d transform_no_translate = volume.transform;
                 transform_no_translate.translation() = Vec3d::Zero();
                 const Vec3f down = (volume.transform.linear().inverse() * (-Vec3d::UnitZ())).cast<float>().normalized();
@@ -782,7 +838,7 @@ void GLGizmoFdmSupports::auto_generate()
                         auto cursor = std::make_unique<TriangleSelector::Sphere>(
                             local_point, local_point - down, spot_radius, volume.transform,
                             TriangleSelector::ClippingPlane{});
-                        selector.select_patch(int(face_idx), std::move(cursor), EnforcerBlockerType::ENFORCER,
+                        selector.select_patch(int(face_idx), std::move(cursor), paint_type,
                             transform_no_translate, true, 89.99f);
                     }
                 }
@@ -838,7 +894,7 @@ void GLGizmoFdmSupports::apply_auto_paint_result()
     }
 
     for (size_t i = 0; i < result.size(); ++i) {
-        m_triangle_selectors[i]->deserialize(result[i], true);
+        m_triangle_selectors[i]->deserialize(result[i], true, EnforcerBlockerType::TREE_SUPPORT);
         m_triangle_selectors[i]->request_update_render_data(true);
     }
     update_model_object();
@@ -884,6 +940,8 @@ void GLGizmoFdmSupports::update_from_model_object(bool first_update)
     ebt_colors.push_back(GLVolume::NEUTRAL_COLOR);
     ebt_colors.push_back(TriangleSelectorGUI::enforcers_color);
     ebt_colors.push_back(TriangleSelectorGUI::blockers_color);
+    ebt_colors.emplace_back(0.25f, 0.7f, 1.f, 1.f);
+    ebt_colors.emplace_back(1.f, 0.7f, 0.2f, 1.f);
     for (const ModelVolume* mv : mo->volumes) {
         if (! mv->is_model_part())
             continue;
@@ -894,8 +952,7 @@ void GLGizmoFdmSupports::update_from_model_object(bool first_update)
         const TriangleMesh* mesh = &mv->mesh();
         m_triangle_selectors.emplace_back(std::make_unique<TriangleSelectorPatch>(*mesh, ebt_colors));
         // Reset of TriangleSelector is done inside TriangleSelectorGUI's constructor, so we don't need it to perform it again in deserialize().
-        // The colour table has NONE/ENFORCER/BLOCKER only: a higher state in the file is reset to NONE.
-        m_triangle_selectors.back()->deserialize(mv->supported_facets.get_data(), false, EnforcerBlockerType::BLOCKER);
+        m_triangle_selectors.back()->deserialize(mv->supported_facets.get_data(), false, EnforcerBlockerType::TREE_SUPPORT);
         m_triangle_selectors.back()->request_update_render_data();
 
         //BBS: add timestamp logic
@@ -911,6 +968,56 @@ PainterGizmoType GLGizmoFdmSupports::get_painter_type() const
     return PainterGizmoType::FDM_SUPPORTS;
 }
 
+bool GLGizmoFdmSupports::typed_support_paint_available() const
+{
+    const ModelObject *object = m_c->selection_info()->model_object();
+    if (!object) return false;
+    const DynamicPrintConfig config = selected_support_config();
+    return config.opt_bool("enable_support");
+}
+
+DynamicPrintConfig GLGizmoFdmSupports::selected_support_config() const
+{
+    static const t_config_option_keys keys{"enable_support", "support_type", "support_style"};
+    DynamicPrintConfig config;
+    config.apply_only(wxGetApp().preset_bundle->prints.get_edited_preset().config, keys);
+    const ModelObject *object = m_c->selection_info()->model_object();
+    if (!object) return config;
+    const auto &objects = wxGetApp().model().objects;
+    const auto found = std::find(objects.begin(), objects.end(), object);
+    if (found != objects.end()) {
+        auto &plates = wxGetApp().plater()->get_partplate_list();
+        const int plate_index = plates.find_instance(int(found - objects.begin()), m_c->selection_info()->get_active_instance());
+        if (plate_index >= 0)
+            if (const auto *plate_config = plates.get_plate(plate_index)->config())
+                config.apply_only(*plate_config, keys);
+    }
+    config.apply_only(object->config.get(), keys);
+    return config;
+}
+
+void GLGizmoFdmSupports::enable_support_for_object()
+{
+    ModelObject *object = m_c->selection_info()->model_object();
+    if (!object) return;
+    Plater::TakeSnapshot snapshot(wxGetApp().plater(), _u8L("Enable supports for this object"), UndoRedo::SnapshotType::GizmoAction);
+    DynamicPrintConfig config = object->config.get();
+    config.set_key_value("enable_support", new ConfigOptionBool(true));
+    object->config.assign_config(config);
+    const auto &objects = wxGetApp().model().objects;
+    const auto found = std::find(objects.begin(), objects.end(), object);
+    if (found != objects.end())
+        wxGetApp().obj_list()->update_info_items(found - objects.begin());
+    invalid_support_volumes(true);
+    m_parent.post_event(SimpleEvent(EVT_GLCANVAS_SCHEDULE_BACKGROUND_PROCESS));
+    m_parent.set_as_dirty();
+}
+
+EnforcerBlockerType GLGizmoFdmSupports::get_left_button_state_type() const
+{
+    return m_support_paint_type;
+}
+
 wxString GLGizmoFdmSupports::handle_snapshot_action_name(bool shift_down, GLGizmoPainterBase::Button button_down) const
 {
     // BBS remove _L()
@@ -919,7 +1026,8 @@ wxString GLGizmoFdmSupports::handle_snapshot_action_name(bool shift_down, GLGizm
         action_name = ("Unselect all");
     else {
         if (button_down == Button::Left)
-            action_name = ("Enforce supports");
+            action_name = m_support_paint_type == EnforcerBlockerType::NORMAL_SUPPORT ? _L("Paint normal support columns") :
+                m_support_paint_type == EnforcerBlockerType::TREE_SUPPORT ? _L("Paint tree support branches") : _L("Enforce supports");
         else
             action_name = ("Block supports");
     }

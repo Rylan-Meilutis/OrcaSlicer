@@ -5,6 +5,7 @@
 #include "libslic3r/TriangleSelector.hpp"
 //BBS
 #include "libslic3r/Print.hpp"
+#include "libslic3r/PrintConfig.hpp"
 #include "libslic3r/ObjectID.hpp"
 #include "slic3r/GUI/3DScene.hpp"
 #include "slic3r/GUI/I18N.hpp"
@@ -45,6 +46,7 @@ protected:
     void on_set_state() override;
     void render_tooltip_button(float x, float y);
     wxString handle_snapshot_action_name(bool shift_down, Button button_down) const override;
+    EnforcerBlockerType get_left_button_state_type() const override;
 
     std::string get_gizmo_entering_text() const override { return _u8L("Entering Paint-on supports"); }
     std::string get_gizmo_leaving_text() const override { return _u8L("Leaving Paint-on supports"); }
@@ -61,6 +63,10 @@ private:
     //BBS: add logic to distinguish the first_time_update and later_update
     void update_from_model_object(bool first_update) override;
     void tool_changed(wchar_t old_tool, wchar_t new_tool);
+    bool typed_support_paint_available() const;
+    DynamicPrintConfig selected_support_config() const;
+    void enable_support_for_object();
+    EnforcerBlockerType m_support_paint_type = EnforcerBlockerType::ENFORCER;
 
     void on_opening() override;
     void on_shutdown() override;

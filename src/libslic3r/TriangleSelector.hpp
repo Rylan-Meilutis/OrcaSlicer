@@ -22,10 +22,13 @@
 namespace Slic3r {
 
 enum class EnforcerBlockerType : int8_t {
-    // Maximum is 3. The value is serialized in TriangleSelector into 2 bits.
+    // Existing support annotations retain their serialized values.
     NONE      = 0,
     ENFORCER  = 1,
     BLOCKER   = 2,
+    // Typed support enforcers use the same extended encoding as filament states.
+    NORMAL_SUPPORT = 3,
+    TREE_SUPPORT = 4,
     // For the fuzzy skin, we use just two values (NONE and FUZZY_SKIN).
     FUZZY_SKIN = ENFORCER,
     // States 3..17 are serialized into 6 bits using a 2 bit prefix code; states 18 and above use

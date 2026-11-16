@@ -83,6 +83,7 @@ add_executable(${_TEST_NAME}_tests
     test_preset_diff.cpp
     test_sequential_gantry_geometry.cpp
     test_nonplanar_surface.cpp
+    test_support_paint.cpp
     test_publish_settings.cpp
     test_vendor_cache.cpp
     test_preset_options.cpp

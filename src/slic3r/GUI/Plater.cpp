@@ -1862,6 +1862,9 @@ struct Sidebar::priv
     wxBoxSizer *sizer_filaments = nullptr;
     wxPanel *area_bindings_panel = nullptr;
     ComboBox *project_print_order = nullptr;
+    std::map<std::string, ::ComboBox *> project_support_choices;
+    std::map<std::string, std::vector<std::string>> project_support_values;
+    Button *project_support_reset_objects = nullptr;
     Button *project_settings_toggle = nullptr;
     Button *adjust_auto_mitigations = nullptr;
     wxPanel *area_bindings_content = nullptr;
@@ -4641,6 +4644,85 @@ Sidebar::Sidebar(Plater *parent)
             p->plater->config_change_notification(*plates.get_curr_plate()->config(), "print_sequence");
             p->plater->update();
         });
+        for (const std::string key : {"enable_support", "support_type", "support_style"}) {
+            auto *row = new wxBoxSizer(wxHORIZONTAL);
+            const wxString label = key == "enable_support" ? _L("Project supports") :
+                key == "support_type" ? _L("Support type") : _L("Support style");
+            row->Add(new wxStaticText(project_content, wxID_ANY, label),
+                     1, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(8));
+            auto *choice = new ::ComboBox(project_content, wxID_ANY, wxEmptyString, wxDefaultPosition,
+                                           wxDefaultSize, 0, nullptr, wxCB_READONLY);
+            choice->SetToolTip(_L("Override support settings for all existing plates without changing the process profile. Object overrides take precedence. Saved with the 3MF project."));
+            p->project_support_choices.emplace(key, choice);
+            row->Add(choice, 1, wxEXPAND);
+            project_sizer->Add(row, 0, wxEXPAND | wxALL, FromDIP(8));
+            choice->Bind(wxEVT_COMBOBOX, [this, key, choice](wxCommandEvent &event) {
+                event.Skip();
+                const int selected = choice->GetSelection();
+                const auto &values = p->project_support_values.at(key);
+                if (selected < 0 || size_t(selected) >= values.size() || values[selected] == "mixed") return;
+                const std::string value = values[selected];
+                auto &plates = p->plater->get_partplate_list();
+                if (key == "support_style" && !value.empty() && value != "default") {
+                    const bool tree_style = value != "grid" && value != "snug";
+                    const auto &profile = wxGetApp().preset_bundle->prints.get_edited_preset().config;
+                    for (int i = 0; i < plates.get_plate_count(); ++i) {
+                        const auto *type = plates.get_plate(i)->config()->option("support_type");
+                        if (!type) type = profile.option("support_type");
+                        if (is_tree(static_cast<SupportType>(type->getInt())) != tree_style) {
+                            show_info(this, _L("Choose a matching project support type first: Normal for Grid or Snug, and Tree for Organic, Slim, Strong or Hybrid."), _L("Support style"));
+                            update_area_bindings();
+                            return;
+                        }
+                    }
+                }
+                p->plater->take_snapshot(_u8L("Change project support settings"));
+                for (int i = 0; i < plates.get_plate_count(); ++i) {
+                    auto *plate = plates.get_plate(i);
+                    if (value.empty()) plate->config()->erase(key);
+                    else plate->config()->set_deserialize_strict(key, value);
+                    if (key == "support_type") {
+                        const auto &profile = wxGetApp().preset_bundle->prints.get_edited_preset().config;
+                        const auto *type = plate->config()->option("support_type");
+                        const auto *style = plate->config()->option("support_style");
+                        if (!type) type = profile.option("support_type");
+                        if (style && style->getInt() != smsDefault) {
+                            const bool tree_style = style->getInt() != smsGrid && style->getInt() != smsSnug;
+                            if (is_tree(static_cast<SupportType>(type->getInt())) != tree_style)
+                                plate->config()->set_key_value("support_style", new ConfigOptionEnum<SupportMaterialStyle>(smsDefault));
+                        }
+                    }
+                    plate->update_slice_result_valid_state(false);
+                }
+                p->plater->set_plater_dirty(true);
+                p->plater->update_project_dirty_from_presets();
+                p->plater->config_change_notification(*plates.get_curr_plate()->config(), key);
+                update_area_bindings();
+                p->plater->update();
+            });
+        }
+        p->project_support_reset_objects = new Button(project_content, _L("Use project support settings for all objects"));
+        p->project_support_reset_objects->SetStyle(ButtonStyle::Regular, ButtonType::Parameter);
+        p->project_support_reset_objects->SetToolTip(_L("Remove object overrides for support enablement, type and style. Painted regions and other support settings are unchanged."));
+        project_sizer->Add(p->project_support_reset_objects, 0, wxEXPAND | wxALL, FromDIP(8));
+        p->project_support_reset_objects->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
+            p->plater->take_snapshot(_u8L("Use project support settings for all objects"));
+            size_t object_index = 0;
+            for (ModelObject *object : p->plater->model().objects) {
+                DynamicPrintConfig config = object->config.get();
+                for (const char *key : {"enable_support", "support_type", "support_style"}) config.erase(key);
+                object->config.assign_config(config);
+                wxGetApp().obj_list()->update_info_items(object_index++);
+            }
+            auto &plates = p->plater->get_partplate_list();
+            for (int i = 0; i < plates.get_plate_count(); ++i)
+                plates.get_plate(i)->update_slice_result_valid_state(false);
+            p->plater->set_plater_dirty(true);
+            p->plater->update_project_dirty_from_presets();
+            update_area_bindings();
+            p->plater->update();
+            p->plater->schedule_background_process();
+        });
         p->area_bindings_panel = new wxPanel(p->scrolled);
         auto *adhesion = new wxButton(project_content, wxID_ANY, _L("Project raft and brim…"));
         project_sizer->Add(adhesion, 0, wxEXPAND | wxALL, FromDIP(8));
@@ -6846,6 +6928,9 @@ void Sidebar::msw_rescale()
     p->single_extruder->Rescale();
     rescale_sidebar_section_header(p->project_settings_toggle);
     if (p->adjust_auto_mitigations) p->adjust_auto_mitigations->Rescale();
+    for (const auto &entry : p->project_support_choices)
+        entry.second->Rescale();
+    if (p->project_support_reset_objects) p->project_support_reset_objects->Rescale();
 
     //p->btn_sync_printer->SetPaddingSize({FromDIP(6), FromDIP(12)});
     //p->btn_sync_printer->SetMinSize(BTN_SYNC_SIZE);
@@ -8436,6 +8521,75 @@ void Sidebar::update_dynamic_filament_list()
 
 void Sidebar::update_area_bindings()
 {
+    auto &support_plates = p->plater->get_partplate_list();
+    if (support_plates.get_plate_count() > 0) {
+        for (const auto &[key, choice] : p->project_support_choices) {
+            std::string current;
+            bool mixed = false;
+            for (int i = 0; i < support_plates.get_plate_count(); ++i) {
+                const auto *option = support_plates.get_plate(i)->config()->option(key);
+                const std::string value = option ? option->serialize() : std::string{};
+                if (i == 0) current = value;
+                else mixed |= current != value;
+            }
+            auto &values = p->project_support_values[key];
+            values = {""};
+            choice->Clear();
+            choice->Append(_L("Use profile"));
+            if (key == "enable_support") {
+                values.insert(values.end(), {"0", "1"});
+                choice->Append(_L("Disabled"));
+                choice->Append(_L("Enabled"));
+            } else {
+                const auto *def = print_config_def.get(key);
+                for (size_t i = 0; i < def->enum_values.size(); ++i) {
+                    if (key == "support_style" && def->enum_values[i] != "default") {
+                        const bool tree_style = def->enum_values[i] != "grid" && def->enum_values[i] != "snug";
+                        const auto &profile = wxGetApp().preset_bundle->prints.get_edited_preset().config;
+                        bool compatible = true;
+                        for (int plate_index = 0; plate_index < support_plates.get_plate_count(); ++plate_index) {
+                            const auto *type = support_plates.get_plate(plate_index)->config()->option("support_type");
+                            if (!type) type = profile.option("support_type");
+                            if (is_tree(static_cast<SupportType>(type->getInt())) != tree_style) {
+                                compatible = false;
+                                break;
+                            }
+                        }
+                        if (!compatible) continue;
+                    }
+                    values.push_back(def->enum_values[i]);
+                    choice->Append(_L(def->enum_labels[i]));
+                }
+            }
+            if (mixed) {
+                values.push_back("mixed");
+                choice->Append(_L("Custom per plate"));
+                choice->SetSelection(int(values.size() - 1));
+            } else {
+                const auto found = std::find(values.begin(), values.end(), current);
+                if (found == values.end()) {
+                    // Do not present an incompatible saved override as inheritance.
+                    values.push_back("mixed");
+                    choice->Append(_L("Incompatible style (choose another)"));
+                    choice->SetSelection(int(values.size() - 1));
+                } else {
+                    choice->SetSelection(int(found - values.begin()));
+                }
+            }
+        }
+    }
+    if (p->project_support_reset_objects) {
+        wxString overridden;
+        for (const ModelObject *object : p->plater->model().objects)
+            if (object->config.has("enable_support") || object->config.has("support_type") || object->config.has("support_style")) {
+                if (!overridden.empty()) overridden += "\n";
+                overridden += from_u8(object->name);
+            }
+        p->project_support_reset_objects->Enable(!overridden.empty());
+        if (!overridden.empty())
+            p->project_support_reset_objects->SetToolTip(format_wxstr(
+                _L("These objects override project support settings:\n%1%\n\nRemove their support enablement, type and style overrides. Painted regions and other settings are unchanged."), overridden));
+    }
     if (p->project_print_order != nullptr) {
         auto &plates = p->plater->get_partplate_list();
         if (plates.get_plate_count() > 0) {

@@ -155,7 +155,7 @@ static const std::map<const wchar_t, std::string> font_icons_large = {
 //    {ImGui::VarLayerHeightMarker    , "layers"                          },
     //{ImGui::DocumentationButton     , "notification_documentation"      },
     //{ImGui::DocumentationHoverButton, "notification_documentation_hover"},
-    //{ImGui::InfoMarker              , "notification_info"               },
+    {ImGui::InfoMarker              , "help"                            },
     // dark mode icon
     {ImGui::CloseNotifDarkButton        , "notification_close_dark"              },
     {ImGui::CloseNotifHoverDarkButton   , "notification_close_hover_dark"        },

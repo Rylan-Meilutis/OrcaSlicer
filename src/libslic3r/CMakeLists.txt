@@ -625,6 +625,8 @@ set(lisbslic3r_sources
     Support/SupportMaterial.cpp
     Support/SupportMaterial.hpp
     Support/SupportParameters.hpp
+    Support/TypedSupportPaint.hpp
+    Format/SupportPaint.hpp
     Support/SupportSpotsGenerator.cpp
     Support/SupportSpotsGenerator.hpp
     Support/TreeModelVolumes.cpp

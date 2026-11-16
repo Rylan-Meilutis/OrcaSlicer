@@ -25,6 +25,8 @@
 #include "Slicing.hpp"
 #include <cstdlib>
 #include "TriangleSelector.hpp"
+#include "Support/TypedSupportPaint.hpp"
+#include "Support/SupportParameters.hpp"
 #include "GCode/AdaptivePAProcessor.hpp"
 #include <exception>
 #include <ostream>
@@ -2731,6 +2733,12 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
             };
         }
     }
+
+    for (const PrintObject *object : m_objects)
+        if (object->config().enable_support.value && has_normal_support_paint(*object->model_object()) &&
+            is_tree(object->config().support_type.value) && SupportParameters(*object).support_style == smsTreeOrganic)
+            return {L("Painted normal support regions cannot be combined with Organic tree supports. Choose another default support style, or change those painted regions to Tree."),
+                    object->model_object(), "support_style"};
 
     // Custom layering is not allowed for tree supports as of now.
     for (size_t print_object_idx = 0; print_object_idx < m_objects.size(); ++ print_object_idx)

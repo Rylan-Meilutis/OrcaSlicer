@@ -738,6 +738,75 @@ static bool load_project(const std::string& path, Model& model, const ScopedTemp
     return loaded;
 }
 
+TEST_CASE("Typed support painting preserves subdivisions and falls back for unsupported metadata", "[3mf][TypedSupport]")
+{
+    const int backend = GENERATE(0, 1, 2); // BBS, split BBS, Prusa.
+    const std::string replacement = GENERATE("1:", "", "2:", "1:GG", "1:2C", "1:D", "1:00", "1:1");
+    CAPTURE(backend, replacement);
+    ScopedTemporaryFile file(".3mf");
+    ScopedTemporaryDir backup("orca_typed_support");
+    Model source;
+    source.set_backup_path(backup.string());
+    ModelObject *object = source.add_object();
+    ModelVolume *volume = object->add_volume(make_cube(10., 10., 10.));
+    object->add_instance();
+    // One split parent with NORMAL and TREE leaves, then unsplit typed/blocker faces.
+    volume->supported_facets.set_triangle_from_string(0, "1C0C1");
+    volume->supported_facets.set_triangle_from_string(1, "0C");
+    volume->supported_facets.set_triangle_from_string(2, "1C");
+    volume->supported_facets.set_triangle_from_string(3, "8");
+    DynamicPrintConfig config;
+    if (backend == 2)
+        REQUIRE(store_3mf(file.string().c_str(), &source, &config, false));
+    else
+        store_project(source, file.string(), backend == 1 ?
+            SaveStrategy::Zip64 | SaveStrategy::Silence | SaveStrategy::SplitModel :
+            SaveStrategy::Zip64 | SaveStrategy::Silence);
+    const std::string typed_attr = backend == 2 ? "slic3rpe:typed_supports" : "paint_supports_typed";
+    const std::string legacy_attr = backend == 2 ? "slic3rpe:custom_supports" : "paint_supports";
+    size_t annotations = 0;
+    bool legacy_split = false;
+    rewrite_3mf_entries(file.string(), [&](std::string &name, std::string &data) {
+        if (!boost::algorithm::ends_with(name, ".model")) return false;
+        legacy_split |= data.find(legacy_attr + "=\"441\"") != std::string::npos;
+        const std::string prefix = " " + typed_attr + "=\"";
+        size_t pos = 0;
+        while ((pos = data.find(prefix, pos)) != std::string::npos) {
+            ++annotations;
+            const size_t end = data.find('"', pos + prefix.size());
+            REQUIRE(end != std::string::npos);
+            if (replacement.empty()) {
+                data.erase(pos, end + 1 - pos);
+            } else if (replacement != "1:") {
+                const std::string value = replacement == "2:" ?
+                    replacement + data.substr(pos + prefix.size() + 2, end - pos - prefix.size() - 2) : replacement;
+                data.replace(pos + prefix.size(), end - pos - prefix.size(), value);
+                pos += prefix.size() + value.size() + 1;
+            } else {
+                pos = end + 1;
+            }
+        }
+        return true;
+    });
+    REQUIRE(annotations == 3);
+    REQUIRE(legacy_split);
+    Model loaded;
+    loaded.set_backup_path(backup.string());
+    if (backend == 2) {
+        ConfigSubstitutionContext context{ForwardCompatibilitySubstitutionRule::Enable};
+        REQUIRE(load_3mf(file.string().c_str(), config, context, &loaded, false));
+    } else {
+        REQUIRE(load_project(file.string(), loaded, backup));
+    }
+    REQUIRE(loaded.objects.size() == 1);
+    REQUIRE(loaded.objects.front()->volumes.size() == 1);
+    const auto &paint = loaded.objects.front()->volumes.front()->supported_facets;
+    CHECK(paint.get_triangle_as_string(0) == (replacement == "1:" ? "1C0C1" : "441"));
+    CHECK(paint.get_triangle_as_string(1) == (replacement == "1:" ? "0C" : "4"));
+    CHECK(paint.get_triangle_as_string(2) == (replacement == "1:" ? "1C" : "4"));
+    CHECK(paint.get_triangle_as_string(3) == "8");
+}
+
 TEST_CASE("A single imported object retains hidden named bodies through cloning and project reload", "[3mf][OriginalNames]")
 {
     const bool hidden = GENERATE(false, true);
@@ -2698,6 +2767,59 @@ TEST_CASE("3MF XML entries declaring more than an int can hold fail to load", "[
         PrusaFileParser parser;
         CHECK_FALSE(parser.check_3mf_from_prusa(path));
     }
+}
+
+TEST_CASE("Plate support overrides round trip without replacing inherited defaults", "[3mf][SupportPaint]")
+{
+    const bool enabled = GENERATE(false, true);
+    ScopedTemporaryDir backup_dir("plate_support_settings");
+    Model model;
+    model.set_backup_path(backup_dir.string());
+    model.add_object()->add_volume(make_cube(4, 4, 4));
+    model.add_default_instances();
+    DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+    config.set_deserialize_strict({{"enable_support", "1"}, {"support_type", "normal(auto)"},
+                                   {"support_style", "snug"}});
+    PlateData overridden, inherited;
+    overridden.plate_index = 0;
+    inherited.plate_index = 1;
+    overridden.config.set_deserialize_strict({{"enable_support", enabled ? "1" : "0"},
+                                               {"support_type", "tree(manual)"},
+                                               {"support_style", "tree_hybrid"}});
+    ScopedTemporaryFile file(".3mf");
+    const std::string path = file.string();
+    StoreParams store;
+    store.path = path.c_str();
+    store.model = &model;
+    store.config = &config;
+    store.plate_data_list = {&overridden, &inherited};
+    store.strategy = SaveStrategy::Zip64 | SaveStrategy::Silence;
+    REQUIRE(store_bbs_3mf(store));
+
+    Model loaded_model;
+    loaded_model.set_backup_path(backup_dir.string());
+    DynamicPrintConfig loaded_config;
+    ConfigSubstitutionContext substitutions{ForwardCompatibilitySubstitutionRule::Enable};
+    PlateDataPtrs plates;
+    std::vector<Preset *> presets;
+    const ScopeGuard cleanup([&] {
+        release_PlateData_list(plates);
+        for (Preset *preset : presets) delete preset;
+    });
+    bool is_bbl = false, is_orca = false;
+    Semver version;
+    REQUIRE(load_bbs_3mf(path.c_str(), &loaded_config, &substitutions, &loaded_model,
+        &plates, &presets, &is_bbl, &is_orca, &version, nullptr,
+        LoadStrategy::LoadModel | LoadStrategy::LoadConfig));
+    REQUIRE(plates.size() == 2);
+    CHECK(plates[0]->config.opt_bool("enable_support") == enabled);
+    CHECK(plates[0]->config.opt_enum<SupportType>("support_type") == stTree);
+    CHECK(plates[0]->config.opt_enum<SupportMaterialStyle>("support_style") == smsTreeHybrid);
+    CHECK_FALSE(plates[1]->config.has("enable_support"));
+    CHECK_FALSE(plates[1]->config.has("support_type"));
+    CHECK_FALSE(plates[1]->config.has("support_style"));
+    CHECK(loaded_config.opt_enum<SupportType>("support_type") == stNormalAuto);
+    CHECK(loaded_config.opt_enum<SupportMaterialStyle>("support_style") == smsSnug);
 }
 
 TEST_CASE("Loading a gcode.3mf from a stream keeps the plate's pick and pattern file paths", "[3mf][Regression]")

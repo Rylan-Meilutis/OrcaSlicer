@@ -18,6 +18,7 @@
 #include "libslic3r/PrintConfig.hpp"
 
 #include "3mf.hpp"
+#include "SupportPaint.hpp"
 
 #include <cstring>
 #include <boost/spirit/home/qi/parse.hpp>
@@ -138,6 +139,7 @@ static constexpr const char* TRANSFORM_ATTR = "transform";
 static constexpr const char* PRINTABLE_ATTR = "printable";
 static constexpr const char* INSTANCESCOUNT_ATTR = "instances_count";
 static constexpr const char* CUSTOM_SUPPORTS_ATTR = "slic3rpe:custom_supports";
+static constexpr const char* TYPED_SUPPORTS_ATTR = "slic3rpe:typed_supports";
 static constexpr const char* CUSTOM_SEAM_ATTR = "slic3rpe:custom_seam";
 static constexpr const char* MMU_SEGMENTATION_ATTR = "slic3rpe:mmu_segmentation";
 static constexpr const char* FUZZY_SKIN_ATTR = "slic3rpe:fuzzy_skin";
@@ -1791,7 +1793,9 @@ ModelVolumeType type_from_string(const std::string &s)
             get_attribute_value_int(attributes, num_attributes, V2_ATTR),
             get_attribute_value_int(attributes, num_attributes, V3_ATTR));
 
-        m_curr_object.geometry.custom_supports.push_back(get_attribute_value_string(attributes, num_attributes, CUSTOM_SUPPORTS_ATTR));
+        m_curr_object.geometry.custom_supports.push_back(select_support_paint(
+            get_attribute_value_string(attributes, num_attributes, CUSTOM_SUPPORTS_ATTR),
+            get_attribute_value_string(attributes, num_attributes, TYPED_SUPPORTS_ATTR)));
         m_curr_object.geometry.custom_seam.push_back(get_attribute_value_string(attributes, num_attributes, CUSTOM_SEAM_ATTR));
         m_curr_object.geometry.fuzzy_skin.push_back(get_attribute_value_string(attributes, num_attributes, FUZZY_SKIN_ATTR));
         m_curr_object.geometry.mmu_segmentation.push_back(get_attribute_value_string(attributes, num_attributes, MMU_SEGMENTATION_ATTR));
@@ -2881,6 +2885,15 @@ ModelVolumeType type_from_string(const std::string &s)
 
                 std::string custom_supports_data_string = volume->supported_facets.get_triangle_as_string(i);
                 if (! custom_supports_data_string.empty()) {
+                    std::string legacy;
+                    if (legacy_support_paint(custom_supports_data_string, legacy) && legacy != custom_supports_data_string) {
+                        output_buffer += " ";
+                        output_buffer += TYPED_SUPPORTS_ATTR;
+                        output_buffer += "=\"1:";
+                        output_buffer += custom_supports_data_string;
+                        output_buffer += "\"";
+                        custom_supports_data_string = std::move(legacy);
+                    }
                     output_buffer += " ";
                     output_buffer += CUSTOM_SUPPORTS_ATTR;
                     output_buffer += "=\"";

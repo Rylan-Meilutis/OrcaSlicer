@@ -239,6 +239,16 @@ static std::vector<std::pair<TreeSupportSettings, std::vector<size_t>>> group_me
     std::vector<Polygons>    enforcers_layers{ print_object.slice_support_enforcers() };
     std::vector<Polygons>    blockers_layers{ print_object.slice_support_blockers() };
     print_object.project_and_append_custom_facets(false, EnforcerBlockerType::ENFORCER, enforcers_layers);
+    // Tree paint is a local demand for the already-selected Organic planner;
+    // it must not rewrite the default style or enable automatic detection.
+    std::vector<Polygons> tree_paint;
+    print_object.project_and_append_custom_facets(false, EnforcerBlockerType::TREE_SUPPORT, tree_paint);
+    if (!tree_paint.empty()) {
+        enforcers_layers.resize(tree_paint.size());
+        for (size_t i = 0; i < tree_paint.size(); ++i)
+            append(enforcers_layers[i], tree_paint[i]);
+    }
+    const bool typed_tree_paint = !tree_paint.empty();
     print_object.project_and_append_custom_facets(false, EnforcerBlockerType::BLOCKER, blockers_layers);
     const int                support_threshold      = config.support_threshold_angle.value;
     const bool               support_threshold_auto = support_threshold == 0;
@@ -268,7 +278,7 @@ static std::vector<std::pair<TreeSupportSettings, std::vector<size_t>>> group_me
     size_t num_overhang_layers = support_auto ? num_object_layers : std::min(num_object_layers, std::max(size_t(support_enforce_layers), enforcers_layers.size()));
     tbb::parallel_for(tbb::blocked_range<LayerIndex>(1, num_overhang_layers),
         [&print_object, &config, &print_config, &enforcers_layers, &blockers_layers,
-         support_auto, support_enforce_layers, support_threshold_auto, tan_threshold, enforcer_overhang_offset, num_raft_layers, radius_sample_resolution, has_tilt, tilt_slope, &throw_on_cancel, &out]
+         support_auto, support_enforce_layers, support_threshold_auto, tan_threshold, enforcer_overhang_offset, num_raft_layers, radius_sample_resolution, has_tilt, tilt_slope, typed_tree_paint, &throw_on_cancel, &out]
         (const tbb::blocked_range<LayerIndex> &range) {
         for (LayerIndex layer_id = range.begin(); layer_id < range.end(); ++ layer_id) {
             const Layer   &current_layer  = *print_object.get_layer(layer_id);
@@ -335,6 +345,8 @@ static std::vector<std::pair<TreeSupportSettings, std::vector<size_t>>> group_me
                     //check_self_intersections(overhangs, "generate_overhangs - enforcers");
                 }
             }
+            if (typed_tree_paint && layer_id < blockers_layers.size() && !blockers_layers[layer_id].empty())
+                overhangs = diff(overhangs, offset_ex(union_(blockers_layers[layer_id]), scale_(radius_sample_resolution)), ApplySafetyOffset::Yes);
             out[layer_id + num_raft_layers] = std::move(overhangs);
             throw_on_cancel();
         }
